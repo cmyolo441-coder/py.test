@@ -131,6 +131,9 @@ class GoalMode:
 
     # ------------------------------------------------------------------
     def run(self, goal: str) -> GoalRun:
+        """Execute ``goal`` autonomously at maximum capacity until complete."""
+        self.ui.hide_prompt()
+        effort: EffortLevel = get_effort(GOAL_EFFORT)
         """Execute ``goal`` autonomously at maximum capacity until complete.
 
         Config overrides (godmode effort, auto-approve, etc.) are managed by

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(grep -rn \"radio\\\\|RadioList\\\\|button_dialog\\\\|checkbox\\\\|●\\\\|\\\\\\\\\\\\\\\\u25cf\\\\|select_model\\\\|def.*pick\\\\|prompt_toolkit.shortcuts\" agent/ui.py agent/commands/*.py agent/*.py)",
+      "Bash(python *)"
+    ]
+  }
+}

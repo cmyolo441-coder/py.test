@@ -161,6 +161,7 @@ class App:
         from .cancellation import CancellationToken, EscListener
 
         self.ui.user_bubble(user_input)
+        self.ui.hide_prompt()
         self._used_tool = False
         renderer = self.ui.stream_response()
         renderer.start_thinking()

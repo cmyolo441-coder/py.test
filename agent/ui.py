@@ -374,6 +374,12 @@ class UI:
             self.console.print(Text("\u2570" + "\u2500" * 50, style=self.accent))
         return text
 
+    def hide_prompt(self) -> None:
+        """Clear the prompt box lines from the terminal so response can start fresh."""
+        import sys
+        sys.stdout.write("\033[3A\033[J")
+        sys.stdout.flush()
+
     def confirm(self, question: str) -> bool:
         answer = self.session.prompt(HTML(f'<prompt>{question} [y/N] </prompt>')).strip().lower()
         return answer in {"y", "yes"}
@@ -532,10 +538,11 @@ class UI:
 
 
 class ResponseRenderer:
-    """Live streaming renderer with an animated thinking state.
+    """Live streaming renderer with animated thinking state and working footer.
 
-    While waiting for the first token it runs a background shimmer animation.
-    Once text streams in it live-renders markdown; the thinking loop stops.
+    While the model is thinking or streaming a response, a persistent
+    "working…" footer with a spinner is shown at the bottom. The footer
+    disappears on ``finish()``.
     """
 
     def __init__(self, console: Console, animations: bool = True, spinner: str = "braille") -> None:
@@ -551,59 +558,63 @@ class ResponseRenderer:
         self._lock = threading.Lock()
         self._cancelled = False
 
+    # -- renderable with working footer ---------------------------------
+    def _make_renderable(self):
+        """Build the full renderable: content + working footer.
+
+        During thinking shows the shimmer animation; during streaming shows
+        the markdown content; the footer always has an animated spinner
+        until ``finish()`` is called.
+        """
+        theme = themes.current()
+        if self._thinking:
+            content = effects.thinking_frame(self._tick, self._label, spinner=self.spinner)
+        elif self._buffer:
+            content = Markdown(self._buffer)
+        else:
+            content = Text("")
+        frames = effects.spinner_frames(self.spinner)
+        glyph = frames[self._tick % len(frames)]
+        footer = Text(f"\n {glyph}  working\u2026", style=f"bold {theme.dim}")
+        return Group(content, footer)
+
     def mark_cancelled(self) -> None:
-        """Flag that the user pressed Esc; switch the label to a stopping state."""
         self._cancelled = True
         self._label = "stopping"
 
     # -- thinking animation --------------------------------------------
     def start_thinking(self, label: str | None = None) -> None:
         self._label = label
-        if self._live is None:
-            self._live = Live(console=self.console, refresh_per_second=30, transient=True)
-            self._live.start()
-        if not self.animations:
-            self._live.update(Text(" thinking\u2026", style=themes.current().dim))
-            return
         self._thinking = True
-        self._thread = threading.Thread(target=self._animate, daemon=True)
-        self._thread.start()
+        self._live = Live(console=self.console, refresh_per_second=30)
+        self._live.start()
+        if self.animations:
+            self._thread = threading.Thread(target=self._animate, daemon=True)
+            self._thread.start()
+        else:
+            self._live.update(self._make_renderable())
 
     def _animate(self) -> None:
-        while self._thinking:
-            frame = effects.thinking_frame(self._tick, self._label, spinner=self.spinner)
+        while self._live is not None:
             with self._lock:
-                if self._live is not None and self._thinking:
+                if self._live is not None:
                     try:
-                        self._live.update(frame)
+                        self._live.update(self._make_renderable())
                     except Exception:
                         break
             self._tick += 1
             time.sleep(0.05)
 
-    def _stop_thinking(self) -> None:
+    # -- streaming ------------------------------------------------------
+    def on_delta(self, chunk: str) -> None:
+        self._thinking = False
+        self._buffer += chunk
+
+    def finish(self, final_text: str | None = None) -> None:
         self._thinking = False
         if self._thread is not None:
             self._thread.join(timeout=0.3)
             self._thread = None
-
-    # -- streaming ------------------------------------------------------
-    def on_delta(self, chunk: str) -> None:
-        if self._thinking:
-            self._stop_thinking()
-            with self._lock:
-                if self._live is not None:
-                    self._live.stop()
-                self._live = Live(console=self.console, refresh_per_second=24, transient=False)
-                self._live.start()
-        self._buffer += chunk
-        if self._live is None:
-            self._live = Live(console=self.console, refresh_per_second=24)
-            self._live.start()
-        self._live.update(Markdown(self._buffer))
-
-    def finish(self, final_text: str | None = None) -> None:
-        self._stop_thinking()
         text = final_text if final_text is not None else self._buffer
         with self._lock:
             if self._live is not None:
