@@ -17,14 +17,41 @@ The world''s most advanced, production-grade terminal AI agent, built in pure Py
 - 8 providers: zen (opencode.ai), OpenAI, Anthropic, Groq, Gemini, Mistral, Together, and local Ollama
 - 65+ tools: shell, files, editing, search, git, python exec, HTTP, data (json/csv), encoding, text, math, system, network, random, archive, unit-convert, process, color
 - Agentic loop with streaming and multi-step tool use
+- **Goal Mode** (`/goal`): persistent autonomous mode — stays active across multiple goals until you type `/chat`; auto godmode effort, full tool capacity, auto-approve
 - Guardrails: dangerous-command detection + per-turn tool-call budget
 - Personas: coder, sysadmin, researcher, concise, default
 - Session persistence + markdown/JSON export
 - Plugin system: drop tools into ~/.terminal_agent/plugins
 - CLI: provider/model/theme/spinner flags and one-shot prompts
 
-## Quick start
+## Installation
 
+### Option 1 — pip install (recommended)
+
+    pip install git+https://github.com/cmyolo441-coder/py.test
+
+After install, run with:
+
+    agent
+
+### Option 2 — Binary (no source needed)
+
+Download `dist/agent` from the repo or build it yourself:
+
+    shiv -o dist/agent -e agent.app:main .
+
+Then run directly:
+
+    ./dist/agent
+    # or copy to PATH:
+    cp dist/agent /usr/local/bin/agent && agent
+
+Requires Python 3.10+ on the target system (all other deps are bundled).
+
+### Option 3 — Source
+
+    git clone https://github.com/cmyolo441-coder/py.test
+    cd py.test
     pip install -r requirements.txt
     python main.py
 
@@ -46,7 +73,7 @@ The Zen provider ships with a built-in key and 3 free models: mimo-v2.5-free, bi
     make tools      # list all tools
     make run        # start the agent
 
-Slash commands include `/help /theme /spinner /keys /matrix /status /model /models /provider /tools /persona /config /export /auto /anim /clear /save /tokens /exit`.
+Slash commands include `/goal /chat /help /theme /spinner /keys /matrix /status /model /models /provider /tools /persona /config /export /auto /anim /clear /save /tokens /exit`.
 
 ## Architecture
 
