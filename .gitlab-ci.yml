@@ -1,0 +1,22 @@
+# CI pipeline: lint + tests on every push and merge request.
+stages:
+  - lint
+  - test
+
+default:
+  image: python:3.12-slim
+  before_script:
+    - python -m pip install --upgrade pip
+    - pip install -r requirements.txt
+    - pip install pytest ruff
+
+lint:
+  stage: lint
+  script:
+    - ruff check agent tests
+  allow_failure: true
+
+pytest:
+  stage: test
+  script:
+    - python -m pytest tests -q

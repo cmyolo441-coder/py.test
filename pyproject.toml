@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "terminal-agent"
+version = "1.0.0"
+description = "The world's most advanced terminal AI agent."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "termianlagent" }]
+keywords = ["ai", "agent", "terminal", "cli", "llm", "tui"]
+dependencies = [
+    "rich>=13.7.0",
+    "prompt_toolkit>=3.0.43",
+    "openai>=1.30.0",
+    "anthropic>=0.28.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.7.0",
+    "python-dotenv>=1.0.1",
+    "pygments>=2.18.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.4.0"]
+tokens = ["tiktoken>=0.7.0"]
+
+[project.scripts]
+agent = "agent.app:main"
+
+[tool.setuptools.packages.find]
+include = ["agent*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+ignore = ["E501"]
