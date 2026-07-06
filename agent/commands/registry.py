@@ -30,6 +30,7 @@ from .ui_commands import (
     ThemeCommand,
 )
 from .enterprise_commands import build_enterprise_commands
+from .v3_commands import build_v3_commands
 
 
 class CommandRegistry:
@@ -100,6 +101,13 @@ def build_command_registry() -> CommandRegistry:
         existing.update(tokens)
     # Register the 40 new enterprise commands (v2), skipping collisions.
     for cmd in build_enterprise_commands():
+        tokens = {cmd.name, *cmd.aliases}
+        if tokens & existing:
+            continue
+        registry.register(cmd)
+        existing.update(tokens)
+    # Register the v3 enterprise commands, skipping collisions.
+    for cmd in build_v3_commands():
         tokens = {cmd.name, *cmd.aliases}
         if tokens & existing:
             continue
