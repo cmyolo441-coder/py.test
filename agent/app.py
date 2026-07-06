@@ -14,6 +14,12 @@ from .providers.factory import ProviderError
 from .tools import build_default_registry
 from .ui import UI
 from .utils.logging import get_logger
+# Enterprise subsystems (v2).
+from .token_counter import get_token_counter
+from .branching import BranchManager
+from .telemetry import get_telemetry
+from .profiler import get_profiler
+from .recovery import get_recovery_manager, Checkpoint
 
 log = get_logger("agent.app")
 
@@ -38,6 +44,15 @@ class App:
         for tool in load_plugins():
             self.registry.register(tool)
             log.info("Loaded plugin tool: %s", tool.name)
+        # Enterprise subsystems.
+        self.token_counter = get_token_counter()
+        self.branch_manager = BranchManager(list(self.conversation.messages))
+        self.telemetry = get_telemetry()
+        self.profiler = get_profiler()
+        if getattr(self.config, "telemetry_enabled", False):
+            self.telemetry.enable()
+        if getattr(self.config, "profiler_enabled", False):
+            self.profiler.enable()
 
     # ------------------------------------------------------------------
     def _command_items(self) -> list[tuple[str, str]]:
@@ -122,10 +137,33 @@ class App:
         )
 
     def run(self) -> None:
-        self.ui.show_banner(self.config.provider, self.config.resolved_model())
+        # Animated boot sequence (skipped if --no-anim).
+        if self.ui.animations:
+            from .boot_sequence import play_boot_sequence
+            play_boot_sequence(
+                self.ui.console,
+                self.config.provider,
+                self.config.resolved_model(),
+                on_stage=self._boot_stage,
+                fast=False,
+            )
+        else:
+            self.ui.show_banner(self.config.provider, self.config.resolved_model())
         if not self.config.has_credentials():
             self.ui.warn(f"No credentials found for provider '{self.config.provider}'.")
         self.build_agent()
+
+        # Prompt to resume an interrupted goal if one exists.
+        try:
+            from .goal_history import get_goal_history
+            interrupted = get_goal_history().find_interrupted()
+            if interrupted:
+                self.ui.warn(
+                    f"Interrupted goal detected: '{interrupted.goal[:60]}…' "
+                    f"({interrupted.id}). Use /goal-resume {interrupted.id} to continue."
+                )
+        except Exception:  # noqa: BLE001
+            pass
 
         while True:
             try:
@@ -148,6 +186,28 @@ class App:
                 continue
 
             self._handle_turn(user_input)
+            # Auto-save recovery checkpoint after each turn.
+            self._save_recovery_checkpoint()
+
+    def _boot_stage(self, stage_index: int, stage_name: str) -> None:
+        """Called by the boot sequence between animation frames — no-op for now."""
+        pass
+
+    def _save_recovery_checkpoint(self) -> None:
+        """Save a recovery checkpoint of the current session."""
+        try:
+            rm = get_recovery_manager()
+            cp = Checkpoint(
+                session_id="default",
+                provider=self.config.provider,
+                model=self.config.resolved_model(),
+                messages=list(self.conversation.messages),
+                turn_count=len([m for m in self.conversation.messages if m.get("role") == "user"]),
+                goal_mode=self.goal_mode,
+            )
+            rm.save(cp)
+        except Exception:  # noqa: BLE001
+            pass
 
     def run_once(self, prompt: str) -> None:
         """Run a single prompt non-interactively then return (for scripting)."""
@@ -158,7 +218,10 @@ class App:
     # ------------------------------------------------------------------
     def _handle_turn(self, user_input: str) -> None:
         assert self.agent is not None
+        import time as _time
         from .cancellation import CancellationToken, EscListener
+        from .context_manager import compress_messages
+        from .token_counter import count_message_tokens
 
         self.ui.user_bubble(user_input)
         self.ui.hide_prompt()
@@ -167,6 +230,21 @@ class App:
         renderer.start_thinking()
 
         cancel_token = CancellationToken()
+        turn_start = _time.perf_counter()
+
+        # Auto-compact the conversation if configured and near the context limit.
+        if getattr(self.config, "auto_compact", True):
+            try:
+                before = len(self.conversation.messages)
+                self.conversation.messages = compress_messages(
+                    self.conversation.messages,
+                    self.config.resolved_model(),
+                    self.config.provider,
+                )
+                if len(self.conversation.messages) < before:
+                    self.ui.info(f"  (compacted context: {before} -> {len(self.conversation.messages)} messages)")
+            except Exception:  # noqa: BLE001
+                pass
 
         def _notify_cancel() -> None:
             renderer.mark_cancelled()
@@ -190,6 +268,11 @@ class App:
             if iteration > 0:
                 renderer.start_thinking("reasoning")
 
+        # Count input tokens before the call.
+        in_tokens = count_message_tokens(
+            self.conversation.messages, self.config.resolved_model(), self.config.provider
+        )
+
         try:
             with EscListener(cancel_token, on_cancel=_notify_cancel):
                 final = self.agent.send(
@@ -203,6 +286,7 @@ class App:
         except Exception as exc:  # noqa: BLE001
             renderer.finish()
             log.exception("Turn failed")
+            self.telemetry.record("turn", duration_s=_time.perf_counter() - turn_start, success=False)
             self.ui.error(f"{type(exc).__name__}: {exc}")
             return
 
@@ -210,18 +294,49 @@ class App:
         if cancel_token.cancelled:
             self.ui.warn("Response stopped (Esc).")
 
+        # Record real token usage for this turn.
+        duration = _time.perf_counter() - turn_start
+        out_tokens = count_message_tokens(
+            [{"role": "assistant", "content": final or ""}],
+            self.config.resolved_model(),
+            self.config.provider,
+        )
+        self.token_counter.record_turn(
+            model=self.config.resolved_model(),
+            provider=self.config.provider,
+            input_tokens=in_tokens,
+            output_tokens=out_tokens,
+            duration_s=duration,
+            tool_calls=1 if self._used_tool else 0,
+        )
+        self.telemetry.record("turn", duration_s=duration, success=True)
+
         # Celebrate when a multi-step, tool-using task completes.
         if self._used_tool and self.ui.animations:
             from . import effects
 
             effects.confetti(self.ui.console, frames=12)
 
-        # Live status bar footer for the turn.
-        self.ui.status_bar(
-            self.config.provider,
-            self.config.resolved_model(),
-            self.conversation.token_estimate(),
-        )
+        # Live status bar footer for the turn — now uses the real token counter.
+        try:
+            from .widgets import render_status_bar
+            snap = self.token_counter.snapshot()
+            bar = render_status_bar(
+                self.config.provider,
+                self.config.resolved_model(),
+                snap,
+                theme_name=getattr(self.ui, "_theme_name", ""),
+                goal_mode=self.goal_mode,
+                effort=getattr(self.config, "effort", ""),
+            )
+            self.ui.console.print(bar)
+        except Exception:  # noqa: BLE001
+            # Fallback to the old status bar.
+            self.ui.status_bar(
+                self.config.provider,
+                self.config.resolved_model(),
+                self.conversation.token_estimate(),
+            )
 
 
 def main() -> None:

@@ -29,6 +29,7 @@ from .ui_commands import (
     StatusCommand,
     ThemeCommand,
 )
+from .enterprise_commands import build_enterprise_commands
 
 
 class CommandRegistry:
@@ -92,6 +93,13 @@ def build_command_registry() -> CommandRegistry:
         existing.add(cmd.name)
         existing.update(cmd.aliases)
     for cmd in build_feature_commands():
+        tokens = {cmd.name, *cmd.aliases}
+        if tokens & existing:
+            continue
+        registry.register(cmd)
+        existing.update(tokens)
+    # Register the 40 new enterprise commands (v2), skipping collisions.
+    for cmd in build_enterprise_commands():
         tokens = {cmd.name, *cmd.aliases}
         if tokens & existing:
             continue

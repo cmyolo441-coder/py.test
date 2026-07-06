@@ -20,6 +20,10 @@ from .network_tools import get_network_tools
 from .convert_tools import get_convert_tools
 from .process_tools import get_process_tools
 from .color_tools import get_color_tools
+from .code_analysis_tools import get_code_analysis_tools
+from .security_tools import get_security_tools
+from .scaffold_tools import get_scaffold_tools
+from .docgen_tools import get_docgen_tools
 
 
 def get_all_tools() -> list[Tool]:
@@ -42,6 +46,11 @@ def get_all_tools() -> list[Tool]:
         get_convert_tools,
         get_process_tools,
         get_color_tools,
+        # Enterprise tool groups (new in v2).
+        get_code_analysis_tools,
+        get_security_tools,
+        get_scaffold_tools,
+        get_docgen_tools,
     ):
         tools.extend(group())
     return tools
