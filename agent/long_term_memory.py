@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from .rag_v2 import VectorStore, get_vector_store
+from .rag_v2 import VectorStore
 
 
 @dataclass
@@ -154,7 +154,7 @@ class LongTermMemory:
             "Long-term memory:",
             f"  episodes:  {s['episodes']}",
             f"  facts:     {s['facts']}",
-            f"  by category:",
+            "  by category:",
         ]
         for cat, count in s["facts_by_category"].items():
             lines.append(f"    {cat:<14} {count}")

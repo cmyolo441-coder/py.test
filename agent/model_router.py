@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any
 
 # Query-class -> recommended (provider, model) pairs, in priority order.
 ROUTING_TABLE: dict[str, list[tuple[str, str]]] = {

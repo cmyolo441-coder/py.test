@@ -14,7 +14,6 @@ Strategies:
 from __future__ import annotations
 
 import concurrent.futures
-import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable
 

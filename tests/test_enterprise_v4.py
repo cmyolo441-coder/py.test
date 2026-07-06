@@ -7,10 +7,7 @@ quantum optimizer, neuroevolution, adversarial defense), v4 effects."""
 
 from __future__ import annotations
 
-import tempfile
-from pathlib import Path
 
-import pytest
 
 
 # --- Self-evolving ---
@@ -647,7 +644,6 @@ def test_goal_mode_truncation_signals():
 
 
 def test_goal_mode_is_truncated():
-    from agent.goal_mode import GoalMode
     # GoalMode._is_truncated is a method — test with a mock.
     # Just verify the signals are detected.
     from agent.goal_mode import TRUNCATION_SIGNALS

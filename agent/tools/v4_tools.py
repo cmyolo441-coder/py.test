@@ -25,7 +25,6 @@ Tools:
 """
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from .base import Tool, ToolResult
@@ -107,7 +106,7 @@ def _formal_verify(path: str) -> ToolResult:
 
 
 def _synthesize(description: str, function_name: str = "synthesized") -> ToolResult:
-    from ..program_synthesis import get_synthesizer, SynthesisSpec
+    from ..program_synthesis import get_synthesizer
     synthesizer = get_synthesizer()
     result = synthesizer.synthesize_from_description(description, function_name)
     return ToolResult(output=f"// Generated: {result.spec.function_name}\n{result.code}", metadata={"verified": result.verified})
@@ -296,7 +295,6 @@ def _interpretable_explain(decision_id: str = "") -> ToolResult:
 def get_v4_tools() -> list[Tool]:
     s = {"type": "string"}
     i = {"type": "integer"}
-    b = {"type": "boolean"}
     return [
         Tool("self_analyze", "Analyze the agent's own source code for improvement opportunities.", {"type": "object", "properties": {}}, _self_analyze),
         Tool("constitutional_check", "Review an action against the agent's constitution (principles).", {"type": "object", "properties": {"action": s}, "required": ["action"]}, _constitutional_check),

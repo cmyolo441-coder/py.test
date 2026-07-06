@@ -21,7 +21,7 @@ import json
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
@@ -236,7 +236,7 @@ class SelfEvolvingAgent:
             lines.append(f"  {status} {e.id}  {ts}  {e.file}")
             lines.append(f"    {e.description}")
             if e.rolled_back:
-                lines.append(f"    [ROLLED BACK]")
+                lines.append("    [ROLLED BACK]")
         return "\n".join(lines)
 
     def _save_genome(self) -> None:

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .token_counter import (
-    TokenCounter, get_token_counter, format_cost, USD_TO_INR,
+    TokenCounter, get_token_counter, format_cost,
 )
 
 
@@ -53,7 +53,7 @@ class CostTracker:
         lines = [
             "╭─ Cost Dashboard ────────────────────────────────╮",
             "│                                                 │",
-            f"│  This session:                                  │",
+            "│  This session:                                  │",
             f"│    turns:      {snap['session_turns']:>6}                              │",
             f"│    input:      {snap['session_input']:>6,} tokens                       │",
             f"│    output:     {snap['session_output']:>6,} tokens                       │",

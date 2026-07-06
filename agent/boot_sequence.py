@@ -14,8 +14,7 @@ import time
 from typing import Callable
 
 from rich.align import Align
-from rich.console import Console, Group
-from rich.panel import Panel
+from rich.console import Console
 from rich.text import Text
 
 from . import effects, themes
@@ -98,6 +97,6 @@ def play_boot_sequence(
 
 def show_goodbye(console: Console) -> None:
     """Play a short farewell animation on exit."""
-    theme = themes.current()
+    themes.current()
     text = effects.gradient_text("Goodbye! 👋")
     console.print(Align.center(text))

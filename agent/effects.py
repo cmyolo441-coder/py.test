@@ -7,7 +7,6 @@ states and animated tool progress that make this TUI feel alive.
 
 from __future__ import annotations
 
-import math
 import random
 import time
 from dataclasses import dataclass

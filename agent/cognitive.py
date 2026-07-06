@@ -136,7 +136,7 @@ class DeclarativeChunk:
     def total_activation(self) -> float:
         """Total activation = base level + spreading - time decay."""
         decay = 0.5  # ACT-R default decay rate
-        time_since_access = time.time() - self.last_accessed
+        time.time() - self.last_accessed
         time_since_creation = time.time() - self.creation_time
         # Base-level learning: log(sum of time^(-decay))
         base = math.log(1 + self.access_count) - decay * math.log(1 + time_since_creation / 3600)

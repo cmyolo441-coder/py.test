@@ -13,7 +13,7 @@ import threading
 from typing import Any
 
 try:
-    import httpx
+    import httpx  # noqa: F401
     _HAS_HTTPX = True
 except ImportError:
     _HAS_HTTPX = False

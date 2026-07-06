@@ -6,7 +6,6 @@ running it. Used by Goal Mode for refactoring, review and documentation tasks.
 from __future__ import annotations
 
 import ast
-import os
 from pathlib import Path
 
 from .base import Tool, ToolResult

@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any
 
 from .cancellation import CancellationToken, EscListener
 from .effort import EffortLevel, get_effort, next_effort

@@ -11,7 +11,6 @@ This is the highest level of abstraction: programs that manipulate programs.
 """
 from __future__ import annotations
 
-import ast
 import textwrap
 from dataclasses import dataclass, field
 from typing import Any
@@ -137,30 +136,30 @@ if __name__ == "__main__":
         """
         lines = [
             f'"""Generated DSL: {name}"""',
-            f"import re",
-            f"",
+            "import re",
+            "",
             f"class {name.title()}DSL:",
             f'    """A DSL for {name}."""',
-            f"",
-            f"    def __init__(self):",
-            f"        self.operations = {{}}",
+            "",
+            "    def __init__(self):",
+            "        self.operations = {}",
         ]
         for op_name, op_desc in operations:
             lines.extend([
-                f"",
+                "",
                 f"    def {op_name}(self, *args):",
                 f'        """{op_desc}"""',
                 f'        self.operations["{op_name}"] = args',
-                f"        return self",
+                "        return self",
             ])
         lines.extend([
-            f"",
-            f"    def execute(self):",
-            f'        """Execute all operations."""',
-            f"        results = []",
-            f"        for op, args in self.operations.items():",
-            f"            results.append(f\"{{op}}({{args}})\")",
-            f"        return results",
+            "",
+            "    def execute(self):",
+            '        """Execute all operations."""',
+            "        results = []",
+            "        for op, args in self.operations.items():",
+            "            results.append(f\"{op}({args})\")",
+            "        return results",
         ])
         return GeneratedProgram(code="\n".join(lines), generator="dsl_generator", metadata={"name": name, "operations": [o[0] for o in operations]})
 
@@ -171,27 +170,27 @@ if __name__ == "__main__":
         """
         lines = [
             f'"""Generated AST transformer: {name}"""',
-            f"import ast",
-            f"",
+            "import ast",
+            "",
             f"class {name.title()}Transformer(ast.NodeTransformer):",
             f'    """{name} — transforms AST nodes."""',
-            f"",
+            "",
         ]
         for node_type, desc in transformations:
             method_name = f"visit_{node_type}"
             lines.extend([
                 f"    def {method_name}(self, node):",
                 f'        """{desc}"""',
-                f"        self.generic_visit(node)",
-                f"        return node",
-                f"",
+                "        self.generic_visit(node)",
+                "        return node",
+                "",
             ])
         lines.extend([
             f"def apply_{name.lower()}(source: str) -> str:",
-            f"    tree = ast.parse(source)",
+            "    tree = ast.parse(source)",
             f"    transformer = {name.title()}Transformer()",
-            f"    transformer.visit(tree)",
-            f"    return ast.unparse(tree)",
+            "    transformer.visit(tree)",
+            "    return ast.unparse(tree)",
         ])
         return GeneratedProgram(code="\n".join(lines), generator="ast_transformer_generator", metadata={"name": name})
 

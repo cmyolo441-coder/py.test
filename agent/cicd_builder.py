@@ -11,7 +11,6 @@ Each generated config runs lint + test on every push/PR. Real, runnable.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 
 GITHUB_ACTIONS_TEMPLATE = """\

@@ -11,7 +11,6 @@ from __future__ import annotations
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 
 def _run(cmd: list[str], cwd: str = ".", timeout: int = 60) -> tuple[bool, str]:

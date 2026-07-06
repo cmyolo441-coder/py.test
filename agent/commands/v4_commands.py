@@ -378,7 +378,7 @@ class QuantumCommand(Command):
         def objective(x):
             return sum(v * v for v in x)
         result = qopt.optimize(objective, [1.0, 2.0, 3.0], max_iterations=iters)
-        ctx.ui.info(f"Optimization result:")
+        ctx.ui.info("Optimization result:")
         ctx.ui.info(f"  best solution: {result.best_solution}")
         ctx.ui.info(f"  best score: {result.best_score:.6f}")
         ctx.ui.info(f"  iterations: {result.iterations}")

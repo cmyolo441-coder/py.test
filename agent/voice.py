@@ -13,7 +13,6 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any
 
 
 def text_to_speech(text: str, output_path: str | Path | None = None, voice: str = "default") -> str:

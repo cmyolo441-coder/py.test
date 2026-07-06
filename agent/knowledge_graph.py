@@ -86,7 +86,7 @@ class KnowledgeGraph:
 
     def top_entities(self, n: int = 10) -> list[tuple[GraphNode, int]]:
         """Return the most-connected nodes (hubs)."""
-        connections = {node_id: len(neighbors) for node_id in self.nodes}
+        connections = {node_id: len(self.neighbors(node_id)) for node_id in self.nodes}
         sorted_nodes = sorted(connections.items(), key=lambda x: -x[1])
         return [(self.nodes[nid], count) for nid, count in sorted_nodes[:n]]
 

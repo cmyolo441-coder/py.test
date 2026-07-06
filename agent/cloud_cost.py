@@ -12,7 +12,6 @@ agent generates by inspecting Terraform/CloudFormation files.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
 
 
 # Approximate monthly USD prices per instance type (on-demand, us-east-1).

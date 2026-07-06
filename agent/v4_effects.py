@@ -20,8 +20,6 @@ from rich.align import Align
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
-from rich.progress import (BarColumn, Progress, SpinnerColumn, TextColumn,
-                            TimeElapsedColumn, TimeRemainingColumn)
 from rich.text import Text
 from rich.table import Table
 
@@ -158,7 +156,7 @@ def phase_transition(console: Console, from_phase: str, to_phase: str) -> None:
 def live_token_widget_animated(console: Console, snapshot: dict[str, Any], duration: float = 2.0) -> None:
     """Animate the token counter going up (for visual feedback)."""
     from . import themes
-    theme = themes.current()
+    themes.current()
     start_total = snapshot.get("session_total", 0)
     # Simulate counting up (in practice this would show real-time updates).
     with Live(console=console, refresh_per_second=30, transient=True) as live:

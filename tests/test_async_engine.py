@@ -1,6 +1,5 @@
 import asyncio
 
-import pytest
 
 from agent.async_engine import (
     AsyncTaskRunner, async_retry, gather_with_timeout, run_concurrent,

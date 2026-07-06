@@ -13,7 +13,6 @@ Falls back gracefully when not available.
 """
 from __future__ import annotations
 
-import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path

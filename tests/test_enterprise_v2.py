@@ -8,7 +8,6 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-import pytest
 
 
 # ---------------------------------------------------------------------------
@@ -163,8 +162,7 @@ def test_fallback_chain_pick():
 
 
 def test_fallback_chain_failure_and_cooldown():
-    import time
-    from agent.fallback import FallbackChain, COOLDOWN_SECONDS
+    from agent.fallback import FallbackChain
     chain = FallbackChain(["zen:mimo-v2.5-free", "ollama:llama3.1"])
     chain.record_failure("zen", "mimo-v2.5-free")
     # The zen entry should now be on cooldown.
@@ -375,7 +373,6 @@ def test_branch_delete_main_fails():
 def test_cost_tracker_no_budget():
     from agent.cost_tracker import CostTracker
     from agent.token_counter import TokenCounter
-    import tempfile
     with tempfile.TemporaryDirectory() as td:
         ct = CostTracker(counter=TokenCounter(persist_path=Path(td) / "u.json"))
         st = ct.budget_status()
@@ -386,7 +383,6 @@ def test_cost_tracker_no_budget():
 def test_cost_tracker_with_budget():
     from agent.cost_tracker import CostTracker
     from agent.token_counter import TokenCounter
-    import tempfile
     with tempfile.TemporaryDirectory() as td:
         counter = TokenCounter(persist_path=Path(td) / "u.json")
         counter.record_turn("gpt-4o", "openai", 1000, 1000)  # costs $0.02
@@ -400,7 +396,6 @@ def test_cost_tracker_with_budget():
 def test_cost_tracker_dashboard():
     from agent.cost_tracker import CostTracker
     from agent.token_counter import TokenCounter
-    import tempfile
     with tempfile.TemporaryDirectory() as td:
         counter = TokenCounter(persist_path=Path(td) / "u.json")
         ct = CostTracker(counter=counter, budget_usd=5.0)
@@ -421,7 +416,6 @@ def test_telemetry_disabled_by_default():
 
 def test_telemetry_enable_and_record():
     from agent.telemetry import TelemetryCollector
-    import tempfile
     with tempfile.TemporaryDirectory() as td:
         tc = TelemetryCollector(persist_path=Path(td) / "tel.jsonl")
         tc.enable()
@@ -515,7 +509,7 @@ def test_recovery_dashboard_empty(tmp_path):
 # Goal history
 # ---------------------------------------------------------------------------
 def test_goal_history_save_and_load(tmp_path, monkeypatch):
-    from agent.goal_history import GoalHistory, GoalRecord, GOALS_DIR
+    from agent.goal_history import GoalHistory, GoalRecord
     history = GoalHistory()
     monkeypatch.setattr(history, "_path", lambda gid: tmp_path / f"{gid}.json")
     record = GoalRecord(goal="test goal", effort="ultrahype", status="complete")

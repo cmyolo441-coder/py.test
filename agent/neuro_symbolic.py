@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any
 
 
 @dataclass
@@ -166,7 +165,7 @@ class NeuroSymbolicEngine:
 
     def dashboard(self) -> str:
         lines = [
-            f"Neuro-symbolic engine:",
+            "Neuro-symbolic engine:",
             f"  rules: {len(self.rules)}",
             f"  facts: {len(self.facts)}",
             "",

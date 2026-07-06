@@ -9,17 +9,12 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 from rich.align import Align
 from rich.console import Console, Group
-from rich.live import Live
 from rich.panel import Panel
-from rich.table import Table
 from rich.text import Text
-from prompt_toolkit.completion import Completer, Completion
-from prompt_toolkit.formatted_text import HTML
-from prompt_toolkit.shortcuts import prompt as pt_prompt
 
 
 # ---------------------------------------------------------------------------

@@ -19,7 +19,6 @@ from __future__ import annotations
 import concurrent.futures
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable
 
 from .logging_config import get_logger
 

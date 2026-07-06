@@ -10,7 +10,6 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-import pytest
 
 
 # --- RAG v2 ---
@@ -79,7 +78,7 @@ def test_rag_v2_answer_context():
 
 # --- Multi-agent ---
 def test_multi_agent_specialists_list():
-    from agent.multi_agent import list_specialists, SPECIALISTS
+    from agent.multi_agent import list_specialists
     specs = list_specialists()
     assert len(specs) >= 6
     names = [s[0] for s in specs]
@@ -151,7 +150,6 @@ def test_tool_learning_persistence(tmp_path):
 # --- Long-term memory ---
 def test_long_term_memory_record_fact(tmp_path, monkeypatch):
     from agent.long_term_memory import LongTermMemory
-    from pathlib import Path
     mem = LongTermMemory()
     mem.semantic_store = type(mem.semantic_store)(persist_path=tmp_path / "sem.json", chunk_size=100, overlap=10)
     mem.episodic_store = type(mem.episodic_store)(persist_path=tmp_path / "ep.json", chunk_size=100, overlap=10)
@@ -362,7 +360,7 @@ def test_sbom_write_to_disk(tmp_path):
     from agent.sbom import generate_sbom
     (tmp_path / "requirements.txt").write_text("rich\n", encoding="utf-8")
     out = tmp_path / "sbom.json"
-    result = generate_sbom(root=str(tmp_path), output_path=out)
+    generate_sbom(root=str(tmp_path), output_path=out)
     assert out.exists()
 
 
@@ -509,7 +507,7 @@ def test_prometheus_status():
 # --- Connection pool ---
 def test_connection_pool_get():
     from agent.connection_pool import get_http_client, pool_stats
-    client = get_http_client()
+    get_http_client()
     stats = pool_stats()
     assert stats["available"] is True
 

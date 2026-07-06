@@ -19,7 +19,6 @@ Tools grouped here:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable
 
 from .base import Tool, ToolResult
 
@@ -171,7 +170,7 @@ def _knowledge_graph_build(root: str = ".") -> ToolResult:
 
 
 def _knowledge_graph_query(name: str, kind: str = "") -> ToolResult:
-    from ..knowledge_graph import get_knowledge_graph
+    from ..knowledge_graph import get_knowledge_graph, build_graph_from_codebase
     # Re-build from the current directory if empty.
     kg = get_knowledge_graph()
     if not kg.nodes:
@@ -201,8 +200,6 @@ def _long_term_memory_remember(fact: str, category: str = "lesson") -> ToolResul
 
 def get_v3_tools() -> list[Tool]:
     s = {"type": "string"}
-    i = {"type": "integer"}
-    b = {"type": "boolean"}
     return [
         Tool(
             name="rag_search",

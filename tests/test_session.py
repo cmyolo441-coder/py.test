@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 
 from agent.session import Session, SessionStore, export_markdown, export_json

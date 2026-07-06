@@ -217,12 +217,14 @@ class SbomCommand(Command):
     help = "Generate a Software Bill of Materials (CycloneDX format)"
 
     def run(self, ctx: CommandContext) -> CommandResult:
+        from pathlib import Path
         from ..sbom import generate_sbom, sbom_summary
         import json
-        sbom = generate_sbom(ctx.args.strip() or ".")
+        root = ctx.args.strip() or "."
+        sbom = generate_sbom(root)
         ctx.ui.console.print(sbom_summary(sbom))
-        path = "sbom.json"
-        Path("sbom.json").write_text(json.dumps(sbom, indent=2), encoding="utf-8") if not ctx.args else None
+        path = Path(root) / "sbom.json" if root != "." else Path("sbom.json")
+        path.write_text(json.dumps(sbom, indent=2), encoding="utf-8")
         ctx.ui.success(f"SBOM written to {path}")
         return CommandResult()
 

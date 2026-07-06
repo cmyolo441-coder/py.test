@@ -13,7 +13,6 @@ import re
 import subprocess
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Callable
 
 # Patterns that indicate potentially destructive operations.

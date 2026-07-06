@@ -16,7 +16,6 @@ Inspired by: FlashFill, SketCode, DeepCoder.
 from __future__ import annotations
 
 import ast
-import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -153,12 +152,12 @@ class ProgramSynthesizer:
     def _generate_memorization(self, spec: SynthesisSpec) -> str:
         """Generate a function that memorizes the input-output mapping (fallback)."""
         lines = [f"def {spec.function_name}(x):"]
-        lines.append(f"    # Memorized mapping (fallback — no pattern inferred)")
-        lines.append(f"    mapping = {{")
+        lines.append("    # Memorized mapping (fallback — no pattern inferred)")
+        lines.append("    mapping = {")
         for inp, out in zip(spec.inputs, spec.outputs):
             lines.append(f"        {repr(inp)}: {repr(out)},")
-        lines.append(f"    }}")
-        lines.append(f"    return mapping.get(x, None)")
+        lines.append("    }")
+        lines.append("    return mapping.get(x, None)")
         return "\n".join(lines)
 
     def synthesize_from_description(self, description: str, function_name: str = "synthesized") -> SynthesisResult:

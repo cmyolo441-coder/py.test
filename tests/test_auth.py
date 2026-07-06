@@ -1,4 +1,4 @@
-from agent.auth import AuthManager, generate_key, hash_key
+from agent.auth import AuthManager, hash_key
 
 
 def test_generate_and_authenticate():

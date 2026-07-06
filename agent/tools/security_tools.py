@@ -127,7 +127,7 @@ def scan_deps(path: str) -> ToolResult:
     if not findings:
         return ToolResult(output=f"No known-vulnerable dependencies in {path}.")
     return ToolResult(
-        output=f"Dependency warnings:\n" + "\n".join(findings)[:_MAX],
+        output="Dependency warnings:\n" + "\n".join(findings)[:_MAX],
         metadata={"count": len(findings)},
     )
 

@@ -18,7 +18,7 @@ def scaffold_python_project(name: str, base_dir: str = ".") -> ToolResult:
     pkg = root / name.replace("-", "_")
     pkg.mkdir(parents=True, exist_ok=True)
     # __init__.py
-    (pkg / "__init__.py").write_text(f'"""{{name}} package."""\n\n__version__ = "0.1.0"\n'.replace("{name}", name), encoding="utf-8")
+    (pkg / "__init__.py").write_text('"""{name} package."""\n\n__version__ = "0.1.0"\n'.replace("{name}", name), encoding="utf-8")
     # main module
     (pkg / "main.py").write_text(
         f'"""Entry point for {name}."""\n\n\ndef main() -> None:\n'

@@ -115,7 +115,7 @@ class CausalWorldModel:
         top_cause = causes[0][0]
         sub_causes = self.find_causes(top_cause)
         if sub_causes:
-            lines.append(f"\nRoot cause chain:")
+            lines.append("\nRoot cause chain:")
             lines.append(f"  {top_cause}")
             for sc, sp, _ in sub_causes[:3]:
                 lines.append(f"    ← {sc} (p={sp:.0%})")
@@ -133,7 +133,7 @@ class CausalWorldModel:
 
     def dashboard(self) -> str:
         lines = [
-            f"Causal world model:",
+            "Causal world model:",
             f"  events observed: {len(self.events)}",
             f"  causal edges: {len(self.edges)}",
             f"  unique actions: {len(self._action_counts)}",

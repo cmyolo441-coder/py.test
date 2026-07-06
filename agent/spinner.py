@@ -1,8 +1,6 @@
 """Animated spinner / status context manager built on rich.live."""
 from __future__ import annotations
 
-import threading
-import time
 
 from rich.console import Console
 from rich.live import Live

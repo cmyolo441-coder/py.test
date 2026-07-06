@@ -86,7 +86,7 @@ class TokensCommand(Command):
         snap = counter.snapshot()
         lines = [
             "╭─ Token Usage ───────────────────────────────────╮",
-            f"│  Session:                                        │",
+            "│  Session:                                        │",
             f"│    turns:      {snap['session_turns']:>6}                              │",
             f"│    input:      {snap['session_input']:>6,} tokens                       │",
             f"│    output:     {snap['session_output']:>6,} tokens                       │",
@@ -95,13 +95,13 @@ class TokensCommand(Command):
         ]
         if snap["goal_turns"] > 0:
             lines += [
-                f"│  Current goal:                                   │",
+                "│  Current goal:                                   │",
                 f"│    turns:      {snap['goal_turns']:>6}                              │",
                 f"│    total:      {snap['goal_total']:>6,} tokens                       │",
                 "│                                                  │",
             ]
         lines += [
-            f"│  All-time:                                       │",
+            "│  All-time:                                       │",
             f"│    turns:      {snap['all_time_turns']:>6}                              │",
             f"│    total:      {snap['all_time_total']:>6,} tokens                       │",
             "╰──────────────────────────────────────────────────╯",
@@ -177,7 +177,7 @@ class RouteCommand(Command):
         available = [p for p in ["zen", "openai", "anthropic", "gemini", "ollama"]
                      if ctx.config.has_credentials() or p == ctx.config.provider]
         decision = route(ctx.args, available_providers=available)
-        old_provider, old_model = ctx.config.provider, ctx.config.model
+        _old_provider, _old_model = ctx.config.provider, ctx.config.model
         ctx.config.provider = decision.provider
         ctx.config.model = decision.model
         ctx.app.build_agent()
@@ -263,7 +263,6 @@ class ConsensusCommand(Command):
             return CommandResult()
         try:
             from ..providers.factory import get_provider as _get_provider
-            from ..fallback import get_fallback_chain
 
             def provider_getter(prov, model):
                 cfg = type(ctx.config)()
@@ -799,7 +798,7 @@ class ContextCommand(Command):
     help = "Show context-window usage and compaction info for the current model"
 
     def run(self, ctx: CommandContext) -> CommandResult:
-        from ..context_manager import context_budget_for, compress_messages
+        from ..context_manager import context_budget_for
         from ..token_counter import count_message_tokens
         model = ctx.config.resolved_model()
         provider = ctx.config.provider

@@ -15,7 +15,6 @@ from __future__ import annotations
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 from .plugins.loader import PLUGINS_DIR
 from .logging_config import get_logger
@@ -106,7 +105,7 @@ def marketplace_dashboard() -> str:
     installed = list_installed()
     available = list_available()
     lines = [
-        f"Plugin marketplace:",
+        "Plugin marketplace:",
         f"  installed: {len(installed)}",
         f"  available: {len(available)}",
         "",

@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 import threading
 from pathlib import Path
-from typing import Any
 
 
 # All known feature flags with their default values.

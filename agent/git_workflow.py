@@ -7,9 +7,7 @@ available, otherwise prints instructions.
 from __future__ import annotations
 
 import subprocess
-import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from .logging_config import get_logger

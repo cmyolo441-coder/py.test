@@ -21,7 +21,7 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style as PTStyle
 from rich.align import Align
-from rich.box import HEAVY, ROUNDED
+from rich.box import ROUNDED
 from rich.columns import Columns
 from rich.console import Console, Group
 from rich.live import Live
@@ -225,7 +225,7 @@ class UI:
         return themes.current().ok
 
     @property
-    def warn(self) -> str:
+    def warn_color(self) -> str:
         return themes.current().warn
 
     @property
@@ -335,7 +335,7 @@ class UI:
         self.console.print(f"[{self.ok}]\u2714[/] {text}")
 
     def warn(self, text: str) -> None:
-        self.console.print(f"[{self.warn}]\u26a0[/] {text}")
+        self.console.print(f"[{self.warn_color}]\u26a0[/] {text}")
 
     def error(self, text: str) -> None:
         self.console.print(f"[{self.err}]\u2716[/] {text}")
@@ -442,7 +442,7 @@ class UI:
         self.console.print(table)
 
     def list_themes(self, current: str) -> None:
-        theme = themes.current()
+        themes.current()
         cards = []
         for name in themes.names():
             th = themes.THEMES[name]

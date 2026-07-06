@@ -13,14 +13,12 @@ Inspired by: Dijkstra's weakest precondition, Hoare logic, SPARK/Ada.
 from __future__ import annotations
 
 import ast
-import re
 from dataclasses import dataclass, field
-from typing import Any
 
 try:
-    from z3 import (  # type: ignore
-        Int, Real, Bool, Solver, And, Or, Not, Implies, sat, unsat,
-        ForAll, Exists, Function, IntSort, BoolSort,
+    from z3 import (  # type: ignore[import-not-found]  # noqa: F401
+        Int, Real, Bool, Solver, And, Or, Not, Implies, sat, unsat,  # noqa: F401
+        ForAll, Exists, Function, IntSort, BoolSort,  # noqa: F401
     )
     _HAS_Z3 = True
 except ImportError:
@@ -99,7 +97,7 @@ class FormalVerifier:
         """Check that no division has a potentially-zero divisor."""
         for child in ast.walk(node):
             if isinstance(child, ast.BinOp) and isinstance(child.op, ast.Div):
-                divisor = ast.dump(child.right)
+                ast.dump(child.right)
                 # If divisor is a literal 0, that's a bug.
                 if isinstance(child.right, ast.Constant) and child.right.value == 0:
                     return VerificationResult(

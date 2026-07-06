@@ -1,7 +1,7 @@
 """A minimal workflow engine to chain steps with conditional branching."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable
 
 Step = Callable[[dict[str, Any]], dict[str, Any]]

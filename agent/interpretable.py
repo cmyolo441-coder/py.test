@@ -76,11 +76,11 @@ class InterpretableAI:
             f"  Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(node.timestamp))}",
         ]
         if node.alternatives:
-            lines.append(f"  Alternatives considered:")
+            lines.append("  Alternatives considered:")
             for alt in node.alternatives:
                 lines.append(f"    - {alt}")
         if node.inputs:
-            lines.append(f"  Inputs:")
+            lines.append("  Inputs:")
             for k, v in node.inputs.items():
                 lines.append(f"    {k}: {v}")
         if node.outcome:
@@ -140,7 +140,7 @@ class InterpretableAI:
     def dashboard(self) -> str:
         lines = [
             f"Interpretable AI ({len(self.decisions)} decisions recorded):",
-            f"  by type:",
+            "  by type:",
         ]
         type_counts: dict[str, int] = {}
         for d in self.decisions:
