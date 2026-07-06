@@ -38,16 +38,33 @@ from .token_counter import get_token_counter
 # The effort level Goal Mode always starts at (the ultra / most-advanced tier).
 GOAL_EFFORT = "godmode"
 
-# Outer verify/fix rounds. Each round is a FULL autonomous agent turn (which
-# can itself run up to `max_tool_iterations` tool calls), so a modest outer
-# cap still yields very deep work while preventing runaway/expensive loops.
-MAX_OUTER_ROUNDS = 12
+# Outer verify/fix rounds. v4: UNLIMITED — Goal Mode never stops mid-work.
+# Set to 0 for unlimited. User can always press Esc to stop manually.
+MAX_OUTER_ROUNDS = 0  # 0 = unlimited (v4 fix: never stop until complete)
 
 # Inner per-turn tool budget used during Goal Mode (raised for full capacity).
 GOAL_TOOL_BUDGET = 40
 
 # After this many consecutive failed verifications, auto-escalate effort.
 ESCALATE_AFTER_FAILURES = 2
+
+# v4: If the model's response looks truncated (finish_reason="length"),
+# automatically continue with "continue from where you left off".
+CONTINUE_ON_TRUNCATION = True
+
+# v4: Hard safety cap — even with unlimited rounds, stop after this many
+# TOTAL rounds to prevent infinite loops (user can override with /goal-unlimited).
+SAFETY_CAP_ROUNDS = 500
+
+# v4: Detect truncation signals in the response text.
+TRUNCATION_SIGNALS = [
+    "...[truncated]",
+    "(truncated)",
+    "continue...",
+    "[output truncated]",
+    "max_tokens",
+    "finish_reason: length",
+]
 
 
 @dataclass
@@ -325,25 +342,45 @@ class GoalMode:
             self.ui.info("📂 Reusing existing plan from checkpoint")
 
         transcript = f"PLAN:\n{plan}\n"
-        max_rounds = max(1, min(effort.max_execution_rounds, MAX_OUTER_ROUNDS))
+        # v4: UNLIMITED rounds — Goal Mode never stops mid-work.
+        # MAX_OUTER_ROUNDS=0 means unlimited. SAFETY_CAP_ROUNDS is the hard cap.
+        if MAX_OUTER_ROUNDS > 0:
+            max_rounds = max(1, min(effort.max_execution_rounds, MAX_OUTER_ROUNDS))
+        else:
+            max_rounds = SAFETY_CAP_ROUNDS  # hard safety cap
         start_round = (resume_from.last_round_completed + 1) if resume_from else 1
+        rnd = start_round
 
-        for rnd in range(start_round, max_rounds + 1):
+        # v4: Main loop — runs until complete or cancelled. NEVER stops mid-work.
+        while rnd <= max_rounds:
             if cancel_token.cancelled:
                 run.cancelled = True
                 break
 
             # 2) Execute the next chunk of the plan with real tools.
-            self.ui.info(f"⚡ Executing (round {rnd}/{max_rounds})…")
+            if max_rounds == SAFETY_CAP_ROUNDS:
+                self.ui.info(f"⚡ Executing (round {rnd})…  [unlimited mode — never stops until complete]")
+            else:
+                self.ui.info(f"⚡ Executing (round {rnd}/{max_rounds})…")
             self._show_live_progress(run, rnd, max_rounds)
             instruction = (
                 f"GOAL:\n{goal}\n\nPLAN:\n{plan}\n\nWORK SO FAR:\n{transcript[-6000:]}\n\n"
                 "Continue executing the plan now. Use the available tools to do "
                 "real work (create/modify files, run commands, etc.). Do only "
                 "what is needed next; do not stop until the goal is done or you "
-                "need verification. No placeholders or simulated output."
+                "need verification. No placeholders or simulated output. "
+                "IMPORTANT: Do NOT truncate your output — give the COMPLETE response."
             )
             work = self._execute_turn(instruction, cancel_token)
+
+            # v4: Auto-continue if the response looks truncated.
+            if CONTINUE_ON_TRUNCATION and self._is_truncated(work):
+                self.ui.warn("⚠️  Response appears truncated — auto-continuing…")
+                continuation = self._auto_continue(work, cancel_token)
+                if continuation:
+                    work = work + "\n\n" + continuation
+                    self.ui.success("✓ Continuation appended.")
+
             step = GoalStep("execute", rnd, work)
             run.steps.append(step)
             transcript += f"\nEXECUTE #{rnd}:\n{work}\n"
@@ -396,7 +433,6 @@ class GoalMode:
                 effort = new_effort
                 run.effort = effort.name
                 run.escalated = True
-                max_rounds = max(1, min(effort.max_execution_rounds, MAX_OUTER_ROUNDS))
 
             if cancel_token.cancelled:
                 run.cancelled = True
@@ -410,13 +446,24 @@ class GoalMode:
                 gaps += f"\n\nAlso: quality score was {quality.score}/100. " + "; ".join(quality.notes[:3])
             fix_instruction = (
                 f"GOAL:\n{goal}\n\nThe goal is not yet complete. Address every "
-                f"remaining item below by doing real work with tools:\n{gaps}"
+                f"remaining item below by doing real work with tools:\n{gaps}\n\n"
+                "IMPORTANT: Do NOT truncate your output — give the COMPLETE response."
             )
             fix_work = self._execute_turn(fix_instruction, cancel_token)
+
+            # v4: Auto-continue fix work too if truncated.
+            if CONTINUE_ON_TRUNCATION and self._is_truncated(fix_work):
+                self.ui.warn("⚠️  Fix response truncated — auto-continuing…")
+                fix_continuation = self._auto_continue(fix_work, cancel_token)
+                if fix_continuation:
+                    fix_work = fix_work + "\n\n" + fix_continuation
+
             f_step = GoalStep("fix", rnd, fix_work)
             run.steps.append(f_step)
             transcript += f"\nFIX #{rnd}:\n{fix_work}\n"
             self._checkpoint(run)
+
+            rnd += 1
 
         run.final = run.final or transcript
         # Aggregate resource usage.
@@ -448,12 +495,57 @@ class GoalMode:
     def _show_live_progress(self, run: GoalRun, current_round: int, max_rounds: int) -> None:
         """Render a compact live progress line."""
         snap = self.token_counter.snapshot()
+        round_str = f"round={current_round}/{max_rounds}" if max_rounds != SAFETY_CAP_ROUNDS else f"round={current_round} (unlimited)"
         self.ui.info(
             f"   📊 tokens={snap['goal_total']:,}  "
             f"cost={snap['goal_cost_fmt']}  "
-            f"round={current_round}/{max_rounds}  "
+            f"{round_str}  "
             f"effort={run.effort}"
         )
+
+    # ------------------------------------------------------------------
+    # v4: Truncation detection and auto-continue — never stop mid-work.
+    # ------------------------------------------------------------------
+    def _is_truncated(self, text: str) -> bool:
+        """Detect if a response looks truncated."""
+        if not text or len(text) < 50:
+            return False
+        # Check for explicit truncation signals.
+        lower = text.lower()
+        for signal in TRUNCATION_SIGNALS:
+            if signal.lower() in lower:
+                return True
+        # Check if the text ends mid-sentence (no punctuation at end).
+        stripped = text.rstrip()
+        if stripped and stripped[-1] not in ".!?\"')]}:;":
+            # Heuristic: if the last line doesn't end with punctuation,
+            # and the text is long, it might be truncated.
+            if len(stripped) > 500:
+                last_line = stripped.split("\n")[-1].strip()
+                if last_line and len(last_line) > 20 and last_line[-1] not in ".!?\"')]}:;,":
+                    return True
+        # Check for incomplete code blocks.
+        if text.count("```") % 2 != 0:
+            return True  # unclosed code block
+        return False
+
+    def _auto_continue(self, partial_text: str, cancel_token: CancellationToken) -> str:
+        """Send a 'continue from where you left off' instruction to get the rest."""
+        if cancel_token.cancelled:
+            return ""
+        # Find the last ~500 chars to give context.
+        tail = partial_text[-500:] if len(partial_text) > 500 else partial_text
+        continue_instruction = (
+            f"Your previous response was truncated. Here is where you left off:\n\n"
+            f"...{tail}\n\n"
+            f"Please CONTINUE from exactly where you stopped. Do not repeat what you "
+            f"already wrote — just give the remaining content. Complete the response fully."
+        )
+        try:
+            return self._execute_turn(continue_instruction, cancel_token)
+        except Exception as exc:  # noqa: BLE001
+            self.ui.error(f"Auto-continue failed: {exc}")
+            return ""
 
     # ------------------------------------------------------------------
     def run_command(self, command_str: str) -> str:

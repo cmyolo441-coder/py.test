@@ -31,6 +31,7 @@ from .ui_commands import (
 )
 from .enterprise_commands import build_enterprise_commands
 from .v3_commands import build_v3_commands
+from .v4_commands import build_v4_commands
 
 
 class CommandRegistry:
@@ -108,6 +109,13 @@ def build_command_registry() -> CommandRegistry:
         existing.update(tokens)
     # Register the v3 enterprise commands, skipping collisions.
     for cmd in build_v3_commands():
+        tokens = {cmd.name, *cmd.aliases}
+        if tokens & existing:
+            continue
+        registry.register(cmd)
+        existing.update(tokens)
+    # Register the v4 frontier AI commands, skipping collisions.
+    for cmd in build_v4_commands():
         tokens = {cmd.name, *cmd.aliases}
         if tokens & existing:
             continue

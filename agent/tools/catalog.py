@@ -25,6 +25,7 @@ from .security_tools import get_security_tools
 from .scaffold_tools import get_scaffold_tools
 from .docgen_tools import get_docgen_tools
 from .v3_tools import get_v3_tools
+from .v4_tools import get_v4_tools
 
 
 def get_all_tools() -> list[Tool]:
@@ -54,6 +55,8 @@ def get_all_tools() -> list[Tool]:
         get_docgen_tools,
         # v3 enterprise tool group (new in v3).
         get_v3_tools,
+        # v4 frontier AI tool group (new in v4).
+        get_v4_tools,
     ):
         tools.extend(group())
     return tools
