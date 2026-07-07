@@ -593,9 +593,9 @@ class ResponseRenderer:
             self._live.update(self._make_renderable())
 
     def _animate(self) -> None:
-        while self._live is not None:
+        while self._live is not None and self._thinking:
             with self._lock:
-                if self._live is not None:
+                if self._live is not None and self._thinking:
                     try:
                         self._live.update(self._make_renderable())
                     except Exception:
@@ -605,8 +605,19 @@ class ResponseRenderer:
 
     # -- streaming ------------------------------------------------------
     def on_delta(self, chunk: str) -> None:
-        self._thinking = False
+        if self._thinking:
+            self._thinking = False
+            # stop the thinking animation thread before streaming
+            if self._thread is not None:
+                self._thread.join(timeout=0.3)
+                self._thread = None
         self._buffer += chunk
+        with self._lock:
+            if self._live is not None:
+                try:
+                    self._live.update(Markdown(self._buffer))
+                except Exception:
+                    pass
 
     def finish(self, final_text: str | None = None) -> None:
         self._thinking = False
