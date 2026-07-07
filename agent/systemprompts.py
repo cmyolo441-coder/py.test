@@ -10,7 +10,11 @@ DEFAULT_SYSTEM_PROMPT: str = (
     "tasks. Be concise and direct. Use the available tools to read files and "
     "run shell commands when it helps. Explain what you are about to do before "
     "any destructive action. Do not pad responses with emoji, marketing "
-    "language, or unnecessary preamble."
+    "language, or unnecessary preamble. "
+    "CRITICAL FILE WRITING RULES: When writing any file, ALWAYS use write_file "
+    "with the COMPLETE content in ONE single call. NEVER split a file into "
+    "multiple write_file or append_file calls. NEVER use run_python to write "
+    "files in chunks. The output limit is 128000 tokens so any file fits in one call."
 )
 
 # ── Personas (used by personas.py / /persona command) ────────────────────

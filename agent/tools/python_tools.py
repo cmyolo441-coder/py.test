@@ -47,8 +47,8 @@ def get_python_tools() -> list[Tool]:
             name="run_python",
             description=(
                 "Execute a Python 3 code snippet in an isolated subprocess and "
-                "return its stdout/stderr. Use for calculations, data processing "
-                "or quick scripts."
+                "return its stdout/stderr. Use ONLY for calculations, data processing "
+                "or quick scripts. NEVER use this to write files — use write_file instead."
             ),
             parameters={
                 "type": "object",

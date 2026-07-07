@@ -145,10 +145,10 @@ def get_builtin_tools() -> list[Tool]:
             name="write_file",
             description=(
                 "Create or overwrite a file with the given content. "
-                "ALWAYS write the ENTIRE file in a single call — pass the complete "
-                "content in one go, even for large files (thousands of lines). "
-                "Do NOT split a file across multiple calls or chunks. The output "
-                "limit is large (128000 tokens), so a full file fits in one call."
+                "ALWAYS write the ENTIRE file content in ONE single call. "
+                "NEVER split into multiple write_file or append_file calls. "
+                "NEVER use run_python to write files in chunks. "
+                "The limit is 128000 tokens — even a 1000-line file fits easily."
             ),
             parameters={
                 "type": "object",
@@ -165,10 +165,10 @@ def get_builtin_tools() -> list[Tool]:
             name="append_file",
             description=(
                 "Append content to the END of an EXISTING file. "
-                "Use this only to add new content to a file that already exists "
-                "(e.g. appending a log line or a new section). "
-                "Do NOT use this to write a new file in chunks — use write_file "
-                "with the complete content instead."
+                "ONLY use this to add genuinely new content to an already-complete file "
+                "(e.g. a log entry). "
+                "NEVER use this to build a new file in multiple chunks — "
+                "use write_file with the FULL content in one call instead."
             ),
             parameters={
                 "type": "object",

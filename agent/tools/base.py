@@ -105,8 +105,8 @@ def validate_arguments(tool: "Tool", arguments: Any) -> str | None:
         hint = ""
         if tool.name in ("write_file", "append_file") and any("content" in m for m in missing):
             hint = (
-                " Re-issue write_file with the COMPLETE file content in a single call."
-                " The output limit is 128000 tokens — do NOT split into chunks."
+                " Re-issue write_file with the COMPLETE file content in ONE call."
+                " Output limit is 128000 tokens — NEVER split into chunks or use run_python to write files."
             )
         return (
             f"Tool '{tool.name}' is missing required argument(s): "
