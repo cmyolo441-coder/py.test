@@ -3,12 +3,67 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Callable
 
 from openai import OpenAI
 
 from ..cancellation import StopStreaming as _StopStreaming
 from .base import LLMProvider, LLMResponse, ToolCall
+
+
+def _salvage_arguments(raw: str, tool_name: str) -> dict[str, Any]:
+    """Best-effort extraction of arguments from a truncated/malformed JSON string.
+
+    When a tool call argument JSON is truncated mid-stream (e.g. a very large
+    ``write_file`` content that exceeds the model's output limit), standard
+    ``json.loads`` fails with ``JSONDecodeError``. This function tries to
+    recover partial arguments via regex heuristics so the tool can still do
+    useful work instead of simply failing.
+
+    Returns a dict with whatever keys were recoverable, or the original
+    ``__malformed_arguments__`` marker if nothing useful could be extracted.
+    """
+    # Attempt full parse first.
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    # For write_file/append_file: try to extract path and partial content.
+    if tool_name in ("write_file", "append_file"):
+        path_m = re.search(r'"path"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
+        content_m = re.search(r'"content"\s*:\s*"((?:[^"\\]|\\.)*)', raw)
+        result: dict[str, Any] = {}
+        if path_m:
+            result["path"] = path_m.group(1)
+        if content_m:
+            raw_content = content_m.group(1)
+            # Unescape JSON escape sequences (\\n -> newline, \\\" -> quote, etc.)
+            # Wrap in quotes and parse as JSON to get proper unescaping.
+            try:
+                result["content"] = json.loads('"' + raw_content + '"')
+            except json.JSONDecodeError:
+                # Content ends mid-escape sequence; use raw
+                # (matches just before the broken escape).
+                cleaned = re.sub(r'\\(.)', r'\1', raw_content)
+                result["content"] = cleaned
+        if "path" in result and "content" in result:
+            return result
+
+    # Generic fallback: extract any key-value pairs we can.
+    result = {}
+    for m in re.finditer(r'"(\w+)"\s*:\s*("(?:[^"\\]|\\.)*"|null|true|false|\d+(?:\.\d+)?)', raw):
+        key = m.group(1)
+        val = m.group(2)
+        try:
+            result[key] = json.loads(val)
+        except json.JSONDecodeError:
+            result[key] = val.strip('"')
+    if result:
+        return result
+
+    return {"__malformed_arguments__": raw}
 
 
 class OpenAIProvider(LLMProvider):
@@ -113,15 +168,7 @@ class OpenAIProvider(LLMProvider):
         tool_calls = []
         for frag in tool_fragments.values():
             raw = frag["arguments"] or "{}"
-            try:
-                args = json.loads(raw)
-            except json.JSONDecodeError:
-                # Streamed arguments were truncated/malformed. Surface a marker
-                # instead of a silent empty dict so the validation layer reports
-                # a clear error and the model re-issues a well-formed call.
-                args = {"__malformed_arguments__": raw}
-            if not isinstance(args, dict):
-                args = {"__malformed_arguments__": raw}
+            args = _salvage_arguments(raw, frag["name"])
             tool_calls.append(ToolCall(id=frag["id"], name=frag["name"], arguments=args))
 
         return LLMResponse(

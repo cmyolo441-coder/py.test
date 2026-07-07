@@ -102,10 +102,23 @@ def validate_arguments(tool: "Tool", arguments: Any) -> str | None:
         expected = ", ".join(
             f"{k} ({props.get(k, {}).get('type', 'any')})" for k in props
         ) or "none"
+        hint = ""
+        if tool.name in ("write_file", "append_file") and any("content" in m for m in missing):
+            if "__malformed_arguments__" in arguments:
+                hint = (
+                    " The model's output may have been truncated because the file "
+                    "content was too large. Split the file into smaller chunks and "
+                    "use append_file for each chunk after the first."
+                )
+            else:
+                hint = (
+                    " For very large files, the content may exceed the model's output "
+                    "limit. Use append_file to write the file in multiple smaller chunks."
+                )
         return (
             f"Tool '{tool.name}' is missing required argument(s): "
             f"{', '.join(missing)}. Expected arguments: {expected}. "
-            f"Re-issue the call including every required argument."
+            f"Re-issue the call including every required argument.{hint}"
         )
 
     # Basic type checks for provided values (best-effort; unknown types skip).

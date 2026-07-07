@@ -143,12 +143,17 @@ def get_builtin_tools() -> list[Tool]:
         ),
         Tool(
             name="write_file",
-            description="Create or overwrite a file with the given content.",
+            description=(
+                "Create or overwrite a file with the given content. "
+                "For very large files (over 2000 chars), the content argument may be "
+                "truncated by the model's output limit. Use append_file to write "
+                "large files in multiple smaller chunks."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
-                    "content": {"type": "string"},
+                    "path": {"type": "string", "description": "File path to write."},
+                    "content": {"type": "string", "description": "Full file content."},
                 },
                 "required": ["path", "content"],
             },
@@ -157,12 +162,17 @@ def get_builtin_tools() -> list[Tool]:
         ),
         Tool(
             name="append_file",
-            description="Append content to the end of a file.",
+            description=(
+                "Append content to the end of a file. "
+                "Use this to write large files in smaller chunks: "
+                "call write_file first to create the file, "
+                "then append_file for each additional chunk."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
-                    "content": {"type": "string"},
+                    "path": {"type": "string", "description": "File path to append to."},
+                    "content": {"type": "string", "description": "Content chunk to append."},
                 },
                 "required": ["path", "content"],
             },
