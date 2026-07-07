@@ -216,23 +216,67 @@ class App:
         self._handle_turn(prompt)
 
     # ------------------------------------------------------------------
+    def _deferred_post_turn(self) -> None:
+        """Run lightweight post-turn bookkeeping (token counter, telemetry, status bar).
+
+        This runs at the START of the next turn so the prompt box appears
+        immediately after a response finishes — the user never waits for
+        bookkeeping.
+        """
+        data = getattr(self, "_pending_post_turn", None)
+        if data is None:
+            return
+        self._pending_post_turn = None
+        import time as _time
+        from .token_counter import count_message_tokens
+
+        duration = _time.time() - data["turn_start"]
+        out_tokens = count_message_tokens(
+            [{"role": "assistant", "content": data["final"] or ""}],
+            self.config.resolved_model(),
+            self.config.provider,
+        )
+        self.token_counter.record_turn(
+            model=self.config.resolved_model(),
+            provider=self.config.provider,
+            input_tokens=data["in_tokens"],
+            output_tokens=out_tokens,
+            duration_s=duration,
+            tool_calls=1 if data.get("used_tool") else 0,
+        )
+        self.telemetry.record("turn", duration_s=duration, success=True)
+        try:
+            from .widgets import render_status_bar
+            snap = self.token_counter.snapshot()
+            bar = render_status_bar(
+                self.config.provider,
+                self.config.resolved_model(),
+                snap,
+                theme_name=getattr(self.ui, "_theme_name", ""),
+                goal_mode=self.goal_mode,
+                effort=getattr(self.config, "effort", ""),
+            )
+            self.ui.console.print(bar)
+        except Exception:  # noqa: BLE001
+            self.ui.status_bar(
+                self.config.provider,
+                self.config.resolved_model(),
+                self.conversation.token_estimate(),
+            )
+
     def _handle_turn(self, user_input: str) -> None:
         assert self.agent is not None
-        import time as _time
         from .cancellation import CancellationToken, EscListener
         from .context_manager import compress_messages
         from .token_counter import count_message_tokens
 
-        # The prompt box already shows the user's input inline (it persists as
-        # the on-screen record of the turn), so we don't re-render it as a
-        # bubble or erase the box — that manual erasure is what used to make the
-        # input box disappear.
+        # Run deferred bookkeeping from the previous turn first.
+        self._deferred_post_turn()
+
         self._used_tool = False
         renderer = self.ui.stream_response()
         renderer.start_thinking()
-
         cancel_token = CancellationToken()
-        turn_start = _time.perf_counter()
 
         # Auto-compact the conversation if configured and near the context limit.
         if getattr(self.config, "auto_compact", True):
@@ -270,11 +314,12 @@ class App:
             if iteration > 0:
                 renderer.start_thinking("reasoning")
 
-        # Count input tokens before the call.
         in_tokens = count_message_tokens(
             self.conversation.messages, self.config.resolved_model(), self.config.provider
         )
 
+        import time as _time
+        turn_start = _time.perf_counter()
         try:
             with EscListener(cancel_token, on_cancel=_notify_cancel):
                 final = self.agent.send(
@@ -296,49 +341,13 @@ class App:
         if cancel_token.cancelled:
             self.ui.warn("Response stopped (Esc).")
 
-        # Record real token usage for this turn.
-        duration = _time.perf_counter() - turn_start
-        out_tokens = count_message_tokens(
-            [{"role": "assistant", "content": final or ""}],
-            self.config.resolved_model(),
-            self.config.provider,
-        )
-        self.token_counter.record_turn(
-            model=self.config.resolved_model(),
-            provider=self.config.provider,
-            input_tokens=in_tokens,
-            output_tokens=out_tokens,
-            duration_s=duration,
-            tool_calls=1 if self._used_tool else 0,
-        )
-        self.telemetry.record("turn", duration_s=duration, success=True)
-
-        # Celebrate when a multi-step, tool-using task completes.
-        if self._used_tool and self.ui.animations:
-            from . import effects
-
-            effects.confetti(self.ui.console, frames=12)
-
-        # Live status bar footer for the turn — now uses the real token counter.
-        try:
-            from .widgets import render_status_bar
-            snap = self.token_counter.snapshot()
-            bar = render_status_bar(
-                self.config.provider,
-                self.config.resolved_model(),
-                snap,
-                theme_name=getattr(self.ui, "_theme_name", ""),
-                goal_mode=self.goal_mode,
-                effort=getattr(self.config, "effort", ""),
-            )
-            self.ui.console.print(bar)
-        except Exception:  # noqa: BLE001
-            # Fallback to the old status bar.
-            self.ui.status_bar(
-                self.config.provider,
-                self.config.resolved_model(),
-                self.conversation.token_estimate(),
-            )
+        # Defer post-turn bookkeeping so the prompt box appears immediately.
+        self._pending_post_turn = {
+            "final": final,
+            "turn_start": turn_start,
+            "in_tokens": in_tokens,
+            "used_tool": self._used_tool,
+        }
 
 
 def main() -> None:

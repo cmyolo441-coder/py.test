@@ -246,17 +246,10 @@ class GoalMode:
 
     # ------------------------------------------------------------------
     def run(self, goal: str, resume_from: GoalRecord | None = None) -> GoalRun:
-        """Execute ``goal`` autonomously at maximum capacity until complete.
-
-        If ``resume_from`` is provided, continues from that goal's last
-        checkpoint instead of starting fresh.
-        """
         self._start_time = time.time()
-        self.ui.hide_prompt()
         effort: EffortLevel = get_effort(GOAL_EFFORT)
         run = GoalRun(goal=goal, effort=effort.name)
 
-        # Set up history record (new or resumed).
         if resume_from is not None:
             run.record = resume_from
             run.record.status = "running"
@@ -277,34 +270,36 @@ class GoalMode:
         )
         self.ui.info(f"Goal ID: {run.record.id} (saved to history)")
 
-        # Reset per-goal token tracking.
         self.token_counter.reset_goal()
 
         try:
             with EscListener(cancel_token, on_cancel=lambda: None):
                 run = self._loop(goal, effort, run, cancel_token, resume_from)
         finally:
-            # Finalize the history record.
-            if run.record is not None:
-                run.record.status = (
-                    "complete" if run.complete
-                    else "cancelled" if run.cancelled
-                    else "interrupted"
-                )
-                run.record.completed_at = time.time()
-                run.record.rounds = sum(1 for s in run.steps if s.kind == "execute")
-                run.record.steps = [
-                    {"kind": s.kind, "round": s.round, "text": s.text[:2000]}
-                    for s in run.steps
-                ]
-                run.record.final = run.final[:5000]
-                snap = self.token_counter.snapshot()
-                run.record.cost_usd = snap["goal_cost_usd"]
-                run.record.total_tokens = snap["goal_total"]
-                run.record.last_round_completed = run.record.rounds
-                run.record.checkpoint_messages = self.app.conversation.messages[-20:]
-                self.history.save(run.record)
+            self._finalize_history(run)
         return run
+
+    def _finalize_history(self, run: GoalRun) -> None:
+        if run.record is None:
+            return
+        run.record.status = (
+            "complete" if run.complete
+            else "cancelled" if run.cancelled
+            else "interrupted"
+        )
+        run.record.completed_at = time.time()
+        run.record.rounds = sum(1 for s in run.steps if s.kind == "execute")
+        run.record.steps = [
+            {"kind": s.kind, "round": s.round, "text": s.text[:2000]}
+            for s in run.steps
+        ]
+        run.record.final = run.final[:5000]
+        snap = self.token_counter.snapshot()
+        run.record.cost_usd = snap["goal_cost_usd"]
+        run.record.total_tokens = snap["goal_total"]
+        run.record.last_round_completed = run.record.rounds
+        run.record.checkpoint_messages = self.app.conversation.messages[-20:]
+        self.history.save(run.record)
 
     def _loop(
         self,
@@ -316,8 +311,10 @@ class GoalMode:
     ) -> GoalRun:
         # 1) Plan (skip if resuming — we already have a plan).
         if resume_from is None or not any(s.kind == "plan" for s in run.steps):
-            self.ui.info("📝 Planning…")
+            renderer = self.ui.stream_response()
+            renderer.start_thinking("planning")
             plan = self._raw_chat(PLANNER_SYS, f"Goal:\n{goal}")
+            renderer.finish(plan)
             step = GoalStep("plan", 0, plan)
             run.steps.append(step)
             self.ui.tool_result("plan", plan[:2000], True)
