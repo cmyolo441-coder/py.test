@@ -112,10 +112,16 @@ class OpenAIProvider(LLMProvider):
 
         tool_calls = []
         for frag in tool_fragments.values():
+            raw = frag["arguments"] or "{}"
             try:
-                args = json.loads(frag["arguments"] or "{}")
+                args = json.loads(raw)
             except json.JSONDecodeError:
-                args = {}
+                # Streamed arguments were truncated/malformed. Surface a marker
+                # instead of a silent empty dict so the validation layer reports
+                # a clear error and the model re-issues a well-formed call.
+                args = {"__malformed_arguments__": raw}
+            if not isinstance(args, dict):
+                args = {"__malformed_arguments__": raw}
             tool_calls.append(ToolCall(id=frag["id"], name=frag["name"], arguments=args))
 
         return LLMResponse(

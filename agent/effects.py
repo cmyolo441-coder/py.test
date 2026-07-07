@@ -108,12 +108,12 @@ def rainbow_text(text: str, offset: float = 0.0, bold: bool = True) -> Text:
 # Banner
 # ---------------------------------------------------------------------------
 BANNER_ART = r"""
-   â–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ•—  â–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ•— â–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ•—â–ˆâ–ˆâ–ˆâ•—   â–ˆâ–ˆâ•—â–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ•—    â–ˆâ–ˆâ•—  â–ˆâ–ˆâ•—
-  â–ˆâ–ˆâ•”â•â•â–ˆâ–ˆâ•—â–ˆâ–ˆâ•”â•â•â•â•â• â–ˆâ–ˆâ•”â•â•â•â•â•â–ˆâ–ˆâ–ˆâ–ˆâ•—  â–ˆâ–ˆâ•‘â•šâ•â•â–ˆâ–ˆâ•”â•â•â•    â•šâ–ˆâ–ˆâ•—â–ˆâ–ˆâ•”â•
-  â–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ•‘â–ˆâ–ˆâ•‘  â–ˆâ–ˆâ–ˆâ•—â–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ•—  â–ˆâ–ˆâ•”â–ˆâ–ˆâ•— â–ˆâ–ˆâ•‘   â–ˆâ–ˆâ•‘        â•šâ–ˆâ–ˆâ–ˆâ•”â•
-  â–ˆâ–ˆâ•”â•â•â–ˆâ–ˆâ•‘â–ˆâ–ˆâ•‘   â–ˆâ–ˆâ•‘â–ˆâ–ˆâ•”â•â•â•  â–ˆâ–ˆâ•‘â•šâ–ˆâ–ˆâ•—â–ˆâ–ˆâ•‘   â–ˆâ–ˆâ•‘        â–ˆâ–ˆâ•”â–ˆâ–ˆâ•—
-  â–ˆâ–ˆâ•‘  â–ˆâ–ˆâ•‘â•šâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ•”â•â–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ–ˆâ•—â–ˆâ–ˆâ•‘ â•šâ–ˆâ–ˆâ–ˆâ–ˆâ•‘   â–ˆâ–ˆâ•‘       â–ˆâ–ˆâ•”â• â–ˆâ–ˆâ•—
-  â•šâ•â•  â•šâ•â• â•šâ•â•â•â•â•â• â•šâ•â•â•â•â•â•â•â•šâ•â•  â•šâ•â•â•â•   â•šâ•â•       â•šâ•â•  â•šâ•â•
+ █████╗  ██████╗ ███████╗███╗   ██╗████████╗   ██╗  ██╗
+██╔══██╗██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝   ╚██╗██╔╝
+███████║██║  ███╗█████╗  ██╔██╗ ██║   ██║       ╚███╔╝
+██╔══██║██║   ██║██╔══╝  ██║╚██╗██║   ██║       ██╔██╗
+██║  ██║╚██████╔╝███████╗██║ ╚████║   ██║      ██╔╝ ██╗
+╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝      ╚═╝  ╚═╝
 """.strip("\n")
 
 GRADIENT_STOPS = ["#7c3aed", "#8b5cf6", "#06b6d4", "#22d3ee", "#a78bfa", "#7c3aed"]
@@ -161,7 +161,7 @@ def typewriter(console: Console, text: str, style: str = "", delay: float = 0.01
 # ---------------------------------------------------------------------------
 # Thinking indicator (shimmer + orbiting glyphs)
 # ---------------------------------------------------------------------------
-ORBIT = ["â ‹", "â ™", "â ¹", "â ¸", "â ¼", "â ´", "â ¦", "â §", "â ‡", "â "]
+ORBIT = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 THINKING_WORDS = [
     "thinking", "reasoning", "planning", "analyzing",
     "synthesizing", "computing", "orchestrating", "reflecting",
@@ -170,13 +170,13 @@ THINKING_WORDS = [
 
 # Selectable spinner styles.
 SPINNERS: dict[str, list[str]] = {
-    "braille": ["â ‹", "â ™", "â ¹", "â ¸", "â ¼", "â ´", "â ¦", "â §", "â ‡", "â "],
-    "dots": ["Â·  ", "Â·Â· ", "Â·Â·Â·", " Â·Â·", "  Â·", "   "],
-    "moon": ["ðŸŒ‘", "ðŸŒ’", "ðŸŒ“", "ðŸŒ”", "ðŸŒ•", "ðŸŒ–", "ðŸŒ—", "ðŸŒ˜"],
+    "braille": ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
+    "dots": ["·  ", "·· ", "···", " ··", "  ·", "   "],
+    "moon": ["🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘"],
     "line": ["|", "/", "-", "\\"],
-    "arc": ["â—œ", "â— ", "â—", "â—ž", "â—¡", "â—Ÿ"],
-    "star": ["âœ¶", "âœ¸", "âœ¹", "âœº", "âœ¹", "âœ·"],
-    "bounce": ["â ", "â ‚", "â „", "â ‚"],
+    "arc": ["◜", "◠", "◝", "◞", "◡", "◟"],
+    "star": ["✶", "✸", "✹", "✺", "✹", "✷"],
+    "bounce": ["▖", "▘", "▝", "▘"],
 }
 
 
@@ -231,17 +231,17 @@ def progress_bar(fraction: float, width: int = 30, label: str = "", offset: floa
     bar = Text()
     if label:
         bar.append(f"{label} ", style=themes.current().dim)
-    bar.append("â”‚", style=themes.current().dim)
+    bar.append("│", style=themes.current().dim)
     for i in range(width):
         if i < filled:
             pos = ((i / max(1, width - 1)) + offset) % 1.0
             seg = pos * (len(palette) - 1)
             k = int(seg)
             color = blend(palette[k], palette[min(k + 1, len(palette) - 1)], seg - k)
-            bar.append("â–ˆ", style=color)
+            bar.append("█", style=color)
         else:
-            bar.append("â–‘", style=themes.current().dim)
-    bar.append("â”‚ ", style=themes.current().dim)
+            bar.append("░", style=themes.current().dim)
+    bar.append("│ ", style=themes.current().dim)
     bar.append(f"{int(fraction * 100):3d}%", style=f"bold {themes.current().accent2}")
     return bar
 
@@ -295,7 +295,7 @@ def slide_in(console: Console, text: str, style: str = "", steps: int = 8, delay
 # ---------------------------------------------------------------------------
 # Celebration confetti
 # ---------------------------------------------------------------------------
-CONFETTI = ["âœ¦", "âœ§", "âœ©", "âœª", "â‹", "â„", "â—", "â—†", "â–²", "ðŸŽ‰", "âœ¨"]
+CONFETTI = ["✦", "✧", "✩", "✪", "✫", "✬", "❉", "❋", "▲", "🎉", "✨"]
 
 
 def confetti(console: Console, frames: int = 16, width: int | None = None) -> None:
@@ -319,13 +319,13 @@ def confetti(console: Console, frames: int = 16, width: int | None = None) -> No
                 lines.append(line)
             live.update(Align.center(Group(*lines)))
             time.sleep(0.05)
-    console.print(Align.center(heading("ðŸŽ‰  done!  ðŸŽ‰")))
+    console.print(Align.center(heading("🎉  done!  🎉")))
 
 
 # ---------------------------------------------------------------------------
 # Matrix rain (idle / splash effect)
 # ---------------------------------------------------------------------------
-_MATRIX_CHARS = "ã‚¢ã‚«ã‚µã‚¿ãƒŠãƒãƒžãƒ¤ãƒ©ãƒ¯0123456789ABCDEFï½¦ï½§ï½¨ï½©ï½ª<>=*+-"
+_MATRIX_CHARS = "アカサタナハマヤラワ0123456789ABCDEFｦｧｨｩｪ<>=*+-"
 
 
 def matrix_rain(console: Console, seconds: float = 2.5, fps: int = 24) -> None:

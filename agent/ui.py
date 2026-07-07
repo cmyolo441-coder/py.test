@@ -1,4 +1,4 @@
-"""Rich-powered terminal UI for the agent â€” the "100x better than Cursor CLI" edition.
+"""Rich-powered terminal UI for the agent.
 
 Highlights:
 - Animated flowing-gradient banner + typewriter subtitle
@@ -37,11 +37,11 @@ from .config import PROMPT_HISTORY_FILE
 
 # Slash commands surfaced in the live completion menu.
 SLASH_COMMANDS: list[tuple[str, str]] = [
-    ("/goal", "\U0001f3af Goal Mode: autonomously achieve a goal (ultra effort)"),
+    ("/goal", "Goal Mode: autonomously work toward a goal"),
     ("/help", "Show all commands"),
     ("/model", "Switch model or show current"),
     ("/models", "List preset models for the provider"),
-    ("/provider", "Switch provider (zen/openai/anthropic/â€¦)"),
+    ("/provider", "Switch provider (zen/openai/anthropic/…)"),
     ("/theme", "Switch UI theme (neon/cyberpunk/pastel/matrix)"),
     ("/tools", "List available tools"),
     ("/persona", "Switch assistant persona"),
@@ -303,29 +303,18 @@ class UI:
     # -- chrome ---------------------------------------------------------
     def show_banner(self, provider: str, model: str) -> None:
         self.console.print()
-        if self.animations:
-            effects.animate_banner(self.console)
-        else:
-            self.console.print(
-                Align.center(effects.gradient_text(effects.BANNER_ART, effects.GRADIENT_STOPS))
-            )
-
-        subtitle = "the world's most advanced terminal AI agent"
-        if self.animations:
-            effects.typewriter(self.console, subtitle, style="italic #22d3ee", delay=0.010)
-        else:
-            self.console.print(Align.center(Text(subtitle, style="italic #22d3ee")))
+        self.console.print(Align.center(effects.gradient_text("terminal-agent")))
+        self.console.print(Align.center(Text(f"{provider}/{model}", style=self.dim)))
 
         status = Text.assemble(
-            ("  \u25c6 provider ", self.dim), (provider, f"bold {self.ok}"),
-            ("   \u25c6 model ", self.dim), (model, f"bold {self.ok}"),
-            ("   \u25c6 theme ", self.dim), (themes.current().name, f"bold {self.accent}"),
+            ("provider ", self.dim), (provider, f"bold {self.ok}"),
+            ("   model ", self.dim), (model, f"bold {self.ok}"),
+            ("   theme ", self.dim), (themes.current().name, f"bold {self.accent}"),
         )
         self.console.print(Align.center(status))
         self.console.print(
-            Align.center(Text("/help for commands \u00b7 Enter to send \u00b7 Alt+Enter for multi-line \u00b7 paste is safe \u00b7 /exit to quit", style=self.dim))
+            Align.center(Text("/help for commands \u00b7 Enter to send \u00b7 /exit to quit", style=self.dim))
         )
-        self.console.print(Align.center(Rule(style=self.accent)))
         self.console.print()
 
     def info(self, text: str) -> None:
@@ -342,7 +331,7 @@ class UI:
 
     # -- status bar -----------------------------------------------------
     def status_bar(self, provider: str, model: str, tokens: int, cost: float | None = None) -> None:
-        """Render a one-line status bar: clock Â· provider Â· model Â· tokens Â· theme."""
+        """Render a one-line status bar: clock · provider · model · tokens · theme."""
         import datetime as _dt
 
         theme = themes.current()
@@ -375,10 +364,19 @@ class UI:
         return text
 
     def hide_prompt(self) -> None:
-        """Clear the prompt box lines from the terminal so response can start fresh."""
-        import sys
-        sys.stdout.write("\033[3A\033[J")
-        sys.stdout.flush()
+        """Deprecated no-op.
+
+        This previously issued ``\\033[3A\\033[J`` (move cursor up exactly three
+        lines and erase to end of screen) to wipe the input box. That hardcoded
+        line count corrupted the display whenever the prompt wrapped, the
+        goal-mode prompt widened the line, or the terminal was narrow — which is
+        what made the input box "disappear" after a response.
+
+        The prompt box now persists as the on-screen record of each turn (like
+        Claude Code keeps your input in scrollback), so no manual erasure is
+        needed. Kept as a no-op for backward compatibility with existing callers.
+        """
+        return
 
     def confirm(self, question: str) -> bool:
         answer = self.session.prompt(HTML(f'<prompt>{question} [y/N] </prompt>')).strip().lower()

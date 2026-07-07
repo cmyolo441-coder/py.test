@@ -15,6 +15,7 @@ from typing import Any, Callable
 
 from .effort import EffortLevel
 from .fake_detector import report as fake_report, scan_text
+from .systemprompts import AUTONOMOUS
 
 # A chat function takes messages and returns the assistant's text reply.
 ChatFn = Callable[[list[dict[str, Any]]], str]
@@ -58,60 +59,43 @@ class AutonomousEngine:
         )
 
     def research(self, task: str) -> str:
-        return self._ask(
-            "You are a world-expert researcher. Do deep, A-to-Z research on the "
-            "task. Identify requirements, edge cases, technologies, risks and an "
-            "expert professional approach. Be thorough and concrete.",
-            f"Task:\n{task}",
-        )
+        return self._ask(AUTONOMOUS["research"], f"Task:\n{task}")
 
     def plan(self, task: str, research: str) -> str:
         return self._ask(
-            "You are a world-class principal engineer. Produce a detailed, "
-            "step-by-step, professional implementation plan. Number the steps. "
-            "Make it complete enough to execute end to end.",
+            AUTONOMOUS["plan"],
             f"Task:\n{task}\n\nResearch:\n{research}",
         )
 
     def verify_plan(self, task: str, plan: str) -> tuple[bool, str]:
         critique = self._ask(
-            "You are a strict reviewer. Verify whether the plan fully and "
-            "correctly solves the task. If it is complete and correct, reply "
-            "starting with 'APPROVED'. Otherwise reply starting with 'REVISE' "
-            "and list precise fixes.",
+            AUTONOMOUS["verify_plan"],
             f"Task:\n{task}\n\nPlan:\n{plan}",
         )
         return critique.strip().upper().startswith("APPROVED"), critique
 
     def execute(self, task: str, plan: str, prior: str = "") -> str:
         return self._ask(
-            "You are an elite engineer. Execute the plan and produce the real, "
-            "complete, working result. No placeholders, no TODOs, no simulated "
-            "or fake code — everything must be real and runnable.",
+            AUTONOMOUS["execute"],
             f"Task:\n{task}\n\nPlan:\n{plan}\n\nPrior work to build on:\n{prior}",
         )
 
     def analyze(self, task: str, work: str) -> tuple[bool, str]:
         verdict = self._ask(
-            "You are a meticulous QA engineer. Analyze whether the work fully "
-            "completes the task with no gaps or bugs. If fully complete and "
-            "correct, reply starting with 'COMPLETE'. Otherwise reply starting "
-            "with 'INCOMPLETE' and list every bug and missing piece.",
+            AUTONOMOUS["analyze"],
             f"Task:\n{task}\n\nWork:\n{work}",
         )
         return verdict.strip().upper().startswith("COMPLETE"), verdict
 
     def fix(self, task: str, work: str, issues: str) -> str:
         return self._ask(
-            "You are an expert debugger. Fix all listed issues and return the "
-            "corrected, complete, real implementation.",
+            AUTONOMOUS["fix"],
             f"Task:\n{task}\n\nCurrent work:\n{work}\n\nIssues to fix:\n{issues}",
         )
 
     def make_real(self, task: str, work: str, findings: str) -> str:
         return self._ask(
-            "Some code appears fake/simulated/placeholder. Replace ALL of it with "
-            "real, working implementations. Return the full corrected work.",
+            AUTONOMOUS["make_real"],
             f"Task:\n{task}\n\nWork:\n{work}\n\nDetected issues:\n{findings}",
         )
 

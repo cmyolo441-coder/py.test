@@ -27,6 +27,7 @@ import time
 from dataclasses import dataclass, field
 
 from .cancellation import CancellationToken, EscListener
+from .systemprompts import PLANNER_SYS, VERIFIER_SYS
 from .effort import EffortLevel, get_effort, next_effort
 from .fake_detector import scan_text
 from .goal_history import GoalRecord, get_goal_history
@@ -122,22 +123,7 @@ class GoalMode:
       * Fallback-resilient via fallback chain.
     """
 
-    # System guidance injected for the planning / verification sub-calls.
-    PLANNER_SYS = (
-        "You are an elite autonomous engineer operating in GOAL MODE at maximum "
-        "effort. Break the goal into a concrete, ordered, end-to-end plan that "
-        "you can execute using the available tools (shell, files, git, search, "
-        "etc.). Be exhaustive and professional. Number every step. Identify "
-        "dependencies between steps. Estimate complexity per step."
-    )
-    VERIFIER_SYS = (
-        "You are a strict QA lead. Given the goal and everything done so far, "
-        "decide if the goal is FULLY and correctly achieved with no gaps, bugs, "
-        "placeholders or simulated work. If it is complete, reply starting with "
-        "'COMPLETE'. Otherwise reply starting with 'INCOMPLETE' and list the "
-        "exact remaining work as numbered, actionable items. Be ruthless — do "
-        "not approve work that has TODOs, placeholders, or untested code."
-    )
+
 
     def __init__(self, app) -> None:  # noqa: ANN001 - avoid import cycle
         self.app = app
@@ -286,10 +272,10 @@ class GoalMode:
 
         cancel_token = CancellationToken()
         self.ui.info(
-            f"🎯 Goal Mode executing — effort '{effort.name}' (ultra), "
-            f"full tool capacity, auto-approve ON. Press Esc to stop."
+            f"Goal Mode running — effort '{effort.name}', auto-approve on. "
+            f"Press Esc to stop."
         )
-        self.ui.info(f"📝 Goal ID: {run.record.id} (saved to history)")
+        self.ui.info(f"Goal ID: {run.record.id} (saved to history)")
 
         # Reset per-goal token tracking.
         self.token_counter.reset_goal()
@@ -331,7 +317,7 @@ class GoalMode:
         # 1) Plan (skip if resuming — we already have a plan).
         if resume_from is None or not any(s.kind == "plan" for s in run.steps):
             self.ui.info("📝 Planning…")
-            plan = self._raw_chat(self.PLANNER_SYS, f"Goal:\n{goal}")
+            plan = self._raw_chat(PLANNER_SYS, f"Goal:\n{goal}")
             step = GoalStep("plan", 0, plan)
             run.steps.append(step)
             self.ui.tool_result("plan", plan[:2000], True)
@@ -391,7 +377,7 @@ class GoalMode:
 
             # 3) Verify against the goal — multi-angle.
             verdict = self._raw_chat(
-                self.VERIFIER_SYS,
+                VERIFIER_SYS,
                 f"Goal:\n{goal}\n\nEverything done so far:\n{transcript[-8000:]}",
             )
             v_step = GoalStep("verify", rnd, verdict)

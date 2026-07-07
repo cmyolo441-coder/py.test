@@ -25,7 +25,7 @@ class CliArgs:
 def parse_args(argv: list[str] | None = None) -> CliArgs:
     parser = argparse.ArgumentParser(
         prog="agent",
-        description="The world's most advanced terminal AI agent.",
+        description="A terminal AI assistant for software engineering tasks.",
     )
     parser.add_argument("-p", "--provider", help="LLM provider (zen/openai/anthropic/gemini/...).")
     parser.add_argument("-m", "--model", help="Model name to use.")

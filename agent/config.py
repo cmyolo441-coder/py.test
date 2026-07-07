@@ -13,6 +13,8 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
 
+from .systemprompts import DEFAULT_SYSTEM_PROMPT
+
 try:
     from dotenv import load_dotenv
 
@@ -51,7 +53,7 @@ class Config:
     anthropic_api_key: str | None = field(default_factory=lambda: _env("ANTHROPIC_API_KEY"))
     groq_api_key: str | None = field(default_factory=lambda: _env("GROQ_API_KEY"))
 
-    # Zen (opencode.ai) â€” OpenAI-compatible endpoint.
+    # Zen (opencode.ai) — OpenAI-compatible endpoint.
     zen_api_key: str | None = field(
         default_factory=lambda: _env(
             "ZEN_API_KEY",
@@ -63,7 +65,7 @@ class Config:
         or "https://opencode.ai/zen/v1"
     )
 
-    # Zyloo â€” OpenAI-compatible endpoint.
+    # Zyloo — OpenAI-compatible endpoint.
     zyloo_api_key: str | None = field(
         default_factory=lambda: _env(
             "ZYLOO_API_KEY",
@@ -84,12 +86,7 @@ class Config:
     )
 
     # Agent behaviour.
-    system_prompt: str = (
-        "You are an elite terminal AI agent. You are precise, proactive and "
-        "helpful. You can run shell commands and manage files through tools. "
-        "Think step by step, prefer safe actions, and always explain what you "
-        "are about to do before doing anything destructive."
-    )
+    system_prompt: str = DEFAULT_SYSTEM_PROMPT
     enable_tools: bool = True
     auto_approve_tools: bool = False
     max_tool_iterations: int = 12

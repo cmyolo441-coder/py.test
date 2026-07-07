@@ -7,6 +7,7 @@ from typing import Any, Callable
 import anthropic
 
 from .base import LLMProvider, LLMResponse, ToolCall
+from ..cancellation import StopStreaming as _StopStreaming
 
 
 class AnthropicProvider(LLMProvider):
@@ -60,9 +61,18 @@ class AnthropicProvider(LLMProvider):
 
         # Streaming path.
         with self.client.messages.stream(**kwargs) as stream:
-            for text in stream.text_stream:
-                content_parts.append(text)
-                on_delta(text)
+            try:
+                for text in stream.text_stream:
+                    content_parts.append(text)
+                    on_delta(text)
+            except _StopStreaming:
+                # User pressed ESC: stop consuming the stream and return the
+                # partial text produced so far as a clean cancellation.
+                return LLMResponse(
+                    content="".join(content_parts),
+                    tool_calls=[],
+                    finish_reason="cancelled",
+                )
             final = stream.get_final_message()
         for block in final.content:
             if block.type == "tool_use":

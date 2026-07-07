@@ -91,6 +91,12 @@ class Agent:
         # Wrap on_delta so a cancelled turn stops emitting/streaming tokens.
         wrapped_delta = self._wrap_delta(on_delta, cancel_token)
 
+        # Guard against a model that keeps re-issuing the same failing tool call
+        # (e.g. malformed arguments). Track a signature -> consecutive-failure
+        # count and abort the loop once it repeats too often.
+        repeat_failures: dict[str, int] = {}
+        MAX_REPEAT = 3
+
         for iteration in range(self.config.max_tool_iterations):
             if cancel_token is not None and cancel_token.cancelled:
                 final_text = self._partial or final_text
@@ -155,9 +161,27 @@ class Agent:
                     continue
 
                 result = self.registry.execute(tc.name, tc.arguments)
+
+                # Detect a tool call that keeps failing identically and break the
+                # loop with an actionable message instead of retrying forever.
+                sig = f"{tc.name}:{json.dumps(tc.arguments, sort_keys=True, default=str)}"
+                if not result.success:
+                    repeat_failures[sig] = repeat_failures.get(sig, 0) + 1
+                else:
+                    repeat_failures.pop(sig, None)
+
                 self._add_tool_output(tc, result.as_message(), result.success)
                 if on_tool_result:
                     on_tool_result(tc, result.output, result.success)
+
+                if repeat_failures.get(sig, 0) >= MAX_REPEAT:
+                    final_text = (
+                        f"Stopped: the tool '{tc.name}' failed {MAX_REPEAT} times "
+                        f"with the same arguments. Last error: {result.output}"
+                    )
+                    self.conversation.add_assistant(final_text)
+                    self.conversation.save()
+                    return final_text
 
             # ESC pressed during/after tool execution: stop before the next
             # LLM round so the turn ends promptly.

@@ -47,18 +47,14 @@ def play_boot_sequence(
     theme = themes.current()
     delay = 0.0 if fast else 0.15
 
-    # 1. Animated gradient banner.
-    if not fast:
-        effects.animate_banner(console, frames=18, fps=45)
-    else:
-        console.print(Align.center(effects.gradient_text(effects.BANNER_ART)))
+    # 1. Minimal header — a single gradient title line, no giant banner.
+    console.print()
+    title = effects.gradient_text("terminal-agent")
+    console.print(Align.center(title))
 
-    # 2. Subtitle / version line.
-    subtitle = f"Advanced Terminal AI Agent  ·  {provider}/{model}"
-    if not fast:
-        effects.typewriter(console, subtitle, style=f"bold {theme.accent2}", delay=0.008)
-    else:
-        console.print(Align.center(Text(subtitle, style=f"bold {theme.accent2}")))
+    # 2. Subtitle: provider/model on a dim line.
+    subtitle = f"{provider}/{model}"
+    console.print(Align.center(Text(subtitle, style=theme.dim)))
     console.print()
 
     # 3. Subsystem init lines with check marks.
@@ -74,9 +70,11 @@ def play_boot_sequence(
         text.append("] ", style="dim")
         text.append(label, style=theme.text)
         if not fast:
-            # Show "loading" briefly then overwrite with "done".
+            # Show "loading" briefly then overwrite with "done". Clear the line
+            # first (\r + blank pad + \r) so a wide glyph can never leave a tail.
             console.print(text, end="\r")
             time.sleep(delay)
+            console.print(" " * (console.size.width - 1), end="\r")
             done_text = Text()
             done_text.append("  [", style="dim")
             done_text.append("✓", style="bold green")
@@ -89,9 +87,13 @@ def play_boot_sequence(
 
     console.print()
 
-    # 4. "Ready" banner.
-    ready = effects.gradient_text("✦ READY ✦", offset=0.0)
-    console.print(Align.center(ready))
+    # 4. Restrained ready line + tips (Claude-style).
+    console.print(Align.center(Text("ready", style=f"bold {theme.accent2}")))
+    console.print(
+        Align.center(
+            Text("/help for commands · Enter to send · /exit to quit", style=theme.dim)
+        )
+    )
     console.print()
 
 

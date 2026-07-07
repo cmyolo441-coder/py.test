@@ -223,8 +223,10 @@ class App:
         from .context_manager import compress_messages
         from .token_counter import count_message_tokens
 
-        self.ui.user_bubble(user_input)
-        self.ui.hide_prompt()
+        # The prompt box already shows the user's input inline (it persists as
+        # the on-screen record of the turn), so we don't re-render it as a
+        # bubble or erase the box — that manual erasure is what used to make the
+        # input box disappear.
         self._used_tool = False
         renderer = self.ui.stream_response()
         renderer.start_thinking()

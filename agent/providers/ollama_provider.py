@@ -8,6 +8,7 @@ from typing import Any, Callable
 import httpx
 
 from .base import LLMProvider, LLMResponse, ToolCall
+from ..cancellation import StopStreaming as _StopStreaming
 
 
 class OllamaProvider(LLMProvider):
@@ -42,23 +43,31 @@ class OllamaProvider(LLMProvider):
         tool_calls: list[ToolCall] = []
         with httpx.stream("POST", url, json=payload, timeout=300) as resp:
             resp.raise_for_status()
-            for line in resp.iter_lines():
-                if not line:
-                    continue
-                data = json.loads(line)
-                msg = data.get("message", {})
-                if msg.get("content"):
-                    content_parts.append(msg["content"])
-                    on_delta(msg["content"])
-                for tc in msg.get("tool_calls", []) or []:
-                    fn = tc.get("function", {})
-                    tool_calls.append(
-                        ToolCall(
-                            id=fn.get("name", "tool"),
-                            name=fn.get("name", ""),
-                            arguments=fn.get("arguments", {}) or {},
+            try:
+                for line in resp.iter_lines():
+                    if not line:
+                        continue
+                    data = json.loads(line)
+                    msg = data.get("message", {})
+                    if msg.get("content"):
+                        content_parts.append(msg["content"])
+                        on_delta(msg["content"])
+                    for tc in msg.get("tool_calls", []) or []:
+                        fn = tc.get("function", {})
+                        tool_calls.append(
+                            ToolCall(
+                                id=fn.get("name", "tool"),
+                                name=fn.get("name", ""),
+                                arguments=fn.get("arguments", {}) or {},
+                            )
                         )
-                    )
+            except _StopStreaming:
+                # User pressed ESC: stop and return partial text cleanly.
+                return LLMResponse(
+                    content="".join(content_parts),
+                    tool_calls=[],
+                    finish_reason="cancelled",
+                )
         return LLMResponse(content="".join(content_parts), tool_calls=tool_calls)
 
     def _parse_message(self, msg: dict[str, Any]) -> LLMResponse:

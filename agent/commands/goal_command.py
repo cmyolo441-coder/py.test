@@ -8,7 +8,7 @@ from .base import Command, CommandContext, CommandResult
 class GoalCommand(Command):
     name = "/goal"
     aliases = ("/goalmode", "/g")
-    help = "Autonomously achieve a goal end-to-end at ultra effort (/goal <goal>)"
+    help = "Autonomously work toward a goal end-to-end (/goal <goal>)"
 
     def run(self, ctx: CommandContext) -> CommandResult:
         goal = ctx.args.strip()

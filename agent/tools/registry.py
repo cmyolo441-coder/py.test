@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .base import Tool, ToolResult
+from .base import Tool, ToolResult, validate_arguments
 from .catalog import get_all_tools
 
 
@@ -27,7 +27,20 @@ class ToolRegistry:
     def execute(self, name: str, arguments: dict[str, Any]) -> ToolResult:
         tool = self.get(name)
         if tool is None:
-            return ToolResult(output=f"Unknown tool: {name}", success=False)
+            known = ", ".join(sorted(self._tools)) or "(none)"
+            return ToolResult(
+                output=f"Unknown tool: {name!r}. Available tools: {known}",
+                success=False,
+            )
+
+        # Validate arguments against the tool's JSON schema BEFORE calling the
+        # Python function. This turns a hard `TypeError: missing positional
+        # argument` crash into a clear, actionable message the model can fix on
+        # the next turn — and guarantees no tool is ever invoked with bad args.
+        error = validate_arguments(tool, arguments)
+        if error is not None:
+            return ToolResult(output=error, success=False)
+
         return tool.run(**arguments)
 
     def openai_schemas(self) -> list[dict[str, Any]]:
