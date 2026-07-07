@@ -16,7 +16,7 @@ def _resolve(path: str) -> Path:
     return Path(path).expanduser()
 
 
-def read_file(path: str, max_bytes: int = 100_000) -> str:
+def read_file(path: str, max_bytes: int = 128_000) -> str:
     p = _resolve(path)
     if not p.exists():
         return f"Error: file not found: {path}"

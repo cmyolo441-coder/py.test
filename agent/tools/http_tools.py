@@ -9,7 +9,7 @@ import httpx
 
 from .base import Tool, ToolResult
 
-_MAX = 12000
+_MAX = 128000
 _TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\n\s*\n+")
 

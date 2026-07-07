@@ -33,16 +33,16 @@ MODEL_CONTEXT_BUDGET: dict[str, int] = {
     "llama-3.3-70b-versatile": 110_000,
     "mistral-large-latest": 110_000,
     "meta-llama/Llama-3.3-70B-Instruct-Turbo": 110_000,
-    "mimo-v2.5-free": 24_000,
-    "big-pickle": 24_000,
-    "deepseek-v4-flash-free": 24_000,
+    "mimo-v2.5-free": 128_000,
+    "big-pickle": 128_000,
+    "deepseek-v4-flash-free": 128_000,
     "zyloo/glm-5.1": 110_000,
     "llama3.1": 110_000,
     "llama3.2": 110_000,
     "qwen2.5": 110_000,
 }
 
-DEFAULT_BUDGET = 24_000
+DEFAULT_BUDGET = 128_000
 
 
 def context_budget_for(model: str) -> int:

@@ -16,7 +16,7 @@ import httpx
 
 from .base import Tool, ToolResult
 
-_MAX_OUTPUT = 12_000  # characters returned to the model
+_MAX_OUTPUT = 128_000  # characters returned to the model
 
 
 def _truncate(text: str) -> str:
@@ -145,15 +145,16 @@ def get_builtin_tools() -> list[Tool]:
             name="write_file",
             description=(
                 "Create or overwrite a file with the given content. "
-                "For very large files (over 2000 chars), the content argument may be "
-                "truncated by the model's output limit. Use append_file to write "
-                "large files in multiple smaller chunks."
+                "ALWAYS write the ENTIRE file in a single call — pass the complete "
+                "content in one go, even for large files (thousands of lines). "
+                "Do NOT split a file across multiple calls or chunks. The output "
+                "limit is large (128000 tokens), so a full file fits in one call."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "File path to write."},
-                    "content": {"type": "string", "description": "Full file content."},
+                    "content": {"type": "string", "description": "Full, complete file content."},
                 },
                 "required": ["path", "content"],
             },
@@ -163,10 +164,11 @@ def get_builtin_tools() -> list[Tool]:
         Tool(
             name="append_file",
             description=(
-                "Append content to the end of a file. "
-                "Use this to write large files in smaller chunks: "
-                "call write_file first to create the file, "
-                "then append_file for each additional chunk."
+                "Append content to the END of an EXISTING file. "
+                "Use this only to add new content to a file that already exists "
+                "(e.g. appending a log line or a new section). "
+                "Do NOT use this to write a new file in chunks — use write_file "
+                "with the complete content instead."
             ),
             parameters={
                 "type": "object",

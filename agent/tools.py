@@ -18,7 +18,7 @@ SAFE_COMMANDS = {
 }
 
 
-def read_file(path: str, max_bytes: int = 20000) -> str:
+def read_file(path: str, max_bytes: int = 128000) -> str:
     p = Path(path).expanduser()
     if not p.exists():
         return f"Error: file not found: {path}"

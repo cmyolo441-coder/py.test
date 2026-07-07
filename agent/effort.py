@@ -42,7 +42,7 @@ class EffortLevel:
     security_audit: bool = False      # dedicated security/threat pass
     performance_pass: bool = False    # profile & optimize pass
     docs_pass: bool = False           # produce documentation
-    max_context_tokens: int = 8000    # working-context budget
+    max_context_tokens: int = 128000    # working-context budget
     escalate_on_failure: bool = False  # bump effort if verification keeps failing
 
     @property
@@ -55,26 +55,26 @@ LEVELS: dict[str, EffortLevel] = {
     "normal": EffortLevel(
         "normal", False, False, False, 1, 0, False, 0, 0.7,
         "Quick single-pass responses.",
-        self_consistency=1, max_context_tokens=8000,
+        self_consistency=1, max_context_tokens=128000,
     ),
     "ultramax": EffortLevel(
         "ultramax", False, True, False, 5, 1, True, 2, 0.5,
         "Heavy work for complex projects: plan, execute, verify once.",
         self_consistency=1, architecture_pass=True, test_generation=True,
-        max_context_tokens=16000,
+        max_context_tokens=128000,
     ),
     "ultracombo": EffortLevel(
         "ultracombo", True, True, True, 12, 2, True, 4, 0.4,
         "Enterprise-grade: research, verified plan, execute, verify twice.",
         self_consistency=2, adversarial_review=True, architecture_pass=True,
-        test_generation=True, docs_pass=True, max_context_tokens=32000,
+        test_generation=True, docs_pass=True, max_context_tokens=128000,
     ),
     "ultrahype": EffortLevel(
         "ultrahype", True, True, True, 40, 3, True, 8, 0.3,
         "Maximum autonomy: full end-to-end loop until truly complete.",
         self_consistency=3, adversarial_review=True, architecture_pass=True,
         test_generation=True, security_audit=True, performance_pass=True,
-        docs_pass=True, max_context_tokens=64000, escalate_on_failure=True,
+        docs_pass=True, max_context_tokens=128000, escalate_on_failure=True,
     ),
     "enterprise": EffortLevel(
         "enterprise", True, True, True, 60, 4, True, 12, 0.25,
@@ -82,7 +82,7 @@ LEVELS: dict[str, EffortLevel] = {
         "adversarial review, multi-sample self-consistency.",
         self_consistency=4, adversarial_review=True, architecture_pass=True,
         test_generation=True, security_audit=True, performance_pass=True,
-        docs_pass=True, max_context_tokens=96000, escalate_on_failure=True,
+        docs_pass=True, max_context_tokens=128000, escalate_on_failure=True,
     ),
     "godmode": EffortLevel(
         "godmode", True, True, True, 120, 6, True, 24, 0.2,

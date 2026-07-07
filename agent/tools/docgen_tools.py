@@ -13,7 +13,7 @@ from pathlib import Path
 
 from .base import Tool, ToolResult
 
-_MAX = 12000
+_MAX = 128000
 
 
 def extract_docstrings(path: str) -> ToolResult:

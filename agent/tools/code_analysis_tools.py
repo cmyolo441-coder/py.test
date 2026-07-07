@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .base import Tool, ToolResult
 
-_MAX = 12000
+_MAX = 128000
 
 
 def _parse_file(path: str) -> tuple[ast.AST | None, str]:
