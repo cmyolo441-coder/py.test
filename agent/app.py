@@ -92,12 +92,14 @@ class App:
         self._goal_config_backup = {
             "effort": getattr(cfg, "effort", "normal"),
             "temperature": cfg.temperature,
+            "max_tokens": cfg.max_tokens,
             "enable_tools": cfg.enable_tools,
             "auto_approve_tools": cfg.auto_approve_tools,
             "max_tool_iterations": cfg.max_tool_iterations,
         }
         cfg.effort = effort.name
         cfg.temperature = effort.temperature
+        cfg.max_tokens = max(cfg.max_tokens, 32768)
         cfg.enable_tools = True
         cfg.auto_approve_tools = True
         cfg.max_tool_iterations = max(cfg.max_tool_iterations, 40)

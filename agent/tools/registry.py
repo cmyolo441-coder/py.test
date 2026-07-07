@@ -33,6 +33,30 @@ class ToolRegistry:
                 success=False,
             )
 
+        # When a write_file/append_file call arrives with __malformed_arguments__
+        # (meaning the streaming JSON was truncated because the content exceeded
+        # the model's output window), try to extract path and partial content
+        # directly from the raw string so the file still gets created.
+        if "__malformed_arguments__" in arguments and name in ("write_file", "append_file"):
+            from ..providers.openai_provider import _salvage_arguments
+            raw_saved = arguments["__malformed_arguments__"]
+            salvaged = _salvage_arguments(raw_saved, name)
+            if "path" in salvaged and "content" in salvaged:
+                arguments = salvaged
+                # Add a note so the model knows the file may be incomplete.
+                path = salvaged["path"]
+                content = salvaged["content"]
+                result = tool.run(path=path, content=content)
+                return ToolResult(
+                    output=(
+                        f"{result.output}\n"
+                        f"NOTE: The tool call was truncated (content too large). "
+                        f"Only {len(content)} chars were written. "
+                        f"Use append_file to write the remaining content in chunks."
+                    ),
+                    success=result.success,
+                )
+
         # Validate arguments against the tool's JSON schema BEFORE calling the
         # Python function. This turns a hard `TypeError: missing positional
         # argument` crash into a clear, actionable message the model can fix on
