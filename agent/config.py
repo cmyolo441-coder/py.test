@@ -44,7 +44,7 @@ class Config:
     provider: str = field(default_factory=lambda: _env("AGENT_PROVIDER", default="zen") or "zen")
     model: str | None = field(default_factory=lambda: _env("AGENT_MODEL"))
     temperature: float = 0.7
-    max_tokens: int = 16384
+    max_tokens: int = 128000
     stream: bool = True
 
     # Provider credentials / endpoints.

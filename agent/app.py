@@ -99,7 +99,7 @@ class App:
         }
         cfg.effort = effort.name
         cfg.temperature = effort.temperature
-        cfg.max_tokens = max(cfg.max_tokens, 32768)
+        cfg.max_tokens = max(cfg.max_tokens, 128000)
         cfg.enable_tools = True
         cfg.auto_approve_tools = True
         cfg.max_tool_iterations = max(cfg.max_tool_iterations, 40)

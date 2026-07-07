@@ -209,7 +209,7 @@ class SelfEvolvingAgent:
         try:
             result = subprocess.run(
                 [sys.executable, "-m", "pytest", str(PROJECT_ROOT / "tests"), "-q", "--tb=no"],
-                capture_output=True, text=True, timeout=120, cwd=str(PROJECT_ROOT),
+                capture_output=True, text=True, timeout=700000, cwd=str(PROJECT_ROOT),
             )
             return result.returncode == 0
         except (subprocess.TimeoutExpired, FileNotFoundError) as exc:

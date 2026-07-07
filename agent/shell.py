@@ -55,7 +55,7 @@ class ShellExecutor:
     """Runs shell commands with guardrails and auditing."""
 
     workdir: str = "."
-    default_timeout: int = 60
+    default_timeout: int = 700000
     allow_dangerous: bool = False
     approval_callback: Callable[[str], bool] | None = None
     audit: list[ShellResult] = field(default_factory=list)
@@ -106,7 +106,7 @@ class ShellExecutor:
 default_executor = ShellExecutor()
 
 
-def shell_exec(command: str, timeout: int = 60) -> str:
+def shell_exec(command: str, timeout: int = 700000) -> str:
     return default_executor.run(command, timeout=timeout).as_text()
 
 

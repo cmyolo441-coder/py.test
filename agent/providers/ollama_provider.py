@@ -34,14 +34,14 @@ class OllamaProvider(LLMProvider):
         url = f"{self.base_url}/api/chat"
 
         if on_delta is None:
-            resp = httpx.post(url, json=payload, timeout=300)
+            resp = httpx.post(url, json=payload, timeout=700000)
             resp.raise_for_status()
             data = resp.json()
             return self._parse_message(data.get("message", {}))
 
         content_parts: list[str] = []
         tool_calls: list[ToolCall] = []
-        with httpx.stream("POST", url, json=payload, timeout=300) as resp:
+        with httpx.stream("POST", url, json=payload, timeout=700000) as resp:
             resp.raise_for_status()
             try:
                 for line in resp.iter_lines():

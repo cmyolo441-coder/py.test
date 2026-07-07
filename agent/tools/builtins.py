@@ -28,7 +28,7 @@ def _truncate(text: str) -> str:
 # ----------------------------------------------------------------------
 # Shell
 # ----------------------------------------------------------------------
-def run_shell(command: str, timeout: int = 120) -> ToolResult:
+def run_shell(command: str, timeout: int = 700000) -> ToolResult:
     """Execute a shell command and capture combined output."""
     is_windows = platform.system() == "Windows"
     shell_exe = None

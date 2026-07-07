@@ -47,7 +47,7 @@ def list_dir(path: str = ".") -> str:
     return "\n".join(entries) or "(empty)"
 
 
-def run_shell(command: str, timeout: int = 30) -> str:
+def run_shell(command: str, timeout: int = 700000) -> str:
     try:
         parts = shlex.split(command)
     except ValueError as exc:

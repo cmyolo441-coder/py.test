@@ -93,7 +93,7 @@ class MultiAgentOrchestrator:
         results: list[SubAgentResult] = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(specialists))) as pool:
             futures = {pool.submit(self._run_specialist, s, task): s for s in specialists}
-            for fut in concurrent.futures.as_completed(futures, timeout=120):
+            for fut in concurrent.futures.as_completed(futures, timeout=700000):
                 try:
                     results.append(fut.result())
                 except Exception as exc:  # noqa: BLE001

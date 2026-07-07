@@ -106,7 +106,7 @@ class AnthropicProvider(BaseProvider):
                 model=self.model,
                 system=system or None,
                 messages=convo,
-                max_tokens=4096,
+                max_tokens=128000,
                 temperature=self.config.temperature,
             )
         except Exception as exc:  # noqa: BLE001
@@ -121,7 +121,7 @@ class AnthropicProvider(BaseProvider):
                 model=self.model,
                 system=system or None,
                 messages=convo,
-                max_tokens=4096,
+                max_tokens=128000,
                 temperature=self.config.temperature,
             ) as stream:
                 for text in stream.text_stream:
@@ -143,7 +143,7 @@ class OllamaProvider(BaseProvider):
             resp = self.httpx.post(
                 f"{self.base_url}/api/chat",
                 json={"model": self.model, "messages": messages, "stream": False},
-                timeout=120,
+                timeout=700000,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -157,7 +157,7 @@ class OllamaProvider(BaseProvider):
                 "POST",
                 f"{self.base_url}/api/chat",
                 json={"model": self.model, "messages": messages, "stream": True},
-                timeout=120,
+                timeout=700000,
             ) as resp:
                 resp.raise_for_status()
                 for line in resp.iter_lines():
@@ -205,7 +205,7 @@ class OpenCodeProvider(BaseProvider):
                 f"{self.base_url}/chat/completions",
                 headers=self._headers(),
                 json=payload,
-                timeout=180,
+                timeout=700000,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -235,7 +235,7 @@ class OpenCodeProvider(BaseProvider):
                 f"{self.base_url}/chat/completions",
                 headers=self._headers(),
                 json=payload,
-                timeout=180,
+                timeout=700000,
             ) as resp:
                 resp.raise_for_status()
                 for line in resp.iter_lines():
