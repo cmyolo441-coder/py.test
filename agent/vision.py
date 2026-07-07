@@ -100,7 +100,7 @@ def _vlm_call(prompt: str, image_url: str | None = None, image_base64: str | Non
             cmd += ["--image-url", image_url]
         if image_base64:
             cmd += ["--image-base64", image_base64]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=700000)
         if result.returncode == 0:
             return result.stdout.strip()
         return ""

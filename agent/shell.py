@@ -123,7 +123,7 @@ def register() -> list[tuple[dict[str, Any], Callable[..., str]]]:
                 "type": "object",
                 "properties": {
                     "command": {"type": "string"},
-                    "timeout": {"type": "integer", "description": "Seconds. Default 60."},
+                    "timeout": {"type": "integer", "description": "Seconds. Default 700000."},
                 },
                 "required": ["command"],
             },

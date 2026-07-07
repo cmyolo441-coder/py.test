@@ -21,7 +21,7 @@ def dns_resolve(host: str) -> ToolResult:
 
 def public_ip() -> ToolResult:
     try:
-        resp = httpx.get("https://api.ipify.org", timeout=10)
+        resp = httpx.get("https://api.ipify.org", timeout=700000)
         resp.raise_for_status()
     except httpx.HTTPError as exc:
         return ToolResult(output=f"Error: {exc}", success=False)
@@ -47,7 +47,7 @@ def ping(host: str, count: int = 4) -> ToolResult:
     flag = "-n" if platform.system() == "Windows" else "-c"
     try:
         proc = subprocess.run(
-            ["ping", flag, str(count), host], capture_output=True, text=True, timeout=30
+            ["ping", flag, str(count), host], capture_output=True, text=True, timeout=700000
         )
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         return ToolResult(output=f"Error: {exc}", success=False)
@@ -63,7 +63,7 @@ def get_network_tools() -> list[Tool]:
         Tool("port_check", "Check whether a TCP port is open on a host.",
              {"type": "object", "properties": {
                  "host": {"type": "string"}, "port": {"type": "integer"},
-                 "timeout": {"type": "number", "default": 3.0}}, "required": ["host", "port"]}, port_check),
+                 "timeout": {"type": "number", "default": 700000}}, "required": ["host", "port"]}, port_check),
         Tool("ping", "Ping a host and return latency output.",
              {"type": "object", "properties": {
                  "host": {"type": "string"}, "count": {"type": "integer", "default": 4}},

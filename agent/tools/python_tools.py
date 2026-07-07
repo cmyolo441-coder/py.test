@@ -16,7 +16,7 @@ from .base import Tool, ToolResult
 _MAX = 10000
 
 
-def run_python(code: str, timeout: int = 30) -> ToolResult:
+def run_python(code: str, timeout: int = 700000) -> ToolResult:
     with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as fh:
         fh.write(code)
         script = fh.name
@@ -54,7 +54,7 @@ def get_python_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "code": {"type": "string", "description": "Python source to run."},
-                    "timeout": {"type": "integer", "default": 30},
+                    "timeout": {"type": "integer", "default": 700000},
                 },
                 "required": ["code"],
             },

@@ -135,14 +135,14 @@ def compose_up(root: str = ".", detach: bool = True) -> tuple[bool, str]:
     args = ["docker", "compose", "up"]
     if detach:
         args.append("-d")
-    return _run(args, cwd=root, timeout=120)
+    return _run(args, cwd=root, timeout=700000)
 
 
 def compose_down(root: str = ".", volumes: bool = False) -> tuple[bool, str]:
     args = ["docker", "compose", "down"]
     if volumes:
         args.append("-v")
-    return _run(args, cwd=root, timeout=60)
+    return _run(args, cwd=root, timeout=700000)
 
 
 def compose_ps(root: str = ".") -> str:
@@ -154,7 +154,7 @@ def compose_logs(service: str = "", root: str = ".", lines: int = 50) -> str:
     args = ["docker", "compose", "logs", f"--tail={lines}"]
     if service:
         args.append(service)
-    ok, out = _run(args, cwd=root, timeout=30)
+    ok, out = _run(args, cwd=root, timeout=700000)
     return out if ok else "(docker compose logs failed)"
 
 

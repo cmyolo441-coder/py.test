@@ -35,11 +35,12 @@ def send_slack(message: str, webhook_url: str | None = None, channel: str | None
         payload["channel"] = channel
     try:
         if _HAS_HTTPX:
-            resp = httpx.post(webhook_url, json=payload, timeout=10)
+            resp = httpx.post(webhook_url, json=payload, timeout=700000)
         else:
             import urllib.request
-            req = urllib.request.Request(webhook_url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
-            urllib.request.urlopen(req, timeout=10)
+
+            req = urllib.request.Request(webhook_url, data=payload_bytes, headers=headers)
+            urllib.request.urlopen(req, timeout=700000)
             return True, "sent"
         return resp.is_success, f"HTTP {resp.status_code}: {resp.text[:200]}"
     except Exception as exc:  # noqa: BLE001
@@ -54,12 +55,12 @@ def send_discord(message: str, webhook_url: str | None = None, username: str = "
     payload = {"content": message[:2000], "username": username}  # Discord 2000-char limit
     try:
         if _HAS_HTTPX:
-            resp = httpx.post(webhook_url, json=payload, timeout=10)
+            resp = httpx.post(webhook_url, json=payload, timeout=700000)
             return resp.is_success, f"HTTP {resp.status_code}"
         else:
             import urllib.request
             req = urllib.request.Request(webhook_url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
-            urllib.request.urlopen(req, timeout=10)
+            urllib.request.urlopen(req, timeout=700000)
             return True, "sent"
     except Exception as exc:  # noqa: BLE001
         return False, str(exc)
@@ -79,12 +80,12 @@ def send_teams(message: str, title: str = "Agent Notification", webhook_url: str
     }
     try:
         if _HAS_HTTPX:
-            resp = httpx.post(webhook_url, json=payload, timeout=10)
+            resp = httpx.post(webhook_url, json=payload, timeout=700000)
             return resp.is_success, f"HTTP {resp.status_code}"
         else:
             import urllib.request
             req = urllib.request.Request(webhook_url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
-            urllib.request.urlopen(req, timeout=10)
+            urllib.request.urlopen(req, timeout=700000)
             return True, "sent"
     except Exception as exc:  # noqa: BLE001
         return False, str(exc)
@@ -116,7 +117,7 @@ def send_email(
     msg["To"] = ", ".join(to_addrs)
     msg.attach(MIMEText(body, "html" if html else "plain", "utf-8"))
     try:
-        with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=700000) as server:
             server.starttls()
             if username and password:
                 server.login(username, password)
@@ -130,7 +131,7 @@ def send_webhook(url: str, payload: dict[str, Any], headers: dict[str, str] | No
     """Send a generic JSON payload to any HTTP webhook."""
     try:
         if _HAS_HTTPX:
-            resp = httpx.post(url, json=payload, headers=headers or {"Content-Type": "application/json"}, timeout=10)
+            resp = httpx.post(url, json=payload, headers=headers or {"Content-Type": "application/json"}, timeout=700000)
             return resp.is_success, f"HTTP {resp.status_code}: {resp.text[:200]}"
         else:
             import urllib.request
@@ -139,7 +140,7 @@ def send_webhook(url: str, payload: dict[str, Any], headers: dict[str, str] | No
                 data=json.dumps(payload).encode(),
                 headers=headers or {"Content-Type": "application/json"},
             )
-            urllib.request.urlopen(req, timeout=10)
+            urllib.request.urlopen(req, timeout=700000)
             return True, "sent"
     except Exception as exc:  # noqa: BLE001
         return False, str(exc)

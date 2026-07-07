@@ -33,7 +33,7 @@ def web_search(query: str, max_results: int = 5) -> str:
             "https://html.duckduckgo.com/html/",
             params={"q": query},
             headers={"User-Agent": "Mozilla/5.0 (compatible; termianlagent/1.0)"},
-            timeout=20,
+            timeout=700000,
             follow_redirects=True,
         )
         resp.raise_for_status()

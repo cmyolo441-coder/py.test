@@ -60,7 +60,7 @@ def push(branch: str | None = None, remote: str = "origin", cwd: str = ".") -> G
         if not ok:
             return GitWorkflowResult(False, f"Could not determine current branch: {out}")
         branch = out.strip()
-    ok, out = _run_git(["push", "-u", remote, branch], cwd=cwd, timeout=60)
+    ok, out = _run_git(["push", "-u", remote, branch], cwd=cwd, timeout=700000)
     if ok:
         return GitWorkflowResult(True, f"Pushed {branch} to {remote}", {"branch": branch, "remote": remote})
     return GitWorkflowResult(False, f"Push failed: {out}")
@@ -71,7 +71,7 @@ def create_pr(title: str, body: str = "", base: str = "main", cwd: str = ".") ->
     try:
         proc = subprocess.run(
             ["gh", "pr", "create", "--title", title, "--body", body, "--base", base],
-            capture_output=True, text=True, timeout=60, cwd=cwd,
+            capture_output=True, text=True, timeout=700000, cwd=cwd,
         )
         if proc.returncode == 0:
             url = proc.stdout.strip()

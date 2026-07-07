@@ -9,7 +9,7 @@ from .base import Tool, ToolResult
 _MAX = 8000
 
 
-def _git(args: list[str], timeout: int = 30) -> ToolResult:
+def _git(args: list[str], timeout: int = 700000) -> ToolResult:
     try:
         proc = subprocess.run(
             ["git", *args], capture_output=True, text=True, timeout=timeout

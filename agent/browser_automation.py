@@ -49,7 +49,7 @@ def navigate(url: str, wait: int = 3, take_screenshot: bool = False) -> BrowserR
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            page.goto(url, wait_until="domcontentloaded", timeout=700000)
             page.wait_for_timeout(wait * 1000)
             result = BrowserResult(
                 success=True,
@@ -73,7 +73,7 @@ def _fallback_fetch(url: str) -> BrowserResult:
     try:
         import httpx
         import re
-        resp = httpx.get(url, timeout=20, follow_redirects=True)
+        resp = httpx.get(url, timeout=700000, follow_redirects=True)
         html = resp.text
         # Extract title.
         title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
@@ -102,8 +102,8 @@ def click_element(url: str, selector: str, wait: int = 2) -> BrowserResult:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            page.click(selector, timeout=10000)
+            page.goto(url, wait_until="domcontentloaded", timeout=700000)
+            page.click(selector, timeout=700000)
             page.wait_for_timeout(wait * 1000)
             result = BrowserResult(
                 success=True,
@@ -126,11 +126,11 @@ def fill_form(url: str, fields: dict[str, str], submit_selector: str | None = No
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            page.goto(url, wait_until="domcontentloaded", timeout=700000)
             for selector, value in fields.items():
-                page.fill(selector, value, timeout=5000)
+                page.fill(selector, value, timeout=700000)
             if submit_selector:
-                page.click(submit_selector, timeout=10000)
+                page.click(submit_selector, timeout=700000)
                 page.wait_for_timeout(wait * 1000)
             result = BrowserResult(
                 success=True,
@@ -153,7 +153,7 @@ def execute_js(url: str, script: str) -> BrowserResult:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            page.goto(url, wait_until="domcontentloaded", timeout=700000)
             result_value = page.evaluate(script)
             browser.close()
             return BrowserResult(

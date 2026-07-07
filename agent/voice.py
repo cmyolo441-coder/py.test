@@ -32,7 +32,7 @@ def text_to_speech(text: str, output_path: str | Path | None = None, voice: str 
 def _try_zai_tts(text: str, output_path: Path, voice: str) -> bool:
     try:
         cmd = ["npx", "z-ai-web-dev-sdk", "tts", "--text", text, "--output", str(output_path), "--voice", voice]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=700000)
         return result.returncode == 0 and output_path.exists()
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
@@ -45,19 +45,19 @@ def _try_system_tts(text: str, output_path: Path, voice: str) -> bool:
     try:
         if system == "Darwin":  # macOS
             cmd = ["say", "-o", str(output_path), text]
-            subprocess.run(cmd, check=True, timeout=30)
+            subprocess.run(cmd, check=True, timeout=700000)
             return output_path.exists()
         if system == "Linux":
             # Try espeak first.
             try:
                 cmd = ["espeak", "-w", str(output_path), text]
-                subprocess.run(cmd, check=True, timeout=30)
+                subprocess.run(cmd, check=True, timeout=700000)
                 return output_path.exists()
             except FileNotFoundError:
                 # Try festival.
                 cmd = ["festival", "--tts"]
                 proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                proc.communicate(input=text.encode(), timeout=30)
+                proc.communicate(input=text.encode(), timeout=700000)
                 return proc.returncode == 0
         if system == "Windows":
             # Use PowerShell SAPI.
@@ -68,7 +68,7 @@ $synth.SetOutputToWaveFile("{output_path}")
 $synth.Speak("{text.replace('"', '`"')}")
 $synth.Dispose()
 '''
-            subprocess.run(["powershell", "-NoProfile", "-Command", ps_script], check=True, timeout=30)
+            subprocess.run(["powershell", "-NoProfile", "-Command", ps_script], check=True, timeout=700000)
             return output_path.exists()
     except Exception:  # noqa: BLE001
         return False
@@ -83,7 +83,7 @@ def speech_to_text(audio_path: str | Path, language: str = "en") -> str:
     # Try z-ai-web-dev-sdk ASR.
     try:
         cmd = ["npx", "z-ai-web-dev-sdk", "asr", "--audio", str(audio_path), "--language", language]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=700000)
         if result.returncode == 0:
             return result.stdout.strip()
     except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -98,13 +98,13 @@ def list_voices() -> list[str]:
     voices: list[str] = []
     try:
         if system == "Darwin":
-            result = subprocess.run(["say", "-v", "?"], capture_output=True, text=True, timeout=10)
+            result = subprocess.run(["say", "-v", "?"], capture_output=True, text=True, timeout=700000)
             for line in result.stdout.splitlines():
                 parts = line.split()
                 if parts:
                     voices.append(parts[0])
         elif system == "Linux":
-            result = subprocess.run(["espeak", "--voices"], capture_output=True, text=True, timeout=10)
+            result = subprocess.run(["espeak", "--voices"], capture_output=True, text=True, timeout=700000)
             for line in result.stdout.splitlines()[1:]:  # skip header
                 parts = line.split()
                 if len(parts) >= 2:
@@ -123,7 +123,7 @@ def voice_available() -> bool:
     if system == "Linux":
         for tool in ["espeak", "festival"]:
             try:
-                subprocess.run([tool, "--version"], capture_output=True, timeout=5)
+                subprocess.run([tool, "--version"], capture_output=True, timeout=700000)
                 return True
             except (FileNotFoundError, subprocess.TimeoutExpired):
                 continue

@@ -102,7 +102,7 @@ def list_dir(path: str = ".") -> ToolResult:
 # ----------------------------------------------------------------------
 def http_get(url: str) -> ToolResult:
     try:
-        resp = httpx.get(url, timeout=30, follow_redirects=True)
+        resp = httpx.get(url, timeout=700000, follow_redirects=True)
         resp.raise_for_status()
     except httpx.HTTPError as exc:
         return ToolResult(output=f"HTTP error: {exc}", success=False)
@@ -124,7 +124,7 @@ def get_builtin_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "The command to run."},
-                    "timeout": {"type": "integer", "description": "Timeout in seconds.", "default": 120},
+                    "timeout": {"type": "integer", "description": "Timeout in seconds.", "default": 700000},
                 },
                 "required": ["command"],
             },

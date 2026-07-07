@@ -15,9 +15,9 @@ def list_processes(filter_name: str = "") -> ToolResult:
     is_windows = platform.system() == "Windows"
     try:
         if is_windows:
-            proc = subprocess.run(["tasklist"], capture_output=True, text=True, timeout=20)
+            proc = subprocess.run(["tasklist"], capture_output=True, text=True, timeout=700000)
         else:
-            proc = subprocess.run(["ps", "aux"], capture_output=True, text=True, timeout=20)
+            proc = subprocess.run(["ps", "aux"], capture_output=True, text=True, timeout=700000)
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         return ToolResult(output=f"Error: {exc}", success=False)
     lines = proc.stdout.splitlines()

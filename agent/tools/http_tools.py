@@ -21,7 +21,7 @@ def http_request(method: str, url: str, headers: dict | None = None, body: str |
             url,
             headers=headers or {},
             content=body.encode("utf-8") if body else None,
-            timeout=30,
+            timeout=700000,
             follow_redirects=True,
         )
     except httpx.HTTPError as exc:
@@ -37,7 +37,7 @@ def http_request(method: str, url: str, headers: dict | None = None, body: str |
 def http_json(url: str, method: str = "GET", payload: dict | None = None) -> ToolResult:
     try:
         resp = httpx.request(
-            method.upper(), url, json=payload, timeout=30, follow_redirects=True
+            method.upper(), url, json=payload, timeout=700000, follow_redirects=True
         )
         data = resp.json()
     except httpx.HTTPError as exc:
@@ -51,7 +51,7 @@ def http_json(url: str, method: str = "GET", payload: dict | None = None) -> Too
 def fetch_text(url: str) -> ToolResult:
     """Fetch a URL and strip HTML tags to return readable text."""
     try:
-        resp = httpx.get(url, timeout=30, follow_redirects=True)
+        resp = httpx.get(url, timeout=700000, follow_redirects=True)
         resp.raise_for_status()
     except httpx.HTTPError as exc:
         return ToolResult(output=f"HTTP error: {exc}", success=False)
