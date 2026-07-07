@@ -311,13 +311,13 @@ class GoalMode:
     ) -> GoalRun:
         # 1) Plan (skip if resuming — we already have a plan).
         if resume_from is None or not any(s.kind == "plan" for s in run.steps):
+            self.ui.info("📋 Plan")
             renderer = self.ui.stream_response()
             renderer.start_thinking("planning")
             plan = self._raw_chat(PLANNER_SYS, f"Goal:\n{goal}")
             renderer.finish(plan)
             step = GoalStep("plan", 0, plan)
             run.steps.append(step)
-            self.ui.tool_result("plan", plan[:2000], True)
             self._checkpoint(run)
         else:
             plan = next((s.text for s in run.steps if s.kind == "plan"), goal)
