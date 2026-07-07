@@ -27,15 +27,30 @@ def _extract_json_value(raw: str, key: str) -> str | None:
     start = m.end()
     chars = []
     i = start
+    # JSON string escape map. The previous implementation appended the raw
+    # escape character (so "\n" became the literal letter "n"), which silently
+    # destroyed every newline/tab in salvaged file content. Decode properly.
+    _simple = {
+        '"': '"', '\\': '\\', '/': '/',
+        'n': '\n', 't': '\t', 'r': '\r',
+        'b': '\b', 'f': '\f',
+    }
     while i < len(raw):
         c = raw[i]
         if c == '\\':
-            # Escape sequence — take next char literally
-            if i + 1 < len(raw):
-                chars.append(raw[i + 1])
-                i += 2
-            else:
+            # Escape sequence — decode it to the character it represents.
+            if i + 1 >= len(raw):
                 break
+            nxt = raw[i + 1]
+            if nxt == 'u' and i + 5 < len(raw):
+                try:
+                    chars.append(chr(int(raw[i + 2:i + 6], 16)))
+                    i += 6
+                    continue
+                except ValueError:
+                    pass
+            chars.append(_simple.get(nxt, nxt))
+            i += 2
         elif c == '"':
             # End of value — but only if followed by , or } or whitespace+}
             # (handles unescaped quotes inside content like Python's \"\"\")
@@ -78,15 +93,28 @@ def _salvage_arguments(raw: str, tool_name: str) -> dict[str, Any]:
         if path_val:
             return {"path": path_val, "content": content_val or ""}
 
-    # Generic fallback: extract any key-value pairs we can.
-    result = {}
-    for m in re.finditer(r'"(\w+)"\s*:\s*("(?:[^"\\]|\\.)*"|null|true|false|\d+(?:\.\d+)?)', raw):
-        key = m.group(1)
-        val = m.group(2)
-        try:
-            result[key] = json.loads(val)
-        except json.JSONDecodeError:
-            result[key] = val.strip('"')
+    # For run_shell: the command string is the one required argument and is the
+    # usual victim of a truncated heredoc. Recover it with the same tolerant
+    # scanner so a large command still runs instead of failing on a missing arg.
+    if tool_name == "run_shell":
+        cmd_val = _extract_json_value(raw, "command")
+        if cmd_val is not None:
+            return {"command": cmd_val}
+
+    # Generic fallback: extract every string key via the tolerant scanner (which
+    # decodes escapes correctly), falling back to a strict regex for scalars.
+    result: dict[str, Any] = {}
+    for key in re.findall(r'"(\w+)"\s*:\s*"', raw):
+        val = _extract_json_value(raw, key)
+        if val is not None:
+            result[key] = val
+    for m in re.finditer(r'"(\w+)"\s*:\s*(null|true|false|-?\d+(?:\.\d+)?)', raw):
+        key, val = m.group(1), m.group(2)
+        if key not in result:
+            try:
+                result[key] = json.loads(val)
+            except json.JSONDecodeError:
+                result[key] = val
     if result:
         return result
 

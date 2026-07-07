@@ -33,29 +33,30 @@ class ToolRegistry:
                 success=False,
             )
 
-        # When a write_file/append_file call arrives with __malformed_arguments__
-        # (meaning the streaming JSON was truncated because the content exceeded
-        # the model's output window), try to extract path and partial content
-        # directly from the raw string so the file still gets created.
-        if "__malformed_arguments__" in arguments and name in ("write_file", "append_file"):
+        # When a call arrives carrying the __malformed_arguments__ marker the
+        # streaming JSON was truncated (usually because the content exceeded the
+        # model's output window). Re-run the salvage scanner against the raw
+        # string so we can recover usable arguments for ANY tool instead of
+        # failing with a bogus "missing required argument".
+        if "__malformed_arguments__" in arguments:
             from ..providers.openai_provider import _salvage_arguments
             raw_saved = arguments["__malformed_arguments__"]
             salvaged = _salvage_arguments(raw_saved, name)
-            if "path" in salvaged and "content" in salvaged:
+            if "__malformed_arguments__" not in salvaged:
                 arguments = salvaged
-                # Add a note so the model knows the file may be incomplete.
-                path = salvaged["path"]
-                content = salvaged["content"]
-                result = tool.run(path=path, content=content)
-                return ToolResult(
-                    output=(
-                        f"{result.output}\n"
-                        f"NOTE: The tool call was truncated (content too large). "
-                        f"Only {len(content)} chars were written. "
-                        f"Use append_file to write the remaining content in chunks."
-                    ),
-                    success=result.success,
-                )
+                # write_file/append_file: warn the model the file may be partial.
+                if name in ("write_file", "append_file") and "content" in salvaged:
+                    result = tool.run(**salvaged)
+                    return ToolResult(
+                        output=(
+                            f"{result.output}\n"
+                            f"NOTE: The tool call was truncated (content too large "
+                            f"for one response). Only {len(salvaged['content'])} chars "
+                            f"were written. Increase max_tokens, or use append_file to "
+                            f"add the remaining content."
+                        ),
+                        success=result.success,
+                    )
 
         # Validate arguments against the tool's JSON schema BEFORE calling the
         # Python function. This turns a hard `TypeError: missing positional
