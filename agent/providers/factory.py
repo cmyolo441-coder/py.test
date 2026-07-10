@@ -55,6 +55,17 @@ def get_provider(config: Config) -> LLMProvider:
             model, temp, max_tokens, key, getattr(config, "zyloo_base_url", "https://api.zyloo.io/v1")
         )
 
+    if provider == "lovable":
+        key = getattr(config, "lovable_api_key", None) or _env("LOVABLE_API_KEY")
+        if not key:
+            raise ProviderError("LOVABLE_API_KEY is not set.")
+        from .lovable_provider import LovableProvider
+
+        return LovableProvider(
+            model, temp, max_tokens, key,
+            getattr(config, "lovable_base_url", "https://ai.gateway.lovable.dev/v1"),
+        )
+
     if provider == "anthropic":
         if not config.anthropic_api_key:
             raise ProviderError("ANTHROPIC_API_KEY is not set.")

@@ -23,6 +23,7 @@ class ProviderSpec:
 PROVIDERS: dict[str, ProviderSpec] = {
     "zen": ProviderSpec("zen", "mimo-v2.5-free", True, "ZEN_API_KEY", True, "opencode.ai Zen (free models)"),
     "zyloo": ProviderSpec("zyloo", "zyloo/glm-5.1", True, "ZYLOO_API_KEY", True, "Zyloo (GLM models)"),
+    "lovable": ProviderSpec("lovable", "openai/gpt-5.5", True, "LOVABLE_API_KEY", True, "Lovable AI Gateway"),
     "openai": ProviderSpec("openai", "gpt-4o", True, "OPENAI_API_KEY", True, "OpenAI GPT models"),
     "anthropic": ProviderSpec("anthropic", "claude-3-5-sonnet-20241022", True, "ANTHROPIC_API_KEY", False, "Anthropic Claude"),
     "groq": ProviderSpec("groq", "llama-3.3-70b-versatile", True, "GROQ_API_KEY", True, "Groq (fast Llama)"),

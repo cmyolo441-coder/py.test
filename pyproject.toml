@@ -28,6 +28,7 @@ tokens = ["tiktoken>=0.7.0"]
 
 [project.scripts]
 agent = "agent.app:main"
+newagent = "agent.app:main"
 
 [tool.setuptools.packages.find]
 include = ["agent*"]
