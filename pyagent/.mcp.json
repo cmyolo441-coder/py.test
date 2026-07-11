@@ -1,0 +1,35 @@
+{
+  "mcpServers": {
+    "gsd-workflow": {
+      "command": "/usr/local/share/nvm/versions/node/v24.14.0/bin/node",
+      "args": [
+        "/usr/local/share/nvm/versions/node/v24.14.0/lib/node_modules/@opengsd/gsd-pi/packages/mcp-server/dist/cli.js"
+      ],
+      "cwd": "/workspaces/gocli",
+      "env": {
+        "GSD_CLI_PATH": "/home/codespace/nvm/current/bin/gsd",
+        "GSD_BIN_PATH": "/home/codespace/nvm/current/bin/gsd",
+        "GSD_WORKFLOW_EXECUTORS_MODULE": "/home/codespace/.gsd/agent/extensions/gsd/tools/workflow-tool-executors.js",
+        "GSD_WORKFLOW_WRITE_GATE_MODULE": "/home/codespace/.gsd/agent/extensions/gsd/bootstrap/write-gate.js",
+        "GSD_PERSIST_WRITE_GATE_STATE": "1",
+        "GSD_WORKFLOW_PROJECT_ROOT": "/workspaces/gocli"
+      }
+    },
+    "gsd-browser": {
+      "command": "/usr/local/share/nvm/versions/node/v24.14.0/bin/node",
+      "args": [
+        "/usr/local/share/nvm/versions/node/v24.14.0/lib/node_modules/@opengsd/gsd-pi/node_modules/@opengsd/gsd-browser/bin/gsd-browser",
+        "mcp",
+        "--session",
+        "gsd-gocli-a4321296",
+        "--identity-scope",
+        "project",
+        "--identity-key",
+        "gsd-gocli-a4321296",
+        "--identity-project",
+        "gsd-gocli-a4321296"
+      ],
+      "cwd": "/workspaces/gocli"
+    }
+  }
+}

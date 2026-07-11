@@ -1,0 +1,6 @@
+{"id":"eb4ea810-e9af-4945-8c96-a5a604c6b153","ts":"2026-07-11T18:39:40.144Z","severity":"info","message":"Native Anthropic web search active","source":"notify","read":false}
+{"id":"0f1e473b-7f6a-455c-aaf9-cec111be0bc5","ts":"2026-07-11T18:39:43.360Z","severity":"info","message":"GSD MCP Server Prepared at /workspaces/gocli/.mcp.json","source":"notify","read":false}
+{"id":"42aa1c3d-f3b1-491e-b468-3316e1389c5c","ts":"2026-07-11T18:40:11.750Z","severity":"warning","message":"Web search: Set BRAVE_API_KEY or use an Anthropic model for built-in search","source":"notify","read":false}
+{"id":"464c65f7-bcf7-40bb-92d7-d5cb425b0399","ts":"2026-07-11T18:46:55.155Z","severity":"warning","message":"Web search: Set BRAVE_API_KEY or use an Anthropic model for built-in search","source":"notify","read":false}
+{"id":"fd28e202-6fcf-46fe-a638-b34560fb1986","ts":"2026-07-11T18:54:33.727Z","severity":"warning","message":"Web search: Set BRAVE_API_KEY or use an Anthropic model for built-in search","source":"notify","read":false}
+{"id":"7fb09292-b481-451f-9805-7d080715c1cc","ts":"2026-07-11T18:55:08.762Z","severity":"warning","message":"Web search: Set BRAVE_API_KEY or use an Anthropic model for built-in search","source":"notify","read":false}
