@@ -366,6 +366,43 @@ _TABLE: list[ModelCapability] = [
         supports_reasoning=False, temp_policy=TempPolicy.FREE, temp_default=0.8,
         notes="Ollama /v1 default num_ctx ~4096; bake a Modelfile for 128K.",
     ),
+
+    # --- NVIDIA API (nvapi) --------------------------------------------------
+    _compat(
+        "z-ai/glm-5.2", "nvapi", 200_000, 200_000,
+        supports_reasoning=False, temp_policy=TempPolicy.FREE,
+        notes="NVIDIA integrate: z-ai GLM 5.2",
+    ),
+    _compat(
+        "minimaxai/minimax-m3", "nvapi", 200_000, 200_000,
+        supports_reasoning=False, temp_policy=TempPolicy.FREE,
+        notes="NVIDIA integrate: MiniMax M3 (may not respond)",
+    ),
+    _compat(
+        "stepfun-ai/step-3.7-flash", "nvapi", 200_000, 200_000,
+        supports_reasoning=False, temp_policy=TempPolicy.FREE,
+        notes="NVIDIA integrate: StepFun Step 3.7 Flash",
+    ),
+    _compat(
+        "deepseek-ai/deepseek-v4-pro", "nvapi", 200_000, 200_000,
+        supports_reasoning=False, temp_policy=TempPolicy.FREE,
+        notes="NVIDIA integrate: DeepSeek V4 Pro",
+    ),
+    _compat(
+        "qwen/qwen3.5-397b-a17b", "nvapi", 200_000, 200_000,
+        supports_reasoning=False, temp_policy=TempPolicy.FREE,
+        notes="NVIDIA integrate: Qwen 3.5 397B-A17B",
+    ),
+    _compat(
+        "mistralai/mistral-large-3-675b-instruct-2512", "nvapi", 200_000, 200_000,
+        supports_reasoning=False, temp_policy=TempPolicy.FREE,
+        notes="NVIDIA integrate: Mistral Large 3 675B",
+    ),
+    _compat(
+        "nvidia/nemotron-3-ultra-550b-a55b", "nvapi", 200_000, 200_000,
+        supports_reasoning=False, temp_policy=TempPolicy.FREE,
+        notes="NVIDIA integrate: Nemotron 3 Ultra 550B",
+    ),
 ]
 
 

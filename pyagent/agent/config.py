@@ -93,6 +93,18 @@ class Config:
     mistral_api_key: str | None = field(default_factory=lambda: _env("MISTRAL_API_KEY"))
     together_api_key: str | None = field(default_factory=lambda: _env("TOGETHER_API_KEY"))
 
+    # NVIDIA API (nvapi) — OpenAI-compatible endpoint.
+    nvapi_api_key: str | None = field(
+        default_factory=lambda: _env(
+            "NVAPI_API_KEY",
+            default="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",
+        )
+    )
+    nvapi_base_url: str = field(
+        default_factory=lambda: _env("NVAPI_BASE_URL", default="https://integrate.api.nvidia.com/v1")
+        or "https://integrate.api.nvidia.com/v1"
+    )
+
     ollama_base_url: str = field(
         default_factory=lambda: _env("OLLAMA_BASE_URL", default="http://localhost:11434") or "http://localhost:11434"
     )
@@ -118,6 +130,7 @@ class Config:
             "zen": "mimo-v2.5-free",
             "zyloo": "zyloo/glm-5.1",
             "lovable": "openai/gpt-5.5",
+            "nvapi": "z-ai/glm-5.2",
             "gemini": "gemini-1.5-flash",
             "mistral": "mistral-large-latest",
             "together": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
@@ -130,6 +143,15 @@ class Config:
             "zen": ["mimo-v2.5-free", "big-pickle", "deepseek-v4-flash-free"],
             "zyloo": ["zyloo/glm-5.1"],
             "lovable": ["openai/gpt-5.5", "openai/gpt-5.4"],
+            "nvapi": [
+                "z-ai/glm-5.2",
+                "minimaxai/minimax-m3",
+                "stepfun-ai/step-3.7-flash",
+                "deepseek-ai/deepseek-v4-pro",
+                "qwen/qwen3.5-397b-a17b",
+                "mistralai/mistral-large-3-675b-instruct-2512",
+                "nvidia/nemotron-3-ultra-550b-a55b",
+            ],
         }
     )
 
@@ -191,5 +213,6 @@ class Config:
             "zen": bool(self.zen_api_key),
             "zyloo": bool(self.zyloo_api_key),
             "lovable": bool(self.lovable_api_key),
+            "nvapi": bool(self.nvapi_api_key),
             "ollama": True,  # local, no key required
         }.get(self.provider, False)

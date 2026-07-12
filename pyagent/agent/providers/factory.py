@@ -97,6 +97,17 @@ def get_provider(config: Config) -> LLMProvider:
 
         return TogetherProvider(model, temp, max_tokens, key)
 
+    if provider == "nvapi":
+        key = getattr(config, "nvapi_api_key", None) or _env("NVAPI_API_KEY")
+        if not key:
+            raise ProviderError("NVAPI_API_KEY is not set.")
+        from .openai_provider import OpenAIProvider
+
+        return OpenAIProvider(
+            model, temp, max_tokens, key,
+            getattr(config, "nvapi_base_url", "https://integrate.api.nvidia.com/v1"),
+        )
+
     if provider == "ollama":
         from .ollama_provider import OllamaProvider
 
