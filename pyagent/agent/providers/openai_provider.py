@@ -10,6 +10,7 @@ from typing import Any
 from openai import OpenAI
 
 from ..cancellation import StopStreaming as _StopStreaming
+from ..capabilities import clamp_output_tokens, output_kwargs, reasoning_kwargs, temperature_kwargs
 from .base import LLMProvider, LLMResponse, ToolCall
 
 
@@ -123,6 +124,10 @@ def _salvage_arguments(raw: str, tool_name: str) -> dict[str, Any]:
 
 
 class OpenAIProvider(LLMProvider):
+    #: Default capability-resolution key; subclasses (Gemini, Mistral, …) or the
+    #: factory override this so fallback caps get the right provider/pattern set.
+    provider_key = "openai"
+
     def __init__(
         self,
         model: str,
@@ -130,9 +135,50 @@ class OpenAIProvider(LLMProvider):
         max_tokens: int,
         api_key: str,
         base_url: str | None = None,
+        thinking_level: str | None = None,
+        provider_key: str | None = None,
+        verbosity: str | None = None,
+        reasoning_pro: bool = False,
     ) -> None:
-        super().__init__(model, temperature, max_tokens)
+        if provider_key is not None:
+            # Instance override wins over the class attribute; must be set before
+            # super().__init__ resolves the capability.
+            self.provider_key = provider_key
+        self.verbosity = verbosity
+        self.reasoning_pro = reasoning_pro
+        super().__init__(model, temperature, max_tokens, thinking_level)
         self.client = OpenAI(api_key=api_key, base_url=base_url)
+
+    def _build_kwargs(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None
+    ) -> dict[str, Any]:
+        """Assemble request kwargs from the model's real capabilities.
+
+        Reasoning models (o-series / gpt-5*) get ``max_completion_tokens`` and no
+        ``temperature`` (they reject both ``max_tokens`` and sampling params);
+        non-reasoning models keep ``max_tokens`` + ``temperature`` as before,
+        clamped to the model's verified output ceiling. Gemini's numeric thinking
+        budget rides along in ``extra_body``.
+        """
+        cap = self.cap
+        reason_top, extra = reasoning_kwargs(
+            cap, self.thinking_level, clamp_output_tokens(cap, self.max_tokens)
+        )
+
+        kwargs: dict[str, Any] = {"model": self.model, "messages": messages}
+        kwargs.update(output_kwargs(cap, self.max_tokens))
+        kwargs.update(temperature_kwargs(cap, self.temperature, thinking_enabled=bool(reason_top or extra)))
+        kwargs.update(reason_top)
+        if cap.supports_verbosity and self.verbosity:
+            kwargs["verbosity"] = self.verbosity
+        if cap.reasoning_mode_pro and self.reasoning_pro:
+            kwargs["reasoning"] = {"mode": "pro"}
+        if extra:
+            kwargs["extra_body"] = extra
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+        return kwargs
 
     def chat(
         self,
@@ -140,15 +186,7 @@ class OpenAIProvider(LLMProvider):
         tools: list[dict[str, Any]] | None = None,
         on_delta: Callable[[str], None] | None = None,
     ) -> LLMResponse:
-        kwargs: dict[str, Any] = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
-        }
-        if tools:
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
+        kwargs = self._build_kwargs(messages, tools)
 
         if on_delta is None:
             return self._chat_blocking(kwargs)
@@ -172,11 +210,13 @@ class OpenAIProvider(LLMProvider):
             content=msg.content or "",
             tool_calls=tool_calls,
             finish_reason=choice.finish_reason,
+            reasoning=getattr(msg, "reasoning_content", None) or "",
         )
 
     def _chat_stream(self, kwargs: dict[str, Any], on_delta: Callable[[str], None]) -> LLMResponse:
         kwargs["stream"] = True
         content_parts: list[str] = []
+        reasoning_parts: list[str] = []
         # Accumulate tool call fragments by index.
         tool_fragments: dict[int, dict[str, Any]] = {}
         finish_reason = None
@@ -189,6 +229,9 @@ class OpenAIProvider(LLMProvider):
             delta = chunk.choices[0].delta
             if chunk.choices[0].finish_reason:
                 finish_reason = chunk.choices[0].finish_reason
+            rc = getattr(delta, "reasoning_content", None)
+            if rc:
+                reasoning_parts.append(rc)
             if delta.content:
                 content_parts.append(delta.content)
                 try:
@@ -231,4 +274,5 @@ class OpenAIProvider(LLMProvider):
             content="".join(content_parts),
             tool_calls=tool_calls,
             finish_reason=finish_reason,
+            reasoning="".join(reasoning_parts),
         )

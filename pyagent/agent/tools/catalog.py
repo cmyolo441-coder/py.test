@@ -17,6 +17,7 @@ from .http_tools import get_http_tools
 from .math_tools import get_math_tools
 from .network_tools import get_network_tools
 from .process_tools import get_process_tools
+from .project_brain_tools import get_project_brain_tools
 from .python_tools import get_python_tools
 from .random_tools import get_random_tools
 from .scaffold_tools import get_scaffold_tools
@@ -48,6 +49,8 @@ def get_all_tools() -> list[Tool]:
         get_convert_tools,
         get_process_tools,
         get_color_tools,
+        # Workspace brain tools.
+        get_project_brain_tools,
         # Enterprise tool groups (new in v2).
         get_code_analysis_tools,
         get_security_tools,

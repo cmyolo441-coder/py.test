@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from .base import Command, CommandContext, CommandResult
 
 
@@ -40,16 +42,21 @@ class ModelCommand(Command):
 
     def run(self, ctx: CommandContext) -> CommandResult:
         if ctx.args:
-            # If the chosen model belongs to another provider (e.g. a zyloo
-            # model while on zen), switch to that provider automatically so
-            # credentials/base-url line up.
-            owner = ctx.config.provider_for_model(ctx.args)
+            # Support "provider │ model" format (the display format from /models).
+            model_name = ctx.args
+            m = re.split(r"\s*[│|]\s*", model_name, maxsplit=1)
+            if len(m) == 2:
+                prov, model_name = m[0].strip(), m[1].strip()
+                if prov in ("lovable", "zen", "zyloo", "openai", "anthropic",
+                            "groq", "gemini", "mistral", "together", "ollama"):
+                    ctx.config.provider = prov
+            owner = ctx.config.provider_for_model(model_name)
             if owner and owner != ctx.config.provider:
                 ctx.config.provider = owner
-            ctx.config.model = ctx.args
+            ctx.config.model = model_name
             ctx.config.save()
             ctx.app.build_agent()
-            ctx.ui.success(f"Model set to {ctx.args} ({ctx.config.provider})")
+            ctx.ui.success(f"Model set to {model_name} ({ctx.config.provider})")
         else:
             ctx.ui.info(f"Current model: {ctx.config.resolved_model()}")
         return CommandResult()

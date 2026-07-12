@@ -1,24 +1,23 @@
 """Lovable AI Gateway provider (OpenAI-compatible endpoint).
 
-The gateway's gpt-5.x models differ from the vanilla OpenAI chat API in two
-ways, so we override ``chat`` rather than reuse the base implementation as-is:
-
-* they reject ``max_tokens`` and require ``max_completion_tokens`` instead;
-* they reject any ``temperature`` other than the default (1).
+The gateway's gpt-5.x models reject ``max_tokens`` (they require
+``max_completion_tokens``) and reject any ``temperature`` other than the default.
+That behaviour is now handled generically by the capability registry — the
+model id (e.g. ``openai/gpt-5.5``) resolves to a reasoning capability that emits
+``max_completion_tokens`` and omits ``temperature`` — so this provider only needs
+to point the base OpenAI client at the gateway URL.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import Any
-
-from .base import LLMResponse
 from .openai_provider import OpenAIProvider
 
 LOVABLE_BASE_URL = "https://ai.gateway.lovable.dev/v1"
 
 
 class LovableProvider(OpenAIProvider):
+    provider_key = "lovable"
+
     def __init__(
         self,
         model: str,
@@ -26,25 +25,9 @@ class LovableProvider(OpenAIProvider):
         max_tokens: int,
         api_key: str,
         base_url: str = LOVABLE_BASE_URL,
+        thinking_level: str | None = None,
     ) -> None:
-        super().__init__(model, temperature, max_tokens, api_key, base_url)
-
-    def chat(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-        on_delta: Callable[[str], None] | None = None,
-    ) -> LLMResponse:
-        kwargs: dict[str, Any] = {
-            "model": self.model,
-            "messages": messages,
-            # Gateway wants max_completion_tokens; temperature is fixed at 1.
-            "max_completion_tokens": self.max_tokens,
-        }
-        if tools:
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
-
-        if on_delta is None:
-            return self._chat_blocking(kwargs)
-        return self._chat_stream(kwargs, on_delta)
+        super().__init__(
+            model, temperature, max_tokens, api_key, base_url,
+            thinking_level=thinking_level,
+        )

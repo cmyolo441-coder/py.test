@@ -8,5 +8,17 @@ MISTRAL_BASE_URL = "https://api.mistral.ai/v1"
 
 
 class MistralProvider(OpenAIProvider):
-    def __init__(self, model: str, temperature: float, max_tokens: int, api_key: str) -> None:
-        super().__init__(model, temperature, max_tokens, api_key, MISTRAL_BASE_URL)
+    provider_key = "mistral"
+
+    def __init__(
+        self,
+        model: str,
+        temperature: float,
+        max_tokens: int,
+        api_key: str,
+        thinking_level: str | None = None,
+    ) -> None:
+        super().__init__(
+            model, temperature, max_tokens, api_key, MISTRAL_BASE_URL,
+            thinking_level=thinking_level,
+        )

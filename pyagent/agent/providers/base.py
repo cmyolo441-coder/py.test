@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from dataclasses import dataclass, field
 from typing import Any
+
+from dataclasses import dataclass, field
+
+from ..capabilities import ModelCapability, resolve_capability
 
 
 @dataclass
@@ -20,6 +23,9 @@ class LLMResponse:
     content: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     finish_reason: str | None = None
+    # Reasoning / chain-of-thought text, when the model exposes it separately
+    # (e.g. DeepSeek ``reasoning_content``). Empty for models without it.
+    reasoning: str = ""
 
     @property
     def wants_tools(self) -> bool:
@@ -33,10 +39,26 @@ class LLMProvider(ABC):
     list of provider-neutral messages (role/content dicts) plus tool schemas.
     """
 
-    def __init__(self, model: str, temperature: float, max_tokens: int) -> None:
+    #: Provider key used to resolve capability fallbacks (e.g. "anthropic",
+    #: "openai", "gemini"). Subclasses may override.
+    provider_key: str | None = None
+
+    def __init__(
+        self,
+        model: str,
+        temperature: float,
+        max_tokens: int,
+        thinking_level: str | None = None,
+    ) -> None:
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.thinking_level = thinking_level
+        # Resolve the model's real capabilities once. Governs how the requested
+        # max_tokens/temperature/thinking level become actual request kwargs so
+        # every model runs at its true full capacity without sending a param the
+        # API rejects.
+        self.cap: ModelCapability = resolve_capability(model, self.provider_key)
 
     @abstractmethod
     def chat(

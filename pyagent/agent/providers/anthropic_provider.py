@@ -8,12 +8,22 @@ from typing import Any
 import anthropic
 
 from ..cancellation import StopStreaming as _StopStreaming
+from ..capabilities import clamp_output_tokens, output_kwargs, reasoning_kwargs, temperature_kwargs
 from .base import LLMProvider, LLMResponse, ToolCall
 
 
 class AnthropicProvider(LLMProvider):
-    def __init__(self, model: str, temperature: float, max_tokens: int, api_key: str) -> None:
-        super().__init__(model, temperature, max_tokens)
+    provider_key = "anthropic"
+
+    def __init__(
+        self,
+        model: str,
+        temperature: float,
+        max_tokens: int,
+        api_key: str,
+        thinking_level: str | None = None,
+    ) -> None:
+        super().__init__(model, temperature, max_tokens, thinking_level)
         self.client = anthropic.Anthropic(api_key=api_key)
 
     def _split_system(self, messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
@@ -33,12 +43,24 @@ class AnthropicProvider(LLMProvider):
         on_delta: Callable[[str], None] | None = None,
     ) -> LLMResponse:
         system, msgs = self._split_system(messages)
+        cap = self.cap
+
+        # Build the real request params from the model's capabilities so the
+        # model runs at full capacity: its true output ceiling, real extended
+        # thinking (adaptive effort or budget_tokens), and a temperature the API
+        # actually accepts (omitted where the model rejects it, e.g. Opus 4.7+).
+        reason_top, _extra = reasoning_kwargs(
+            cap, self.thinking_level, clamp_output_tokens(cap, self.max_tokens)
+        )
+        thinking_enabled = bool(reason_top)
+
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": msgs,
-            "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
         }
+        kwargs.update(output_kwargs(cap, self.max_tokens))
+        kwargs.update(temperature_kwargs(cap, self.temperature, thinking_enabled))
+        kwargs.update(reason_top)
         if system:
             kwargs["system"] = system
         if tools:

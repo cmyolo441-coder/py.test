@@ -22,6 +22,7 @@ from .enterprise_commands import build_enterprise_commands
 from .feature_commands import build_feature_commands
 from .goal_command import GoalCommand
 from .persona_command import PersonaCommand
+from .project_brain_command import BrainCommand
 from .session_commands import ExportCommand
 from .ui_commands import (
     KeysCommand,
@@ -85,6 +86,7 @@ def build_command_registry() -> CommandRegistry:
         MatrixCommand(),
         StatusCommand(),
         GoalCommand(),
+        BrainCommand(),
         ChatCommand(),
     ):
         registry.register(cmd)
