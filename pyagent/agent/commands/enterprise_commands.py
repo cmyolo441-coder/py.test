@@ -1005,6 +1005,20 @@ class Zenith97Command(Command):
         return CommandResult()
 
 
+class Quantum83Command(Command):
+    name = "/quantum83"
+    aliases = ("/quantum", "/features83")
+    help = "Show the 83 next-level Quantum Suite features"
+
+    def run(self, ctx: CommandContext) -> CommandResult:
+        from ..quantum_suite import dashboard
+
+        arg = ctx.args.strip().lower()
+        limit = None if arg in {"all", "full", "83"} else 40
+        ctx.ui.console.print(dashboard(limit=limit))
+        return CommandResult()
+
+
 # =========================================================================== #
 # REGISTRATION
 # =========================================================================== #
@@ -1061,11 +1075,12 @@ def build_enterprise_commands() -> list[Command]:
         # Power-user utilities (2)
         DashboardCommand(),
         StatsCommand(),
-        # Enterprise + hyper + apex + omega + nova + zenith profiles
+        # Enterprise + hyper + apex + omega + nova + zenith + quantum profiles
         Features129Command(),
         Hyper70Command(),
         Apex40Command(),
         Omega49Command(),
         Nova71Command(),
         Zenith97Command(),
+        Quantum83Command(),
     ]

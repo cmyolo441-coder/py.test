@@ -229,6 +229,12 @@ def combined_feature_count() -> int:
         total += zenith_feature_count()
     except Exception:
         pass
+    try:
+        from .quantum_suite import quantum_feature_count
+
+        total += quantum_feature_count()
+    except Exception:
+        pass
     return total
 
 
@@ -313,6 +319,12 @@ def activate_enterprise_mode(app: Any | None = None) -> dict[str, Any]:
         from .zenith_suite import activate_zenith_mode
 
         summary["zenith"] = activate_zenith_mode(app)
+    except Exception:
+        pass
+    try:
+        from .quantum_suite import activate_quantum_mode
+
+        summary["quantum"] = activate_quantum_mode(app)
     except Exception:
         pass
     summary["combined_features"] = combined_feature_count()

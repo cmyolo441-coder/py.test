@@ -98,6 +98,7 @@ class EnterpriseAutostart:
             ("omega suite", self._omega_suite),
             ("nova suite", self._nova_suite),
             ("zenith suite", self._zenith_suite),
+            ("quantum suite", self._quantum_suite),
             ("tool registry", self._tool_registry),
             ("command registry", self._command_registry),
             ("knowledge graph", self._knowledge_graph),
@@ -239,6 +240,27 @@ class EnterpriseAutostart:
         }
         defs = snapshot.lsp.get("stats", {}).get("definitions", 0)
         return f"{snapshot.features} zenith features, {defs} LSP definitions", metadata
+
+    def _quantum_suite(self) -> tuple[str, dict[str, Any]]:
+        from .quantum_suite import run_quantum_warmup
+
+        snapshot = run_quantum_warmup(self.app, root=self.root)
+        metadata = {
+            "features": snapshot.features,
+            "trace": snapshot.trace,
+            "risk": snapshot.risk,
+            "benchmark": snapshot.benchmark,
+            "ux": snapshot.ux,
+            "dataflow": snapshot.dataflow,
+            "contracts": snapshot.contracts,
+            "scaffold": snapshot.scaffold,
+            "ops": snapshot.ops,
+            "recommendations": snapshot.recommendations,
+            "context": snapshot.to_context(),
+            "duration_s": snapshot.duration_s,
+        }
+        nodes = snapshot.trace.get("stats", {}).get("nodes", 0)
+        return f"{snapshot.features} quantum features, {nodes} trace nodes", metadata
 
     def _tool_registry(self) -> tuple[str, dict[str, Any]]:
         tools = self.app.registry.all()

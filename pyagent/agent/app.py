@@ -318,6 +318,21 @@ class App:
                 zctx = zenith.get("context")
                 if zctx:
                     parts.append(str(zctx)[:3800])
+            quantum = snapshot.context.get("quantum suite", {})
+            if quantum:
+                parts.append(
+                    "Quantum suite: "
+                    f"features={quantum.get('features', 0)}, "
+                    f"trace_nodes={quantum.get('trace', {}).get('stats', {}).get('nodes', 0)}, "
+                    f"risk_items={quantum.get('risk', {}).get('stats', {}).get('items', 0)}, "
+                    f"contracts={quantum.get('contracts', {}).get('stats', {}).get('contracts', 0)}"
+                )
+                qrecs = quantum.get("recommendations") or []
+                if qrecs:
+                    parts.append("Quantum recommendations: " + "; ".join(str(r) for r in qrecs[:5]))
+                qctx = quantum.get("context")
+                if qctx:
+                    parts.append(str(qctx)[:4200])
             try:
                 from .rag_v2 import get_vector_store
 

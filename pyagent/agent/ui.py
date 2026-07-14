@@ -50,6 +50,7 @@ SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/omega49", "Show the 49 next-level Omega Suite features"),
     ("/nova71", "Show the 71 ultra-advanced Nova Suite features"),
     ("/zenith97", "Show the 97 max-level Zenith Suite features"),
+    ("/quantum83", "Show the 83 next-level Quantum Suite features"),
     ("/persona", "Switch assistant persona"),
     ("/spinner", "Change the thinking spinner style"),
     ("/matrix", "Play a Matrix rain animation"),

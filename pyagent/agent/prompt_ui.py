@@ -43,6 +43,7 @@ SLASH_COMMANDS = {
     "/omega49": "Show the 49 next-level Omega Suite features",
     "/nova71": "Show the 71 ultra-advanced Nova Suite features",
     "/zenith97": "Show the 97 max-level Zenith Suite features",
+    "/quantum83": "Show the 83 next-level Quantum Suite features",
     "/theme": "Change UI theme",
     "/vivid": "Change vivid theme (neon, cyberpunk...)",
     "/health": "Show health status",
