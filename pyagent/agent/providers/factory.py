@@ -73,17 +73,26 @@ def get_provider(config: Config) -> LLMProvider:
         key = getattr(config, "lovable_api_key", None) or _env("LOVABLE_API_KEY")
         if not key:
             raise ProviderError("LOVABLE_API_KEY is not set.")
-        from .lovable_provider import LovableProvider
+        OpenAIProvider = _openai_compatible_provider()
 
-        return LovableProvider(
+        return OpenAIProvider(
             model, temp, max_tokens, key,
             getattr(config, "lovable_base_url", "https://ai.gateway.lovable.dev/v1"),
+            provider_key="lovable",
         )
 
     if provider == "anthropic":
         if not config.anthropic_api_key:
             raise ProviderError("ANTHROPIC_API_KEY is not set.")
-        from .anthropic_provider import AnthropicProvider
+        try:
+            from .anthropic_provider import AnthropicProvider
+        except ModuleNotFoundError as exc:
+            if exc.name == "anthropic":
+                raise ProviderError(
+                    "The Anthropic SDK is not bundled in the lightweight binary. "
+                    "Install optional providers with: pip install 'terminal-agent[providers]'"
+                ) from exc
+            raise
 
         return AnthropicProvider(model, temp, max_tokens, config.anthropic_api_key)
 
@@ -91,25 +100,37 @@ def get_provider(config: Config) -> LLMProvider:
         key = getattr(config, "gemini_api_key", None) or _env("GEMINI_API_KEY")
         if not key:
             raise ProviderError("GEMINI_API_KEY is not set.")
-        from .gemini_provider import GeminiProvider
+        OpenAIProvider = _openai_compatible_provider()
 
-        return GeminiProvider(model, temp, max_tokens, key)
+        return OpenAIProvider(
+            model, temp, max_tokens, key,
+            "https://generativelanguage.googleapis.com/v1beta/openai/",
+            provider_key="gemini",
+        )
 
     if provider == "mistral":
         key = getattr(config, "mistral_api_key", None) or _env("MISTRAL_API_KEY")
         if not key:
             raise ProviderError("MISTRAL_API_KEY is not set.")
-        from .mistral_provider import MistralProvider
+        OpenAIProvider = _openai_compatible_provider()
 
-        return MistralProvider(model, temp, max_tokens, key)
+        return OpenAIProvider(
+            model, temp, max_tokens, key,
+            "https://api.mistral.ai/v1",
+            provider_key="mistral",
+        )
 
     if provider == "together":
         key = getattr(config, "together_api_key", None) or _env("TOGETHER_API_KEY")
         if not key:
             raise ProviderError("TOGETHER_API_KEY is not set.")
-        from .together_provider import TogetherProvider
+        OpenAIProvider = _openai_compatible_provider()
 
-        return TogetherProvider(model, temp, max_tokens, key)
+        return OpenAIProvider(
+            model, temp, max_tokens, key,
+            "https://api.together.xyz/v1",
+            provider_key="together",
+        )
 
     if provider == "nvapi":
         key = getattr(config, "nvapi_api_key", None) or _env("NVAPI_API_KEY")

@@ -27,6 +27,8 @@ case "$MODE" in
       exit 1
     fi
     chmod +x "$BIN_DIR/$BIN_NAME"
+    # Clear stale shiv extraction caches from older native-dependency builds.
+    rm -rf "$HOME"/.shiv/agent_* 2>/dev/null || true
     ;;
   pip)
     echo "==> Installing Terminal AI Agent from source with pip"

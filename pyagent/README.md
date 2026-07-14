@@ -10,9 +10,9 @@ The latest build auto-activates the full intelligence stack on `python3 main.py`
 - **Fast startup**: 539 features activate immediately; deep repo analysis warms in the background instead of blocking the prompt.
 - **456+ local intelligence features plus Quantum layer**: Enterprise, Hyper, Apex, Omega, Nova, Zenith, and Quantum startup suites.
 - **123 tools / 153 commands / 11 providers** in the current full registry.
-- **Standalone binary**: `dist/agent` is rebuilt with `shiv` and can be installed via `curl`.
+- **Standalone binary**: `dist/agent` is rebuilt with `shiv`, uses pure-Python runtime deps, and can be installed via `curl`.
 - **Pip install supported** from this GitHub repository with the `pyagent` subdirectory.
-- **HTTP OpenAI-compatible fallback**: OpenAI-compatible providers can run even if the official `openai` Python package is absent.
+- **HTTP OpenAI-compatible fallback**: OpenAI-compatible providers run without the official `openai` package, avoiding native `pydantic_core` binary issues.
 
 ## Install
 
@@ -37,7 +37,7 @@ If `agent` is not found, add this to your shell profile:
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-> Note: the checked-in binary is a Python shiv executable built on Linux with the current build Python. If it does not run on your machine, use the pip install or local build options below.
+> Note: the checked-in binary is a Python shiv executable with pure-Python runtime dependencies only. The previous native `pydantic_core`/OpenAI SDK bundle was removed so the binary works across Python 3.10+ environments without the `pydantic_core._pydantic_core` crash. If your shell has an older shiv cache, re-run the installer; it clears `~/.shiv/agent_*`.
 
 ### Option 2 — curl + pip source install
 
