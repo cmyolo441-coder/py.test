@@ -1,107 +1,208 @@
-ï»¿# Advanced Terminal AI Agent
+# Advanced Terminal AI Agent
 
-The world''s most advanced, production-grade terminal AI agent, built in pure Python. Beautiful animated TUI, multi-LLM support, 65+ real tools, agentic tool-calling, guardrails, sessions, personas and a plugin system.
+A production-grade terminal AI coding agent with a Codex-style TUI, multi-provider LLM support, real tool calling, autonomous startup intelligence, local codebase indexing, sessions, personas, plugins, and a large test suite.
 
-100+ files, fully real working code, with a test suite (90+ tests).
+The latest build auto-activates the full intelligence stack on `python3 main.py` / `agent` startup and warms heavy code intelligence in the background for fast prompt readiness.
 
-## Features
+## Latest highlights
 
-- Animated Rich TUI: flowing-gradient banner, typewriter intro, shimmering thinking indicator, framed prompt box, live streaming markdown, colored tool cards
-- Live theming: switch between **neon, cyberpunk, pastel, matrix, solarized** at runtime with `/theme`; the whole UI (banner, prompt box, bubbles, spinners, status bar) restyles instantly
-- Chat bubbles: user messages render as right-aligned bubbles; assistant answers stream as live markdown with syntax-highlighted code blocks
-- Rich effects: gradient headings, animated progress bars, fade-in / slide-in reveals, celebration confetti on task completion, and a Matrix digital-rain animation (`/matrix`)
-- Selectable spinners: braille, dots, moon, line, arc, star, bounce (`/spinner`)
-- Live slash-command menu: floating dropdown with command descriptions while you type
-- Status bar: live UTC clock, provider/model, token counter and active theme after every turn
-- Keyboard shortcuts overlay (`/keys`)
-- 8 providers: zen (opencode.ai), OpenAI, Anthropic, Groq, Gemini, Mistral, Together, and local Ollama
-- 65+ tools: shell, files, editing, search, git, python exec, HTTP, data (json/csv), encoding, text, math, system, network, random, archive, unit-convert, process, color
-- Agentic loop with streaming and multi-step tool use
-- **Goal Mode** (`/goal`): persistent autonomous mode — stays active across multiple goals until you type `/chat`; auto godmode effort, full tool capacity, auto-approve
-- Guardrails: dangerous-command detection + per-turn tool-call budget
-- Personas: coder, sysadmin, researcher, concise, default
-- Session persistence + markdown/JSON export
-- Plugin system: drop tools into ~/.terminal_agent/plugins
-- CLI: provider/model/theme/spinner flags and one-shot prompts
+- **Fast Codex-style TUI**: clean dark UI, fixed double-line prompt box, clean slash completions, no duplicate/noisy popup rows.
+- **Fast startup**: 539 features activate immediately; deep repo analysis warms in the background instead of blocking the prompt.
+- **456+ local intelligence features plus Quantum layer**: Enterprise, Hyper, Apex, Omega, Nova, Zenith, and Quantum startup suites.
+- **123 tools / 153 commands / 11 providers** in the current full registry.
+- **Standalone binary**: `dist/agent` is rebuilt with `shiv` and can be installed via `curl`.
+- **Pip install supported** from this GitHub repository with the `pyagent` subdirectory.
+- **HTTP OpenAI-compatible fallback**: OpenAI-compatible providers can run even if the official `openai` Python package is absent.
 
-## Installation
+## Install
 
-### Option 1 — pip install (recommended)
+### Option 1 — curl binary install
 
-    pip install git+https://github.com/cmyolo441-coder/py.test
+Installs the latest checked-in `dist/agent` binary to `~/.local/bin/agent`:
 
-After install, run with:
+```bash
+curl -fsSL https://raw.githubusercontent.com/cmyolo441-coder/py.test/main/pyagent/scripts/install.sh | sh
+```
 
-    agent
+Then run:
 
-### Option 2 — Binary (no source needed)
+```bash
+agent
+agent --version
+```
 
-Download `dist/agent` from the repo or build it yourself:
+If `agent` is not found, add this to your shell profile:
 
-    shiv -o dist/agent -e agent.app:main .
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
 
-Then run directly:
+> Note: the checked-in binary is a Python shiv executable built on Linux with the current build Python. If it does not run on your machine, use the pip install or local build options below.
 
-    ./dist/agent
-    # or copy to PATH:
-    cp dist/agent /usr/local/bin/agent && agent
+### Option 2 — curl + pip source install
 
-Requires Python 3.10+ on the target system (all other deps are bundled).
+```bash
+curl -fsSL https://raw.githubusercontent.com/cmyolo441-coder/py.test/main/pyagent/scripts/install.sh | TERMINAL_AGENT_INSTALL_MODE=pip sh
+```
 
-### Option 3 — Source
+### Option 3 — direct pip install from GitHub
 
-    git clone https://github.com/cmyolo441-coder/py.test
-    cd py.test
-    pip install -r requirements.txt
-    python main.py
+Because the Python project lives inside the `pyagent/` subdirectory, use `#subdirectory=pyagent`:
 
-Pick a theme and spinner at startup:
+```bash
+python3 -m pip install --upgrade "git+https://github.com/cmyolo441-coder/py.test.git#subdirectory=pyagent"
+```
 
-    python main.py --theme cyberpunk --spinner moon
+Then run:
+
+```bash
+agent
+newagent
+```
+
+### Option 4 — source checkout
+
+```bash
+git clone https://github.com/cmyolo441-coder/py.test.git
+cd py.test/pyagent
+python3 -m pip install -r requirements.txt
+python3 main.py
+```
 
 One-shot / scripted:
 
-    python main.py -p zen -m big-pickle -c "what is 2+2?"
+```bash
+python3 main.py -p zen -m big-pickle -c "what is 2+2?"
+```
 
-The Zen provider ships with a built-in key and 3 free models: mimo-v2.5-free, big-pickle, deepseek-v4-flash-free.
+Pick theme/spinner:
 
-## Commands
+```bash
+python3 main.py --theme cyberpunk --spinner moon
+```
 
-    make install    # install deps
-    make test       # run tests
-    make health     # verify install (no API calls)
-    make tools      # list all tools
-    make run        # start the agent
+## Binary build / rebuild
 
-Slash commands include `/goal /chat /help /theme /spinner /keys /matrix /status /model /models /provider /tools /persona /config /export /auto /anim /clear /save /tokens /exit`.
+Old `dist/` and `build/` artifacts are removed before every binary build.
+
+```bash
+cd py.test/pyagent
+./scripts/build_binary.sh
+```
+
+Output:
+
+```text
+dist/agent
+```
+
+Run directly:
+
+```bash
+./dist/agent --version
+./dist/agent
+```
+
+Install manually:
+
+```bash
+install -Dm755 dist/agent ~/.local/bin/agent
+agent
+```
+
+## Runtime commands
+
+Common Make/script commands:
+
+```bash
+make install    # install deps
+make test       # run tests
+make health     # verify install without API calls
+make tools      # list tools
+make run        # start the agent
+```
+
+Slash commands include:
+
+```text
+/help /exit /model /models /models-all /provider /tools /theme /spinner /keys
+/goal /chat /status /tokens /cost /dashboard /features129 /hyper70 /apex40
+/omega49 /nova71 /zenith97 /quantum83 /rag /kg /sast /sbom /memory /mcp
+```
+
+## Auto-start intelligence stack
+
+On normal interactive startup, the agent now uses **fast start**:
+
+1. 539 features are available immediately.
+2. The prompt appears quickly.
+3. Heavy local analysis warms in a background thread.
+4. Once ready, later prompts automatically receive compact local context.
+
+Startup layers include:
+
+- **Enterprise Suite** — 129 feature profile and runtime activation.
+- **Hyper Suite** — repository inventory, symbol density, docs/test/runtime hints.
+- **Apex Suite** — call graph, impact scoring, workflow and verification planning.
+- **Omega Suite** — semantic index, refactor engine, test matrix, runtime map, context packer.
+- **Nova Suite** — symbol intelligence, similarity, change forecast, workflow DAG, docs/quality insights.
+- **Zenith Suite** — LSP index, dependency graph, metrics fusion, release/cache/context/handoff engines.
+- **Quantum Suite** — intent tracing, reliability risk, benchmark, UX, dataflow, contracts, scaffold, ops runbooks.
+
+The background warmup is safe/local/offline. Dangerous tool execution still requires confirmation unless `/auto` is explicitly enabled.
 
 ## Architecture
 
-    main.py                 -> entry point (CLI parsing)
-    agent/
-      app.py                -> application shell + turn loop
-      core.py               -> reasoning + tool-execution loop
-      guardrails.py         -> safety layer
-      personas.py           -> system-prompt presets
-      config.py, memory.py  -> config + conversation state
-      cli.py                -> argument parsing
-      ui.py, effects.py     -> animated Rich TUI
-      providers/            -> 8 LLM backends behind one interface
-      tools/                -> 17 tool groups (65+ tools)
-      commands/             -> modular slash-command framework
-      session/              -> named sessions + export
-      plugins/              -> runtime plugin loader
-      utils/                -> logging, tokens, text, files, security, timing, retry
-    tests/                  -> 90+ unit tests
-    scripts/                -> healthcheck + tool listing
-    docs/                   -> architecture, tools, providers
+```text
+main.py                 -> source entry point
+agent/app.py            -> app shell, CLI entry point, turn loop, autostart
+agent/core.py           -> LLM reasoning + tool execution loop
+agent/ui.py             -> Codex-style Rich/prompt_toolkit TUI
+agent/autostart.py      -> zero-command startup warmup orchestrator
+agent/enterprise_suite.py
+agent/hyper_suite.py
+agent/apex_suite.py
+agent/omega_suite.py
+agent/nova_suite.py
+agent/zenith_suite.py
+agent/quantum_suite.py  -> layered local intelligence suites
+agent/providers/        -> OpenAI-compatible, Anthropic, Gemini, Ollama, etc.
+agent/tools/            -> built-in tool registry
+agent/commands/         -> slash command registry
+agent/session/          -> session storage/export
+agent/plugins/          -> runtime plugin loader
+scripts/build_binary.sh -> clean + rebuild dist/agent
+scripts/install.sh      -> curl installer
+```
 
-See docs/ARCHITECTURE.md, docs/TOOLS.md and docs/PROVIDERS.md for details.
+Docs:
+
+```text
+docs/ARCHITECTURE.md
+docs/TOOLS.md
+docs/PROVIDERS.md
+```
 
 ## Safety
 
-Dangerous tools (shell, python exec, file writes) require confirmation unless /auto is on. Guardrails independently scan shell commands for destructive patterns and cap tool calls per turn.
+Dangerous tools such as shell execution, Python execution, and file writes require confirmation unless `/auto` is enabled. Guardrails scan dangerous shell patterns and cap tool calls per turn.
+
+## Development validation
+
+```bash
+python3 -m pytest -q
+python3 -m compileall -q agent scripts tests
+python3 scripts/healthcheck.py
+```
+
+Current validation status from this build:
+
+```text
+427 tests passed
+healthcheck: All good
+binary smoke: terminal-agent 1.0.0
+```
 
 ## License
 
-MIT (see LICENSE)
+MIT — see `LICENSE`.
