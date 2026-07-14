@@ -42,22 +42,30 @@ class ModelCommand(Command):
 
     def run(self, ctx: CommandContext) -> CommandResult:
         if ctx.args:
-            # Support "provider │ model" format (the display format from /models).
-            model_name = ctx.args
+            # Support display format (`provider │ model`) and a convenient
+            # CLI-ish format (`provider/model`) for provider names that do not
+            # themselves contain `/`.  Model names such as `meta-llama/...` are
+            # left untouched unless the prefix is a known provider.
+            from ..providers.registry import PROVIDERS
+
+            model_name = ctx.args.strip()
             m = re.split(r"\s*[│|]\s*", model_name, maxsplit=1)
             if len(m) == 2:
                 prov, model_name = m[0].strip(), m[1].strip()
-                from ..providers.registry import PROVIDERS
-
                 if prov in PROVIDERS:
                     ctx.config.provider = prov
+            else:
+                maybe_provider, sep, rest = model_name.partition("/")
+                if sep and maybe_provider in PROVIDERS and rest:
+                    ctx.config.provider = maybe_provider
+                    model_name = rest
             owner = ctx.config.provider_for_model(model_name)
             if owner and owner != ctx.config.provider:
                 ctx.config.provider = owner
             ctx.config.model = model_name
             ctx.config.save()
-            ctx.app.build_agent()
-            ctx.ui.success(f"Model set to {model_name} ({ctx.config.provider})")
+            if ctx.app.build_agent():
+                ctx.ui.success(f"Model set to {ctx.config.resolved_model()} ({ctx.config.provider})")
         else:
             ctx.ui.info(f"Current model: {ctx.config.resolved_model()}")
         return CommandResult()

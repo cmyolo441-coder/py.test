@@ -401,11 +401,19 @@ class App:
         return items
 
     def build_agent(self) -> bool:
+        # Strict model ownership: if the selected model is known to belong to a
+        # provider, always build that exact provider/model pair.  This prevents
+        # a stale provider from answering with a different default model after
+        # `/model agnes-2.5-pro`, `/model MiniMax-M2.7`, etc.
+        if self.config.model:
+            owner = self.config.provider_for_model(self.config.model)
+            if owner and owner != self.config.provider:
+                self.config.provider = owner
         try:
             provider = get_provider(self.config)
         except ProviderError as exc:
             self.ui.error(str(exc))
-            self.ui.info("Tip: for a zero-config local setup run `/provider ollama`, or set an API key env var (e.g. ZEN_API_KEY).")
+            self.ui.info("Tip: set the selected provider API key env var, or run `/provider ollama` for local mode.")
             return False
         self.agent = Agent(self.config, provider, self.registry, self.conversation)
         log.info("Agent ready: provider=%s model=%s", self.config.provider, self.config.resolved_model())
