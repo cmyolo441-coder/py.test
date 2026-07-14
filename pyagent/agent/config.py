@@ -105,6 +105,22 @@ class Config:
         or "https://integrate.api.nvidia.com/v1"
     )
 
+    # SambaNova Cloud — OpenAI-compatible endpoint.
+    # Set SAMBANOVA_API_KEY in your environment or ~/.terminal_agent/config.json.
+    sambanova_api_key: str | None = field(default_factory=lambda: _env("SAMBANOVA_API_KEY"))
+    sambanova_base_url: str = field(
+        default_factory=lambda: _env("SAMBANOVA_BASE_URL", default="https://api.sambanova.ai/v1")
+        or "https://api.sambanova.ai/v1"
+    )
+
+    # Agnes AI API Hub — OpenAI-compatible endpoint.
+    # Set AGNES_API_KEY in your environment or ~/.terminal_agent/config.json.
+    agnes_api_key: str | None = field(default_factory=lambda: _env("AGNES_API_KEY"))
+    agnes_base_url: str = field(
+        default_factory=lambda: _env("AGNES_BASE_URL", default="https://apihub.agnes-ai.com/v1")
+        or "https://apihub.agnes-ai.com/v1"
+    )
+
     ollama_base_url: str = field(
         default_factory=lambda: _env("OLLAMA_BASE_URL", default="http://localhost:11434") or "http://localhost:11434"
     )
@@ -131,6 +147,8 @@ class Config:
             "zyloo": "zyloo/glm-5.1",
             "lovable": "openai/gpt-5.5",
             "nvapi": "z-ai/glm-5.2",
+            "sambanova": "MiniMax-M2.7",
+            "agnes": "agnes-2.5-flash",
             "gemini": "gemini-1.5-flash",
             "mistral": "mistral-large-latest",
             "together": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
@@ -152,6 +170,8 @@ class Config:
                 "mistralai/mistral-large-3-675b-instruct-2512",
                 "nvidia/nemotron-3-ultra-550b-a55b",
             ],
+            "sambanova": ["MiniMax-M2.7"],
+            "agnes": ["agnes-2.0-flash", "agnes-2.5-flash", "agnes-2.5-pro"],
         }
     )
 
@@ -214,5 +234,7 @@ class Config:
             "zyloo": bool(self.zyloo_api_key),
             "lovable": bool(self.lovable_api_key),
             "nvapi": bool(self.nvapi_api_key),
+            "sambanova": bool(self.sambanova_api_key),
+            "agnes": bool(self.agnes_api_key),
             "ollama": True,  # local, no key required
         }.get(self.provider, False)

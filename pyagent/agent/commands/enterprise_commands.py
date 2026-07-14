@@ -153,8 +153,8 @@ class RouterCommand(Command):
         if not ctx.args:
             ctx.ui.console.print(describe_routing_table())
             return CommandResult()
-        available = [p for p in ["zen", "openai", "anthropic", "gemini", "ollama", "groq", "mistral", "together", "zyloo"]
-                     if ctx.config.has_credentials() or p == ctx.config.provider]
+        from ..providers.registry import PROVIDERS
+        available = [p for p in PROVIDERS if ctx.config.has_credentials() or p == ctx.config.provider]
         decision = route(ctx.args, available_providers=available, preferred_provider=ctx.config.provider)
         ctx.ui.info(f"Query class: {decision.query_class}")
         ctx.ui.info(f"Routed to: {decision.provider}/{decision.model}")
@@ -174,8 +174,8 @@ class RouteCommand(Command):
         if not ctx.args:
             ctx.ui.error("Usage: /route <your prompt>")
             return CommandResult()
-        available = [p for p in ["zen", "openai", "anthropic", "gemini", "ollama"]
-                     if ctx.config.has_credentials() or p == ctx.config.provider]
+        from ..providers.registry import PROVIDERS
+        available = [p for p in PROVIDERS if ctx.config.has_credentials() or p == ctx.config.provider]
         decision = route(ctx.args, available_providers=available)
         _old_provider, _old_model = ctx.config.provider, ctx.config.model
         ctx.config.provider = decision.provider
@@ -254,7 +254,7 @@ class ConsensusCommand(Command):
         ctx.ui.info("Running consensus query…")
         # Build candidate list from configured providers.
         candidates = []
-        for prov in ["zen", "openai", "anthropic", "gemini", "ollama"]:
+        for prov in ["zen", "openai", "anthropic", "gemini", "ollama", "sambanova", "agnes"]:
             if prov == ctx.config.provider:
                 candidates.append((prov, ctx.config.resolved_model()))
             elif prov == "ollama":

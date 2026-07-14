@@ -47,8 +47,9 @@ class ModelCommand(Command):
             m = re.split(r"\s*[│|]\s*", model_name, maxsplit=1)
             if len(m) == 2:
                 prov, model_name = m[0].strip(), m[1].strip()
-                if prov in ("lovable", "zen", "zyloo", "openai", "anthropic",
-                            "groq", "gemini", "mistral", "together", "ollama"):
+                from ..providers.registry import PROVIDERS
+
+                if prov in PROVIDERS:
                     ctx.config.provider = prov
             owner = ctx.config.provider_for_model(model_name)
             if owner and owner != ctx.config.provider:

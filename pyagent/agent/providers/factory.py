@@ -143,6 +143,31 @@ def get_provider(config: Config) -> LLMProvider:
             getattr(config, "nvapi_base_url", "https://integrate.api.nvidia.com/v1"),
         )
 
+
+    if provider == "sambanova":
+        key = getattr(config, "sambanova_api_key", None) or _env("SAMBANOVA_API_KEY")
+        if not key:
+            raise ProviderError("SAMBANOVA_API_KEY is not set.")
+        OpenAIProvider = _openai_compatible_provider()
+
+        return OpenAIProvider(
+            model, temp, max_tokens, key,
+            getattr(config, "sambanova_base_url", "https://api.sambanova.ai/v1"),
+            provider_key="sambanova",
+        )
+
+    if provider == "agnes":
+        key = getattr(config, "agnes_api_key", None) or _env("AGNES_API_KEY")
+        if not key:
+            raise ProviderError("AGNES_API_KEY is not set.")
+        OpenAIProvider = _openai_compatible_provider()
+
+        return OpenAIProvider(
+            model, temp, max_tokens, key,
+            getattr(config, "agnes_base_url", "https://apihub.agnes-ai.com/v1"),
+            provider_key="agnes",
+        )
+
     if provider == "ollama":
         from .ollama_provider import OllamaProvider
 

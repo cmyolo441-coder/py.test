@@ -362,9 +362,24 @@ _TABLE: list[ModelCapability] = [
               "Deprecates 2026-07-24.",
     ),
     _compat(
-        "llama3.1", "ollama", 4_096, 4_096,
-        supports_reasoning=False, temp_policy=TempPolicy.FREE, temp_default=0.8,
-        notes="Ollama /v1 default num_ctx ~4096; bake a Modelfile for 128K.",
+        "MiniMax-M2.7", "sambanova", 128_000, 16_384,
+        supports_reasoning=False, temp_policy=TempPolicy.FREE,
+        notes="SambaNova Cloud OpenAI-compatible endpoint.",
+    ),
+    _compat(
+        "agnes-2.0-flash", "agnes", 128_000, 16_384,
+        supports_reasoning=False, temp_policy=TempPolicy.FREE,
+        notes="Agnes AI API Hub OpenAI-compatible endpoint.",
+    ),
+    _compat(
+        "agnes-2.5-flash", "agnes", 128_000, 16_384,
+        supports_reasoning=False, temp_policy=TempPolicy.FREE,
+        notes="Agnes AI API Hub OpenAI-compatible endpoint.",
+    ),
+    _compat(
+        "agnes-2.5-pro", "agnes", 128_000, 32_768,
+        supports_reasoning=False, temp_policy=TempPolicy.FREE,
+        notes="Agnes AI API Hub OpenAI-compatible endpoint.",
     ),
 
     # --- NVIDIA API (nvapi) --------------------------------------------------

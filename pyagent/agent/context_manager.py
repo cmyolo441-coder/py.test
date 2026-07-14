@@ -37,6 +37,10 @@ MODEL_CONTEXT_BUDGET: dict[str, int] = {
     "big-pickle": 128_000,
     "deepseek-v4-flash-free": 128_000,
     "zyloo/glm-5.1": 110_000,
+    "MiniMax-M2.7": 110_000,
+    "agnes-2.0-flash": 110_000,
+    "agnes-2.5-flash": 110_000,
+    "agnes-2.5-pro": 128_000,
     "llama3.1": 110_000,
     "llama3.2": 110_000,
     "qwen2.5": 110_000,
@@ -58,6 +62,8 @@ def context_budget_for(model: str) -> int:
     if "gemini-1.5" in lower or "gemini-2" in lower:
         return 800_000
     if "llama-3.3" in lower or "llama3" in lower:
+        return 110_000
+    if "minimax" in lower or "agnes" in lower:
         return 110_000
     return DEFAULT_BUDGET
 

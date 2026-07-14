@@ -13,6 +13,7 @@ The latest build auto-activates the full intelligence stack on `python3 main.py`
 - **Standalone binary**: `dist/agent` is rebuilt with `shiv`, uses pure-Python runtime deps, and can be installed via `curl`.
 - **Pip install supported** from this GitHub repository with the `pyagent` subdirectory.
 - **HTTP OpenAI-compatible fallback**: OpenAI-compatible providers run without the official `openai` package, avoiding native `pydantic_core` binary issues.
+- **New providers**: SambaNova Cloud (`MiniMax-M2.7`) and Agnes AI API Hub (`agnes-2.0-flash`, `agnes-2.5-flash`, `agnes-2.5-pro`).
 
 ## Install
 
@@ -109,6 +110,41 @@ Install manually:
 install -Dm755 dist/agent ~/.local/bin/agent
 agent
 ```
+
+
+## Provider keys
+
+OpenAI-compatible provider additions:
+
+```bash
+# SambaNova Cloud
+export AGENT_PROVIDER=sambanova
+export SAMBANOVA_API_KEY="your-sambanova-key"
+export SAMBANOVA_BASE_URL="https://api.sambanova.ai/v1"
+export AGENT_MODEL="MiniMax-M2.7"
+
+# Agnes AI API Hub
+export AGENT_PROVIDER=agnes
+export AGNES_API_KEY="your-agnes-key"
+export AGNES_BASE_URL="https://apihub.agnes-ai.com/v1"
+export AGENT_MODEL="agnes-2.5-flash"
+```
+
+Available built-in Agnes models:
+
+```text
+agnes-2.0-flash
+agnes-2.5-flash
+agnes-2.5-pro
+```
+
+Available built-in SambaNova model:
+
+```text
+MiniMax-M2.7
+```
+
+Do not commit real API keys. Put them in your shell environment, `.env`, or `~/.terminal_agent/config.json`.
 
 ## Runtime commands
 

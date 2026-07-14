@@ -32,6 +32,8 @@ PROVIDERS: dict[str, ProviderSpec] = {
     "together": ProviderSpec("together", "meta-llama/Llama-3.3-70B-Instruct-Turbo", True, "TOGETHER_API_KEY", True, "Together AI"),
     "ollama": ProviderSpec("ollama", "llama3.1", False, None, True, "Local Ollama (offline)"),
     "nvapi": ProviderSpec("nvapi", "z-ai/glm-5.2", True, "NVAPI_API_KEY", True, "NVIDIA API (OpenAI-compatible)"),
+    "sambanova": ProviderSpec("sambanova", "MiniMax-M2.7", True, "SAMBANOVA_API_KEY", True, "SambaNova Cloud (OpenAI-compatible)"),
+    "agnes": ProviderSpec("agnes", "agnes-2.5-flash", True, "AGNES_API_KEY", True, "Agnes AI API Hub (OpenAI-compatible)"),
 }
 
 
