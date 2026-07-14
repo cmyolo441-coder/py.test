@@ -62,13 +62,14 @@ if _HAS_PTK:
 
         @staticmethod
         def _match(command: str, description: str, query: str) -> bool:
+            del description
             q = query.lower().strip()
             if not q:
                 return True
             q_plain = q.lstrip("/").replace("-", "")
             hay_cmd = command.lower()
             hay_plain = hay_cmd.lstrip("/").replace("-", "")
-            if hay_cmd.startswith(q) or q_plain in hay_plain or q_plain in description.lower():
+            if hay_cmd.startswith(q) or q_plain in hay_plain:
                 return True
             it = iter(hay_plain)
             return all(ch in it for ch in q_plain)
@@ -78,6 +79,7 @@ if _HAS_PTK:
             if not text.startswith("/"):
                 return
             word = text.split()[0] if text.split() else text
+            shown = 0
             for cmd, desc in SLASH_COMMANDS.items():
                 if self._match(cmd, desc, word):
                     yield Completion(
@@ -86,6 +88,9 @@ if _HAS_PTK:
                         display=cmd,
                         display_meta=desc,
                     )
+                    shown += 1
+                    if shown >= 10:
+                        break
 
     def _build_keybindings() -> KeyBindings:
         kb = KeyBindings()

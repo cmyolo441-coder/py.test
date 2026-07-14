@@ -447,30 +447,55 @@ class App:
             self.ui.warn(f"Goal not fully verified after {rounds} round(s). Type a refined goal to continue.")
         self.ui.status_bar(self.config.provider, self.config.resolved_model(), self.conversation.token_estimate())
 
-    def _run_enterprise_autostart(self) -> None:
-        """Run safe local enterprise warmups once per process."""
+    def _run_enterprise_autostart(self, sync: bool = False) -> None:
+        """Run safe local enterprise warmups once per process.
+
+        Interactive startup must be fast: feature flags and registries are active
+        immediately, while heavy repository indexing warms in a background
+        thread.  One-shot mode can request ``sync=True`` to wait for the full
+        context before sending the prompt.
+        """
         if self._enterprise_autostart_ran:
             return
         self._enterprise_autostart_ran = True
         try:
-            from .autostart import run_enterprise_autostart
+            from .enterprise_suite import combined_feature_count
 
-            self.ui.info("Auto-activating all enterprise features and warming local intelligence…")
-            snapshot = run_enterprise_autostart(self, root=".")
-            self.enterprise_autostart = snapshot
-            self.ui.success(
-                f"Autostart complete: {snapshot.ok_count} tasks OK, "
-                f"{snapshot.fail_count} failed, {snapshot.duration_s:.2f}s"
-            )
-            for task in snapshot.tasks:
-                icon = "✓" if task.ok else "✗"
-                color_msg = f"{icon} {task.name}: {task.detail}"
-                if task.ok:
-                    self.ui.info(color_msg)
-                else:
-                    self.ui.warn(color_msg)
-        except Exception as exc:  # noqa: BLE001
-            self.ui.warn(f"Enterprise autostart skipped: {type(exc).__name__}: {exc}")
+            total = combined_feature_count()
+        except Exception:  # noqa: BLE001
+            total = 0
+
+        def _warm() -> None:
+            try:
+                from .autostart import run_enterprise_autostart
+
+                snapshot = run_enterprise_autostart(self, root=".")
+                self.enterprise_autostart = snapshot
+                self.enterprise_autostart_status = (
+                    f"ready: {snapshot.ok_count} OK / {snapshot.fail_count} failed in {snapshot.duration_s:.2f}s"
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.enterprise_autostart_status = f"failed: {type(exc).__name__}: {exc}"
+                log.debug("Enterprise autostart failed", exc_info=True)
+
+        if sync:
+            self.ui.info(f"Loading {total} features and full local intelligence…")
+            _warm()
+            status = getattr(self, "enterprise_autostart_status", "ready")
+            if status.startswith("failed"):
+                self.ui.warn(f"Autostart {status}")
+            else:
+                self.ui.success(f"Autostart {status}")
+            return
+
+        # Fast interactive path: do not block the prompt for 15-20 seconds.
+        self.enterprise_autostart_status = "warming in background"
+        self.ui.success(f"Fast start: {total} features active. Deep code intelligence is warming in background.")
+        import threading
+
+        thread = threading.Thread(target=_warm, name="enterprise-autostart", daemon=True)
+        thread.start()
+        self.enterprise_autostart_thread = thread
 
     def run(self) -> None:
         if self.ui.animations:
@@ -481,7 +506,7 @@ class App:
         if not self.config.has_credentials():
             self.ui.warn(f"No credentials found for provider '{self.config.provider}'.")
         self.build_agent()
-        self._run_enterprise_autostart()
+        self._run_enterprise_autostart(sync=False)
         try:
             from .goal_history import get_goal_history
             interrupted = get_goal_history().find_interrupted()
@@ -526,7 +551,7 @@ class App:
     def run_once(self, prompt: str) -> None:
         if not self.build_agent():
             return
-        self._run_enterprise_autostart()
+        self._run_enterprise_autostart(sync=True)
         self._handle_turn(prompt)
 
     # ------------------------------------------------------------------

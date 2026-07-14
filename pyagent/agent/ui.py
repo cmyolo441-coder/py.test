@@ -86,29 +86,46 @@ class SlashCompleter(Completer):
         self._source = source
 
     def _items(self) -> list[tuple[str, str]]:
+        raw = SLASH_COMMANDS
         if self._source is not None:
             try:
                 items = self._source()
                 if items:
-                    return items
+                    raw = items
             except Exception:  # noqa: BLE001 - never break input on error
                 pass
-        return SLASH_COMMANDS
+        # De-duplicate command rows.  The registry can expose aliases and some
+        # commands are rebuilt dynamically; duplicate rows make the popup noisy.
+        seen: set[str] = set()
+        deduped: list[tuple[str, str]] = []
+        for cmd, desc in raw:
+            if cmd in seen:
+                continue
+            seen.add(cmd)
+            deduped.append((cmd, desc))
+        return deduped
 
     @staticmethod
     def _fuzzy_match(command: str, description: str, query: str) -> bool:
-        """Return True for prefix, substring, description, or subsequence matches."""
+        """Match slash commands without noisy description hits.
+
+        A query like ``/models`` must not show ``/consensus`` merely because its
+        description contains the word "models".  Description matching is useful
+        for command palettes, but in a slash-command token it makes the popup
+        look broken.  So we match only command/alias text here.
+        """
+        del description
         q = query.lower().strip()
         if not q:
             return True
-        hay_cmd = command.lower()
-        hay_desc = description.lower()
-        q_no_slash = q.lstrip("/")
-        if hay_cmd.startswith(q) or q_no_slash in hay_cmd.lstrip("/") or q_no_slash in hay_desc:
+        hay = command.lower()
+        hay_plain = hay.lstrip("/").replace("-", "")
+        q_plain = q.lstrip("/").replace("-", "")
+        if hay.startswith(q) or q_plain in hay_plain:
             return True
         # Fuzzy subsequence: `/thm` finds `/theme`, `/idx` finds `/index-codebase`.
-        it = iter(hay_cmd.replace("-", ""))
-        return all(ch in it for ch in q.replace("/", "").replace("-", ""))
+        it = iter(hay_plain)
+        return all(ch in it for ch in q_plain)
 
     def get_completions(self, document, complete_event):  # noqa: ANN001
         text = document.text_before_cursor
@@ -116,6 +133,7 @@ class SlashCompleter(Completer):
             return
         # Complete only the command token; arguments after a space are left alone.
         word = text.split()[0] if text.split() else text
+        shown = 0
         for cmd, desc in self._items():
             if self._fuzzy_match(cmd, desc, word):
                 yield Completion(
@@ -124,6 +142,9 @@ class SlashCompleter(Completer):
                     display=cmd,
                     display_meta=desc,
                 )
+                shown += 1
+                if shown >= 10:
+                    break
 
 
 # Backwards-compatible module colors (default to the active theme).
@@ -183,9 +204,20 @@ class UI:
         """
         kb = KeyBindings()
 
+        def _submit_if_exact_command(event) -> bool:  # noqa: ANN001
+            buff = event.current_buffer
+            token = (buff.document.text_before_cursor.strip().split() or [""])[0]
+            if token and token in {cmd for cmd, _desc in self.commands_list()}:
+                buff.complete_state = None
+                buff.validate_and_handle()
+                return True
+            return False
+
         @kb.add("enter", filter=has_completions & completion_is_selected)
         def _(event):  # noqa: ANN001
-            """Accept the highlighted slash-command completion."""
+            """Submit exact commands; otherwise accept highlighted completion."""
+            if _submit_if_exact_command(event):
+                return
             buff = event.current_buffer
             completion = buff.complete_state.current_completion if buff.complete_state else None
             if completion is not None:
@@ -195,7 +227,9 @@ class UI:
 
         @kb.add("enter", filter=has_completions)
         def _(event):  # noqa: ANN001
-            """First Enter selects/applies the current completion, never submits."""
+            """Exact command Enter submits; partial command Enter completes."""
+            if _submit_if_exact_command(event):
+                return
             buff = event.current_buffer
             if buff.complete_state and buff.complete_state.current_completion:
                 buff.apply_completion(buff.complete_state.current_completion)
@@ -289,9 +323,10 @@ class UI:
                 key_bindings=self._bindings,
                 completer=SlashCompleter(self.commands_list),
                 complete_while_typing=True,
-                # Cursor-style editing: real multiline buffer so long/pasted
-                # text stays editable and is never auto-submitted by a newline.
-                multiline=True,
+                # Keep the live prompt stable.  Multi-line paste is still safe
+                # through the smart Enter bindings, but the default view stays
+                # single-line so completion menus cannot tear the border apart.
+                multiline=False,
                 # NOTE: enable_history_search is intentionally OFF. prompt_toolkit
                 # force-disables complete_while_typing whenever history search is
                 # on (see shortcuts/prompt.py), which would make the live `/`
@@ -305,7 +340,7 @@ class UI:
                 enable_history_search=False,
                 auto_suggest=AutoSuggestFromHistory(),
                 complete_in_thread=True,
-                reserve_space_for_menu=8,
+                reserve_space_for_menu=6,
                 bottom_toolbar=self._bottom_toolbar,
                 prompt_continuation=self._prompt_continuation,
                 style=PTStyle.from_dict(
@@ -334,9 +369,10 @@ class UI:
 
     def _prompt_continuation(self, width: int, line_number: int, is_soft_wrap: bool) -> HTML:
         """Left gutter for continuation lines of a multi-line prompt."""
-        if is_soft_wrap:
-            return HTML("")
-        return HTML('<frame>\u2551</frame> <hint>\u00b7 </hint>')
+        del width, line_number, is_soft_wrap
+        # No left gutter while completions are open.  The previous `║ ·` gutter
+        # was rendered before every popup row, making the prompt look broken.
+        return HTML("")
 
     def reset_session(self) -> None:
         """Drop the cached prompt session so a new theme restyles it."""
@@ -448,7 +484,7 @@ class UI:
         """
         label = "message (GOAL MODE)" if self.goal_mode else "message"
         prompt_char = "▣" if self.goal_mode else "▌"
-        width = min(96, max(60, self.console.size.width - 2))
+        width = max(60, self.console.size.width - 1)
         theme = themes.current()
 
         inner = width - 4
