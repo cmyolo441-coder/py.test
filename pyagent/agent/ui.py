@@ -14,6 +14,7 @@ import time
 from typing import Any
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.filters import completion_is_selected, has_completions
 from prompt_toolkit.formatted_text import HTML
@@ -43,6 +44,12 @@ SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/provider", "Switch provider (zen/openai/anthropic/…)"),
     ("/theme", "Switch UI theme (neon/cyberpunk/pastel/matrix)"),
     ("/tools", "List available tools"),
+    ("/features129", "Show the 129-feature enterprise dashboard"),
+    ("/hyper70", "Show the 70 added hyper-suite features"),
+    ("/apex40", "Show the 40 max-level Apex Suite features"),
+    ("/omega49", "Show the 49 next-level Omega Suite features"),
+    ("/nova71", "Show the 71 ultra-advanced Nova Suite features"),
+    ("/zenith97", "Show the 97 max-level Zenith Suite features"),
     ("/persona", "Switch assistant persona"),
     ("/spinner", "Change the thinking spinner style"),
     ("/matrix", "Play a Matrix rain animation"),
@@ -87,13 +94,29 @@ class SlashCompleter(Completer):
                 pass
         return SLASH_COMMANDS
 
+    @staticmethod
+    def _fuzzy_match(command: str, description: str, query: str) -> bool:
+        """Return True for prefix, substring, description, or subsequence matches."""
+        q = query.lower().strip()
+        if not q:
+            return True
+        hay_cmd = command.lower()
+        hay_desc = description.lower()
+        q_no_slash = q.lstrip("/")
+        if hay_cmd.startswith(q) or q_no_slash in hay_cmd.lstrip("/") or q_no_slash in hay_desc:
+            return True
+        # Fuzzy subsequence: `/thm` finds `/theme`, `/idx` finds `/index-codebase`.
+        it = iter(hay_cmd.replace("-", ""))
+        return all(ch in it for ch in q.replace("/", "").replace("-", ""))
+
     def get_completions(self, document, complete_event):  # noqa: ANN001
         text = document.text_before_cursor
         if not text.startswith("/"):
             return
+        # Complete only the command token; arguments after a space are left alone.
         word = text.split()[0] if text.split() else text
         for cmd, desc in self._items():
-            if cmd.startswith(word):
+            if self._fuzzy_match(cmd, desc, word):
                 yield Completion(
                     cmd,
                     start_position=-len(word),
@@ -121,6 +144,7 @@ class UI:
         self.animations = animations
         self.spinner = "braille"
         self.goal_mode = False
+        self._local_session_id = hex(int(time.time() * 1000000))[2:14]
         self._bindings = self._build_key_bindings()
         self._session: PromptSession | None = None
         # Callback returning [(command, description), ...] for the live menu +
@@ -161,16 +185,31 @@ class UI:
         @kb.add("enter", filter=has_completions & completion_is_selected)
         def _(event):  # noqa: ANN001
             """Accept the highlighted slash-command completion."""
-            event.current_buffer.complete_state = None
+            buff = event.current_buffer
+            completion = buff.complete_state.current_completion if buff.complete_state else None
+            if completion is not None:
+                buff.apply_completion(completion)
+            else:
+                buff.complete_state = None
 
         @kb.add("enter", filter=has_completions)
         def _(event):  # noqa: ANN001
-            """First Enter selects the current completion, does not submit."""
+            """First Enter selects/applies the current completion, never submits."""
             buff = event.current_buffer
             if buff.complete_state and buff.complete_state.current_completion:
                 buff.apply_completion(buff.complete_state.current_completion)
             else:
                 buff.complete_next()
+
+        @kb.add("c-space")
+        def _(event):  # noqa: ANN001
+            """Open the command palette/completion menu on demand."""
+            event.current_buffer.start_completion(select_first=True)
+
+        @kb.add("c-l")
+        def _(event):  # noqa: ANN001
+            """Clear the current prompt buffer without touching scrollback."""
+            event.current_buffer.reset()
 
         @kb.add("enter")
         def _(event):  # noqa: ANN001
@@ -263,6 +302,9 @@ class UI:
                 mouse_support=False,
                 wrap_lines=True,
                 enable_history_search=False,
+                auto_suggest=AutoSuggestFromHistory(),
+                complete_in_thread=True,
+                reserve_space_for_menu=8,
                 bottom_toolbar=self._bottom_toolbar,
                 prompt_continuation=self._prompt_continuation,
                 style=PTStyle.from_dict(
@@ -284,15 +326,16 @@ class UI:
     def _bottom_toolbar(self) -> HTML:
         """Clean bottom toolbar with key hints (Codex-CLI-style)."""
         return HTML(
-            ' <b>Enter</b> send \u2502 <b>Alt+Enter</b> multiline \u2502 '
-            '<b>/</b> commands \u2502 <b>Ctrl+C</b> quit '
+            ' <b>Enter</b> send single-line \u2502 <b>Ctrl+J</b> newline \u2502 '
+            '<b>Alt+Enter</b> send multiline \u2502 <b>Ctrl+Space</b> menu \u2502 '
+            '<b>Ctrl+R</b> history \u2502 <b>Ctrl+C</b> cancel '
         )
 
     def _prompt_continuation(self, width: int, line_number: int, is_soft_wrap: bool) -> HTML:
         """Left gutter for continuation lines of a multi-line prompt."""
         if is_soft_wrap:
             return HTML("")
-        return HTML('<frame>\u2502</frame> <hint>\u00b7 </hint>')
+        return HTML('<frame>\u2551</frame> <hint>\u00b7 </hint>')
 
     def reset_session(self) -> None:
         """Drop the cached prompt session so a new theme restyles it."""
@@ -300,30 +343,68 @@ class UI:
 
     # -- chrome ---------------------------------------------------------
     def show_banner(self, provider: str, model: str) -> None:
-        """Render a clean Codex-CLI-style banner inside a double-line box."""
+        """Render a Codex-CLI-inspired terminal welcome screen."""
+        from pathlib import Path
+
         theme = themes.current()
-        width = min(72, self.console.size.width)
-        inner = width - 4
+        width = min(96, max(60, self.console.size.width - 2))
+        rule = "─" * width
+        workdir = str(Path.cwd())
+        home = str(Path.home())
+        if workdir.startswith(home):
+            workdir = "~" + workdir[len(home):]
+        try:
+            from .enterprise_suite import combined_feature_count
 
-        title = "terminal-agent"
-        subtitle = f"{provider} / {model}"
-        hints = "/help for commands \u00b7 Enter to send \u00b7 /exit to quit"
+            features = combined_feature_count()
+        except Exception:  # noqa: BLE001
+            features = 0
 
-        def _center(text: str) -> str:
-            return text.center(inner)
-
-        accent = theme.accent
-        accent2 = theme.accent2
-        hline = "\u2550" * (width - 2)
-        sep = "\u2551"
-
-        # Double-line box: ╔═╗ ║ ║ ╚═╝
         self.console.print()
-        self.console.print(f"[bold {accent}]\u2554{hline}\u2557[/]")
-        self.console.print(f"[bold {accent}]{sep}[/][bold {accent2}]{_center(title)}[/][bold {accent}]{sep}[/]")
-        self.console.print(f"[bold {accent}]{sep}[/][dim]{_center(subtitle)}[/][bold {accent}]{sep}[/]")
-        self.console.print(f"[bold {accent}]{sep}[/][dim]{_center(hints)}[/][bold {accent}]{sep}[/]")
-        self.console.print(f"[bold {accent}]\u255a{hline}\u255d[/]")
+        self.console.print(Align.center(effects.gradient_text("Terminal AI Agent CLI")))
+        self.console.print(f"[dim]{rule}[/]")
+        self.console.print(Align.center(Text("Lightweight coding agent that runs in your terminal", style=theme.text)))
+        self.console.print()
+        pill = Text.assemble((" python3 main.py ", f"bold {theme.text} on #1f2430"))
+        self.console.print(Align.center(pill))
+        self.console.print()
+
+        path_line = Text.assemble((workdir, f"bold {theme.accent2}"), ("  main", theme.dim))
+        self.console.print(path_line)
+        self.console.print(Text(f"openai › codex-like-ui › {provider}/{model}", style=theme.dim))
+
+        box_w = min(width, 74)
+        inner = box_w - 4
+        top = "╔" + "═" * (box_w - 2) + "╗"
+        bottom = "╚" + "═" * (box_w - 2) + "╝"
+
+        def row(label: str, value: str, color: str = theme.text) -> Text:
+            plain = f"│ {label:<10} {value}"
+            pad = max(0, inner - len(plain) + 1)
+            t = Text()
+            t.append("║ ", style=f"bold {theme.accent}")
+            t.append(f"{label:<10}", style=theme.dim)
+            t.append(value[: max(0, inner - 11)], style=color)
+            t.append(" " * pad, style=theme.dim)
+            t.append("║", style=f"bold {theme.accent}")
+            return t
+
+        self.console.print(f"[bold {theme.accent}]{top}[/]")
+        header = Text()
+        header.append("║ ", style=f"bold {theme.accent}")
+        header.append("● ", style=f"bold {theme.ok}")
+        header.append("Terminal AI Agent", style=f"bold {theme.text}")
+        header.append("  enterprise preview", style=theme.dim)
+        header.append(" " * max(0, inner - len(header.plain) + 2), style=theme.dim)
+        header.append("║", style=f"bold {theme.accent}")
+        self.console.print(header)
+        self.console.print(row("session:", self._local_session_id, theme.accent2))
+        self.console.print(row("workdir:", workdir, theme.text))
+        self.console.print(row("model:", f"{provider}/{model}", theme.ok))
+        self.console.print(row("features:", f"{features} active", theme.warn))
+        self.console.print(row("approval:", "suggest (dangerous tools still confirm)", theme.text))
+        self.console.print(f"[bold {theme.accent}]{bottom}[/]")
+        self.console.print(Text("try: explain this codebase to me  |  fix any build errors  |  /features129", style=theme.dim))
         self.console.print()
 
     def info(self, text: str) -> None:
@@ -358,26 +439,31 @@ class UI:
 
     # -- input ----------------------------------------------------------
     def prompt(self) -> str:
-        """Render a Codex-CLI-style double-line prompt box."""
-        label = "you (GOAL MODE)" if self.goal_mode else "you"
-        prompt_char = "\U0001f3af" if self.goal_mode else "\u276f"
-        width = min(72, self.console.size.width)
-        inner = width - 4
-        theme = themes.current()
-        accent = theme.accent
+        """Render a Codex-CLI-style double-line prompt box.
 
-        sep = "\u2551"
-        top_pad = inner - len(label) - 4  # 4 = ╔ + space + label + space
-        if top_pad < 0:
-            top_pad = 0
-        # Double-line box: ╔═ you ══╗ ║ ║ ╚═╝
-        top_line = "\u2554\u2550 " + label + " \u2550" + ("\u2550" * top_pad) + "\u2557"
-        bot_line = "\u255a" + ("\u2550" * (width - 2)) + "\u255d"
-        self.console.print(f"[bold {accent}]{top_line}[/]")
+        The prompt_toolkit input itself is placed between a left border prompt
+        and a right rprompt border, so typed text stays visually inside the
+        double-line box while editing.
+        """
+        label = "message (GOAL MODE)" if self.goal_mode else "message"
+        prompt_char = "▣" if self.goal_mode else "▌"
+        width = min(96, max(60, self.console.size.width - 2))
+        theme = themes.current()
+
+        inner = width - 4
+        left = f"╔═ {label} "
+        right_len = max(1, width - len(left) - 1)
+        top_line = left + ("═" * right_len) + "╗"
+        bot_line = "╚" + ("═" * (width - 2)) + "╝"
+        sep = "║"
+        self.console.print(f"[bold {theme.accent}]{top_line}[/]")
         try:
-            text = self.session.prompt(HTML(f'<frame>{sep}</frame> <prompt>{prompt_char} </prompt>'))
+            text = self.session.prompt(
+                HTML(f'<frame>{sep}</frame> <prompt>{prompt_char} </prompt>'),
+                rprompt=HTML(f'<frame>{sep}</frame>'),
+            )
         finally:
-            self.console.print(f"[bold {accent}]{bot_line}[/]")
+            self.console.print(f"[bold {theme.accent}]{bot_line}[/]")
         return text
 
     def hide_prompt(self) -> None:

@@ -23,10 +23,11 @@ BOOT_STAGES: list[tuple[str, str]] = [
     ("Initialising core", "agent.core"),
     ("Loading tool registry", "agent.tools"),
     ("Wiring command framework", "agent.commands"),
+    ("Activating 129 enterprise features", "agent.enterprise_suite"),
     ("Connecting provider", "agent.providers"),
     ("Starting token counter", "agent.token_counter"),
     ("Restoring session state", "agent.recovery"),
-    ("Booting UI subsystems", "agent.ui"),
+    ("Booting Codex-style UI", "agent.ui"),
     ("Ready", ""),
 ]
 
@@ -46,17 +47,19 @@ def play_boot_sequence(
     theme = themes.current()
     delay = 0.0 if fast else 0.15
 
-    # 1. Minimal header — a single gradient title line, no giant banner.
+    # 1. Codex-inspired header: title, horizontal rule, subtitle and run pill.
+    width = min(96, max(60, console.size.width - 2))
     console.print()
-    title = effects.gradient_text("terminal-agent")
-    console.print(Align.center(title))
-
-    # 2. Subtitle: provider/model on a dim line.
-    subtitle = f"{provider}/{model}"
-    console.print(Align.center(Text(subtitle, style=theme.dim)))
+    console.print(Align.center(effects.gradient_text("Terminal AI Agent CLI")))
+    console.print(f"[dim]{'─' * width}[/]")
+    console.print(Align.center(Text("Lightweight coding agent that runs in your terminal", style=theme.text)))
+    console.print()
+    console.print(Align.center(Text(" python3 main.py ", style=f"bold {theme.text} on #1f2430")))
+    console.print()
+    console.print(Align.center(Text(f"{provider}/{model}", style=theme.dim)))
     console.print()
 
-    # 3. Subsystem init lines with check marks.
+    # 2. Subsystem init lines with check marks.
     for i, (label, _module) in enumerate(BOOT_STAGES):
         if on_stage is not None:
             on_stage(i, label)
@@ -86,15 +89,22 @@ def play_boot_sequence(
 
     console.print()
 
-    # 4. Double-line ready box (matches Codex-CLI style).
-    width = min(72, console.size.width)
+    # 3. Double-line ready box (matches the prompt chrome).
+    try:
+        from .enterprise_suite import combined_feature_count
+
+        features = combined_feature_count()
+    except Exception:  # noqa: BLE001
+        features = 0
+    width = min(96, max(60, console.size.width - 2))
     hline = "═" * (width - 2)
-    ready_text = "ready"
-    hints_text = "/help for commands \u00b7 Enter to send \u00b7 /exit to quit"
+    ready_text = f"ready · {features} enterprise+hyper features active"
+    hints_text = "/help commands · /features129 dashboard · Enter send · /exit quit"
     console.print(f"[bold {theme.accent}]╔{hline}╗[/]")
     console.print(f"[bold {theme.accent}]║[/][bold {theme.accent2}]{ready_text.center(width - 4)}[/][bold {theme.accent}]║[/]")
     console.print(f"[bold {theme.accent}]║[/][dim]{hints_text.center(width - 4)}[/][bold {theme.accent}]║[/]")
     console.print(f"[bold {theme.accent}]╚{hline}╝[/]")
+    console.print(Text("try: explain this codebase to me  |  fix any build errors  |  /features129", style=theme.dim))
     console.print()
 
 

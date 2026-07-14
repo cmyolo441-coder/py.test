@@ -28,6 +28,9 @@ class BranchNode:
     children: list[str] = field(default_factory=list)
     label: str = ""
     name: str = ""  # Alias for label
+    # Full snapshot for high-level branch objects (BranchManager legacy API).
+    # ConversationTree message nodes leave this empty.
+    messages: list[dict[str, Any]] = field(default_factory=list)
     
     def __post_init__(self):
         if not self.name and self.label:
@@ -232,6 +235,7 @@ class ConversationTree:
         node = self.nodes.get(node_id)
         if node:
             node.label = label
+            node.name = label
     
     def delete_branch(self, node_id: str) -> bool:
         """Delete a branch and all its descendants.
@@ -368,40 +372,163 @@ def get_conversation_tree() -> ConversationTree:
 
 # Alias for backward compatibility with tests
 class BranchManager:
-    """Manage conversation branches (legacy API)."""
-    
+    """Manage named conversation branches (legacy high-level API).
+
+    ``ConversationTree`` stores every message as a low-level tree node.  The
+    application and enterprise slash-commands, however, expect a simpler
+    branch-centric API where each branch is a named snapshot of the message
+    list.  The previous implementation mixed those two models: ``fork()`` only
+    re-labelled the current leaf node, which destroyed the ``main`` branch and
+    made ``bm.tree()`` impossible because an attribute and a method had the same
+    name.  This manager keeps branch snapshots explicitly while still updating a
+    low-level ``ConversationTree`` for callers that need it.
+    """
+
     def __init__(self, messages: list[dict[str, Any]] | None = None):
-        self.tree = ConversationTree()
+        self._tree = ConversationTree()
         self.branches: dict[str, BranchNode] = {}
         self.active_id = "main"
-        self.messages: list[dict[str, Any]] = messages or []
-        
-        # Add initial messages to the main branch
+        self.messages: list[dict[str, Any]] = list(messages or [])
+
+        # Keep a low-level path for compatibility with ConversationTree users.
         for msg in self.messages:
-            self.tree.add_message(msg, label="main")
-    
+            self._tree.add_message(msg, label="main")
+
+        self.branches["main"] = self._make_branch(
+            branch_id="main",
+            name="main",
+            parent_id=None,
+            messages=self.messages,
+        )
+
+    @property
+    def conversation_tree(self) -> ConversationTree:
+        """Return the underlying message-level tree."""
+        return self._tree
+
+    def _make_branch(
+        self,
+        branch_id: str,
+        name: str,
+        parent_id: str | None,
+        messages: list[dict[str, Any]],
+    ) -> BranchNode:
+        """Create a BranchNode that represents a whole branch snapshot."""
+        return BranchNode(
+            id=branch_id,
+            parent_id=parent_id,
+            message=messages[-1] if messages else {"role": "system", "content": ""},
+            timestamp=time.time(),
+            label=name,
+            name=name,
+            messages=list(messages),
+        )
+
+    def _resolve(self, branch_id: str) -> BranchNode | None:
+        """Resolve a branch by id, name, or label."""
+        if branch_id in self.branches:
+            return self.branches[branch_id]
+        for branch in self.branches.values():
+            if branch.name == branch_id or branch.label == branch_id:
+                return branch
+        return None
+
     def fork(self, name: str = "") -> BranchNode:
-        """Fork a new branch from the current position."""
-        node_id = self.tree.branch(self.tree.leaf_id)
-        self.tree.label_node(node_id, name)
-        self.active_id = name or node_id
-        return self.tree.nodes[node_id]
-    
+        """Fork a new branch from the active branch's current messages."""
+        parent = self._resolve(self.active_id) or self.branches["main"]
+        branch_id = uuid.uuid4().hex[:12]
+        branch_name = name or branch_id
+        branch = self._make_branch(
+            branch_id=branch_id,
+            name=branch_name,
+            parent_id=parent.id,
+            messages=self.messages,
+        )
+        self.branches[branch_id] = branch
+        parent.children.append(branch_id)
+
+        # Mark the current message-level leaf with the branch name for the
+        # low-level rendered tree without mutating ``main``.
+        if self._tree.leaf_id is not None:
+            self._tree.label_node(self._tree.leaf_id, parent.name)
+
+        self.active_id = branch_id
+        self.messages = list(branch.messages)
+        return branch
+
     def switch(self, branch_id: str) -> None:
-        """Switch to a different branch."""
-        # Find node by label
-        for nid, node in self.tree.nodes.items():
-            if node.label == branch_id or nid == branch_id:
-                self.tree.switch_branch(nid)
-                self.active_id = branch_id
-                return
-        raise ValueError(f"Branch '{branch_id}' not found")
-    
+        """Switch to a different branch by id or name."""
+        branch = self._resolve(branch_id)
+        if branch is None:
+            raise ValueError(f"Branch '{branch_id}' not found")
+        self.active_id = branch.id
+        self.messages = list(branch.messages)
+
     def list_branches(self) -> list[BranchNode]:
-        """List all branches."""
-        return self.tree.get_branches()
-    
+        """List all branch snapshots, with ``main`` first."""
+        branches = list(self.branches.values())
+        return sorted(branches, key=lambda b: (b.id != "main", b.timestamp))
+
+    def sync(self, messages: list[dict[str, Any]]) -> None:
+        """Synchronise the active branch with an externally managed conversation."""
+        self.messages = list(messages)
+        active = self._resolve(self.active_id)
+        if active is not None:
+            active.messages = list(self.messages)
+            active.message = self.messages[-1] if self.messages else {"role": "system", "content": ""}
+
     def add_message(self, message: dict[str, Any]) -> str:
-        """Add a message to the current branch."""
+        """Append a message to the active branch and underlying tree."""
         self.messages.append(message)
-        return self.tree.add_message(message)
+        active = self._resolve(self.active_id)
+        if active is not None:
+            active.messages = list(self.messages)
+            active.message = message
+        return self._tree.add_message(message, label=active.name if active else "")
+
+    def tree(self) -> str:
+        """Render the branch tree as a readable string."""
+        lines: list[str] = []
+
+        def render(branch: BranchNode, depth: int = 0) -> None:
+            marker = "●" if branch.id == self.active_id else "○"
+            active = " (active)" if branch.id == self.active_id else ""
+            lines.append(
+                f"{'  ' * depth}{marker} {branch.name} [{branch.id}] "
+                f"{len(branch.messages)} messages{active}"
+            )
+            for child_id in branch.children:
+                child = self.branches.get(child_id)
+                if child is not None:
+                    render(child, depth + 1)
+
+        render(self.branches["main"])
+        return "\n".join(lines)
+
+    def delete(self, branch_id: str) -> bool:
+        """Delete a branch by id/name.  The main branch is protected."""
+        branch = self._resolve(branch_id)
+        if branch is None or branch.id == "main":
+            return False
+
+        def collect(n: BranchNode) -> list[str]:
+            ids = [n.id]
+            for child_id in n.children:
+                child = self.branches.get(child_id)
+                if child is not None:
+                    ids.extend(collect(child))
+            return ids
+
+        ids_to_delete = collect(branch)
+        parent = self.branches.get(branch.parent_id or "")
+        if parent is not None:
+            parent.children = [cid for cid in parent.children if cid not in ids_to_delete]
+        for bid in ids_to_delete:
+            self.branches.pop(bid, None)
+        if self.active_id in ids_to_delete:
+            self.switch("main")
+        return True
+
+    # Compatibility aliases used by some callers.
+    render_tree = tree
+    delete_branch = delete

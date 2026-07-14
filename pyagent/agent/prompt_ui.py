@@ -15,6 +15,7 @@ from collections.abc import Iterable
 
 try:
     from prompt_toolkit import PromptSession
+    from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
     from prompt_toolkit.completion import Completer, Completion
     from prompt_toolkit.formatted_text import HTML
     from prompt_toolkit.history import FileHistory
@@ -36,6 +37,12 @@ SLASH_COMMANDS = {
     "/persona": "Switch persona",
     "/usage": "Show token usage & cost",
     "/tools": "Toggle tool calling",
+    "/features129": "Show the 129-feature enterprise dashboard",
+    "/hyper70": "Show the 70 added hyper-suite features",
+    "/apex40": "Show the 40 max-level Apex Suite features",
+    "/omega49": "Show the 49 next-level Omega Suite features",
+    "/nova71": "Show the 71 ultra-advanced Nova Suite features",
+    "/zenith97": "Show the 97 max-level Zenith Suite features",
     "/theme": "Change UI theme",
     "/vivid": "Change vivid theme (neon, cyberpunk...)",
     "/health": "Show health status",
@@ -52,13 +59,26 @@ if _HAS_PTK:
     class SlashCompleter(Completer):
         """Completes slash commands with descriptions in the dropdown."""
 
+        @staticmethod
+        def _match(command: str, description: str, query: str) -> bool:
+            q = query.lower().strip()
+            if not q:
+                return True
+            q_plain = q.lstrip("/").replace("-", "")
+            hay_cmd = command.lower()
+            hay_plain = hay_cmd.lstrip("/").replace("-", "")
+            if hay_cmd.startswith(q) or q_plain in hay_plain or q_plain in description.lower():
+                return True
+            it = iter(hay_plain)
+            return all(ch in it for ch in q_plain)
+
         def get_completions(self, document, complete_event) -> Iterable:
             text = document.text_before_cursor
             if not text.startswith("/"):
                 return
             word = text.split()[0] if text.split() else text
             for cmd, desc in SLASH_COMMANDS.items():
-                if cmd.startswith(word):
+                if self._match(cmd, desc, word):
                     yield Completion(
                         cmd,
                         start_position=-len(word),
@@ -87,9 +107,21 @@ if _HAS_PTK:
             else:
                 buff.start_completion(select_first=False)
 
+        @kb.add("c-space")
+        def _(event):
+            event.app.current_buffer.start_completion(select_first=True)
+
+        @kb.add("c-l")
+        def _(event):
+            event.app.current_buffer.reset()
+
         @kb.add("c-j")  # Ctrl+J inserts a newline for long multiline prompts
         def _(event):
             event.app.current_buffer.insert_text("\n")
+
+        @kb.add("escape", "enter")  # Alt/Option+Enter force-submits multiline text
+        def _(event):
+            event.app.current_buffer.validate_and_handle()
 
         return kb
 
@@ -107,8 +139,10 @@ if _HAS_PTK:
         return HTML(
             " <b>Enter</b> send  "
             "<b>Ctrl+J</b> newline  "
-            "<b>PgUp/PgDn</b> pick command  "
-            "<b>/</b> commands  "
+            "<b>Alt+Enter</b> send multiline  "
+            "<b>Ctrl+Space</b> menu  "
+            "<b>PgUp/PgDn</b> pick  "
+            "<b>Ctrl+R</b> history  "
             "<b>Ctrl+C</b> quit "
         )
 
@@ -123,8 +157,13 @@ if _HAS_PTK:
                 key_bindings=_build_keybindings(),
                 style=_STYLE,
                 bottom_toolbar=_bottom_toolbar,
-                multiline=False,
-                mouse_support=True,
+                multiline=True,
+                wrap_lines=True,
+                auto_suggest=AutoSuggestFromHistory(),
+                complete_in_thread=True,
+                reserve_space_for_menu=8,
+                mouse_support=False,
+                enable_history_search=False,
             )
 
         def ask(self) -> str:

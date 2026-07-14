@@ -12,6 +12,7 @@ Key features:
 - Requirements, decisions, summaries, validation evidence stored
 """
 
+import ast
 import sqlite3
 import json
 import os
@@ -123,6 +124,27 @@ class KnowledgeQuery:
     offset: int = 0
 
 
+@dataclass
+class GraphNode:
+    """A node in the codebase knowledge graph."""
+
+    id: str
+    kind: str
+    name: str
+    location: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class GraphEdge:
+    """A directed relationship between two graph nodes."""
+
+    source: str
+    target: str
+    kind: str
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
 class KnowledgeGraph:
     """
     SQLite-backed knowledge accumulation with markdown projections.
@@ -135,8 +157,20 @@ class KnowledgeGraph:
     - Append-only KNOWLEDGE.md for project rules
     """
     
-    def __init__(self, project_root: str):
-        self.project_root = Path(project_root).resolve()
+    def __init__(self, project_root: Optional[Union[str, os.PathLike[str]]] = None):
+        # Lightweight in-memory code graph used by /kg, v3 tools, and tests.
+        self.nodes: Dict[str, GraphNode] = {}
+        self.edges: List[GraphEdge] = []
+        self._adjacency: Dict[str, set[str]] = {}
+
+        # When project_root is provided, also enable the original SQLite-backed
+        # local-memory store.  When omitted, KnowledgeGraph behaves as a pure
+        # in-memory code graph, so ``KnowledgeGraph()`` is cheap and side-effect
+        # free.
+        self.project_root: Optional[Path] = Path(project_root).resolve() if project_root is not None else None
+        if self.project_root is None:
+            return
+
         self.gsd_dir = self.project_root / ".gsd"
         self.db_path = self.gsd_dir / "knowledge.db"
         self.knowledge_md = self.gsd_dir / "KNOWLEDGE.md"
@@ -152,6 +186,91 @@ class KnowledgeGraph:
         
         # Initialize markdown projections
         self._init_markdown_projections()
+
+    # ------------------------------------------------------------------
+    # In-memory code graph API
+    # ------------------------------------------------------------------
+    def add_node(self, node: GraphNode) -> None:
+        """Add or replace a code graph node."""
+        self.nodes[node.id] = node
+        self._adjacency.setdefault(node.id, set())
+
+    def add_edge(self, edge: GraphEdge) -> None:
+        """Add a directed relationship if both endpoints are known."""
+        if edge.source not in self.nodes or edge.target not in self.nodes:
+            return
+        key = (edge.source, edge.target, edge.kind)
+        if any((e.source, e.target, e.kind) == key for e in self.edges):
+            return
+        self.edges.append(edge)
+        self._adjacency.setdefault(edge.source, set()).add(edge.target)
+
+    def find(self, name: str, kind: Optional[str] = None) -> List[GraphNode]:
+        """Find nodes by case-insensitive substring match on name/id/location."""
+        needle = name.lower()
+        results = []
+        for node in self.nodes.values():
+            if kind and node.kind != kind:
+                continue
+            haystack = f"{node.name} {node.id} {node.location}".lower()
+            if needle in haystack:
+                results.append(node)
+        return sorted(results, key=lambda n: (n.kind, n.name, n.location))
+
+    def shortest_path(self, source: str, target: str) -> List[str]:
+        """Return the shortest directed path between two node ids, if any."""
+        if source not in self.nodes or target not in self.nodes:
+            return []
+        queue: List[tuple[str, List[str]]] = [(source, [source])]
+        seen = {source}
+        while queue:
+            current, path = queue.pop(0)
+            if current == target:
+                return path
+            for nxt in sorted(self._adjacency.get(current, set())):
+                if nxt in seen:
+                    continue
+                seen.add(nxt)
+                queue.append((nxt, path + [nxt]))
+        return []
+
+    def stats(self) -> Dict[str, Any]:
+        """Return compact graph statistics."""
+        by_kind: Dict[str, int] = {}
+        edge_kinds: Dict[str, int] = {}
+        for node in self.nodes.values():
+            by_kind[node.kind] = by_kind.get(node.kind, 0) + 1
+        for edge in self.edges:
+            edge_kinds[edge.kind] = edge_kinds.get(edge.kind, 0) + 1
+        return {
+            "nodes": len(self.nodes),
+            "edges": len(self.edges),
+            "node_kinds": by_kind,
+            "edge_kinds": edge_kinds,
+        }
+
+    def dashboard(self) -> str:
+        """Human-readable graph summary for terminal output."""
+        stats = self.stats()
+        lines = [
+            "╔════════════════════════════════════════════════════╗",
+            "║              KNOWLEDGE GRAPH                       ║",
+            "╠════════════════════════════════════════════════════╣",
+            f"║  Nodes: {stats['nodes']:<40}║",
+            f"║  Edges: {stats['edges']:<40}║",
+            "╚════════════════════════════════════════════════════╝",
+            "",
+            "Node kinds:",
+        ]
+        for kind, count in sorted(stats["node_kinds"].items()):
+            lines.append(f"  - {kind}: {count}")
+        if not stats["node_kinds"]:
+            lines.append("  - (empty)")
+        lines.append("\nTop nodes:")
+        for node in list(sorted(self.nodes.values(), key=lambda n: (n.kind, n.name)))[:20]:
+            loc = f" @ {node.location}" if node.location else ""
+            lines.append(f"  [{node.kind}] {node.name}{loc}")
+        return "\n".join(lines)
     
     def _init_database(self):
         """Initialize SQLite database with knowledge schema"""
@@ -736,3 +855,100 @@ This file contains project-specific knowledge, rules, and decisions accumulated 
             imported_count += 1
         
         return imported_count
+
+# ---------------------------------------------------------------------------
+# Codebase graph builder helpers
+# ---------------------------------------------------------------------------
+_CODE_GRAPH: Optional[KnowledgeGraph] = None
+
+
+def _safe_rel(path: Path, root: Path) -> str:
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def _iter_python_files(root: Path) -> List[Path]:
+    ignored = {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", "build", "dist"}
+    files: List[Path] = []
+    for path in root.rglob("*.py"):
+        if any(part in ignored for part in path.parts):
+            continue
+        files.append(path)
+    return sorted(files)
+
+
+def _node_id(kind: str, rel: str, name: str = "") -> str:
+    return f"{kind}:{rel}:{name}" if name else f"{kind}:{rel}"
+
+
+def build_graph_from_codebase(root: Union[str, os.PathLike[str]] = ".") -> KnowledgeGraph:
+    """Build an in-memory graph of Python files, imports, classes and functions.
+
+    The graph intentionally avoids executing project code.  It uses Python's
+    AST only, so it is fast, deterministic and safe to run on untrusted
+    repositories.
+    """
+    global _CODE_GRAPH
+    root_path = Path(root).resolve()
+    kg = KnowledgeGraph()
+
+    for file_path in _iter_python_files(root_path):
+        rel = _safe_rel(file_path, root_path)
+        file_id = _node_id("file", rel)
+        kg.add_node(GraphNode(id=file_id, kind="file", name=file_path.name, location=rel, metadata={"path": rel}))
+
+        try:
+            source = file_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            source = file_path.read_text(encoding="utf-8", errors="ignore")
+        try:
+            tree = ast.parse(source, filename=str(file_path))
+        except SyntaxError as exc:
+            err_id = _node_id("syntax_error", rel, str(exc.lineno or 0))
+            kg.add_node(GraphNode(id=err_id, kind="syntax_error", name=f"line {exc.lineno}", location=f"{rel}:{exc.lineno or 0}", metadata={"message": exc.msg}))
+            kg.add_edge(GraphEdge(source=file_id, target=err_id, kind="has_error"))
+            continue
+
+        for node in ast.iter_child_nodes(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                module_names: List[str] = []
+                if isinstance(node, ast.Import):
+                    module_names = [alias.name for alias in node.names]
+                else:
+                    module_names = [node.module or ""]
+                for module in [m for m in module_names if m]:
+                    mod_id = f"module:{module}"
+                    kg.add_node(GraphNode(id=mod_id, kind="module", name=module, location=f"{rel}:{getattr(node, 'lineno', 0)}"))
+                    kg.add_edge(GraphEdge(source=file_id, target=mod_id, kind="imports"))
+            elif isinstance(node, ast.ClassDef):
+                class_id = _node_id("class", rel, node.name)
+                kg.add_node(GraphNode(
+                    id=class_id,
+                    kind="class",
+                    name=node.name,
+                    location=f"{rel}:{node.lineno}",
+                    metadata={"bases": [ast.unparse(b) if hasattr(ast, "unparse") else "" for b in node.bases]},
+                ))
+                kg.add_edge(GraphEdge(source=file_id, target=class_id, kind="defines"))
+                for child in node.body:
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        method_id = _node_id("method", rel, f"{node.name}.{child.name}")
+                        kg.add_node(GraphNode(id=method_id, kind="method", name=child.name, location=f"{rel}:{child.lineno}", metadata={"class": node.name}))
+                        kg.add_edge(GraphEdge(source=class_id, target=method_id, kind="defines"))
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                func_id = _node_id("function", rel, node.name)
+                kg.add_node(GraphNode(id=func_id, kind="function", name=node.name, location=f"{rel}:{node.lineno}"))
+                kg.add_edge(GraphEdge(source=file_id, target=func_id, kind="defines"))
+
+    _CODE_GRAPH = kg
+    return kg
+
+
+def get_knowledge_graph() -> KnowledgeGraph:
+    """Return the last built code graph, or an empty one."""
+    global _CODE_GRAPH
+    if _CODE_GRAPH is None:
+        _CODE_GRAPH = KnowledgeGraph()
+    return _CODE_GRAPH

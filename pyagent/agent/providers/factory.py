@@ -16,6 +16,20 @@ class ProviderError(RuntimeError):
     pass
 
 
+def _openai_compatible_provider():
+    """Return the best OpenAI-compatible provider implementation available."""
+    try:
+        from .openai_provider import OpenAIProvider
+
+        return OpenAIProvider
+    except ModuleNotFoundError as exc:
+        if exc.name != "openai":
+            raise
+        from .http_openai_provider import HttpOpenAIProvider
+
+        return HttpOpenAIProvider
+
+
 def get_provider(config: Config) -> LLMProvider:
     provider = config.provider.lower()
     model = config.resolved_model()
@@ -25,14 +39,14 @@ def get_provider(config: Config) -> LLMProvider:
     if provider == "openai":
         if not config.openai_api_key:
             raise ProviderError("OPENAI_API_KEY is not set. Set it or run `/config`.")
-        from .openai_provider import OpenAIProvider
+        OpenAIProvider = _openai_compatible_provider()
 
         return OpenAIProvider(model, temp, max_tokens, config.openai_api_key, config.openai_base_url)
 
     if provider == "groq":
         if not config.groq_api_key:
             raise ProviderError("GROQ_API_KEY is not set.")
-        from .openai_provider import OpenAIProvider
+        OpenAIProvider = _openai_compatible_provider()
 
         return OpenAIProvider(
             model, temp, max_tokens, config.groq_api_key, "https://api.groq.com/openai/v1"
@@ -41,7 +55,7 @@ def get_provider(config: Config) -> LLMProvider:
     if provider == "zen":
         if not config.zen_api_key:
             raise ProviderError("ZEN_API_KEY is not set.")
-        from .openai_provider import OpenAIProvider
+        OpenAIProvider = _openai_compatible_provider()
 
         return OpenAIProvider(model, temp, max_tokens, config.zen_api_key, config.zen_base_url)
 
@@ -49,7 +63,7 @@ def get_provider(config: Config) -> LLMProvider:
         key = getattr(config, "zyloo_api_key", None) or _env("ZYLOO_API_KEY")
         if not key:
             raise ProviderError("ZYLOO_API_KEY is not set.")
-        from .openai_provider import OpenAIProvider
+        OpenAIProvider = _openai_compatible_provider()
 
         return OpenAIProvider(
             model, temp, max_tokens, key, getattr(config, "zyloo_base_url", "https://api.zyloo.io/v1")
@@ -101,7 +115,7 @@ def get_provider(config: Config) -> LLMProvider:
         key = getattr(config, "nvapi_api_key", None) or _env("NVAPI_API_KEY")
         if not key:
             raise ProviderError("NVAPI_API_KEY is not set.")
-        from .openai_provider import OpenAIProvider
+        OpenAIProvider = _openai_compatible_provider()
 
         return OpenAIProvider(
             model, temp, max_tokens, key,

@@ -36,6 +36,8 @@ class App:
         self.commands = build_command_registry()
         self.conversation = Conversation(self.config.system_prompt)
         self.agent: Agent | None = None
+        self.enterprise_autostart = None
+        self._enterprise_autostart_ran = False
         self.goal_mode = False
         self._goal_config_backup: dict | None = None
         self._started_at = time.time()
@@ -52,6 +54,12 @@ class App:
         self._init_atlas_reactor()
         self._init_forgecore()
         self._init_megaforge()
+        try:
+            from .enterprise_suite import activate_enterprise_mode
+
+            self.enterprise_summary = activate_enterprise_mode(self)
+        except Exception as exc:  # noqa: BLE001
+            self.enterprise_summary = {"features": 0, "error": str(exc)}
         self.ui.set_command_source(self._command_items)
         for tool in load_plugins():
             self.registry.register(tool)
@@ -198,6 +206,134 @@ class App:
             log.debug("MEGAFORGE enrichment skipped: %s", exc)
             return user_input
 
+    def _enterprise_auto_context(self, user_input: str) -> str:
+        """Inject autostart RAG/KG/security context automatically.
+
+        Because startup now indexes and analyses the project automatically, the
+        model gets relevant local context without the user needing `/kg`, `/rag`,
+        `/sast`, or `/metrics` first.  The injected packet is compact and only
+        includes local, precomputed information.
+        """
+        snapshot = getattr(self, "enterprise_autostart", None)
+        if snapshot is None:
+            return user_input
+        try:
+            parts = ["[ENTERPRISE AUTOSTART CONTEXT]"]
+            metrics = snapshot.context.get("code metrics", {})
+            sast = snapshot.context.get("sast scan", {})
+            kg = snapshot.context.get("knowledge graph", {})
+            rag = snapshot.context.get("rag index", {})
+            if metrics:
+                parts.append(
+                    "Code metrics: "
+                    f"files={metrics.get('files_scanned', 0)}, "
+                    f"lines={metrics.get('total_lines', 0)}, "
+                    f"functions={metrics.get('functions', 0)}, "
+                    f"classes={metrics.get('classes', 0)}, "
+                    f"max_complexity={metrics.get('max_complexity', 0)}"
+                )
+                suggestions = metrics.get("suggestions") or []
+                if suggestions:
+                    parts.append("Refactor hints: " + "; ".join(str(s) for s in suggestions[:3]))
+            if sast:
+                parts.append(
+                    "Security scan: "
+                    f"findings={sast.get('findings', 0)}, "
+                    f"critical={sast.get('critical', 0)}, high={sast.get('high', 0)}, "
+                    f"medium={sast.get('medium', 0)}, low={sast.get('low', 0)}"
+                )
+            if kg:
+                parts.append(f"Knowledge graph: nodes={kg.get('nodes', 0)}, edges={kg.get('edges', 0)}")
+            if rag:
+                parts.append(f"RAG index: chunks={rag.get('documents', 0)}, sources={rag.get('sources', 0)}")
+            hyper = snapshot.context.get("hyper suite", {})
+            if hyper:
+                parts.append(
+                    "Hyper suite: "
+                    f"features={hyper.get('features', 0)}, files={hyper.get('files', 0)}, "
+                    f"functions={hyper.get('functions', 0)}, classes={hyper.get('classes', 0)}, "
+                    f"tests={hyper.get('tests', 0)}, docs={hyper.get('docs', 0)}"
+                )
+                recs = hyper.get("recommendations") or []
+                if recs:
+                    parts.append("Hyper recommendations: " + "; ".join(str(r) for r in recs[:3]))
+                hyper_ctx = hyper.get("context")
+                if hyper_ctx:
+                    parts.append(str(hyper_ctx)[:1800])
+            apex = snapshot.context.get("apex suite", {})
+            if apex:
+                parts.append(
+                    "Apex suite: "
+                    f"features={apex.get('features', 0)}, files={apex.get('files_scanned', 0)}, "
+                    f"symbols={apex.get('symbols', 0)}, fingerprint={apex.get('fingerprint', '')}"
+                )
+                hot = apex.get("hot_files") or []
+                if hot:
+                    parts.append("Apex hot files: " + "; ".join(f"{p}({s})" for p, s in hot[:5]))
+                backlog = apex.get("backlog") or []
+                if backlog:
+                    parts.append("Apex backlog: " + "; ".join(str(item) for item in backlog[:4]))
+                apex_ctx = apex.get("context")
+                if apex_ctx:
+                    parts.append(str(apex_ctx)[:2200])
+            omega = snapshot.context.get("omega suite", {})
+            if omega:
+                parts.append(
+                    "Omega suite: "
+                    f"features={omega.get('features', 0)}, "
+                    f"semantic_docs={omega.get('semantic', {}).get('stats', {}).get('documents', 0)}, "
+                    f"symbols={omega.get('semantic', {}).get('stats', {}).get('symbols', 0)}, "
+                    f"refactor_findings={omega.get('refactor', {}).get('stats', {}).get('findings', 0)}"
+                )
+                recs = omega.get("recommendations") or []
+                if recs:
+                    parts.append("Omega recommendations: " + "; ".join(str(r) for r in recs[:5]))
+                omega_ctx = omega.get("context")
+                if omega_ctx:
+                    parts.append(str(omega_ctx)[:2600])
+            nova = snapshot.context.get("nova suite", {})
+            if nova:
+                parts.append(
+                    "Nova suite: "
+                    f"features={nova.get('features', 0)}, "
+                    f"symbols={nova.get('symbols', {}).get('stats', {}).get('symbols', 0)}, "
+                    f"impact_items={nova.get('impact', {}).get('stats', {}).get('impacts', 0)}, "
+                    f"quality={nova.get('quality', {}).get('stats', {}).get('overall_score', 0)}"
+                )
+                recs = nova.get("recommendations") or []
+                if recs:
+                    parts.append("Nova recommendations: " + "; ".join(str(r) for r in recs[:5]))
+                nova_ctx = nova.get("context")
+                if nova_ctx:
+                    parts.append(str(nova_ctx)[:3200])
+            zenith = snapshot.context.get("zenith suite", {})
+            if zenith:
+                parts.append(
+                    "Zenith suite: "
+                    f"features={zenith.get('features', 0)}, "
+                    f"definitions={zenith.get('lsp', {}).get('stats', {}).get('definitions', 0)}, "
+                    f"graph_nodes={zenith.get('graph', {}).get('stats', {}).get('nodes', 0)}, "
+                    f"metrics_total={zenith.get('metrics', {}).get('stats', {}).get('total', 0)}"
+                )
+                zctx = zenith.get("context")
+                if zctx:
+                    parts.append(str(zctx)[:3800])
+            try:
+                from .rag_v2 import get_vector_store
+
+                store = get_vector_store()
+                if store.documents:
+                    ctx = store.answer_context(user_input, top_k=3)
+                    if ctx and not ctx.startswith("No relevant context"):
+                        parts.append("Relevant indexed codebase snippets:\n" + ctx[:2500])
+            except Exception:  # noqa: BLE001
+                pass
+            parts.append("[/ENTERPRISE AUTOSTART CONTEXT]")
+            return f"{user_input}\n\n" + "\n".join(parts)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("Enterprise autostart context skipped: %s", exc)
+            return user_input
+
     def _enrich_user_input(self, user_input: str) -> str:
         enriched = self._project_brain_context(user_input)
         enriched = self._omni_aion_context(enriched)
@@ -205,6 +341,7 @@ class App:
         enriched = self._atlas_reactor_context(enriched)
         enriched = self._forgecore_context(enriched)
         enriched = self._megaforge_context(enriched)
+        enriched = self._enterprise_auto_context(enriched)
         return enriched
 
     def _remember_project_turn(self, user_input: str, final: str, success: bool = True) -> None:
@@ -295,6 +432,31 @@ class App:
             self.ui.warn(f"Goal not fully verified after {rounds} round(s). Type a refined goal to continue.")
         self.ui.status_bar(self.config.provider, self.config.resolved_model(), self.conversation.token_estimate())
 
+    def _run_enterprise_autostart(self) -> None:
+        """Run safe local enterprise warmups once per process."""
+        if self._enterprise_autostart_ran:
+            return
+        self._enterprise_autostart_ran = True
+        try:
+            from .autostart import run_enterprise_autostart
+
+            self.ui.info("Auto-activating all enterprise features and warming local intelligence…")
+            snapshot = run_enterprise_autostart(self, root=".")
+            self.enterprise_autostart = snapshot
+            self.ui.success(
+                f"Autostart complete: {snapshot.ok_count} tasks OK, "
+                f"{snapshot.fail_count} failed, {snapshot.duration_s:.2f}s"
+            )
+            for task in snapshot.tasks:
+                icon = "✓" if task.ok else "✗"
+                color_msg = f"{icon} {task.name}: {task.detail}"
+                if task.ok:
+                    self.ui.info(color_msg)
+                else:
+                    self.ui.warn(color_msg)
+        except Exception as exc:  # noqa: BLE001
+            self.ui.warn(f"Enterprise autostart skipped: {type(exc).__name__}: {exc}")
+
     def run(self) -> None:
         if self.ui.animations:
             from .boot_sequence import play_boot_sequence
@@ -304,6 +466,7 @@ class App:
         if not self.config.has_credentials():
             self.ui.warn(f"No credentials found for provider '{self.config.provider}'.")
         self.build_agent()
+        self._run_enterprise_autostart()
         try:
             from .goal_history import get_goal_history
             interrupted = get_goal_history().find_interrupted()
@@ -348,6 +511,7 @@ class App:
     def run_once(self, prompt: str) -> None:
         if not self.build_agent():
             return
+        self._run_enterprise_autostart()
         self._handle_turn(prompt)
 
     # ------------------------------------------------------------------
@@ -435,6 +599,10 @@ class App:
         if cancel_token.cancelled:
             self.ui.warn("Response stopped (Esc).")
         self._remember_project_turn(original_user_input, final, success=True)
+        try:
+            self.branch_manager.sync(self.conversation.messages)
+        except Exception:  # noqa: BLE001
+            pass
         self._pending_post_turn = {"final": final, "turn_start": turn_start, "in_tokens": in_tokens, "used_tool": self._used_tool}
 
     def _handle_orchestrated_turn(self, user_input: str, analysis) -> None:
@@ -465,6 +633,10 @@ class App:
                 _time.sleep(0.01)
             renderer.finish(merged)
             self._remember_project_turn(original_user_input, merged, success=True)
+            try:
+                self.branch_manager.sync(self.conversation.messages)
+            except Exception:  # noqa: BLE001
+                pass
         else:
             self.ui.warn("No output from sub-agents — falling back to single agent.")
             self._handle_turn(user_input)

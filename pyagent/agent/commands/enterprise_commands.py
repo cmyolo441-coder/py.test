@@ -919,6 +919,93 @@ class StatsCommand(Command):
 
 
 # =========================================================================== #
+# ENTERPRISE PROFILE (1)
+# =========================================================================== #
+class Features129Command(Command):
+    name = "/features129"
+    aliases = ("/features", "/enterprise-features")
+    help = "Show the 129-feature enterprise activation dashboard"
+
+    def run(self, ctx: CommandContext) -> CommandResult:
+        from ..enterprise_suite import dashboard
+
+        arg = ctx.args.strip().lower()
+        limit = None if arg in {"all", "full", "129"} else 40
+        ctx.ui.console.print(dashboard(limit=limit))
+        return CommandResult()
+
+
+class Hyper70Command(Command):
+    name = "/hyper70"
+    aliases = ("/hyper", "/features70")
+    help = "Show the 70 additional hyper-suite features"
+
+    def run(self, ctx: CommandContext) -> CommandResult:
+        from ..hyper_suite import dashboard
+
+        arg = ctx.args.strip().lower()
+        limit = None if arg in {"all", "full", "70"} else 35
+        ctx.ui.console.print(dashboard(limit=limit))
+        return CommandResult()
+
+
+class Apex40Command(Command):
+    name = "/apex40"
+    aliases = ("/apex", "/features40")
+    help = "Show the 40 max-level Apex Suite features"
+
+    def run(self, ctx: CommandContext) -> CommandResult:
+        from ..apex_suite import dashboard
+
+        arg = ctx.args.strip().lower()
+        limit = None if arg in {"all", "full", "40"} else 25
+        ctx.ui.console.print(dashboard(limit=limit))
+        return CommandResult()
+
+
+class Omega49Command(Command):
+    name = "/omega49"
+    aliases = ("/omega", "/features49")
+    help = "Show the 49 next-level Omega Suite features"
+
+    def run(self, ctx: CommandContext) -> CommandResult:
+        from ..omega_suite import dashboard
+
+        arg = ctx.args.strip().lower()
+        limit = None if arg in {"all", "full", "49"} else 28
+        ctx.ui.console.print(dashboard(limit=limit))
+        return CommandResult()
+
+
+class Nova71Command(Command):
+    name = "/nova71"
+    aliases = ("/nova", "/features71")
+    help = "Show the 71 ultra-advanced Nova Suite features"
+
+    def run(self, ctx: CommandContext) -> CommandResult:
+        from ..nova_suite import dashboard
+
+        arg = ctx.args.strip().lower()
+        limit = None if arg in {"all", "full", "71"} else 36
+        ctx.ui.console.print(dashboard(limit=limit))
+        return CommandResult()
+
+
+class Zenith97Command(Command):
+    name = "/zenith97"
+    aliases = ("/zenith", "/features97")
+    help = "Show the 97 max-level Zenith Suite features"
+
+    def run(self, ctx: CommandContext) -> CommandResult:
+        from ..zenith_suite import dashboard
+
+        arg = ctx.args.strip().lower()
+        limit = None if arg in {"all", "full", "97"} else 42
+        ctx.ui.console.print(dashboard(limit=limit))
+        return CommandResult()
+
+
+# =========================================================================== #
 # REGISTRATION
 # =========================================================================== #
 def build_enterprise_commands() -> list[Command]:
@@ -974,4 +1061,11 @@ def build_enterprise_commands() -> list[Command]:
         # Power-user utilities (2)
         DashboardCommand(),
         StatsCommand(),
+        # Enterprise + hyper + apex + omega + nova + zenith profiles
+        Features129Command(),
+        Hyper70Command(),
+        Apex40Command(),
+        Omega49Command(),
+        Nova71Command(),
+        Zenith97Command(),
     ]

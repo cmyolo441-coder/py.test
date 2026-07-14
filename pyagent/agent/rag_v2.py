@@ -196,11 +196,20 @@ def get_vector_store(persist: bool = True) -> VectorStore:
     return _store
 
 
-def index_codebase(root: Path | str = ".") -> dict[str, Any]:
-    """Index a codebase into the global vector store. Returns stats."""
+def index_codebase(root: Path | str = ".", *, clear_existing: bool = True) -> dict[str, Any]:
+    """Index a codebase into the global vector store. Returns stats.
+
+    By default this is a **re-index** operation rather than an append.  Earlier
+    versions appended every run, so automatic startup indexing could duplicate
+    chunks forever.  `clear_existing=False` is still available for callers that
+    intentionally want to aggregate multiple roots.
+    """
     store = get_vector_store()
+    if clear_existing:
+        store.clear()
     added = store.add_directory(root)
     store.save()
     stats = store.stats()
     stats["newly_indexed"] = added
+    stats["reindexed"] = clear_existing
     return stats

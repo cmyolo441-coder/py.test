@@ -39,6 +39,19 @@ class Theme:
 # Built-in themes
 # ---------------------------------------------------------------------------
 THEMES: dict[str, Theme] = {
+    "codex": Theme(
+        name="codex",
+        accent="#c9d1d9",
+        accent2="#58a6ff",
+        ok="#7ee787",
+        warn="#f2cc60",
+        err="#ff7b72",
+        dim="#8b949e",
+        user_bubble="#58a6ff",
+        ai_bubble="#c9d1d9",
+        text="#f0f6fc",
+        gradient=("#f0f6fc", "#8b949e", "#58a6ff", "#c9d1d9", "#f0f6fc"),
+    ),
     "neon": Theme(
         name="neon",
         accent="#a855f7",
@@ -106,7 +119,7 @@ THEMES: dict[str, Theme] = {
     ),
 }
 
-DEFAULT_THEME = "neon"
+DEFAULT_THEME = "codex"
 
 _active: Theme = THEMES[DEFAULT_THEME]
 
