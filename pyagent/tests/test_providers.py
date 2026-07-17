@@ -1,4 +1,4 @@
-"""Tests for provider registry metadata and factory error handling."""
+"""Tests for provider registry and factory."""
 
 from __future__ import annotations
 
@@ -10,26 +10,30 @@ from agent.providers.registry import PROVIDERS, get_spec, list_providers
 
 
 def test_provider_specs_present():
-    assert "zen" in PROVIDERS
     assert "openai" in PROVIDERS
-    assert get_spec("ZEN").name == "zen"
-    assert len(list_providers()) >= 6
+    assert "anthropic" in PROVIDERS
+    assert "ollama" in PROVIDERS
+    assert "gemini" in PROVIDERS
 
 
-def test_zen_is_openai_compatible():
-    assert get_spec("zen").openai_compatible is True
+def test_list_providers():
+    specs = list_providers()
+    assert len(specs) >= 7
 
 
-def test_factory_missing_key_raises():
-    cfg = Config()
-    cfg.provider = "openai"
-    cfg.openai_api_key = None
+def test_get_spec():
+    spec = get_spec("openai")
+    assert spec is not None
+    assert spec.name == "openai"
+
+
+def test_unknown_provider_raises():
+    config = Config(provider="nonexistent_provider_xyz")
     with pytest.raises(ProviderError):
-        get_provider(cfg)
+        get_provider(config)
 
 
-def test_factory_unknown_provider():
-    cfg = Config()
-    cfg.provider = "nonexistent"
+def test_missing_key_raises():
+    config = Config(provider="openai", openai_api_key=None)
     with pytest.raises(ProviderError):
-        get_provider(cfg)
+        get_provider(config)
