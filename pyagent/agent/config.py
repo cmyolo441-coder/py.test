@@ -1,9 +1,4 @@
-"""Configuration management for the terminal AI agent.
-
-Loads settings from environment variables, a local .env file and an optional
-JSON config file at ~/.terminal_agent/config.json. Environment variables always
-take precedence so the agent works well in CI and scripted environments.
-"""
+"""Configuration management for the terminal AI agent."""
 
 from __future__ import annotations
 
@@ -17,11 +12,9 @@ from .systemprompts import DEFAULT_SYSTEM_PROMPT
 
 try:
     from dotenv import load_dotenv
-
     load_dotenv()
-except Exception:  # pragma: no cover - dotenv is optional at runtime
+except Exception:
     pass
-
 
 CONFIG_DIR = Path.home() / ".terminal_agent"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -39,139 +32,48 @@ def _env(*names: str, default: str | None = None) -> str | None:
 
 @dataclass
 class Config:
-    """Runtime configuration for the agent."""
-
-    provider: str = field(default_factory=lambda: _env("AGENT_PROVIDER", default="zen") or "zen")
+    provider: str = field(default_factory=lambda: _env("AGENT_PROVIDER", default="openai") or "openai")
     model: str | None = field(default_factory=lambda: _env("AGENT_MODEL"))
     temperature: float = 0.7
     max_tokens: int = 128000
     stream: bool = True
 
-    # Provider credentials / endpoints.
     openai_api_key: str | None = field(default_factory=lambda: _env("OPENAI_API_KEY"))
     openai_base_url: str | None = field(default_factory=lambda: _env("OPENAI_BASE_URL"))
     anthropic_api_key: str | None = field(default_factory=lambda: _env("ANTHROPIC_API_KEY"))
     groq_api_key: str | None = field(default_factory=lambda: _env("GROQ_API_KEY"))
-
-    # Zen (opencode.ai) — OpenAI-compatible endpoint.
-    zen_api_key: str | None = field(
-        default_factory=lambda: _env(
-            "ZEN_API_KEY",
-            default="sk-uM0oXXKJGFhyn3bk9kwvjF0RfZ2MSOfKMW5kyDrYXEGZnO1ZJT8BptOX6i6ry7Ue",
-        )
-    )
-    zen_base_url: str = field(
-        default_factory=lambda: _env("ZEN_BASE_URL", default="https://opencode.ai/zen/v1")
-        or "https://opencode.ai/zen/v1"
-    )
-
-    # Zyloo — OpenAI-compatible endpoint.
-    zyloo_api_key: str | None = field(
-        default_factory=lambda: _env(
-            "ZYLOO_API_KEY",
-            default="sk-zy-7b9efa90f2bd4116caaca84c1fe8d58e78db6bdf9514fe30",
-        )
-    )
-    zyloo_base_url: str = field(
-        default_factory=lambda: _env("ZYLOO_BASE_URL", default="https://api.zyloo.io/v1")
-        or "https://api.zyloo.io/v1"
-    )
-
-    # Lovable AI Gateway — OpenAI-compatible endpoint.
-    lovable_api_key: str | None = field(
-        default_factory=lambda: _env(
-            "LOVABLE_API_KEY",
-            default="sk_axbW60GPjGmRwKEhtduCOvIGpiZTW0241WnIE3T+n6t5jMOP070qVdlmEXI6YK8e0kqh/gKsLP9UJ2sKQxyvcSWFi5It4AFK2fiHq2xf0I2EgOb90kxzH4hb6lyTyZvVHZBfVCDbjcgAjTkPK7J5VFtt3bRJ8BIzqyfAf5HZGZFQUunBjbUQydRJUMe8em3IDt3wTirl5yxnKCVytnkeHNVWQOI+1GB263fxexz2Oa9GdV94GLTL2NcP4wzKiCSd0TnDig==",
-        )
-    )
-    lovable_base_url: str = field(
-        default_factory=lambda: _env("LOVABLE_BASE_URL", default="https://ai.gateway.lovable.dev/v1")
-        or "https://ai.gateway.lovable.dev/v1"
-    )
-
     gemini_api_key: str | None = field(default_factory=lambda: _env("GEMINI_API_KEY"))
     mistral_api_key: str | None = field(default_factory=lambda: _env("MISTRAL_API_KEY"))
     together_api_key: str | None = field(default_factory=lambda: _env("TOGETHER_API_KEY"))
-
-    # NVIDIA API (nvapi) — OpenAI-compatible endpoint.
-    nvapi_api_key: str | None = field(
-        default_factory=lambda: _env(
-            "NVAPI_API_KEY",
-            default="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",
-        )
-    )
-    nvapi_base_url: str = field(
-        default_factory=lambda: _env("NVAPI_BASE_URL", default="https://integrate.api.nvidia.com/v1")
-        or "https://integrate.api.nvidia.com/v1"
-    )
-
-    # SambaNova Cloud — OpenAI-compatible endpoint.
-    # Set SAMBANOVA_API_KEY in your environment or ~/.terminal_agent/config.json.
-    sambanova_api_key: str | None = field(default_factory=lambda: _env("SAMBANOVA_API_KEY"))
-    sambanova_base_url: str = field(
-        default_factory=lambda: _env("SAMBANOVA_BASE_URL", default="https://api.sambanova.ai/v1")
-        or "https://api.sambanova.ai/v1"
-    )
-
-    # Agnes AI API Hub — OpenAI-compatible endpoint.
-    # Set AGNES_API_KEY in your environment or ~/.terminal_agent/config.json.
-    agnes_api_key: str | None = field(default_factory=lambda: _env("AGNES_API_KEY"))
-    agnes_base_url: str = field(
-        default_factory=lambda: _env("AGNES_BASE_URL", default="https://apihub.agnes-ai.com/v1")
-        or "https://apihub.agnes-ai.com/v1"
-    )
-
     ollama_base_url: str = field(
         default_factory=lambda: _env("OLLAMA_BASE_URL", default="http://localhost:11434") or "http://localhost:11434"
     )
 
-    # Agent behaviour.
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     enable_tools: bool = True
     auto_approve_tools: bool = False
     max_tool_iterations: int = 12
-    # Autonomous effort level (see agent/effort.py): normal | ultramax |
-    # ultracombo | ultrahype | enterprise | godmode.
-    effort: str = "normal"
-    # Auto-orchestrate complex tasks with parallel sub-agents.
-    auto_orchestrate: bool = True
 
-    # Default model per provider when none is explicitly set.
     _default_models: dict[str, str] = field(
         default_factory=lambda: {
             "openai": "gpt-4o",
-            "anthropic": "claude-3-5-sonnet-20241022",
+            "anthropic": "claude-sonnet-4-20250514",
             "groq": "llama-3.3-70b-versatile",
             "ollama": "llama3.1",
-            "zen": "mimo-v2.5-free",
-            "zyloo": "zyloo/glm-5.1",
-            "lovable": "openai/gpt-5.5",
-            "nvapi": "z-ai/glm-5.2",
-            "sambanova": "MiniMax-M2.7",
-            "agnes": "agnes-2.5-flash",
-            "gemini": "gemini-1.5-flash",
+            "gemini": "gemini-2.5-flash",
             "mistral": "mistral-large-latest",
             "together": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
         }
     )
 
-    # Known models per provider (used for /models listing and switching).
     _known_models: dict[str, list[str]] = field(
         default_factory=lambda: {
-            "zen": ["mimo-v2.5-free", "big-pickle", "deepseek-v4-flash-free"],
-            "zyloo": ["zyloo/glm-5.1"],
-            "lovable": ["openai/gpt-5.5", "openai/gpt-5.4"],
-            "nvapi": [
-                "z-ai/glm-5.2",
-                "minimaxai/minimax-m3",
-                "stepfun-ai/step-3.7-flash",
-                "deepseek-ai/deepseek-v4-pro",
-                "qwen/qwen3.5-397b-a17b",
-                "mistralai/mistral-large-3-675b-instruct-2512",
-                "nvidia/nemotron-3-ultra-550b-a55b",
-            ],
-            "sambanova": ["MiniMax-M2.7"],
-            "agnes": ["agnes-2.0-flash", "agnes-2.5-flash", "agnes-2.5-pro"],
+            "openai": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "o4-mini"],
+            "anthropic": ["claude-sonnet-4-20250514", "claude-3-5-sonnet-20241022"],
+            "groq": ["llama-3.3-70b-versatile"],
+            "gemini": ["gemini-2.5-flash", "gemini-2.5-pro"],
+            "mistral": ["mistral-large-latest"],
+            "together": ["meta-llama/Llama-3.3-70B-Instruct-Turbo"],
         }
     )
 
@@ -179,11 +81,6 @@ class Config:
         return self._known_models.get(self.provider, [])
 
     def all_known_models(self) -> list[tuple[str, str]]:
-        """(provider, model) for every preset model across all providers.
-
-        Powers the /model picker so models from other providers (e.g. zyloo)
-        are always visible, not just the currently-selected provider's list.
-        """
         pairs: list[tuple[str, str]] = []
         for prov, models in self._known_models.items():
             for m in models:
@@ -191,7 +88,6 @@ class Config:
         return pairs
 
     def provider_for_model(self, model: str) -> str | None:
-        """Return the provider that owns ``model`` in the preset lists."""
         for prov, models in self._known_models.items():
             if model in models:
                 return prov
@@ -202,9 +98,6 @@ class Config:
             return self.model
         return self._default_models.get(self.provider, "gpt-4o")
 
-    # ------------------------------------------------------------------
-    # Persistence helpers
-    # ------------------------------------------------------------------
     @classmethod
     def load(cls) -> Config:
         cfg = cls()
@@ -230,11 +123,8 @@ class Config:
             "openai": bool(self.openai_api_key),
             "anthropic": bool(self.anthropic_api_key),
             "groq": bool(self.groq_api_key),
-            "zen": bool(self.zen_api_key),
-            "zyloo": bool(self.zyloo_api_key),
-            "lovable": bool(self.lovable_api_key),
-            "nvapi": bool(self.nvapi_api_key),
-            "sambanova": bool(self.sambanova_api_key),
-            "agnes": bool(self.agnes_api_key),
-            "ollama": True,  # local, no key required
+            "gemini": bool(self.gemini_api_key),
+            "mistral": bool(self.mistral_api_key),
+            "together": bool(self.together_api_key),
+            "ollama": True,
         }.get(self.provider, False)

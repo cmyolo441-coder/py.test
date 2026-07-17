@@ -1,142 +1,42 @@
-"""Theme system for the terminal UI.
-
-A ``Theme`` is a named palette of colors plus a gradient used across the banner,
-headings, prompt box, spinners and message bubbles. Themes can be switched live
-at runtime via the ``/theme`` command; the active theme is a process-global that
-every UI helper reads from, so a switch instantly restyles the whole interface.
-"""
+"""Theme system for the terminal UI."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
 class Theme:
-    """A complete color palette for the UI."""
-
     name: str
-    # Core accents.
-    accent: str          # primary brand color (frames, rules)
-    accent2: str         # secondary accent (tool cards, highlights)
-    # Semantic colors.
+    accent: str
+    accent2: str
     ok: str
     warn: str
     err: str
     dim: str
-    # Text / bubbles.
-    user_bubble: str
-    ai_bubble: str
     text: str
-    # Multi-stop gradient for banner + headings.
-    gradient: tuple[str, ...] = field(default=())
-
-    def grad(self) -> list[str]:
-        return list(self.gradient) if self.gradient else [self.accent, self.accent2, self.accent]
 
 
-# ---------------------------------------------------------------------------
-# Built-in themes
-# ---------------------------------------------------------------------------
 THEMES: dict[str, Theme] = {
-    "codex": Theme(
-        name="codex",
-        accent="#c9d1d9",
-        accent2="#58a6ff",
-        ok="#7ee787",
-        warn="#f2cc60",
-        err="#ff7b72",
-        dim="#8b949e",
-        user_bubble="#58a6ff",
-        ai_bubble="#c9d1d9",
-        text="#f0f6fc",
-        gradient=("#f0f6fc", "#8b949e", "#58a6ff", "#c9d1d9", "#f0f6fc"),
-    ),
-    "neon": Theme(
-        name="neon",
-        accent="#a855f7",
-        accent2="#22d3ee",
-        ok="#22c55e",
-        warn="#f59e0b",
-        err="#ef4444",
-        dim="#9e9e9e",
-        user_bubble="#22d3ee",
-        ai_bubble="#a855f7",
-        text="#ededed",
-        gradient=("#a855f7", "#d946ef", "#22d3ee", "#38bdf8", "#a855f7"),
-    ),
-    "cyberpunk": Theme(
-        name="cyberpunk",
-        accent="#ff00ff",
-        accent2="#00ffff",
-        ok="#39ff14",
-        warn="#ffd300",
-        err="#ff2a6d",
-        dim="#6b5b95",
-        user_bubble="#00ffff",
-        ai_bubble="#ff2a6d",
-        text="#f8f8f2",
-        gradient=("#ff2a6d", "#d900ff", "#00b3ff", "#05ffa1", "#ffd300", "#ff2a6d"),
-    ),
-    "pastel": Theme(
-        name="pastel",
-        accent="#c4a7e7",
-        accent2="#9ccfd8",
-        ok="#a6da95",
-        warn="#eed49f",
-        err="#ed8796",
-        dim="#8087a2",
-        user_bubble="#9ccfd8",
-        ai_bubble="#c4a7e7",
-        text="#e0def4",
-        gradient=("#c4a7e7", "#f6c1cd", "#9ccfd8", "#a6da95", "#c4a7e7"),
-    ),
-    "matrix": Theme(
-        name="matrix",
-        accent="#00ff41",
-        accent2="#008f11",
-        ok="#00ff41",
-        warn="#9dff00",
-        err="#ff5555",
-        dim="#0d5c1a",
-        user_bubble="#00ff41",
-        ai_bubble="#00cf35",
-        text="#c8ffc8",
-        gradient=("#003b00", "#008f11", "#00ff41", "#9dff00", "#00ff41", "#008f11"),
-    ),
-    "solarized": Theme(
-        name="solarized",
-        accent="#268bd2",
-        accent2="#2aa198",
-        ok="#859900",
-        warn="#b58900",
-        err="#dc322f",
-        dim="#657b83",
-        user_bubble="#2aa198",
-        ai_bubble="#268bd2",
-        text="#eee8d5",
-        gradient=("#268bd2", "#2aa198", "#859900", "#b58900", "#268bd2"),
-    ),
+    "default": Theme("default", "#c9d1d9", "#58a6ff", "#7ee787", "#f2cc60", "#ff7b72", "#8b949e", "#f0f6fc"),
+    "neon": Theme("neon", "#a855f7", "#22d3ee", "#22c55e", "#f59e0b", "#ef4444", "#6b7280", "#f3f4f6"),
+    "pastel": Theme("pastel", "#f9a8d4", "#93c5fd", "#86efac", "#fcd34d", "#fca5a5", "#9ca3af", "#f9fafb"),
+    "matrix": Theme("matrix", "#00ff00", "#00cc00", "#00ff00", "#ffff00", "#ff0000", "#006600", "#00ff00"),
 }
 
-DEFAULT_THEME = "codex"
-
-_active: Theme = THEMES[DEFAULT_THEME]
+_current: str = "default"
 
 
 def current() -> Theme:
-    """Return the process-wide active theme."""
-    return _active
+    return THEMES.get(_current, THEMES["default"])
 
 
 def set_theme(name: str) -> bool:
-    """Switch the active theme. Returns True if the name is known."""
-    global _active
-    key = name.strip().lower()
-    if key not in THEMES:
-        return False
-    _active = THEMES[key]
-    return True
+    global _current
+    if name in THEMES:
+        _current = name
+        return True
+    return False
 
 
 def names() -> list[str]:

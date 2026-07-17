@@ -1,9 +1,4 @@
-"""LLM provider abstraction layer.
-
-Each provider implements the ``LLMProvider`` interface so the agent core is
-provider-agnostic. Use ``get_provider`` to instantiate the correct one from
-config.
-"""
+"""LLM provider abstraction layer."""
 
 from __future__ import annotations
 
