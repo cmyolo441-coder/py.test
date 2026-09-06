@@ -25,6 +25,9 @@ import time
 from dataclasses import dataclass, field
 
 from .client import APIError, chat_blocking, shrink_tool_outputs
+from ._foundation import get_logger
+
+_log = get_logger("team")
 
 MAX_WORKER_STEPS = 96      # tool-loop budget per worker (big-project grade)
 MAX_WORKERS = 8            # roster ceiling; baked into worker prompts

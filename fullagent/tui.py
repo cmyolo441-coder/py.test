@@ -5,12 +5,17 @@ The double-line box stays pinned at the bottom at all times; all output
 (user echo, streamed tokens, tool lines, errors) scrolls above it through
 prompt_toolkit's patch_stdout. The box border carries live state:
 
-    ╭─ FullAgent ── model: MiMo v2.5 FREE ── effort: HIGH ── session a1b2c3d4 ─╮
+    ╭─ FullAgent ──●── MiMo v2.5 ──◆ FREE── ◈ high ──⬢ L3── ◎ goal ▰▰▰▱▱ 60% ──◉ ctx 12% ─╮
     │ ❯ user types here…                                                       │
-    ╰─ ⠹ thinking…  ·  Ctrl+C cancel ──────────────────────────────────────────╯
+    ╰ ⏎ send · ⇧⏎ newline · / cmds · ^T models · ^E effort ────────────────────╯
 
-Overlays (model / effort / help / history) render directly above the box and
-are navigated with ↑↓, PgUp/PgDn, Tab, Home/End.
+Top border: provider dot (provider colour), FREE/FAST tag, effort
+(effort colour), autonomy badge ⬢ (dim→green→yellow→red with level),
+goal progress bar ◎ ▰▱ + %, focus counter, live context meter ◉.
+Bottom border: live spinner + elapsed seconds while busy, ✦ flash
+messages, coloured [y]es/[n]o/[a]lways approval bar, styled key hints
+when idle. Overlays (model / effort / help / history) render directly
+above the box and are navigated with ↑↓, PgUp/PgDn, Tab, Home/End.
 """
 
 from __future__ import annotations
@@ -136,6 +141,9 @@ STYLE = Style.from_dict({
     "box.spinner": f"bold {C['accent']}",
     "box.flash": f"bold {C['yellow']}",
     "box.approve": f"bold {C['yellow']}",
+    "box.key": f"bold {C['cyan']}",
+    "box.sep": C["dim"],
+    "box.goalbar": f"bold {C['green']}",
     "arrow": f"bold {C['green']}",
     "cont": C["dim"],
     "stream.preview": C["fg"],
@@ -274,7 +282,6 @@ SLASH_COMMANDS = [
     ("/vitals", "homeostasis check + self-repair"),
     ("/attention", "last context token auction"),
     ("/fabric", "bitemporal knowledge — /fabric ask|assert|history"),
-    ("/crew", "persistent subagents — /crew [spawn|send|wait|close|resume|status]"),
     ("/auto", "autopilot self-routing — /auto [on|off|status]"),
     ("/prompt", "system prompt — /prompt [main|master|list]"),
     ("/mastermind", "prompt coherence ledger — sealed prompts, gate, lineage"),
@@ -567,7 +574,9 @@ class UI:
         self._busy = False
         self._status_text = ""
         self._spinner_i = 0
+        self._spinner_gen = 0
         self._spinner_on = False
+        self._turn_start_ts = 0.0
         self._cancel_flag = threading.Event()
         self._last_flush = 0.0
         # SPEED: cached terminal size (queried at most twice a second)
@@ -578,9 +587,11 @@ class UI:
         self._approve_request: tuple[Tool, dict, threading.Event] | None = None
         self._approve_result = False
 
-        # flash message in the bottom border
+        # flash message in the bottom border (generation-guarded: a
+        # stale timer from an older flash can never clear a newer one)
         self._flash: tuple[str, str] | None = None
         self._flash_timer: threading.Timer | None = None
+        self._flash_gen = 0
 
         # goal-status cache for the border (fold is not free per frame)
         self._goal_cache = None
@@ -628,15 +639,21 @@ class UI:
             pass
 
     def _set_flash(self, text: str, color: str = C["yellow"]) -> None:
+        self._flash_gen += 1
+        gen = self._flash_gen
         self._flash = (text, color)
         if self._flash_timer:
             self._flash_timer.cancel()
-        self._flash_timer = threading.Timer(4.0, self._clear_flash)
+        self._flash_timer = threading.Timer(4.0, self._clear_flash, args=(gen,))
         self._flash_timer.daemon = True
         self._flash_timer.start()
         self._invalidate()
 
-    def _clear_flash(self) -> None:
+    def _clear_flash(self, gen: int | None = None) -> None:
+        # A timer from an older flash must never wipe a newer message —
+        # the generation check makes the clear a no-op when stale.
+        if gen is not None and gen != self._flash_gen:
+            return
         self._flash = None
         self._invalidate()
 
@@ -653,15 +670,24 @@ class UI:
         model = self._model()
         effort = self._effort()
         effort_color = EFFORT_COLORS.get(effort.key, C["fg"])
+        prov = PROVIDERS.get(model.provider)
+        prov_color = (prov.color if prov is not None else C["accent"])
 
         segs: list[tuple[str, str]] = []
         segs.append((f" {APP_NAME} ", "class:box.title"))
-        segs.append((f" model: {model.label} ", "class:box.model"))
+        segs.append((" ● ", f"bold {prov_color}"))
+        segs.append((f" {model.label} ", "class:box.model"))
         if model.tag:
-            segs.append((f"{model.tag} ", "class:box.tag"))
-        segs.append((f" effort: {effort.label.lower()} ",
+            segs.append((f"◆ {model.tag} ", "class:box.tag"))
+        segs.append((f" ◈ {effort.label.lower()} ",
                      f"class:box.effort {effort_color}"))
-        segs.append((f" L{self.agent.autonomy} ", "class:box.tag"))
+        # autonomy ladder — colour tells the risk at a glance:
+        # observer/advisor dim, assistant/collaborator green,
+        # pilot yellow, autonomous red
+        auto = self.agent.autonomy
+        auto_color = (C["dim"] if auto <= 1 else C["green"] if auto <= 3
+                      else C["yellow"] if auto == 4 else C["red"])
+        segs.append((f" ⬢ L{auto} ", f"bold {auto_color}"))
         # live goal distance — always on screen when a goal is active (§24).
         # cached for 1s: the border re-renders every frame, and status()
         # folds the whole log
@@ -671,7 +697,10 @@ class UI:
             self._goal_cache_ts = now
         goal = self._goal_cache
         if goal.active:
-            segs.append((f" goal: {(1 - goal.distance) * 100:.0f}% ",
+            pct = max(0, min(100, (1 - goal.distance) * 100))
+            filled = int(round(pct / 20))
+            bar = "▰" * filled + "▱" * (5 - filled)
+            segs.append((f" ◎ goal {bar} {pct:.0f}% ",
                          "class:box.status"))
         if self._focus_remaining > 0:
             segs.append((f" 🎯 focus×{self._focus_remaining} ",
@@ -690,9 +719,9 @@ class UI:
         ctx_color = (C["green"] if self._ctx_cache < 60
                      else C["yellow"] if self._ctx_cache < 85
                      else C["red"])
-        segs.append((f" ctx {self._ctx_cache}% ",
+        segs.append((f" ◉ ctx {self._ctx_cache}% ",
                      f"bold {ctx_color}"))
-        segs.append((f" session: {self.agent.session_id} ", "class:box.session"))
+        segs.append((f" ⌛ session: {self.agent.session_id} ", "class:box.session"))
 
         # fixed = corners (2) + first dash (1) + "──" before each later seg
         def fixed_len(segs: list) -> int:
@@ -718,37 +747,64 @@ class UI:
 
         if self._approve_request is not None:
             tool = self._approve_request[0]
-            bar = f" ⚠ approve {tool.name}?  [y]es  [n]o  [a]lways "[:max(1, inner)]
-            return ([("class:box", "╰"), ("class:box.approve", bar),
-                     ("class:box", "─" * max(0, inner - len(bar)) + "╯")]
+            name = tool.name[: max(1, inner - 34)]
+            head = f" ⚠ approve {name}? "
+            y, n, a = " [y]es ", " [n]o ", " [a]lways "
+            plain = head + y.strip() + " " + n.strip() + " " + a.strip()
+            fill = "─" * max(0, inner - len(head) - len(y) - len(n) - len(a))
+            return ([("class:box", "╰"),
+                     ("class:box.approve", head),
+                     (f"bold {C['green']}", y),
+                     ("class:box.hint", " "),
+                     (f"bold {C['red']}", n),
+                     ("class:box.hint", " "),
+                     (f"bold {C['yellow']}", a),
+                     ("class:box", fill + "╯")]
                     + self._approve_args_line(tool, self._approve_request[1]))
 
         if self._busy:
             frame = SPINNER_FRAMES[self._spinner_i]
-            max_status = max(0, inner - len(" ⠹  ·  Esc/Ctrl+C cancel ") - 4)
+            elapsed = ""
+            if self._turn_start_ts:
+                elapsed = f" · {max(0, int(time.time() - self._turn_start_ts))}s"
+            tail = " · Esc cancel "
+            max_status = max(0, inner - len(f" ⠹  ·  Esc cancel ") - len(elapsed) - 4)
             status = self._status_text[:max_status]
-            bar = f" {frame} {status}  ·  Esc/Ctrl+C cancel "
+            bar_len = len(f" {frame} {status}{elapsed} {tail}")
             return [("class:box", "╰"),
                     ("class:box.spinner", f" {frame} "),
                     ("class:box.status", status),
-                    ("class:box.hint", "  ·  Esc/Ctrl+C cancel "),
+                    ("class:box.hint", f"{elapsed}{tail}"),
                     ("class:box",
-                     "─" * max(0, inner - len(bar)) + "╯")]
+                     "─" * max(0, inner - bar_len) + "╯")]
 
         if self._flash:
             text, color = self._flash
-            hint = f" {text} "[:max(1, inner)]
+            hint = f" ✦ {text} "[:max(1, inner)]
             return [("class:box", "╰"), (f"bold {color}", hint),
                     ("class:box", "─" * max(0, inner - len(hint)) + "╯")]
 
-        hint = (" Enter send · Esc+Enter newline · / commands · "
-                "Ctrl+T models · Ctrl+E effort · Ctrl+C cancel ")
-        if len(hint) > inner:
-            hint = " Enter send · / commands · Ctrl+T models · Ctrl+C cancel "
-        if len(hint) > inner:
-            hint = " Enter send "
-        return [("class:box", "╰"), ("class:box.hint", hint[:inner]),
-                ("class:box", "─" * max(0, inner - len(hint)) + "╯")]
+        # idle — styled keys, gracefully degrading on narrow terminals
+        # NOTE: fragments are (style, text) tuples — keep this order.
+        key = "class:box.key"
+        dim = "class:box.hint"
+        box = "class:box"
+        if inner >= len("⏎ send · ⇧⏎ newline · / cmds · ^T models · ^E effort ") + 1:
+            segs = [(box, " ⏎ "), (key, "send"),
+                    (dim, " · ⇧⏎ newline · "), (key, "/"), (dim, " cmds · "),
+                    (key, "^T"), (dim, " models · "), (key, "^E"),
+                    (dim, " effort ")]
+        elif inner >= len("⏎ send · / cmds · ^T models ") + 1:
+            segs = [(box, " ⏎ "), (key, "send"),
+                    (dim, " · "), (key, "/"), (dim, " cmds · "),
+                    (key, "^T"), (dim, " models ")]
+        else:
+            segs = [(box, " ⏎ "), (key, "send"), (dim, " ")]
+        frags: list = [(box, "╰")]
+        frags.extend(segs)
+        used = 1 + sum(len(t) for _, t in segs)
+        frags.append((box, "─" * max(0, inner - used) + "╯"))
+        return frags
 
     def _approve_args_line(self, tool: Tool, args: dict) -> list:
         return []
@@ -777,7 +833,7 @@ class UI:
         def get_line_prefix(line: int, wrap_count: int):
             if line == 0 and wrap_count == 0:
                 return [("class:arrow", "❯ ")]
-            return [("class:cont", "  ")]
+            return [("class:cont", "│ ")]
 
         self.input_control = BufferControl(
             buffer=self.buffer,
@@ -984,6 +1040,7 @@ class UI:
         def _ctrl_c(event):
             if self._busy:
                 self._cancel_flag.set()
+                self.agent._cancel_flag.set()  # sync with agent for crew force stop
                 self._set_status("cancelling…")
             elif self.buffer.text:
                 self.buffer.reset()
@@ -998,7 +1055,9 @@ class UI:
                 Condition(lambda: self._busy))
         def _esc_cancel(event):
             self._cancel_flag.set()
+            self.agent._cancel_flag.set()  # sync with agent for crew force stop
             self._set_status("cancelling…")
+            self._set_flash("⊘ cancelling — force stopping…", C["yellow"])
 
         # Esc at the approve bar = "no", same as Ctrl+C there
         @kb.add(Keys.Escape, filter=approving)
@@ -1100,6 +1159,33 @@ class UI:
                     self.print_info(f"✓ model → {m.label} ({m.id})", C["green"])
             else:
                 self.open_model_selector()
+        elif cmd == "/models":
+            sub = arg.strip().lower()
+            if sub == "reload":
+                from . import config as _cfg
+                before = len(_cfg.MODELS)
+                _cfg.load_custom_models()
+                after = len(_cfg.MODELS)
+                added = after - before
+                self.print_info(
+                    f"✓ models reloaded — {after} total"
+                    + (f" (+{added} new)" if added else ""),
+                    C["green"])
+            elif sub == "list":
+                from .config import MODELS as _MODELS, PROVIDERS as _PROVS
+                lines = [f"MODELS ({len(_MODELS)}):"]
+                for m in _MODELS:
+                    p = _PROVS.get(m.provider)
+                    pname = p.name if p else "?"
+                    tag = f" [{m.tag}]" if m.tag else ""
+                    lines.append(f"  {m.id:<45} {m.label}{tag} · {pname}")
+                self.print_info("\n".join(lines), C["cyan"])
+            else:
+                self.print_info(
+                    "usage: /models reload | /models list\n"
+                    "  reload — hot-load models.json (add models without restart)\n"
+                    "  list   — show all available models",
+                    C["dim"])
         elif cmd == "/effort":
             arg = arg.split()[0] if arg else ""
             if arg:
@@ -1229,8 +1315,6 @@ class UI:
             self.print_info(self.agent.attention.format_last(), C["cyan"])
         elif cmd == "/fabric":
             self._cmd_fabric(arg)
-        elif cmd == "/crew":
-            self._cmd_crew(arg)
         elif cmd == "/auto":
             self._cmd_auto(arg)
         elif cmd == "/prompt":
@@ -2448,119 +2532,6 @@ class UI:
             return
         self.print_error("usage: /mission [start|tick|list|abandon] …")
 
-    def _cmd_crew(self, arg: str) -> None:
-        """Persistent Codex-style subagents:
-        /crew                             roster + states
-        /crew spawn <role> <task>         launch a background subagent
-        /crew send <id> <message>         follow-up into its context
-        /crew wait [id,…]                 collect results (blocking)
-        /crew close <id> · /crew resume <id>"""
-        from .crew import CrewError
-        crew = self.agent.crew
-        parts = arg.split(None, 1)
-        sub = parts[0].lower() if parts else "status"
-        rest = parts[1].strip() if len(parts) > 1 else ""
-
-        if sub in ("", "status", "list"):
-            self.print_info(crew.format_status(), C["cyan"])
-            return
-        if sub == "spawn":
-            rparts = rest.split(None, 1)
-            if len(rparts) < 2:
-                self.print_error("usage: /crew spawn <role> <task>  "
-                                 "(roles: coder researcher tester "
-                                 "reviewer analyst)")
-                return
-            role, task = rparts[0], rparts[1]
-            try:
-                agent = crew.spawn(task, role=role,
-                                   context=self.agent.scout_context(),
-                                   read_only=self.agent.autonomy <= 1)
-            except CrewError as e:
-                self.print_error(str(e))
-                return
-            self.print_info(f"⚡ subagent [{agent.id}] '{agent.nickname}' "
-                            f"({agent.role}) launched in background — "
-                            f"/crew wait collects it", C["green"])
-            return
-        if sub == "send":
-            sparts = rest.split(None, 1)
-            if len(sparts) < 2:
-                self.print_error("usage: /crew send <id> <message>")
-                return
-            try:
-                agent = crew.send(sparts[0], sparts[1])
-            except CrewError as e:
-                self.print_error(str(e))
-                return
-            self.print_info(f"✓ message → [{agent.id}] '{agent.nickname}' "
-                            f"(state: {agent.state})", C["green"])
-            return
-        if sub == "wait":
-            ids = [s.strip() for s in rest.split(",") if s.strip()] or None
-            self.print_info("⏳ waiting for subagents…", C["dim"])
-            try:
-                states = crew.wait(ids, timeout=300.0)
-            except CrewError as e:
-                self.print_error(str(e))
-                return
-            self.print_info(f"states: {states}", C["cyan"])
-            self.console.print(self._crew_panel(
-                [crew.get(i) for i in states if crew.get(i)]))
-            return
-        if sub == "close":
-            try:
-                agent = crew.close(rest)
-            except CrewError as e:
-                self.print_error(str(e))
-                return
-            self.print_info(f"✓ [{agent.id}] '{agent.nickname}' closed",
-                            C["yellow"])
-            return
-        if sub == "resume":
-            try:
-                agent = crew.resume(rest)
-            except CrewError as e:
-                self.print_error(str(e))
-                return
-            self.print_info(f"✓ [{agent.id}] '{agent.nickname}' resumed "
-                            f"({agent.state})", C["green"])
-            return
-        self.print_error("crew subcommands: spawn · send · wait · close · "
-                         "resume · status")
-
-    def _crew_panel(self, agents) -> Panel:
-        """A rich panel rendering the crew's reports — role icons, status
-        glyphs, files touched, summaries."""
-        body = Text()
-        icons = {"done": ("✓", C["green"]), "blocked": ("◐", C["yellow"]),
-                 "error": ("✗", C["red"]), "closed": ("⊘", C["dim"]),
-                 "running": ("…", C["cyan"])}
-        role_icons = {"researcher": "🔎", "coder": "👨‍💻", "tester": "🧪",
-                      "reviewer": "🧐", "analyst": "📊"}
-        for a in agents:
-            glyph, color = icons.get(a.state, ("?", C["dim"]))
-            body.append(f"{role_icons.get(a.role, '◆')} ", style=color)
-            body.append(f"[{a.id}] {a.nickname}", style=f"bold {C['fg']}")
-            body.append(f" ({a.role}) ", style=C["dim"])
-            body.append(f"{glyph} {a.state}", style=f"bold {color}")
-            body.append(f"  ·  {a.tool_calls} tools · "
-                        f"{a.elapsed_ms / 1000:.1f}s\n", style=C["dim"])
-            body.append(f"  task: {a.task[:160]}\n", style=C["dim"])
-            if a.files_touched:
-                body.append("  files: ", style=C["dim"])
-                body.append(", ".join(a.files_touched[:8]) + "\n",
-                            style=C["cyan"])
-            if a.error:
-                body.append(f"  error: {a.error[:200]}\n", style=C["red"])
-            if a.summary:
-                body.append("  " + a.summary.replace("\n", "\n  ")[:900]
-                            + "\n", style=C["fg"])
-            body.append("\n")
-        return Panel(body, title=f"⚡ CREW — {len(agents)} subagent(s)",
-                     border_style=C["accent"], expand=False,
-                     padding=(0, 1))
-
     def _cmd_council(self, arg: str) -> None:
         """Convene an adversarial debate: /council <proposition>."""
         question = arg.strip()
@@ -2689,6 +2660,7 @@ class UI:
     def _run_turn_thread(self, text: str) -> None:
         self._busy = True
         self._cancel_flag.clear()
+        self._turn_start_ts = time.time()
         self._set_status("thinking…")
         self._start_spinner()
         self._last_preview_ts = 0.0
@@ -3187,6 +3159,13 @@ class UI:
             self.cfg.model_id = m.id
             self.cfg.save()
             self._set_flash(f"model → {m.label} ({m.id})", C["green"])
+            # SPEED: pre-warm the connection to the new provider so the
+            # next turn hits a warm socket instantly
+            from .client import prewarm_connection
+            from .config import PROVIDERS
+            p = PROVIDERS.get(m.provider)
+            if p:
+                prewarm_connection(p)
 
         self.overlay = OverlayList("SELECT MODEL", items, current, on_select)
         self.overlay.open()
@@ -3321,9 +3300,10 @@ class UI:
             # tagline + feature stripe under the ascii (kept ≤74 chars to avoid Panel wrap)
             banner.append("  ◆ FullAgent ", style=f"bold {C['accent']}")
             banner.append(f"v{__version__}", style=f"bold {C['pink']}")
-            banner.append("  ·  Event-Sourced Kernel  ·  Goal Contracts  ·  Crew", style=C["dim"])
+            banner.append("  ·  Event-Sourced Kernel  ·  Goal Contracts  ·  Self-Healing", style=C["dim"])
             banner.append("\n")
-            banner.append("  ⚡ 40+ Commands · 16 Tools · 5 Providers · Real-time Web · Self-Healing", style=C["dim"])
+            n_prov = len(PROVIDERS)
+            banner.append(f"  ⚡ 40+ Commands · 16 Tools · {n_prov} Providers · Real-time Web · Crew & Daemon", style=C["dim"])
             self.console.print(Panel(banner, width=width,
                                      border_style=C["border"], padding=(0, 1),
                                      title=f"[bold {C['accent']}]FullAgent[/]",
@@ -3336,7 +3316,7 @@ class UI:
             logo.append(f" v{__version__}", style=f"bold {C['pink']}")
             logo.append("  ·  advanced terminal AI agent", style=C["dim"])
             logo.append("\n")
-            logo.append("event-sourced kernel · goal contracts · persistent crew · "
+            logo.append("event-sourced kernel · goal contracts · "
                         "self-healing", style=C["dim"])
             self.console.print(Panel(logo, width=width,
                                      border_style=C["border"], padding=(0, 1)))
@@ -3362,9 +3342,7 @@ class UI:
         hints.append("Ctrl+T", style=f"bold {C['cyan']}")
         hints.append(" models · ", style=C["dim"])
         hints.append("Ctrl+E", style=f"bold {C['cyan']}")
-        hints.append(" effort · ", style=C["dim"])
-        hints.append("/crew", style=f"bold {C['pink']}")
-        hints.append(" background subagents", style=C["dim"])
+        hints.append(" effort", style=C["dim"])
         self.console.print(hints)
         self.console.print()
 
