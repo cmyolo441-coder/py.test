@@ -546,8 +546,7 @@ class Agent:
         # 'lost in the middle' effect where models lose focus on long prompts.
         # The reminder is placed right before the user message so it's the
         # LAST thing the model sees before generating a response.
-        # NOTE: uses "user" role because most APIs (TokenRouter, Qwen, etc.)
-        # reject requests with system messages after position 0.
+        # Use a user turn to keep the system instruction at position 0.
         sys_len = len(self.messages[0].get("content", "")) if self.messages else 0
         if sys_len > 50_000:
             self.messages.append({

@@ -19,21 +19,6 @@ _log = get_logger("client")
 RETRY_STATUSES = {408, 429, 500, 502, 503, 504}
 MAX_RETRIES = 3
 
-# TokenRouter's free tier admits a request only when its prompt cache is
-# warm; a cold or overloaded one is rejected with "cache-only admission
-# rejected". This is transient — backing off and retrying succeeds once the
-# cache warms up (the CLIs that "just work" retry implicitly). We give cold
-# rejections their own, longer retry budget, separate from MAX_RETRIES.
-_COLD_ADMISSION_RE = re.compile(
-    r"cache-only admission|cold or overloaded", re.I)
-MAX_COLD_RETRIES = 4
-COLD_RETRY_WAIT = 4.0  # seconds; multiplied by the retry number
-
-
-def is_cold_admission(message: str) -> bool:
-    return bool(_COLD_ADMISSION_RE.search(message or ""))
-
-
 class APIError(Exception):
     def __init__(self, message: str, status: int | None = None):
         super().__init__(message)
@@ -104,7 +89,7 @@ def assistant_message(content: str | None, tool_calls: list[dict],
     """Build an assistant message that is valid for thinking-aware
     backends.
 
-    Providers like TokenRouter (Qwen3) validate the *history*: any
+    Reasoning-capable backends can validate the *history*: any
     assistant turn that carried tool_calls must also carry
     reasoning_content when the model was invoked with thinking enabled
     (reasoning_effort=low). If the history was built while reasoning
@@ -196,14 +181,9 @@ def build_payload(model: Model, effort: Effort, messages: list[dict],
     if tools and model.supports_tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
-    # THINKING IS GLOBALLY OFF — no effort level ever turns it on. Every
-    # request to a reasoning-capable backend carries the strongest
-    # suppression that backend accepts (see _THINKING_OFF_PAYLOAD); any
-    # thinking tokens a backend still produces are dropped client-side,
-    # never streamed and never stored.
+    # Thinking remains disabled; Union Alpha does not advertise reasoning.
     if model.supports_reasoning:
-        payload.update(_THINKING_OFF_PAYLOAD.get(
-            model.provider, {"reasoning_effort": "none"}))
+        payload["reasoning_effort"] = "none"
     return payload
 
 
@@ -394,12 +374,7 @@ def _window_max_tokens(model: Model, effort: Effort, messages: list[dict],
 # FullAgent asks for 200k output tokens everywhere, but each backend has its
 # own hard ceiling. Clamp at send time so the request is never rejected for
 # an oversized max_tokens; providers without a known cap pass through.
-_MAX_TOKENS_CAP: dict[str, int] = {
-    "agnes": 65_536,   # sglang backend: "max_tokens exceeds the limit of 65536"
-    "bai": 131_072,    # B.AI: 200k max_tokens causes "openai_error"
-    "tokenrouter": 131_072,  # "Validation: max_tokens must be at most 131072"
-    "xkiro": 65_536,  # XKiro max_output_tokens is 65536 for all 4 models
-}
+_MAX_TOKENS_CAP: dict[str, int] = {"kilo": 131_072}
 
 
 def _clamp_max_tokens(provider_key: str, value: int) -> int:
@@ -407,24 +382,6 @@ def _clamp_max_tokens(provider_key: str, value: int) -> int:
     if cap is None:
         return value
     return min(value, cap)
-
-
-# THINKING IS GLOBALLY OFF. Every reasoning-capable model gets its
-# backend's strongest thinking suppression at send time:
-#   - tokenrouter (Qwen3.8 open-text checkpoints): the backend REJECTS
-#     enable_thinking=false ("checkpoints require thinking") and
-#     reasoning_effort must be low|medium|xhigh — so we force the
-#     floor effort "low". The thinking the model still produces is
-#     stripped client-side (never streamed, never stored).
-#   - bai (GLM models): "none" is rejected — must use low/high/max.
-#   - kiosapi (Grok 4.6): "none" is rejected — must use low.
-#   - every other provider: an explicit reasoning_effort "none".
-_THINKING_OFF_PAYLOAD: dict[str, dict[str, Any]] = {
-    "tokenrouter": {"reasoning_effort": "low"},
-    "bai": {"reasoning_effort": "low"},  # GLM: "none" rejected, use low
-    "kiosapi": {"reasoning_effort": "low"},  # Grok 4.6: "none" rejected
-    "xkiro": {"reasoning_effort": "low"},  # Qwen/MiniMax reasoning: use low
-}
 
 
 def _iter_sse_events(resp: requests.Response) -> Iterator[dict]:
@@ -597,14 +554,11 @@ def shrink_tool_outputs(messages: list[dict], keep: int = 1,
 def _check_api_key(provider: Provider) -> None:
     """Fail fast with actionable guidance instead of an opaque 401."""
     if not provider.api_key:
-        env_name = {"zen": "OPENCODE_API_KEY",
-                    "tokenrouter": "TOKENROUTER_API_KEY",
-                    "agnes": "AGNES_API_KEY"}.get(
-                        provider.key, f"{provider.key.upper()}_API_KEY")
+        env_name = f"{provider.key.upper()}_API_KEY"
         raise APIError(
             f"no API key configured for {provider.name}. Set the "
-            f"{env_name} environment variable (export {env_name}=sk-...) "
-            f"and restart.", status=401)
+            f"{env_name} environment variable or save the key in "
+            f"{config.APP_DIR / (provider.key + '_api_key')} and restart.", status=401)
 
 
 def chat_stream(provider: Provider, model: Model, effort: Effort,
@@ -719,15 +673,13 @@ def _chat_stream_with_retries(url: str, headers: dict, payload: dict,
                                on_token, on_reasoning, on_tool_start,
                                on_tool_args, should_cancel,
                                timeout: float) -> StreamResult:
-    """The plain retry loop (rate limits, timeouts, connection errors, and
-    TokenRouter cold-admission rejections).
+    """The plain retry loop (rate limits, timeouts, connection errors).
 
     A retry restarts the WHOLE request — once any token has already been
     streamed to the UI a restart would replay (duplicate) the completion on
     top of the partial output, so mid-output failures surface immediately
     instead of being retried."""
     last_error: Exception | None = None
-    cold_retries = 0
     attempt = 0
     emitted = {"out": False}
 
@@ -757,18 +709,6 @@ def _chat_stream_with_retries(url: str, headers: dict, payload: dict,
             raise
         except APIError as e:
             last_error = e
-            # Cold-admission rejection: not an HTTP failure and not a hard
-            # error — the prompt cache just isn't warm yet. Give it a
-            # dedicated backoff budget so a session-opening request on a
-            # free-tier endpoint survives until admission opens up.
-            if is_cold_admission(str(e)):
-                if should_cancel is not None and should_cancel():
-                    raise TurnCancelled()
-                cold_retries += 1
-                if cold_retries <= MAX_COLD_RETRIES:
-                    time.sleep(COLD_RETRY_WAIT * cold_retries)
-                    continue
-                raise
             if e.status in RETRY_STATUSES and attempt < MAX_RETRIES - 1:
                 # fast first retry, then escalate — rate limits resolve
                 # quickly on free tiers; never stall the UI for seconds
@@ -885,26 +825,6 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
     return result
 
 
-def _post_with_cold_retries(url: str, headers: dict, payload: dict,
-                            timeout: float) -> requests.Response:
-    """POST with a dedicated budget for TokenRouter cold-admission
-    rejections ("cache-only admission rejected"). Returns a 200 response or
-    raises; non-cold errors raise immediately."""
-    last: APIError | None = None
-    for cold in range(MAX_COLD_RETRIES + 1):
-        resp = _http().post(url, headers=headers, json=payload,
-                            timeout=timeout)
-        if resp.status_code == 200:
-            return resp
-        err = APIError(_extract_error_message(resp.text),
-                       status=resp.status_code)
-        if not is_cold_admission(str(err)) or cold >= MAX_COLD_RETRIES:
-            raise err
-        last = err
-        time.sleep(COLD_RETRY_WAIT * (cold + 1))
-    raise last
-
-
 def _result_from_json(data: dict, model_id: str) -> StreamResult:
     """Parse a non-streamed chat.completion JSON body into a StreamResult
     (shared by blocking mode and the stream-mode JSON fallback)."""
@@ -960,7 +880,11 @@ def chat_blocking(provider: Provider, model: Model, effort: Effort,
                 continue
             raise
         try:
-            resp = _post_with_cold_retries(url, headers, payload, timeout)
+            resp = _http().post(url, headers=headers, json=payload,
+                                timeout=timeout)
+            if resp.status_code != 200:
+                raise APIError(_extract_error_message(resp.text),
+                               status=resp.status_code)
         except APIError as err:
             if _is_reasoning_content_error(err):
                 if _sanitize_messages(messages):

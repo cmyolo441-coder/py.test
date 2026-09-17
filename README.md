@@ -22,7 +22,7 @@
   <a href="https://github.com/cmyolo441-coder/perfectagent/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-6272a4?style=flat-square" alt="license"></a>
 </p>
 
-*`Event-Sourced Kernel` · `Goal Contracts` · `Persistent Crew` · `Self-Healing` · `Temporal Kernel` · `40+ Slash Commands` · `16 Tools` · `5 Providers`*
+*`Event-Sourced Kernel` · `Goal Contracts` · `Persistent Crew` · `Self-Healing` · `Temporal Kernel` · `40+ Slash Commands` · `16 Tools` · `Kilo Code`*
 
 <p>
   <a href="#-install-binary--curl-one-liner"><b>Install</b></a> •
@@ -40,7 +40,7 @@
 > Terminal `python main.py` chalate hi ab naya gradient ASCII banner + session info dikhega — aur GitHub README pe yahi banner sabse upar.
 
 ```
-╭─ FullAgent ── model: MiMo v2.5 FREE ── effort: HIGH ── session a1b2c3d4 ─╮
+╭─ FullAgent ── model: Union Alpha ── effort: HIGH ── session a1b2c3d4 ─────╮
 │ ❯ type anything… the agent reads, writes, edits files, runs commands     │
 ╰─ Enter send · Esc+Enter newline · / commands · Ctrl+T models ────────────╯
 ```
@@ -56,6 +56,12 @@ works, the bottom border shows a live animated status:
 Tokens stream live above the box, tool calls appear as `⚙ name args` with
 `✓`/`✗` results, and each turn ends with a stats line (`2.3s · 512→87 tokens`).
 
+Streaming updates the unfinished-line preview on every token; only terminal
+redraws are throttled (about 33 fps). Complete lines print without waiting for
+the next token. Rapid submissions cannot overlap an active turn, including
+final rendering and session saving. Completed file-change output prints
+without artificial animation delays.
+
 <details>
 <summary><b>🖼️ Terminal Banner Preview (after <code>python main.py</code>)</b></summary>
 
@@ -63,7 +69,7 @@ Tokens stream live above the box, tool calls appear as `⚙ name args` with
  ◆ FullAgent v3.1.0  ·  advanced terminal AI agent
  event-sourced kernel · goal contracts · persistent crew · self-healing
  ──────────────────────────────────────────────────────────────────
- ❯ model  MiMo v2.5 FREE   effort  high   autonomy  L4   session  a1b2c3d4
+ ❯ model  Union Alpha   effort  high   autonomy  L4   session  a1b2c3d4
    / commands · Ctrl+T models · Ctrl+E effort · /crew background subagents
 ```
 
@@ -91,6 +97,7 @@ to install elsewhere (e.g. `INSTALL_DIR=$HOME/.local/bin curl -fsSL … | bash`)
 
 ```bash
 pip install prompt_toolkit rich requests
+export KILO_API_KEY='your-kilo-api-key'
 python main.py
 ```
 
@@ -120,8 +127,7 @@ python main.py
   `wait_for_agents` collects results, `close_agent` / `resume_agent`
   manage the lifecycle. Subagents run **one at a time** through a serial
   queue — never in parallel. Live progress streams in the prompt border.
-  Every subagent accepts a **per-agent model override** (route grunt
-  work to a fast model, the hard piece to the strongest one)
+  All subagents use Union Alpha through Kilo Code.
 - **Focus Mode** — deep work: `/focus 10` arms auto-continuation and the
   agent keeps working turn after turn until the goal closes, progress
   stalls, or the budget pauses. Every continuation decision is a sealed
@@ -138,9 +144,8 @@ python main.py
   report: timeline, tool stats, judge verdicts, per-model usage
 - **Forecast** — `/forecast` projects turns-to-done from measured goal
   velocity and tokens-per-turn (numbers, not vibes)
-- **Provider failover** — on outage (429/5xx) the agent switches to a
-  fallback model once, sealed as `provider.failover`; `/health` shows
-  the stats
+- **Provider health** — `/health` shows model errors. No alternate model
+  or provider is configured, so cross-model failover is unavailable.
 - **Notifications** — `/notify <webhook|file:path>` fires kernel events
   (goal closed, focus stop, workflow done…) to your sink
 - **Session resume** — `/resume` lists branches/sessions; continue any
@@ -207,7 +212,7 @@ Event-log commands:
   composed context, lineage)
 - `/dashboard` — live observability: cost, goal, crew, router, spec,
   memory, health in one screen
-- `/router` — smart model routing: decisions + savings vs always-strongest
+- `/router` — task classification and routing history; all tasks use Union Alpha
 - `/spec` — speculative execution: prefetch stats + hit-rate
 - `/recall <question>` — semantic (meaning-based) memory recall
 - `/mission [start|tick|list|abandon]` — daemon mission control
@@ -231,34 +236,36 @@ tokens, temperature, and reasoning effort.
 
 ## Models & providers
 
-Six OpenAI-compatible providers are built in:
+Both **Kilo Code** and **Kios API** are available. The default model is
+Union Alpha; saved selections of removed models fall back to it. Custom
+providers and `models.json` loading are no longer supported.
 
-- **OpenCode Zen** (`https://opencode.ai/zen/v1`) — mimo-v2.5-free,
-  big-pickle, grok-code-fast-1, claude-sonnet-4-5, claude-opus-4-6,
-  gemini-3.1-pro, gpt-5.2, muse-spark-1.2-contributor-free,
-  muse-spark-1.3-contributor-free
-- **TokenRouter** (`https://api.tokenrouter.com/v1`) — qwen/qwen3.8-max-free,
-  deepseek-ai/DeepSeek-V3.2, deepseek/deepseek-v4-pro-0813-free,
-  moonshotai/Kimi-K2-Instruct
-- **Agnes** (`https://apihub.agnes-ai.com/v1`) — agnes-2.5-flash (fast,
-  tool-capable, reasoning-aware)
-- **ZenMux** (`https://zenmux.ai/api/v1`) — dots-studio/dots3-note-prev
-- **NVIDIA NIM** (`https://integrate.api.nvidia.com/v1`) —
-  deepseek-ai/deepseek-v4-pro-0813 (1M context, tool-calling, reasoning)
-- **KiosAPI Router** (`https://router.kiosapi.com/v1`) —
-  grok-composer-2.5-fast, grok-4.6, oc/muse-spark-1.2-contributor
+- Kilo — Base URL: `https://api.kilo.ai/api/gateway`; context window
+  262,144 tokens; maximum completion 131,072 tokens; tool calling
+  supported; reasoning parameters omitted
+- Kios — Base URL: `https://kiosapi.com/v1`; model `atria-dawn-preview`
+  (OpenAI-compatible chat + tool calling)
 
-API keys ship as built-in defaults so the app works out of the box;
-environment variables always take precedence if you want to use your
-own:
 
-```bash
-export OPENCODE_API_KEY=***      # OpenCode Zen (default provider)
-# and/or: TOKENROUTER_API_KEY, AGNES_API_KEY, ZENMUX_API_KEY, NVIDIA_API_KEY, KIOSAPI_API_KEY
+No API keys are embedded in source. Configure a key before starting:
+
+export KIOS_API_KEY='your-kios-api-key'
+python main.py
 ```
 
-> ⚠️ The built-in keys live in git history — if you push this repo
-> publicly, rotate them or replace them with your own.
+| Provider | Base URL | Model |
+|---|---|---|
+| Kilo Code | `https://api.kilo.ai/api/gateway` | `stealth/union-alpha` |
+| Kios API | `https://kiosapi.com/v1` | `atria-dawn-preview` |
+
+`/models list` shows both models; `/model` or Ctrl+T opens the selector.
+The turn always runs on your selected model; failover happens only on a
+provider outage (see `/health`).
+Save the key instead in `~/.fullagent/kilo_api_key` or
+`~/.fullagent/kios_api_key` (permissions `600`); env vars take precedence.
+Keep keys outside the repository. Previously embedded credentials may remain
+in git history and should be rotated; removing them from current source does
+not revoke them.
 
 Config (model, effort, auto-approve) persists in
 `~/.fullagent/config.json`; sessions save to `~/.fullagent/sessions/`.
@@ -285,7 +292,7 @@ fullagent/
   crew.py          persistent Codex-style subagents — serial execution, one at a time
   workflows.py     saved multi-step pipelines — phased orchestration (serial steps)
   autopilot.py     self-routing: auto goal mode / real-time web
-  router.py        smart model routing — cheapest capable model per task
+  router.py        task classification and routing through Union Alpha
   semantic.py      semantic vector memory — meaning-based recall
   speculate.py     speculative execution — prefetch read-only tool calls
   dashboard.py     live observability — real-time ledger projection
@@ -308,6 +315,9 @@ with `FULLAGENT_HOME`). Each module ships a self-test:
 `.team`, `.crew`, `.autopilot`, `.systemprompt`, `.mastermind`, `.router`,
 `.semantic`, `.speculate`, `.dashboard`, `.daemon`, `.healer`, `.skills`,
 `.council`, `.taint`, `.kgraph`, `.cov`, `.fuzz`, `.mutate`).
+
+Streaming/UI regressions (no API key needed), from this directory:
+`python -m unittest discover -s tests -v`.
 
 ## System prompts — one file, one delivery path
 
@@ -334,9 +344,8 @@ registering it in the `PROMPTS` map (or call `register()` at runtime).
 ## Output budget — 200k tokens
 
 Every effort level requests **200,000 output tokens** (`config.MAX_TOKENS`).
-Backends with a lower hard ceiling (e.g. Agnes caps at 65,536) are clamped
-per-provider at send time in `client.py`, so the request is never rejected
-for an oversized `max_tokens`.
+The client clamps requests to Union Alpha's **131,072-token** completion
+ceiling and the remaining context window before sending them to Kilo.
 
 ## Mastermind — coherence, not coercion
 
@@ -364,7 +373,7 @@ from the log.
 
 | Module | What it does | Command |
 |---|---|---|
-| **router.py** | The cost brain. A deterministic difficulty classifier (reasoning, code density, tooling, length) scores each task; a capability/cost table scores the models; the cheapest model that clears the task's difficulty + a quality margin wins. Tool-needing tasks never land on no-tool models; a pinned model that can't do the job is escalated past. Savings vs always-using-the-strongest are auditable. | `/router` |
+| **router.py** | A deterministic difficulty classifier scores each task and records routing decisions. This build routes all tasks to Union Alpha; no alternate models or cost-saving switches are available. | `/router` |
 | **semantic.py** | Hippocampus 2.0. Every episode, fact and dead-end is embedded via signed feature hashing (stdlib only, no numpy) and recalled by cosine similarity — "how did we solve a similar problem before?", including remembering what *failed*. The index is a pure projection of the log and refreshes itself. Recall is injected into the memory context section each turn. | `/recall <q>` |
 | **speculate.py** | While the model thinks, the agent predicts the read-only calls it will likely make (paths in your message, search verbs, siblings of recent reads) and prefetches them in a background pool. When the model actually asks, the result is served from cache — a hit instead of an execution. Only whitelisted read-only tools can ever be prefetched; a speculative write is structurally impossible. | `/spec` |
 | **dashboard.py** | The X-ray: cost, tokens, goal progress bar, crew reports, routing spend, speculation hit-rate, memory counts, verdicts, loop alerts and budget events — one screen, always agreeing with the kernel because it is a fold. | `/dashboard` |

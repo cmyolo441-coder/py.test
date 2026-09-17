@@ -5,7 +5,7 @@ The double-line box stays pinned at the bottom at all times; all output
 (user echo, streamed tokens, tool lines, errors) scrolls above it through
 prompt_toolkit's patch_stdout. The box border carries live state:
 
-    ╭─ FullAgent ──●── MiMo v2.5 ──◆ FREE── ◈ high ──⬢ L3── ◎ goal ▰▰▰▱▱ 60% ──◉ ctx 12% ─╮
+    ╭─ FullAgent ──●── Union Alpha ── ◈ high ──⬢ L3── ◎ goal ▰▰▰▱▱ 60% ──◉ ctx 12% ─╮
     │ ❯ user types here…                                                       │
     ╰ ⏎ send · ⇧⏎ newline · / cmds · ^T models · ^E effort ────────────────────╯
 
@@ -634,7 +634,7 @@ class UI:
 
     def _invalidate(self) -> None:
         try:
-            get_app().invalidate()
+            self.app.invalidate()
         except Exception:
             pass
 
@@ -884,6 +884,7 @@ class UI:
             style=STYLE,
             key_bindings=self._build_key_bindings(),
             full_screen=False,
+            min_redraw_interval=0.03,
             mouse_support=False,
         )
 
@@ -1114,9 +1115,16 @@ class UI:
             self._set_flash("busy — wait for the current turn (Ctrl+C to "
                             "cancel)", C["yellow"])
             return
-        self._emit_user(text)
-        threading.Thread(target=self._run_turn_thread, args=(text,),
-                         daemon=True).start()
+        # Claim the turn on the UI thread, before a worker can be scheduled.
+        self._busy = True
+        self._cancel_flag.clear()
+        try:
+            self._emit_user(text)
+            threading.Thread(target=self._run_turn_thread, args=(text,),
+                             daemon=True).start()
+        except Exception:
+            self._busy = False
+            raise
 
     def _handle_slash(self, text: str) -> None:
         parts = text.strip().split(None, 1)
@@ -1161,17 +1169,7 @@ class UI:
                 self.open_model_selector()
         elif cmd == "/models":
             sub = arg.strip().lower()
-            if sub == "reload":
-                from . import config as _cfg
-                before = len(_cfg.MODELS)
-                _cfg.load_custom_models()
-                after = len(_cfg.MODELS)
-                added = after - before
-                self.print_info(
-                    f"✓ models reloaded — {after} total"
-                    + (f" (+{added} new)" if added else ""),
-                    C["green"])
-            elif sub == "list":
+            if sub in ("", "list"):
                 from .config import MODELS as _MODELS, PROVIDERS as _PROVS
                 lines = [f"MODELS ({len(_MODELS)}):"]
                 for m in _MODELS:
@@ -1182,9 +1180,8 @@ class UI:
                 self.print_info("\n".join(lines), C["cyan"])
             else:
                 self.print_info(
-                    "usage: /models reload | /models list\n"
-                    "  reload — hot-load models.json (add models without restart)\n"
-                    "  list   — show all available models",
+                    "usage: /models list\n"
+                    "  Use /model to select an available model.",
                     C["dim"])
         elif cmd == "/effort":
             arg = arg.split()[0] if arg else ""
@@ -1352,7 +1349,7 @@ class UI:
             self.print_info(f"{APP_NAME} v{__version__} — advanced terminal "
                             "AI agent", C["accent"])
             self.print_info("  python + prompt_toolkit + rich · "
-                            "OpenCode Zen & TokenRouter providers", C["dim"])
+                            + " · ".join(p.name for p in PROVIDERS.values()), C["dim"])
         else:
             self.print_error(f"unknown command: {cmd} — try /help")
 
@@ -1647,11 +1644,7 @@ class UI:
                 lines.append(f"  model errors           : {m} × {n}")
         else:
             lines.append("  model errors           : none")
-        fb = str(self.cfg.extra.get("failover_model", "") or "")
-        lines.append(f"  failover target        : "
-                     f"{fb or 'auto (same provider first)'}")
-        lines.append("  set explicit target    : edit config.json -> "
-                     "\"failover_model\"")
+        lines.append("  failover              : disabled (manual model selection)")
         self.print_info("\n".join(lines), C["cyan"])
 
     def _cmd_notify(self, arg: str) -> None:
@@ -2659,49 +2652,31 @@ class UI:
 
     def _run_turn_thread(self, text: str) -> None:
         self._busy = True
-        self._cancel_flag.clear()
+        try:
+            self._run_turn(text)
+        finally:
+            self._stop_spinner()
+            self._busy = False
+            self._set_status("")
+            self._invalidate()
+
+    def _run_turn(self, text: str) -> None:
         self._turn_start_ts = time.time()
         self._set_status("thinking…")
         self._start_spinner()
-        self._last_preview_ts = 0.0
-        self._preview_pending = False
-        streamed = {"n": 0}
-        # SPEED: single tail string — appending a token is O(1), never a
-        # re-join of the whole stream (that was quadratic on long replies).
-        # "blank" tracks blank-line runs so the model's "\n\n\n" spam
-        # between tool calls collapses to a single blank line.
+        # Only retain the unfinished line; emit complete lines immediately.
+        # Throttle terminal redraws in Application, never token ingestion.
         stream_tail = {"t": "", "blank": False}
         render_md = bool(self.cfg.extra.get("render_markdown", False))
-        md_buf: list[str] = []
-        md_len = {"n": 0}
+        md_preview = ""
 
         def on_token(piece: str):
-            streamed["n"] += len(piece)
-            now = time.time()
-            if now - self._last_preview_ts < 0.03:
-                # SPEED: coalesce border redraws to ~33fps — a long reply
-                # streams thousands of chunks; redrawing on every one
-                # wastes CPU and makes the box stutter
-                if render_md:
-                    md_buf.append(piece)
-                    md_len["n"] += len(piece)
-                else:
-                    stream_tail["t"] += piece
-                self._preview_pending = True
-                return
-            self._last_preview_ts = now
-            self._preview_pending = False
+            nonlocal md_preview
             if render_md:
-                # markdown mode: nothing raw hits the console — the live
-                # preview runs in the box border, the finished reply is
-                # printed once, rendered as rich Markdown.
-                md_buf.append(piece)
-                md_len["n"] += len(piece)
-                maxw = self._width() - 26
-                if md_len["n"] <= maxw:
-                    preview = "".join(md_buf).strip("\n")
-                else:
-                    preview = ("".join(md_buf))[-maxw:].strip("\n")
+                # Keep a bounded preview; the agent owns the complete reply.
+                maxw = max(1, self._width() - 26)
+                md_preview = (md_preview + piece)[-maxw:]
+                preview = md_preview.strip("\n")
                 self._set_status(preview if preview else "writing…")
                 return
             # patch_stdout can only interleave output safely when every
@@ -2725,7 +2700,7 @@ class UI:
                     self.console.print(Text("\n".join(out)), soft_wrap=True)
                 tail = rem
             stream_tail["t"] = tail
-            maxw = self._width() - 26
+            maxw = max(1, self._width() - 26)
             preview = tail.strip("\n")
             if len(preview) > maxw:
                 preview = preview[-maxw:]
@@ -2926,9 +2901,8 @@ class UI:
                 self.console.print(self._write_footer(ev, live_f["count"]))
             elif ev.name in ("write_file", "edit_file", "apply_patch") \
                     and ev.status in ("done", "error"):
-                # live-write animation — the file changes cascade down the
-                # terminal line by line, like model tokens streaming
-                self._stream_live_block(ev)
+                # Completed output must not delay the next model request.
+                self.console.print(self._live_block(ev))
             elif ev.name in ("run_command", "live_shell") \
                     and ev.status in ("done", "error"):
                 if shell_live["streamed"]:
@@ -2983,7 +2957,6 @@ class UI:
             else:
                 self.console.print()
             self._stop_spinner()
-            self._busy = False
             self._set_status("")
             self._invalidate()
 
@@ -3026,7 +2999,7 @@ class UI:
                         f"({self._focus_remaining} turn(s) left)…",
                         C["pink"])
                     self._emit_user("CONTINUE (focus mode)")
-                    self._run_turn_thread(cont)
+                    self._run_turn(cont)
                     return
 
     def _print_turn_stats(self, turn) -> None:
@@ -3677,47 +3650,6 @@ class UI:
             out.append(t)
         return out
 
-    def _stream_delay(self, n_lines: int) -> float:
-        """Per-line delay for the live-write animation. Tuned so the cascade
-        is unmistakably 'live': ~24ms/line, the whole block capped at ~3.5s,
-        and even tiny edits get >= ~0.5s so they don't just flash by. A fast
-        ~8ms/line dump reads as an instant append on a scrolling terminal —
-        that's what made writes look non-live before."""
-        if not self.cfg.extra.get("live_stream_edits", True):
-            return 0.0
-        if not self.console.is_terminal:
-            return 0.0  # piped/redirected output — never animate
-        if n_lines <= 0:
-            return 0.0
-        per = min(0.024, 3.5 / n_lines)   # keep the whole block under ~3.5s
-        per = max(per, 0.5 / n_lines)     # keep small blocks >= ~0.5s total
-        return per
-
-    def _stream_live_block(self, ev: ToolEvent) -> None:
-        """Stream a finished write/edit/patch block line by line — the same
-        live feel as model token streaming, but for file changes. Runs on
-        the turn's worker thread, so sleeping between lines never blocks
-        the prompt_toolkit event loop."""
-        lines = self._live_body_lines(ev)
-        n = len(lines)
-        if n == 0:
-            return
-        delay = self._stream_delay(n)
-        rel = self._rel_path(str(ev.args.get("path", "")))
-        verb = {"write_file": "writing", "edit_file": "editing",
-                "apply_patch": "patching"}.get(ev.name, "writing")
-        last_status = 0.0
-        for idx, line in enumerate(lines):
-            if self._cancel_flag.is_set():
-                delay = 0.0  # cancelled — flush the rest instantly
-            self.console.print(line, soft_wrap=True)
-            if delay and idx < n - 1:
-                now = time.time()
-                if now - last_status >= 0.08:
-                    self._set_status(f"{verb} {rel} · "
-                                     f"{idx + 1}/{n} lines…")
-                    last_status = now
-                time.sleep(delay)
 
     def _live_block(self, ev: ToolEvent) -> Text:
         """Devin-CLI style live-action block (see banner above). The header

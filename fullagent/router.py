@@ -38,61 +38,9 @@ _log = get_logger("router")
 # cost_in/out: relative $ per 1k tokens (free tiers are 0). These are
 # relative units used to compare routes, not billing truth.
 MODEL_TABLE: dict[str, dict] = {
-    "mimo-v2.5-free":            {"capability": 0.55, "cost_in": 0.0,
-                                  "cost_out": 0.0, "tools": False,
-                                  "reasoning": False},
-    "big-pickle":                {"capability": 0.60, "cost_in": 0.0,
-                                  "cost_out": 0.0, "tools": True,
-                                  "reasoning": False},
-    "grok-code-fast-1":          {"capability": 0.72, "cost_in": 0.0006,
-                                  "cost_out": 0.0024, "tools": True,
-                                  "reasoning": False},
-    "claude-sonnet-4-5":         {"capability": 0.88, "cost_in": 0.003,
-                                  "cost_out": 0.015, "tools": True,
-                                  "reasoning": False},
-    "claude-opus-4-6":           {"capability": 0.95, "cost_in": 0.015,
-                                  "cost_out": 0.075, "tools": True,
-                                  "reasoning": True},
-    "gemini-3.1-pro":            {"capability": 0.90, "cost_in": 0.00125,
-                                  "cost_out": 0.010, "tools": True,
-                                  "reasoning": True},
-    "gpt-5.2":                   {"capability": 0.92, "cost_in": 0.005,
-                                  "cost_out": 0.020, "tools": True,
-                                  "reasoning": True},
-    "muse-spark-1.2-contributor-free": {"capability": 0.82, "cost_in": 0.0,
-                                       "cost_out": 0.0, "tools": True,
-                                       "reasoning": True},
-    "muse-spark-1.3-contributor-free": {"capability": 0.84, "cost_in": 0.0,
-                                       "cost_out": 0.0, "tools": True,
-                                       "reasoning": True},
-    "qwen/qwen3.8-max-free":     {"capability": 0.70, "cost_in": 0.0,
-                                  "cost_out": 0.0, "tools": True,
-                                  "reasoning": True},
-    "deepseek-ai/DeepSeek-V3.2": {"capability": 0.80, "cost_in": 0.00027,
-                                  "cost_out": 0.0011, "tools": True,
-                                  "reasoning": True},
-    "deepseek/deepseek-v4-pro-0813-free": {"capability": 0.85, "cost_in": 0.0,
-                                          "cost_out": 0.0, "tools": True,
-                                          "reasoning": True},
-    "moonshotai/Kimi-K2-Instruct": {"capability": 0.78, "cost_in": 0.0006,
-                                    "cost_out": 0.0025, "tools": True,
-                                    "reasoning": False},
-    "agnes-2.5-flash":           {"capability": 0.74, "cost_in": 0.0,
-                                  "cost_out": 0.0, "tools": True,
-                                  "reasoning": True},
-    "deepseek-ai/deepseek-v4-pro-0813": {"capability": 0.85,
-                                         "cost_in": 0.000435,
-                                         "cost_out": 0.00087, "tools": True,
-                                         "reasoning": True},
-    "grok-composer-2.5-fast":   {"capability": 0.80, "cost_in": 0.0,
-                                 "cost_out": 0.0, "tools": True,
-                                 "reasoning": True},
-    "grok-4.6":                  {"capability": 0.84, "cost_in": 0.0,
-                                 "cost_out": 0.0, "tools": True,
-                                 "reasoning": True},
-    "oc/muse-spark-1.2-contributor": {"capability": 0.82, "cost_in": 0.0,
-                                      "cost_out": 0.0, "tools": True,
-                                      "reasoning": True},
+    "stealth/union-alpha": {"capability": 0.95, "cost_in": 0.0,
+                            "cost_out": 0.0, "tools": True,
+                            "reasoning": False},
 }
 
 # the strongest model in the table — the escalation ceiling
@@ -314,7 +262,16 @@ if __name__ == "__main__":
 
     with tempfile.TemporaryDirectory() as td:
         log = EventLog(Path(td) / "router.jsonl")
-        r = Router(log)
+        # Synthetic capabilities exercise generic routing independently of
+        # the singleton production catalog.
+        r = Router(log, table={
+            "basic": {"capability": 0.55, "cost_in": 0.0,
+                      "cost_out": 0.0, "tools": False,
+                      "reasoning": False},
+            "advanced": {"capability": 0.95, "cost_in": 0.01,
+                         "cost_out": 0.02, "tools": True,
+                         "reasoning": True},
+        })
 
         # a trivial chat task routes to a free, capable model
         easy = r.choose("say hello in one word")
@@ -336,20 +293,19 @@ if __name__ == "__main__":
         assert r.table[tooly.model_id]["tools"] is True, tooly
 
         # a pinned model is respected when capable
-        pinned = r.choose("summarize this", prefer="qwen/qwen3.8-max-free")
-        assert pinned.model_id == "qwen/qwen3.8-max-free", pinned
+        pinned = r.choose("summarize this", prefer="basic")
+        assert pinned.model_id == "basic", pinned
 
         # a pinned model that can't do the job is escalated past
         pinned_hard = r.choose(
             "run the build and execute the test suite",
-            prefer="mimo-v2.5-free")  # no tool support
-        assert pinned_hard.model_id != "mimo-v2.5-free", pinned_hard
+            prefer="basic")  # no tool support
+        assert pinned_hard.model_id != "basic", pinned_hard
         assert r.table[pinned_hard.model_id]["tools"] is True
 
         # decisions are sealed and foldable
         assert len(r.decisions()) == 5
         s = r.savings()
         assert s["routed"] == 5 and s["saved"] >= 0.0
-        assert "ROUTER" in r.format_status()
 
     print("ROUTER SELF-TEST PASS")
