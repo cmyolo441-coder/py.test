@@ -477,12 +477,15 @@ def glob_files(pattern: str, path: str = ".") -> str:
 
 def _pump_process(proc: "subprocess.Popen", timeout: float,
                   on_output: "Callable[[str, str], None] | None" = None,
+                  should_cancel: "Callable[[], bool] | None" = None,
                   ) -> tuple[list, list] | None:
     """Read stdout/stderr of `proc` line-by-line until it exits or the
     timeout elapses. Returns (stdout_lines, stderr_lines), or None on
     timeout (the process is killed). Every line is relayed to
     on_output(line, "out"|"err") the moment it is produced — this is what
-    lets the TUI stream shell output live, like watching a real terminal."""
+    lets the TUI stream shell output live, like watching a real terminal.
+    If `should_cancel` is set and returns True, the process is killed
+    immediately and partial output is returned (Esc/Ctrl+C support)."""
     q: "queue.Queue" = queue.Queue()
 
     def pump(stream, tag: str) -> None:
@@ -503,7 +506,12 @@ def _pump_process(proc: "subprocess.Popen", timeout: float,
     err_lines: list = []
     open_streams = 2
     deadline = time.monotonic() + timeout
+    cancelled = False
     while open_streams > 0:
+        # Esc/Ctrl+C: kill the process immediately
+        if should_cancel is not None and should_cancel():
+            cancelled = True
+            break
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             proc.kill()
@@ -525,6 +533,15 @@ def _pump_process(proc: "subprocess.Popen", timeout: float,
                 on_output(line.rstrip("\n"), tag)
             except Exception:  # noqa: BLE001 — never break the tool
                 pass
+    if cancelled:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        proc.wait()
+        # Mark as cancelled so the caller can report it properly
+        out_lines.append("\n[CANCELLED by user (Esc/Ctrl+C)]\n")
+        return out_lines, err_lines
     proc.wait()
     return out_lines, err_lines
 
@@ -546,13 +563,15 @@ def _validate_shell_args(command: str, timeout: int,
 
 
 def run_command(command: str, timeout: int = 120,
-                on_output: "Callable[[str, str], None] | None" = None) -> str:
+                on_output: "Callable[[str, str], None] | None" = None,
+                should_cancel: "Callable[[], bool] | None" = None) -> str:
     """Run a shell command via bash and return exit code + output.
 
     The shell is resolved once (judge.resolve_shell): on Windows,
     System32\\bash.exe is the WSL stub and fails when no distro is
     installed, so Git Bash is probed and preferred. If `on_output` is
-    provided, each output line is streamed to it live as it appears."""
+    provided, each output line is streamed to it live as it appears.
+    If `should_cancel` returns True, the process is killed (Esc/Ctrl+C)."""
     command, secs, err = _validate_shell_args(command, timeout)
     if err:
         return err
@@ -570,7 +589,7 @@ def run_command(command: str, timeout: int = 120,
         )
     except OSError as e:
         return f"ERROR: {e}"
-    pumped = _pump_process(proc, secs, on_output)
+    pumped = _pump_process(proc, secs, on_output, should_cancel)
     if pumped is None:
         return f"ERROR: command timed out after {secs:g}s"
     out_lines, err_lines = pumped
@@ -596,7 +615,8 @@ _SHELL_STATE = {"cwd": None,        # sticky working directory
 
 
 def live_shell(command: str, timeout: int = 120,
-               on_output: "Callable[[str, str], None] | None" = None) -> str:
+               on_output: "Callable[[str, str], None] | None" = None,
+               should_cancel: "Callable[[], bool] | None" = None) -> str:
     """Run a command inside a persistent bash session.
 
     Unlike `run_command` (which spawns a fresh shell per call), this one
@@ -620,11 +640,13 @@ def live_shell(command: str, timeout: int = 120,
     # read a cwd/env that the first command is about to change — the
     # interleaving this lock exists to prevent.
     with _SHELL_LOCK:
-        return _live_shell_locked(argv, command, secs, on_output)
+        return _live_shell_locked(argv, command, secs, on_output,
+                                  should_cancel)
 
 
 def _live_shell_locked(argv: list[str], command: str, timeout: float,
-                       on_output: "Callable[[str, str], None] | None"
+                       on_output: "Callable[[str, str], None] | None",
+                       should_cancel: "Callable[[], bool] | None" = None
                        ) -> str:
     """live_shell body; the caller must hold _SHELL_LOCK."""
     cwd = _SHELL_STATE["cwd"] or os.getcwd()
@@ -685,7 +707,7 @@ def _live_shell_locked(argv: list[str], command: str, timeout: float,
         )
     except OSError as e:
         return f"ERROR: {e}"
-    pumped = _pump_process(proc, timeout, relay)
+    pumped = _pump_process(proc, timeout, relay, should_cancel)
     if pumped is None:
         return f"ERROR: command timed out after {timeout:g}s (cwd={cwd})"
     out_lines, err_lines = pumped

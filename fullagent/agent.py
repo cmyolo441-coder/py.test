@@ -217,6 +217,11 @@ class Agent:
         self.tools = build_registry()
         self.session_id = uuid.uuid4().hex[:8]
         self.turns: list[Turn] = []
+        # Cancellation flag — the TUI sets this on Esc/Ctrl+C. The turn
+        # loop and long-running tools (run_command, crew) check it to
+        # stop promptly. Cleared at the start of every turn.
+        import threading
+        self._cancel_flag = threading.Event()
 
         # Temporal kernel + the nine subsystems
         config.ensure_dirs()
@@ -507,6 +512,8 @@ class Agent:
         started = time.time()
         self._turn_start_seq = self.log.head()
         self._failed_over = False
+        # Fresh turn: clear any stale cancellation from a previous turn
+        self._cancel_flag.clear()
 
         # AUTOPILOT: the agent decides for itself which powers this turn
         # needs — goal mode, real-time web — and enables
@@ -1295,6 +1302,9 @@ class Agent:
             if on_tool_output is not None and ev.name in ("run_command",
                                                           "live_shell"):
                 extra["on_output"] = on_tool_output
+            # Esc/Ctrl+C: let shell tools kill their subprocess promptly
+            if ev.name in ("run_command", "live_shell"):
+                extra["should_cancel"] = self._cancel_flag.is_set
             try:
                 ev.result = tool.handler(**ev.args, **extra)
                 ev.status = "done"
