@@ -97,10 +97,24 @@ class TreeSearch:
         if not items or not strategies:
             return SearchReport({}, 0.0, 0, 0, 0, 0)
 
-        root = StrategyNode(untried=[(0, s) for s in strategies])
-        best: dict = {}
-        best_score = 0.0  # evaluator range is [0,1] — never leak a sentinel
+        # Cap the branching factor: with many strategies the frontier
+        # explodes combinatorially. _MAX_CHILDREN_EXPANSION was defined
+        # but never used — the tree grew unbounded. Sample the move set
+        # when it exceeds the cap (deterministic via self.rng).
+        def capped_moves(item: int) -> list[tuple[int, str]]:
+            moves = [(item, s) for s in strategies]
+            if len(moves) > _MAX_CHILDREN_EXPANSION:
+                moves = self.rng.sample(moves, _MAX_CHILDREN_EXPANSION)
+            return moves
+
+        root = StrategyNode(untried=capped_moves(0))
+        # -inf, not 0.0: the old 0.0 init assumed evaluator output in
+        # [0, 1]. A scorer returning negatives left `best` as {} even
+        # with valid assignments explored — a silent wrong answer.
+        best: dict[int, str] = {}
+        best_score = float("-inf")
         it = 0
+        stale = 0
         while it < iterations and time.monotonic() - t0 < deadline_s:
             it += 1
             node = root
@@ -116,8 +130,8 @@ class TreeSearch:
                 child = StrategyNode(
                     assignment={**node.assignment, item: strat},
                     parent=node,
-                    untried=[(item + 1, s) for s in strategies
-                             ] if item + 1 < len(items) else [])
+                    untried=capped_moves(item + 1)
+                    if item + 1 < len(items) else [])
                 node.children.append(child)
                 node = child
 
@@ -136,10 +150,30 @@ class TreeSearch:
 
             if score > best_score:
                 best_score, best = score, dict(assignment)
+                stale = 0
+            else:
+                # Early stop on convergence: when the search stops
+                # finding anything better for long enough, further
+                # iterations only burn evaluator calls. The bar scales
+                # with the iteration budget so short searches are
+                # unaffected.
+                stale += 1
+                if stale >= max(20, iterations // 4):
+                    break
 
-        depth = max((len(n.assignment) for _ in
-                     [0] for n in _walk(root)), default=0)
-        nodes = sum(1 for _ in _walk(root))
+        # Single tree walk for both stats (was two full walks).
+        nodes = 0
+        depth = 0
+        stack = [root]
+        while stack:
+            n = stack.pop()
+            nodes += 1
+            d = len(n.assignment)
+            if d > depth:
+                depth = d
+            stack.extend(n.children)
+        if best_score == float("-inf"):
+            best_score = 0.0
         report = SearchReport(best_assignment=best,
                               best_score=best_score, iterations=it,
                               nodes=nodes, depth=depth,

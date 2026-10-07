@@ -37,6 +37,15 @@ def _hash_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+# a valid object id is always a 64-char lowercase hex digest — anything
+# else is corruption or an attack, never a real blob
+_VALID_HASH = frozenset("0123456789abcdef")
+
+
+def _valid_hash(h: str) -> bool:
+    return len(h) == 64 and all(c in _VALID_HASH for c in h)
+
+
 class SnapshotStore:
     """Content-addressed blob + tree storage. Stateless beyond the disk."""
 
@@ -48,6 +57,10 @@ class SnapshotStore:
     # -- blobs ---------------------------------------------------------------
 
     def _obj_path(self, h: str) -> Path:
+        if not _valid_hash(h):
+            # corrupt manifests / hostile input must not turn into
+            # filesystem path traversal (e.g. h="../../etc/x")
+            raise ValueError(f"invalid blob hash: {h!r}")
         return self.objects / h[:2] / h[2:]
 
     def put_blob(self, data: bytes) -> str:
@@ -59,9 +72,22 @@ class SnapshotStore:
             tmp = p.with_suffix(".tmp")
             tmp.write_bytes(zlib.compress(data, 6))
             os.replace(tmp, p)  # atomic: a crash never leaves a torn blob
+            # fsync the DIRECTORY entry: without it a crash can lose the
+            # rename itself, silently dropping a snapshot this store
+            # exists to guarantee (Axiom A2: every mutation reversible)
+            try:
+                fd = os.open(p.parent, os.O_DIRECTORY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except OSError:
+                pass
         return h
 
     def get_blob(self, h: str) -> bytes | None:
+        if not _valid_hash(h):
+            return None
         p = self._obj_path(h)
         if not p.exists():
             return None
@@ -183,8 +209,19 @@ class SnapshotStore:
 
     def gc(self, log: EventLog) -> int:
         """Mark-and-sweep: delete blobs no reachable snapshot references.
-        Never collects a blob referenced by a reachable event (I9)."""
+        Never collects a blob referenced by a reachable event (I9).
+
+        Blobs created AFTER the sweep started are never deleted, even if
+        the keep-set (computed at sweep start) does not list them yet —
+        otherwise a concurrent take() racing the gc could lose a blob
+        whose snapshot event had not been sealed when reachable_hashes()
+        ran.
+        """
+        import time
         keep = self.reachable_hashes(log)
+        # nanosecond clock: a blob born after this instant is concurrent
+        # with the sweep and must survive it (see docstring)
+        started_ns = time.time_ns()
         deleted = 0
         if not self.objects.exists():
             return 0
@@ -202,6 +239,12 @@ class SnapshotStore:
                     except OSError:
                         pass
                 elif h not in keep:
+                    try:
+                        # newborn blob racing this gc: leave it alone
+                        if f.stat().st_mtime_ns >= started_ns:
+                            continue
+                    except OSError:
+                        continue
                     try:
                         f.unlink()
                         deleted += 1

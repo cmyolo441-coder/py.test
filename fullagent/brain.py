@@ -193,27 +193,45 @@ class Brain:
         """Pull episodic material from the event log: assistant summaries,
         learned facts, dead ends, judge verdicts. Idempotent — only
         events newer than the last ingest are read."""
-        last = max((int(e.data.get("brain_marker", 0))
-                    for e in self.log.events()
+        # BUGFIX: brain_marker is written by sleep() as an int head, but a
+        # hand-edited or older log could carry a non-numeric value —
+        # int() would raise and kill the whole ingest.
+        def _marker(e) -> int:
+            try:
+                return int(e.data.get("brain_marker", 0))
+            except (TypeError, ValueError):
+                return 0
+
+        last = max((_marker(e) for e in self.log.events()
                     if e.type == "brain.consolidated"), default=0)
         added = 0
         for ev in self.log.events():
             if ev.seq <= last:
                 continue
             if ev.type == "fact.learned":
-                self.remember(str(ev.data.get("fact", ""))[:400],
-                              store="semantic", kind="fact",
+                # BUGFIX: an empty fact ("") made remember() raise
+                # ValueError and abort the entire ingest mid-loop —
+                # half the events silently skipped. Skip empties.
+                fact = str(ev.data.get("fact", "")).strip()[:400]
+                if not fact:
+                    continue
+                self.remember(fact, store="semantic", kind="fact",
                               verified=ev.data.get("kind") == "goal")
                 added += 1
             elif ev.type == "deadend.recorded":
-                self.remember(
-                    f"dead end: {ev.data.get('reason', '')}"[:400],
-                    store="semantic", kind="dead_end")
+                reason = str(ev.data.get("reason", "")).strip()
+                if not reason:
+                    continue
+                self.remember(f"dead end: {reason}"[:400],
+                              store="semantic", kind="dead_end")
                 added += 1
             elif ev.type == "assistant.message":
                 text = str(ev.data.get("text", ""))
                 if len(text) > 120:            # substantive replies only
-                    self.remember(text[:300], store="episodic",
+                    snippet = text.strip()[:300]
+                    if not snippet:
+                        continue
+                    self.remember(snippet, store="episodic",
                                   kind="episode")
                     added += 1
         return added

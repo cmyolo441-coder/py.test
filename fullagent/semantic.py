@@ -18,12 +18,13 @@ Design (pure Python, stdlib only — no numpy, no model calls):
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import math
 import re
 from dataclasses import dataclass, field
 
-from .kernel import EventLog, fold
+from .kernel import EventLog, State, fold
 from ._foundation import get_logger
 
 _log = get_logger("semantic")
@@ -38,8 +39,12 @@ _STOP = frozenset("a an the and or of to in for is are was were be been "
 # Embedding — signed feature hashing (deterministic, stdlib only)
 # ---------------------------------------------------------------------------
 
+@functools.lru_cache(maxsize=8192)
 def _token_hash(token: str) -> tuple[int, int]:
-    """Map a token to (bucket, sign) via sha256 — collision-tolerant."""
+    """Map a token to (bucket, sign) via sha256 — collision-tolerant.
+
+    Cached: tokens repeat heavily across embeds in a session corpus, and
+    hashing dominated embed() cost."""
     h = hashlib.sha256(token.encode("utf-8")).digest()
     bucket = int.from_bytes(h[:2], "big") % DIM
     sign = 1 if h[2] & 1 else -1
@@ -103,31 +108,54 @@ class SemanticMemory:
         self._items: list[MemoryItem] = []
         self._indexed = 0
         self._indexed_head = -1   # log head at last reindex
+        # (kind, text) of every item already embedded — the incremental
+        # index only embeds NEW records instead of re-hashing the corpus
+        self._seen: set[tuple[str, str]] = set()
 
-    def reindex(self) -> int:
-        """Rebuild the whole index from the fold. Returns item count."""
-        st = fold(self.log)
-        items: list[MemoryItem] = []
+    def _collect_new(self, st: State) -> list[MemoryItem]:
+        """Embed only records not seen before. Returns the new items."""
+        new: list[MemoryItem] = []
         for ep in st.episodes:
             text = _episode_text(ep)
-            if text.strip():
-                items.append(MemoryItem("episode", text, ep, embed(text)))
+            key = ("episode", text)
+            if text.strip() and key not in self._seen:
+                self._seen.add(key)
+                new.append(MemoryItem("episode", text, ep, embed(text)))
         for f in st.facts:
             text = str(f.get("fact", ""))
-            if text.strip():
-                items.append(MemoryItem("fact", text, f, embed(text)))
+            key = ("fact", text)
+            if text.strip() and key not in self._seen:
+                self._seen.add(key)
+                new.append(MemoryItem("fact", text, f, embed(text)))
         for d in st.dead_ends:
             text = f"{d.get('signature', '')} {d.get('reason', '')}"
-            if text.strip():
-                items.append(MemoryItem("dead_end", text, d, embed(text)))
-        self._items = items
-        self._indexed = len(items)
-        self.log.append("semantic.indexed", {"items": len(items)},
-                        actor="librarian")
-        # capture the head AFTER the index event is sealed, so _ensure_fresh
-        # does not immediately reindex on its own append
+            key = ("dead_end", text)
+            if text.strip() and key not in self._seen:
+                self._seen.add(key)
+                new.append(MemoryItem("dead_end", text, d, embed(text)))
+        return new
+
+    def reindex(self) -> int:
+        """Extend the index with records added since the last index.
+
+        Only NEW records are embedded (incremental); the whole corpus is
+        never re-hashed. The 'semantic.indexed' event is sealed only when
+        new items actually arrived — sealing unconditionally made two
+        SemanticMemory instances sharing one log ping-pong index events
+        at each other forever (unbounded log growth from reads).
+        Returns total item count."""
+        st = fold(self.log)
+        new = self._collect_new(st)
+        if new:
+            self._items.extend(new)
+            self._indexed = len(self._items)
+            self.log.append("semantic.indexed",
+                            {"items": len(self._items), "new": len(new)},
+                            actor="librarian")
+        # capture the head AFTER any index event is sealed, so
+        # _ensure_fresh does not immediately reindex on its own append
         self._indexed_head = self.log.head()
-        return len(items)
+        return len(self._items)
 
     def _ensure_fresh(self) -> None:
         """Reindex if the log has grown since the last index, so recall

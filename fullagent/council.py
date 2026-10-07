@@ -134,6 +134,7 @@ class Council:
         self.log = log
         self.speaker = speaker
         self.timeout = timeout
+        self._verdicts_cache: tuple[int, list[dict]] | None = None
 
     def convene(self, question: str) -> Verdict:
         """Run one full debate: thesis, then antithesis (serial), then the
@@ -221,8 +222,14 @@ class Council:
     # -- projections -----------------------------------------------------------
 
     def verdicts(self) -> list[dict]:
-        return [e for e in fold(self.log).council_events
-                if e.get("type") == "council.verdict"]
+        """All sealed council.verdict events. Cached against the log head
+        — status screens that poll verdicts() don't re-fold every time."""
+        head = self.log.head()
+        if self._verdicts_cache is None or self._verdicts_cache[0] != head:
+            evs = [e for e in fold(self.log).council_events
+                   if e.get("type") == "council.verdict"]
+            self._verdicts_cache = (head, evs)
+        return list(self._verdicts_cache[1])
 
     def format_status(self) -> str:
         vs = self.verdicts()

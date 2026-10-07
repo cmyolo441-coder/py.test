@@ -44,10 +44,14 @@ ALLOWED_IMPORTS = frozenset(
     "collections statistics textwrap unicodedata urllib.parse html "
     "pathlib posixpath random typing dataclasses enum".split())
 
-# AST nodes / names that are never allowed in a skill
+# AST nodes / names that are never allowed in a skill.
+# getattr/hasattr are the classic sandbox escape: getattr(fn,
+# "__globals__") reaches the very dunders the attribute gate forbids,
+# because the check only inspects ast.Attribute nodes, never the string
+# argument of a getattr() call.
 _FORBIDDEN_CALLS = frozenset(
-    "eval exec compile open input __import__ globals locals vars setattr "
-    "delattr breakpoint exit quit".split())
+    "eval exec compile open input __import__ globals locals vars getattr "
+    "hasattr setattr delattr breakpoint exit quit".split())
 # File/process-mutation attributes are only dangerous when the *receiver* is
 # a known dangerous module (os, shutil, pathlib, subprocess, io, builtins).
 # Matching the bare attribute name used to reject benign code such as

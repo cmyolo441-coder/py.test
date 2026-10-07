@@ -35,8 +35,18 @@ RISK_LEVELS = ("SAFE", "GUARDED", "DESTRUCTIVE", "IRREVERSIBLE")
 
 
 def _canonical_args(name: str, args: dict) -> str:
-    payload = json.dumps({"name": name, "args": args}, sort_keys=True,
-                         ensure_ascii=False, default=str)
+    try:
+        payload = json.dumps({"name": name, "args": args}, sort_keys=True,
+                             ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        # circular references or exotic objects would otherwise raise and
+        # take down the loop detector — fall back to a repr-based hash
+        try:
+            items = sorted((str(k), repr(v))
+                           for k, v in (args or {}).items())
+        except Exception:
+            items = [("unhashable", repr(type(args)))]
+        payload = repr((name, items))
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
@@ -114,18 +124,37 @@ class Plan:
     def eligible(self, max_parallel: int = 8) -> list[dict]:
         """The frontier filtered by write-exclusivity (I7): no two WRITE
         nodes with overlapping path sets, and no more than max_parallel.
-        Deterministic ordering keeps the selection reproducible."""
+        Deterministic ordering keeps the selection reproducible.
+
+        I7 holds ACROSS scheduler ticks, not just within one call: WRITE
+        nodes already RUNNING seed the lock set, so a second overlapping
+        write scheduled on the next tick can never run concurrently.
+        A WRITE with an empty path_set has unknown scope and is treated
+        conservatively — it serialises against every other write."""
         frontier = sorted(self.frontier(), key=lambda n: n.get("id", ""))
-        chosen: list[dict] = []
+        # seed locks from writes already in flight (cross-tick I7)
         locked_paths: set[str] = set()
+        lock_all = False
+        for n in self.nodes().values():
+            if n.get("status") == "RUNNING" and n.get("kind") == "WRITE":
+                ps = set(n.get("path_set") or [])
+                if ps:
+                    locked_paths |= ps
+                else:
+                    lock_all = True
+        chosen: list[dict] = []
         for n in frontier:
             if len(chosen) >= max_parallel:
                 break
-            paths = set(n.get("path_set") or [])
-            if n.get("kind") == "WRITE" and paths & locked_paths:
-                continue  # would overlap an already-scheduled write
             if n.get("kind") == "WRITE":
-                locked_paths |= paths
+                paths = set(n.get("path_set") or [])
+                if lock_all or (paths & locked_paths) \
+                        or (not paths and locked_paths):
+                    continue  # would overlap an already-scheduled write
+                if paths:
+                    locked_paths |= paths
+                else:
+                    lock_all = True
             chosen.append(n)
         return chosen
 
@@ -144,7 +173,7 @@ class Budget:
     max_steps: int = 1_000_000_000
     max_tokens: int = 1_000_000_000_000
     max_files: int = 100_000_000
-    slices: dict = field(default_factory=dict)  # subtree -> fraction
+    slices: dict[str, float] = field(default_factory=dict)  # subtree -> fraction
 
 
 class BudgetGovernor:
@@ -161,14 +190,24 @@ class BudgetGovernor:
         self.budget = budget or Budget()
         self.baseline_seq = -1  # reset() anchor: ignore events <= this
         self._last_reason = ""  # dedupe budget.event spam while paused
+        self._session_cache: tuple[int, int] | None = None  # (head, start)
 
     def _session_start(self) -> int:
         """seq of the latest session.start (-1 if none) — where the current
-        session's spend begins. -1 (not 0) so seq-0 events still count."""
+        session's spend begins. -1 (not 0) so seq-0 events still count.
+
+        Cached against the log head: session.start events are rare and
+        the latest one sits near the head, so we scan backwards and stop
+        at the first hit instead of walking the whole log every spend()."""
+        head = self.log.head()
+        if self._session_cache is not None and self._session_cache[0] == head:
+            return self._session_cache[1]
         start = -1
-        for ev in self.log.events():
-            if ev.type == "session.start" and ev.seq > start:
+        for ev in reversed(self.log.events()):
+            if ev.type == "session.start":
                 start = ev.seq
+                break
+        self._session_cache = (head, start)
         return start
 
     def spend(self) -> dict:
@@ -197,32 +236,43 @@ class BudgetGovernor:
             raise ValueError("axis must be one of: "
                              + ", ".join(sorted(limits)))
         attr, cast = limits[axis]
-        setattr(self.budget, attr, cast(value))
+        try:
+            value = cast(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{axis} budget must be a number, "
+                             f"got {value!r}")
+        setattr(self.budget, attr, value)
         self._last_reason = ""
         self.log.append("budget.event",
-                        {"kind": "limit", "axis": axis, "value": cast(value)},
+                        {"kind": "limit", "axis": axis, "value": value},
                         actor="human")
-        return f"{axis} budget set to {cast(value)}"
+        return f"{axis} budget set to {value}"
 
     def check(self) -> tuple[bool, str]:
         """Return (ok, reason). A breach on ANY axis pauses the run."""
+        ok, reason, _ = self._check()
+        return ok, reason
+
+    def _check(self) -> tuple[bool, str, dict]:
+        """check() plus the spend dict — the breach path reuses the same
+        fold instead of paying for a second one."""
         s = self.spend()
         b = self.budget
         if s["usd"] > b.max_usd:
-            return False, f"USD budget exceeded: ${s['usd']:.4f} > ${b.max_usd}"
+            return False, f"USD budget exceeded: ${s['usd']:.4f} > ${b.max_usd}", s
         if s["steps"] > b.max_steps:
-            return False, f"step budget exceeded: {s['steps']} > {b.max_steps}"
+            return False, f"step budget exceeded: {s['steps']} > {b.max_steps}", s
         if s["tokens"] > b.max_tokens:
-            return False, f"token budget exceeded: {s['tokens']} > {b.max_tokens}"
+            return False, f"token budget exceeded: {s['tokens']} > {b.max_tokens}", s
         if s["files"] > b.max_files:
-            return False, f"file budget exceeded: {s['files']} > {b.max_files}"
-        return True, ""
+            return False, f"file budget exceeded: {s['files']} > {b.max_files}", s
+        return True, "", s
 
     def enforce(self) -> bool:
         """Check and, on breach, seal a budget.event (pause). Returns True
         if the run may continue. While paused, only the FIRST breach per
         reason is sealed — no event spam on every loop iteration."""
-        ok, reason = self.check()
+        ok, reason, spend = self._check()
         if ok:
             self._last_reason = ""
             return True
@@ -230,7 +280,7 @@ class BudgetGovernor:
             self._last_reason = reason
             self.log.append("budget.event",
                             {"kind": "exceeded", "reason": reason,
-                             "spend": self.spend()},
+                             "spend": spend},
                             actor="kernel")
         return False
 
@@ -253,14 +303,22 @@ class LoopDetector:
         self.log = log
         self.repeat_threshold = repeat_threshold
         self.window = window
+        self._last_sig = ""  # dedupe loop.alert spam while repeating
 
     def exact_repeat(self) -> str | None:
         """hash(tool, canonical_args) seen repeat_threshold times within
-        the last `window` tool.call events -> returns the signature."""
-        calls = [e for e in self.log.events() if e.type == "tool.call"]
-        recent = calls[-self.window:]
+        the last `window` tool.call events -> returns the signature.
+
+        Scans backwards and stops after `window` tool calls — the hot
+        path is O(window), not O(log size)."""
         counts: dict[str, int] = {}
-        for ev in recent:
+        seen = 0
+        for ev in reversed(self.log.events()):
+            if ev.type != "tool.call":
+                continue
+            seen += 1
+            if seen > self.window:
+                break
             sig = _canonical_args(ev.data.get("name", ""),
                                   ev.data.get("args") or {})
             counts[sig] = counts.get(sig, 0) + 1
@@ -277,14 +335,19 @@ class LoopDetector:
         return a == c and b == d and a != b
 
     def detect(self) -> list[dict]:
-        """Run all detectors, seal loop.alert events, return the alerts."""
+        """Run all detectors, seal loop.alert events, return the alerts.
+        While the same repetition persists, only the first detection is
+        sealed — no alert spam on every turn."""
         alerts: list[dict] = []
         sig = self.exact_repeat()
-        if sig:
+        if sig and sig != self._last_sig:
+            self._last_sig = sig
             alert = {"kind": "exact_repeat", "signature": sig,
                      "action": "force REFLECT with the repetition as evidence"}
             alerts.append(alert)
             self.log.append("loop.alert", alert, actor="kernel")
+        elif not sig:
+            self._last_sig = ""
         return alerts
 
 

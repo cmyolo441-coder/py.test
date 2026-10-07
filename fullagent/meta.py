@@ -38,6 +38,14 @@ _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{2,20}$")
 _MIN_BRIEF_CHARS = 80
 _PASS_BAR = 0.6
 
+# Tools that grant write/execute power. A role holding any of these is
+# flagged writes=True (drives sandboxing + audit strictness downstream).
+# Kept as an explicit policy set — not inferred — so a newly added tool
+# is read-only by default until a human opts it into this list.
+_WRITE_TOOLS = frozenset({"write_file", "edit_file", "create_directory",
+                          "delete_path", "move_path", "copy_path",
+                          "run_command"})
+
 
 @dataclass
 class RoleDraft:
@@ -82,11 +90,18 @@ def default_drafter(provider, model, effort):
     return draft
 
 
+_TOOL_NAMES_CACHE: list[str] | None = None
+
+
 def _all_tool_names() -> list[str]:
     """Every tool name the role whitelists may draw from (the base
-    registry's read/write shell tools)."""
-    from .tools import build_registry
-    return sorted(build_registry())
+    registry's read/write shell tools). Cached — build_registry() walks
+    modules, so rebuilding it on every forge() was pure waste."""
+    global _TOOL_NAMES_CACHE
+    if _TOOL_NAMES_CACHE is None:
+        from .tools import build_registry
+        _TOOL_NAMES_CACHE = sorted(build_registry())
+    return _TOOL_NAMES_CACHE
 
 
 class RoleForge:
@@ -152,16 +167,23 @@ class RoleForge:
                           f"{_MIN_BRIEF_CHARS}) — a specialist needs "
                           "real instructions")
         known = set(_all_tool_names())
-        tools = [str(t).strip() for t in (raw.get("tools") or [])
-                 if str(t).strip() in known]
+        requested = [str(t).strip() for t in (raw.get("tools") or [])
+                     if str(t).strip()]
+        # Ghost tools are dropped — but LOUDLY. Silently shrinking the
+        # whitelist meant the drafter believed it had a capability the
+        # sealed role never received; the audition then passed against
+        # a different toolset than the drafter designed for.
+        dropped = [t for t in requested if t not in known]
+        if dropped:
+            _log.warning("draft %r requested unknown tools %s — dropped",
+                         name, dropped)
+        tools = [t for t in requested if t in known]
         if not tools:
             return None, "no valid tools in the whitelist"
         benchmark = str(raw.get("benchmark", "")).strip()
         if not benchmark:
             return None, "no benchmark — a role must prove itself"
-        writes = bool({"write_file", "edit_file", "create_directory",
-                       "delete_path", "move_path", "copy_path",
-                       "run_command"} & set(tools))
+        writes = bool(_WRITE_TOOLS & set(tools))
         return RoleDraft(name=name, brief=brief, tools=sorted(tools),
                          benchmark=benchmark, writes=writes), ""
 

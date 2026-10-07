@@ -44,7 +44,19 @@ MAX_GENERATIONS_PER_SESSION = 5
 EVAL_WINDOW = 12          # recent reports per role for fitness
 BENCHMARK_TIMEOUT = 240.0
 
-_EVOLVABLE = tuple(systemprompt.ROLE_BRIEFS)   # worker roles only
+# Roles the engine refuses to touch even if they appear in ROLE_BRIEFS.
+_PROTECTED_ROLES = frozenset({"main", "master"})
+
+
+def _evolvable_roles() -> tuple[str, ...]:
+    """Worker roles evolvable RIGHT NOW — computed fresh on every call.
+
+    The old module-level `_EVOLVABLE` tuple was frozen at import time,
+    so roles forged at runtime by meta.RoleForge were silently
+    ineligible for evolution forever. A role with declining performance
+    that was forged mid-session could never be improved."""
+    return tuple(r for r in systemprompt.ROLE_BRIEFS
+                 if r not in _PROTECTED_ROLES)
 
 
 @dataclass
@@ -93,22 +105,37 @@ class EvolutionEngine:
         self.benchmark = benchmark
         self.margin = margin
         self.generations = 0
+        # Candidate score cache: the evaluator runs a REAL worker per
+        # candidate (expensive). A brief evaluated in an earlier
+        # generation keeps its score — re-running it is pure waste.
+        self._eval_cache: dict[str, float] = {}
+        # Fitness cache: fitness() rescans the event log (O(events)).
+        # The log only grows, so (event_count -> fitness) is a valid
+        # cache key — no recompute unless new events arrived.
+        self._fitness_cache: tuple[int, dict[str, float]] | None = None
 
     # -- fitness from history (rung 1, deterministic) ------------------------
 
     def fitness(self) -> dict[str, float]:
         """Trailing success rate per role from sealed worker reports —
         done=1.0, blocked=0.4, error=0.0, newest reports weigh double."""
+        events = self.log.events()
+        n_events = len(events)
+        if self._fitness_cache is not None:
+            cached_n, cached_fit = self._fitness_cache
+            if cached_n == n_events:
+                return dict(cached_fit)
         scores: dict[str, list[float]] = {}
         # Filter to evolvable roles BEFORE slicing the window. The old
         # order (slice then filter) meant a chatty non-evolvable role
         # like `main` or `master` could push real evolvable events out
         # of the window — a role with declining performance looked
         # stable because its decline fell off the end of the slice.
-        events = [e.data for e in self.log.events()
+        evolvable = _evolvable_roles()
+        events = [e.data for e in events
                   if e.type == "crew.done"
-                  and str(e.data.get("role", "")).strip() in _EVOLVABLE]
-        for d in events[-EVAL_WINDOW * len(_EVOLVABLE):]:
+                  and str(e.data.get("role", "")).strip() in evolvable]
+        for d in events[-EVAL_WINDOW * len(evolvable):]:
             role = str(d.get("role", "")).strip()
             status = d.get("status") or d.get("state") or ""
             score = {"done": 1.0, "blocked": 0.4}.get(status, 0.0)
@@ -120,6 +147,7 @@ class EvolutionEngine:
             out[role] = sum(weighted) / sum(
                 2.0 if i >= len(vals) // 2 else 1.0
                 for i in range(len(vals)))
+        self._fitness_cache = (n_events, out)
         return out
 
     def weakest_role(self) -> str | None:
@@ -130,6 +158,16 @@ class EvolutionEngine:
         if not fit:
             return None
         return min(fit, key=lambda r: fit[r])
+
+    def _evaluated(self, role: str, brief: str) -> tuple[str, float]:
+        """Evaluate a brief, reusing a cached score when this exact brief
+        was scored before. The evaluator spins up a real worker, so a
+        repeat evaluation is the most expensive waste in the loop."""
+        if brief in self._eval_cache:
+            return "", self._eval_cache[brief]
+        reply, score = self.evaluator(role, brief)
+        self._eval_cache[brief] = float(score)
+        return reply, float(score)
 
     # -- one generation -------------------------------------------------------
 
@@ -143,13 +181,12 @@ class EvolutionEngine:
                                     "session")
             return gen
         role = role or self.weakest_role()
-        if role is None or role not in _EVOLVABLE:
+        if role is None or role not in _evolvable_roles():
             return Generation(self.generations, role or "?", 0.0,
                               reason="no role history to evolve on yet")
         self.generations += 1
         incumbent = systemprompt.ROLE_BRIEFS[role]
-        incumbent_reply, incumbent_score = self.evaluator(
-            role, incumbent)
+        incumbent_reply, incumbent_score = self._evaluated(role, incumbent)
 
         candidates = [c for c in self.mutator(role, incumbent, 3)
                       if c and c != incumbent]
@@ -157,7 +194,7 @@ class EvolutionEngine:
         best_text, best_score = "", incumbent_score
         for cand in candidates:
             try:
-                _, score = self.evaluator(role, cand)
+                _, score = self._evaluated(role, cand)
             except Exception:            # a bad candidate never kills a run
                 continue
             if score > best_score:

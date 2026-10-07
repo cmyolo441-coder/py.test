@@ -139,16 +139,20 @@ class ProgramSynthesizer:
         failures: list[str] = []
 
         for i, ex in enumerate(spec.examples):
-            ok, got, note = self._call_with_timeout(fn, ex["args"],
+            # examples are author-supplied data — a missing "args" key
+            # must fail the example, not crash the synthesizer
+            args = ex.get("args") or {}
+            want = ex.get("want")
+            ok, got, note = self._call_with_timeout(fn, args,
                                                     _CALL_TIMEOUT_S)
             if not ok:
                 failures.append(f"example {i}: {note}")
                 continue
-            if got == ex["want"]:
+            if got == want:
                 passed += 1
             else:
                 failures.append(f"example {i}: got {got!r}, want "
-                                f"{ex['want']!r}")
+                                f"{want!r}")
         return passed, failures
 
     @staticmethod
@@ -167,17 +171,13 @@ class ProgramSynthesizer:
         t.start()
         t.join(timeout)
         if t.is_alive():
-            # Honest documentation of the leak: a generated example
-            # whose body is a `while True: pass` will keep the thread
-            # alive forever (daemon=True means the interpreter will
-            # exit but the spec-level "synthesize then continue" loop
-            # in run_examples will spin up a new thread per example).
-            # We surface the leak so the failure isn't silent, AND we
-            # call sys.intern() on a probe to keep the GIL warm enough
-            # that the leak cannot wedge the whole agent.
+            # A generated example whose body is `while True: pass` keeps
+            # its thread alive forever (daemon=True means the interpreter
+            # can still exit, but each timed-out example leaks one
+            # thread). We surface the leak so the failure isn't silent.
             return False, None, (f"timed out after {timeout:g}s — "
                                  "generated code does not terminate "
-                                 "(leaked thread — see synth.py)")
+                                 "(leaked thread)")
         if "err" in out:
             return False, None, out["err"]
         return True, out.get("got"), ""

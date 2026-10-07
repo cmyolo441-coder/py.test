@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import random
 import string
+import threading
 from dataclasses import dataclass, field
+from typing import Callable
 
 from .kernel import EventLog, fold
 from ._foundation import get_logger
@@ -29,6 +31,8 @@ from ._foundation import get_logger
 _log = get_logger("fuzz")
 
 MAX_SHRINK_STEPS = 60
+DEFAULT_CALL_TIMEOUT = 5.0   # per-invocation hang guard (seconds)
+SHRINK_PROBE_TIMEOUT = 1.0   # shorter probe while shrinking hangs
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +153,7 @@ class Crash:
     shrunk_args: tuple = field(default_factory=tuple)
     shrunk_error: str = ""
     iterations: int = 0
+    kind: str = "exception"  # "exception" | "hang" | "invariant"
 
 
 @dataclass
@@ -165,12 +170,41 @@ class FuzzReport:
         if self.first_crash:
             fc = {"args": repr(self.first_crash.args)[:200],
                   "error": self.first_crash.error[:200],
+                  "kind": self.first_crash.kind,
                   "shrunk_args": repr(self.first_crash.shrunk_args)[:200],
                   "shrunk_error": self.first_crash.shrunk_error[:200]}
         return {"target": self.target, "iterations": self.iterations,
                 "crashes": self.crashes,
                 "invariant_failures": self.invariant_failures,
                 "first_crash": fc, "ok": self.ok}
+
+
+def _call_guarded(target: Callable, args: tuple,
+                  timeout: float) -> tuple[bool, object, str]:
+    """Invoke target(*args) with a hang guard.
+
+    Returns (ok, result, error): ok=True on clean return; ok=False with
+    error set on exception OR on hang (call exceeded `timeout`). The
+    worker is a daemon thread — on timeout the fuzz run moves on while
+    the stuck call keeps running in the background (Python cannot kill
+    threads), which is exactly the "hang" finding the docstring promises.
+    """
+    box: dict = {}
+
+    def run() -> None:
+        try:
+            box["result"] = target(*args)
+        except Exception as e:  # noqa: BLE001 — any crash is a finding
+            box["error"] = f"{type(e).__name__}: {e}"
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        return False, None, f"TimeoutError: hung for >{timeout:g}s"
+    if "error" in box:
+        return False, None, box["error"]
+    return True, box.get("result"), ""
 
 
 class Fuzzer:
@@ -184,56 +218,90 @@ class Fuzzer:
         self.log = log
         self.gen = Generator(seed)
 
-    def fuzz(self, target, iterations: int = 200, nargs: int = 1,
-             invariant=None, name: str = "") -> FuzzReport:
+    def fuzz(self, target: Callable, iterations: int = 200, nargs: int = 1,
+             invariant: Callable | None = None, name: str = "",
+             timeout: float = DEFAULT_CALL_TIMEOUT) -> FuzzReport:
+        # fail fast on bad input — a negative iteration count or a
+        # non-callable target is a caller bug, not a fuzz finding
+        if not callable(target):
+            raise ValueError("target must be callable")
+        if iterations is None or int(iterations) < 0:
+            raise ValueError(f"iterations must be >= 0, got {iterations!r}")
+        if nargs is None or int(nargs) < 0:
+            raise ValueError(f"nargs must be >= 0, got {nargs!r}")
+        if timeout is None or float(timeout) <= 0:
+            raise ValueError(f"timeout must be positive, got {timeout!r}")
+        iterations, nargs, timeout = int(iterations), int(nargs), float(timeout)
         report = FuzzReport(target=name or getattr(target, "__name__",
                                                    "target"))
         self.log.append("fuzz.run",
                         {"target": report.target, "iterations": iterations,
-                         "nargs": nargs}, actor="fuzzer")
+                         "nargs": nargs, "timeout": timeout}, actor="fuzzer")
         for i in range(iterations):
             report.iterations = i + 1
             args = self.gen.args_for(nargs)
-            try:
-                result = target(*args)
-            except Exception as e:
-                report.crashes += 1
-                crash = Crash(args=args,
-                              error=f"{type(e).__name__}: {e}",
-                              iterations=i + 1)
-                self._shrink(crash, target)
-                if report.first_crash is None:
-                    report.first_crash = crash
-                self.log.append("fuzz.crash",
-                                {"target": report.target,
-                                 "args": repr(args)[:200],
-                                 "error": crash.error[:200]},
-                                actor="fuzzer")
+            ok, result, error = _call_guarded(target, args, timeout)
+            if not ok:
+                kind = "hang" if error.startswith("TimeoutError") \
+                    else "exception"
+                self._record_crash(report, target, args, error, kind,
+                                   i + 1, timeout)
                 continue
             if invariant is not None:
                 try:
-                    ok = invariant(result, *args)
+                    inv_ok = invariant(result, *args)
                 except Exception as e:
-                    ok = False
-                    report.crashes += 1
-                    crash = Crash(args=args,
-                                  error=f"invariant raised "
-                                        f"{type(e).__name__}: {e}",
-                                  iterations=i + 1)
-                    if report.first_crash is None:
-                        report.first_crash = crash
+                    self._record_crash(
+                        report, target, args,
+                        f"invariant raised {type(e).__name__}: {e}",
+                        "invariant", i + 1, timeout)
                     continue
-                if not ok:
+                if not inv_ok:
                     report.invariant_failures += 1
                     if report.first_crash is None:
                         report.first_crash = Crash(
                             args=args, error="invariant returned False",
-                            iterations=i + 1)
+                            kind="invariant", iterations=i + 1)
         report.ok = report.crashes == 0 and report.invariant_failures == 0
         return report
 
-    def _shrink(self, crash: Crash, target) -> None:
-        """Reduce the failing args to a minimal reproducer."""
+    def _record_crash(self, report: FuzzReport, target: Callable,
+                      args: tuple, error: str, kind: str, iteration: int,
+                      timeout: float) -> None:
+        """Single choke point for every crash kind: count it, shrink it,
+        remember the first, seal the event. (The old code forgot to shrink
+        and log invariant-raised crashes — every kind now gets the same
+        treatment.)"""
+        report.crashes += 1
+        crash = Crash(args=args, error=error, kind=kind,
+                      iterations=iteration)
+        self._shrink(crash, target, timeout)
+        if report.first_crash is None:
+            report.first_crash = crash
+        self.log.append("fuzz.crash",
+                        {"target": report.target, "kind": kind,
+                         "args": repr(args)[:200], "error": error[:200]},
+                        actor="fuzzer")
+
+    def _shrink(self, crash: Crash, target: Callable,
+                timeout: float) -> None:
+        """Reduce the failing args to a minimal reproducer.
+
+        A simplification only counts if it reproduces the SAME failure:
+        the same exception type for exceptions, another hang for hangs.
+        (The old code accepted any exception, so shrinking could drift
+        onto a completely different bug.) Hang probes use a short
+        timeout — waiting the full budget per candidate would make
+        shrinking take forever."""
+        want_type = crash.error.split(":")[0]
+        probe = SHRINK_PROBE_TIMEOUT if crash.kind == "hang" else timeout
+
+        def reproduces(candidate: list) -> bool:
+            ok, _, error = _call_guarded(target, tuple(candidate), probe)
+            if crash.kind == "hang":
+                return not ok and error.startswith("TimeoutError")
+            return not ok and error.split(":")[0] == want_type
+
         current = list(crash.args)
         for _ in range(MAX_SHRINK_STEPS):
             improved = False
@@ -241,20 +309,20 @@ class Fuzzer:
                 for simpler in _simpler(val, self.gen):
                     candidate = list(current)
                     candidate[idx] = simpler
-                    try:
-                        target(*candidate)
-                    except Exception:
+                    if reproduces(candidate):
                         current = candidate
                         improved = True
                         break
+                if improved:
+                    break
             if not improved:
                 break
         crash.shrunk_args = tuple(current)
-        try:
-            target(*current)
+        ok, _, error = _call_guarded(target, tuple(current), probe)
+        if ok:
             crash.shrunk_error = "(no longer reproduces)"
-        except Exception as e:
-            crash.shrunk_error = f"{type(e).__name__}: {e}"
+        else:
+            crash.shrunk_error = error
         self.log.append("fuzz.shrunk",
                         {"args": repr(crash.shrunk_args)[:200],
                          "error": crash.shrunk_error[:200]},

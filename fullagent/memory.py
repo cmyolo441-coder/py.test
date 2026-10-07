@@ -14,7 +14,7 @@ Design (pure Python, stdlib only):
 
 from __future__ import annotations
 
-from .kernel import EventLog, fold
+from .kernel import EventLog, State, fold
 from ._foundation import get_logger
 
 _log = get_logger("memory")
@@ -31,19 +31,63 @@ def _clip(text: str, limit: int = _FIELD_CHARS) -> str:
     return text[: limit - 1] + "…"
 
 
+def _safe_int(v: object, default: int = 0) -> int:
+    """Coerce a log value to int; corrupt log data must not crash rendering."""
+    try:
+        return int(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(v: object, default: float = 0.0) -> float:
+    """Coerce a log value to float; corrupt log data must not crash rendering."""
+    try:
+        return float(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
 class Hippocampus:
     """Episodic memory projected from `memory.episode` / `deadend.recorded`
     events in the log. All reads fold the log; writes append to it."""
 
     def __init__(self, log: EventLog) -> None:
         self.log = log
+        # rendered context_block cache: (branch, head seq, max_episodes)
+        # -> text. context_block() runs every turn for prompt injection;
+        # rebuilding the strings from the fold each time is pure waste
+        # when the log has not advanced.
+        self._ctx_cache: tuple[str, int, int, str] | None = None
 
     # -- writes ------------------------------------------------------------
 
+    def _validate_dead_ends(self, dead_ends: list) -> list[dict]:
+        """Normalize dead-end entries to record dicts, raising BEFORE any
+        event is appended so a bad entry cannot leave a half-sealed write
+        (episode sealed, dead-ends missing)."""
+        out: list[dict] = []
+        for entry in dead_ends:
+            if isinstance(entry, dict):
+                signature = str(entry.get("signature", "")).strip()
+                reason = str(entry.get("reason", "")).strip()
+                scope = str(entry.get("scope", "session"))
+                confidence = str(entry.get("confidence", "definitive"))
+            else:
+                signature = str(entry).strip()
+                reason = ""
+                scope = "session"
+                confidence = "definitive"
+            if not signature:
+                raise ValueError(
+                    "record_dead_end requires a non-empty signature")
+            out.append({"signature": signature, "reason": reason,
+                        "scope": scope, "confidence": confidence})
+        return out
+
     def record_episode(self, *, goal: str, approach: str,
-                       actions: list, outcome: str,
-                       artifacts: list | None = None,
-                       facts: list | None = None,
+                       actions: list[str], outcome: str,
+                       artifacts: list[str] | None = None,
+                       facts: list[str] | None = None,
                        lesson: str | None = None,
                        dead_ends: list | None = None,
                        cost_usd: float = 0.0, steps: int = 0) -> dict:
@@ -51,6 +95,8 @@ class Hippocampus:
         and emit a 'memory.episode' event. Returns the record dict.
         If dead_ends is given, also call record_dead_end for each entry
         (a signature string, or a dict with signature/reason/scope/confidence)."""
+        # validate first: no partial writes
+        validated_dead_ends = self._validate_dead_ends(list(dead_ends or []))
         record = {
             "goal": goal,
             "approach": approach,
@@ -64,19 +110,10 @@ class Hippocampus:
             "steps": int(steps),
         }
         self.log.append("memory.episode", record)
-        for entry in record["dead_ends"]:
-            if isinstance(entry, dict):
-                self.record_dead_end(
-                    signature=str(entry.get("signature", "")),
-                    reason=str(entry.get("reason", "")),
-                    scope=str(entry.get("scope", "session")),
-                    confidence=str(entry.get("confidence", "definitive")),
-                )
-            else:
-                self.record_dead_end(
-                    signature=str(entry),
-                    reason=f"failed while pursuing: {goal}",
-                )
+        for de in validated_dead_ends:
+            if not de["reason"]:
+                de["reason"] = f"failed while pursuing: {goal}"
+            self.log.append("deadend.recorded", de)
         return record
 
     def record_dead_end(self, *, signature: str, reason: str,
@@ -118,9 +155,8 @@ class Hippocampus:
         st = fold(self.log)
         return list(reversed(st.episodes[-n:]))
 
-    def facts(self) -> list[str]:
-        """Aggregate all 'facts' across episodes, deduplicated, order-preserving."""
-        st = fold(self.log)
+    def _all_facts(self, st: State) -> list[str]:
+        """Deduplicated, order-preserving facts from episodes + top-level."""
         seen: set[str] = set()
         out: list[str] = []
         for ep in st.episodes:
@@ -129,12 +165,36 @@ class Hippocampus:
                 if fact not in seen:
                     seen.add(fact)
                     out.append(fact)
+        # top-level learned facts (goal proofs, team worker results)
+        for f in st.facts:
+            fact = str(f.get("fact", ""))
+            if fact and fact not in seen:
+                seen.add(fact)
+                out.append(fact)
         return out
+
+    def facts(self) -> list[str]:
+        """Aggregate all 'facts' across episodes, deduplicated, order-preserving."""
+        return self._all_facts(fold(self.log))
 
     def context_block(self, max_episodes: int = 3) -> str:
         """Render a compact, prompt-injectable text block summarizing recent
         episodes, learned facts, and active dead-ends. Kept <= ~400 tokens
-        by clipping each rendered field."""
+        by clipping each rendered field.
+
+        The rendering is cached per (branch, log head): the block is
+        rebuilt only when the log actually advanced.
+        """
+        branch = self.log.branch
+        head = self.log.head()
+        cached = self._ctx_cache
+        if cached is not None and cached[:3] == (branch, head, max_episodes):
+            return cached[3]
+        text = self._render_context_block(max_episodes)
+        self._ctx_cache = (branch, head, max_episodes, text)
+        return text
+
+    def _render_context_block(self, max_episodes: int = 3) -> str:
         st = fold(self.log)
         lines: list[str] = ["MEMORY"]
 
@@ -146,26 +206,13 @@ class Hippocampus:
                     f"- [{_clip(ep.get('outcome', '?'), 20)}] "
                     f"goal: {_clip(ep.get('goal', ''))} | "
                     f"approach: {_clip(ep.get('approach', ''))} | "
-                    f"steps: {int(ep.get('steps', 0))} | "
-                    f"cost: ${float(ep.get('cost_usd', 0.0)):.4f}"
+                    f"steps: {_safe_int(ep.get('steps', 0))} | "
+                    f"cost: ${_safe_float(ep.get('cost_usd', 0.0)):.4f}"
                 )
                 if ep.get("lesson"):
                     lines.append(f"  lesson: {_clip(ep['lesson'])}")
 
-        facts: list[str] = []
-        seen_facts: set[str] = set()
-        for ep in st.episodes:
-            for fact in ep.get("facts") or []:
-                fact = str(fact)
-                if fact not in seen_facts:
-                    seen_facts.add(fact)
-                    facts.append(fact)
-        # top-level learned facts (goal proofs, team worker results)
-        for f in st.facts:
-            fact = str(f.get("fact", ""))
-            if fact and fact not in seen_facts:
-                seen_facts.add(fact)
-                facts.append(fact)
+        facts = self._all_facts(st)
         if facts:
             lines.append("FACTS:")
             lines.extend(f"- {_clip(f)}" for f in facts[-12:])

@@ -153,6 +153,27 @@ class CausalEngine:
             out.setdefault((cause_bin,) + tuple(key), []).append(o)
         return out
 
+    def _binarized_rank(self, obs: list[Observation],
+                        ys: list[float]) -> dict[str, float]:
+        """|association| of every feature with the outcome (features
+        binarized at 0.5, the same scale the strata use). Computed ONCE
+        per discover() — the old code recomputed this whole ranking
+        inside effect() for every single cause."""
+        rank: dict[str, float] = {}
+        for c in {k for o in obs for k in o.features}:
+            xs = [1.0 if o.features.get(c, 0.0) > 0.5 else 0.0 for o in obs]
+            rank[c] = abs(pearson(xs, ys))
+        return rank
+
+    @staticmethod
+    def _auto_confounders(cause: str,
+                          rank: dict[str, float]) -> list[str]:
+        """The two strongest-associated features (excluding the cause) —
+        enough to kill common confounding without fragmenting strata."""
+        cands = sorted(((a, c) for c, a in rank.items() if c != cause),
+                       reverse=True)
+        return [c for a, c in cands[:2] if a > 0.1]
+
     def effect(self, obs: list[Observation], cause: str,
                confounders: list[str] | None = None) -> tuple[float, int]:
         """Discrete backdoor-adjusted effect of cause on outcome.
@@ -160,21 +181,22 @@ class CausalEngine:
         (outcome | cause=1) − (outcome | cause=0) within strata."""
         if len(obs) < _MIN_TOTAL:
             return 0.0, 0
-        features_seen = {k for o in obs for k in o.features}
-        candidates = [c for c in (confounders if confounders is not None
-                                  else sorted(features_seen))
-                      if c != cause]
-        # adjust on the two strongest associated confounders — enough to
-        # kill common confounding without fragmenting the strata
-        confounders: list[str] = []
-        if candidates:
-            ys = [o.outcome for o in obs]
-            assocs = [(abs(pearson(
-                [1.0 if o.features.get(c, 0.0) > 0.5 else 0.0
-                 for o in obs], ys)), c) for c in candidates]
-            assocs.sort(reverse=True)
-            confounders = [c for a, c in assocs[:2] if a > 0.1]
+        ys = [o.outcome for o in obs]
+        rank = self._binarized_rank(obs, ys)
+        if confounders is None:
+            confounders = self._auto_confounders(cause, rank)
+        else:
+            # an explicit list still passes through the top-2 association
+            # filter — callers name candidates, the data picks
+            cands = sorted(((rank.get(c, 0.0), c) for c in confounders
+                            if c != cause), reverse=True)
+            confounders = [c for a, c in cands[:2] if a > 0.1]
+        return self._adjusted(obs, cause, confounders)
 
+    def _adjusted(self, obs: list[Observation], cause: str,
+                  confounders: list[str]) -> tuple[float, int]:
+        """The backdoor computation proper: stratify, compare WITHIN each
+        stratum, weight by stratum size."""
         strata = (self._strata(obs, cause, confounders) if confounders
                   else {(1,): [o for o in obs
                                if o.features.get(cause, 0.0) > 0.5],
@@ -215,13 +237,17 @@ class CausalEngine:
             return []
         ys = [o.outcome for o in obs]
         causes = sorted({k for o in obs for k in o.features})
+        # one ranking for the whole discovery — effect() no longer
+        # recomputes per-cause associations
+        rank = self._binarized_rank(obs, ys)
         edges: list[CausalEdge] = []
         for cause in causes:
             xs = [o.features.get(cause, 0.0) for o in obs]
             association = pearson(xs, ys)
             if abs(association) < 0.08:
                 continue                      # nothing to explain
-            adjusted, usable = self.effect(obs, cause)
+            adjusted, usable = self._adjusted(
+                obs, cause, self._auto_confounders(cause, rank))
             if usable == 0:
                 verdict = "UNMEASURED"
             elif (association > 0) == (adjusted > 0) \

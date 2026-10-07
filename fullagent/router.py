@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from typing import Any
 
 from .kernel import EventLog, fold
 from ._foundation import get_logger
@@ -37,13 +38,14 @@ _log = get_logger("router")
 # capability: 0.0..1.0 — how strong the model is on hard tasks.
 # cost_in/out: relative $ per 1k tokens (free tiers are 0). These are
 # relative units used to compare routes, not billing truth.
-MODEL_TABLE: dict[str, dict] = {
+MODEL_TABLE: dict[str, dict[str, Any]] = {
     "stealth/union-alpha": {"capability": 0.95, "cost_in": 0.0,
                             "cost_out": 0.0, "tools": True,
                             "reasoning": False},
 }
 
-# the strongest model in the table — the escalation ceiling
+# the strongest model in the DEFAULT table — the escalation ceiling when no
+# custom table is in play (kept for backwards compatibility)
 _STRONGEST = max(MODEL_TABLE, key=lambda m: MODEL_TABLE[m]["capability"])
 
 # ---------------------------------------------------------------------------
@@ -69,7 +71,7 @@ class Difficulty:
     score: float = 0.0
     needs_tools: bool = False
     needs_reasoning: bool = False
-    axes: dict = field(default_factory=dict)
+    axes: dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {"score": round(self.score, 3),
@@ -80,6 +82,9 @@ class Difficulty:
 
 def classify(text: str) -> Difficulty:
     """Score a task's difficulty across cheap heuristic axes."""
+    # harden against non-string callers (None, bytes) — never a crash path
+    if not isinstance(text, str):
+        text = str(text)
     low = text.lower()
     words = max(1, len(text.split()))
 
@@ -131,6 +136,13 @@ class Router:
                  table: dict[str, dict] | None = None) -> None:
         self.log = log
         self.table = table or MODEL_TABLE
+        # BUGFIX: the escalation ceiling belongs to THIS router's table.
+        # The old module-global _STRONGEST leaked across Router instances
+        # with custom tables — the `escalated` flag and savings() both
+        # compared against the wrong model.
+        self._strongest = (max(self.table,
+                               key=lambda m: self.table[m]["capability"])
+                           if self.table else _STRONGEST)
 
     def _capable(self, model_id: str, diff: Difficulty) -> bool:
         spec = self.table.get(model_id)
@@ -187,9 +199,9 @@ class Router:
             # table without a tool-capable model, or an empty table) —
             # degrade to the table's best instead of raising ValueError
             if not self.table:
-                choice = RouteChoice(_STRONGEST, diff.score,
+                choice = RouteChoice(self._strongest, diff.score,
                                      "no models in routing table — "
-                                     f"defaulting to '{_STRONGEST}'",
+                                     f"defaulting to '{self._strongest}'",
                                      escalated=True, est_cost=0.0)
                 self._seal(task, diff, choice)
                 return choice
@@ -208,7 +220,7 @@ class Router:
         reason = (f"difficulty {diff.score:.2f} -> cheapest capable "
                   f"'{best}' (cap {spec['capability']:.2f})")
         choice = RouteChoice(best, diff.score, reason,
-                             escalated=escalated or best == _STRONGEST,
+                             escalated=escalated or best == self._strongest,
                              est_cost=self._cost(best, est_tokens))
         self._seal(task, diff, choice)
         return choice
@@ -232,7 +244,7 @@ class Router:
             return {"routed": 0, "est_spent": 0.0, "strongest_cost": 0.0,
                     "saved": 0.0}
         spent = sum(float(d.get("est_cost", 0.0)) for d in decs)
-        strongest = sum(self._cost(_STRONGEST, 1500) for _ in decs)
+        strongest = sum(self._cost(self._strongest, 1500) for _ in decs)
         return {"routed": len(decs), "est_spent": round(spent, 6),
                 "strongest_cost": round(strongest, 6),
                 "saved": round(max(0.0, strongest - spent), 6)}

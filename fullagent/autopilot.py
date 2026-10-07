@@ -19,6 +19,7 @@ enables is ever hidden (axiom A7).
 from __future__ import annotations
 
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -48,9 +49,15 @@ _GOAL_VERB_RE = re.compile(
     r"\b(?:" + "|".join(re.escape(v) for v in _GOAL_VERBS) + r")\b")
 
 _QUESTION_STARTERS = (
-    "what", "why", "how", "when", "where", "who", "which", "is ", "are ",
-    "do ", "does ", "can ", "kya", "kaun", "kab", "kahan", "kyu", "kaise",
+    "what", "why", "how", "when", "where", "who", "which", "is", "are",
+    "do", "does", "can", "kya", "kaun", "kab", "kahan", "kyu", "kaise",
 )
+
+# BUGFIX: the old low.startswith(_QUESTION_STARTERS) matched "whatever"
+# as a question ("what" prefix). Anchored regex with a word boundary —
+# only a real leading question word counts.
+_QUESTION_RE = re.compile(
+    r"^(?:" + "|".join(_QUESTION_STARTERS) + r")\b")
 
 # segment-free trigger regex — word-boundary match so "rate" never
 # fires inside "generate"
@@ -99,7 +106,7 @@ class AutoPilot:
 
         low = text.lower()
         is_question = (text.strip().endswith("?")
-                       or low.startswith(_QUESTION_STARTERS))
+                       or _QUESTION_RE.match(low) is not None)
 
         # 1. real-time web — questions about live data
         hits = _WEB_TRIGGER_RE.findall(low)
@@ -165,13 +172,18 @@ class AutoPilot:
 
     @staticmethod
     def _detect_test_command() -> str | None:
-        """Probe the cwd for a real test runner (deterministic, rung 3)."""
+        """Probe the cwd for a real test runner (deterministic, rung 3).
+
+        BUGFIX: used a hardcoded "python" — on systems with only a
+        "python3" binary every clause proof failed with exit 127.
+        sys.executable is correct on every platform."""
+        py = sys.executable
         cwd = Path.cwd()
         if (cwd / "pytest.ini").exists() or (cwd / "pyproject.toml").exists() \
                 or (cwd / "tests").is_dir() or (cwd / "test").is_dir():
-            return "python -m pytest -q"
+            return f"{py} -m pytest -q"
         if any(cwd.glob("test_*.py")) or any(cwd.glob("*_test.py")):
-            return "python -m pytest -q"
+            return f"{py} -m pytest -q"
         if (cwd / "package.json").exists():
             return "npm test"
         return None

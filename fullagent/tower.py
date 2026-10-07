@@ -148,6 +148,9 @@ class Tower:
         self.server: ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
         self.url = ""
+        # web turns run in background threads — serialize them so two
+        # rapid SENDs can't interleave inside a non-thread-safe agent
+        self._turn_lock = threading.Lock()
 
     # -- state assembly ----------------------------------------------------------
 
@@ -194,15 +197,18 @@ class Tower:
             return {"ok": False, "error": "empty command"}
 
         def _run() -> None:
-            try:
-                ag.run_turn(text, on_token=lambda t: None,
-                            on_reasoning=lambda r: None,
-                            on_tool_call=lambda e: None,
-                            on_tool_update=lambda e: None,
-                            on_status=lambda s: None,
-                            approve=lambda tool, args: False)
-            except Exception:      # the river shows the sealed error
-                pass
+            # serialized: concurrent web turns would interleave agent
+            # state; a second SEND waits for the first turn to finish
+            with self._turn_lock:
+                try:
+                    ag.run_turn(text, on_token=lambda t: None,
+                                on_reasoning=lambda r: None,
+                                on_tool_call=lambda e: None,
+                                on_tool_update=lambda e: None,
+                                on_status=lambda s: None,
+                                approve=lambda tool, args: False)
+                except Exception:      # the river shows the sealed error
+                    pass
 
         threading.Thread(target=_run, name="tower:turn",
                          daemon=True).start()

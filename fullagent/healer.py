@@ -20,6 +20,7 @@ Hard rules (mechanical, rung 1 — no LLM in the loop):
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from .kernel import EventLog, fold
@@ -28,60 +29,98 @@ from ._foundation import get_logger
 _log = get_logger("healer")
 
 # ---------------------------------------------------------------------------
-# Root-cause taxonomy — pattern -> (root_cause, suggested_fix)
+# Root-cause taxonomy — pattern -> (root_cause, suggested_fix, fast keywords)
 # ---------------------------------------------------------------------------
-# Each entry: (compiled regex, root cause label, deterministic suggestion).
-# Order matters: first match wins. Keep patterns cheap and specific.
-TAXONOMY: list[tuple[re.Pattern, str, str]] = [
+# Each entry: (compiled regex, root cause label, deterministic suggestion,
+# lowercase literal keywords for the fast prefilter). Order matters: first
+# match wins. Keep patterns cheap and specific.
+TAXONOMY: list[tuple[re.Pattern, str, str, tuple[str, ...]]] = [
     (re.compile(r"ModuleNotFoundError|No module named", re.I),
      "missing_module",
-     "install the missing module or fix the import path"),
+     "install the missing module or fix the import path",
+     ("modulenotfounderror", "no module named")),
+    (re.compile(r"ImportError", re.I),
+     "import_error",
+     "fix the import statement — the module exists but the name does not",
+     ("importerror",)),
     (re.compile(r"FileNotFoundError|No such file or directory", re.I),
      "missing_file",
-     "create the file or fix the path"),
+     "create the file or fix the path",
+     ("filenotfounderror", "no such file or directory")),
     (re.compile(r"PermissionError", re.I),
      "permission_denied",
-     "check file permissions / run with appropriate access"),
+     "check file permissions / run with appropriate access",
+     ("permissionerror",)),
     (re.compile(r"ConnectionError|Connection refused|Name or service not "
                 r"known|getaddrinfo", re.I),
      "network_unreachable",
-     "check network / target host availability"),
+     "check network / target host availability",
+     ("connectionerror", "connection refused", "name or service not known",
+      "getaddrinfo")),
     (re.compile(r"TimeoutError|timed out", re.I),
      "timeout",
-     "raise the timeout or optimise the slow step"),
+     "raise the timeout or optimise the slow step",
+     ("timeouterror", "timed out")),
     (re.compile(r"SyntaxError", re.I),
      "syntax_error",
-     "fix the syntax at the reported line"),
+     "fix the syntax at the reported line",
+     ("syntaxerror",)),
     (re.compile(r"IndentationError", re.I),
      "indentation_error",
-     "fix the indentation at the reported line"),
+     "fix the indentation at the reported line",
+     ("indentationerror",)),
     (re.compile(r"NameError", re.I),
      "undefined_name",
-     "define or import the missing name"),
+     "define or import the missing name",
+     ("nameerror",)),
     (re.compile(r"TypeError", re.I),
      "type_mismatch",
-     "fix the argument types / signature"),
+     "fix the argument types / signature",
+     ("typeerror",)),
     (re.compile(r"KeyError", re.I),
      "missing_key",
-     "use .get() or ensure the key exists"),
+     "use .get() or ensure the key exists",
+     ("keyerror",)),
     (re.compile(r"AttributeError", re.I),
      "missing_attribute",
-     "check the object type / attribute name"),
+     "check the object type / attribute name",
+     ("attributeerror",)),
     (re.compile(r"ZeroDivisionError", re.I),
      "division_by_zero",
-     "guard the divisor against zero"),
+     "guard the divisor against zero",
+     ("zerodivisionerror",)),
     (re.compile(r"AssertionError", re.I),
      "assertion_failed",
-     "the behaviour under test is wrong — inspect the assertion"),
+     "the behaviour under test is wrong — inspect the assertion",
+     ("assertionerror",)),
     (re.compile(r"command not found|not recognized", re.I),
      "missing_binary",
-     "install the tool or fix PATH"),
+     "install the tool or fix PATH",
+     ("command not found", "not recognized")),
     (re.compile(r"out of memory|MemoryError|Cannot allocate", re.I),
      "out_of_memory",
-     "reduce memory use or raise the limit"),
-    (re.compile(r"rate limit|429|too many requests", re.I),
+     "reduce memory use or raise the limit",
+     ("out of memory", "memoryerror", "cannot allocate")),
+    (re.compile(r"rate limit|\b429\b|too many requests", re.I),
      "rate_limited",
-     "back off and retry with delay"),
+     "back off and retry with delay",
+     ("rate limit", "429", "too many requests")),
+    (re.compile(r"Segmentation fault|segfault", re.I),
+     "segfault",
+     "native crash — check C extensions / recursion depth",
+     ("segmentation fault", "segfault")),
+    (re.compile(r"No space left on device|disk quota|ENOSPC", re.I),
+     "disk_full",
+     "free disk space or point temp files elsewhere",
+     ("no space left on device", "disk quota", "enospc")),
+    (re.compile(r"BrokenPipeError", re.I),
+     "broken_pipe",
+     "the downstream consumer closed the pipe — handle SIGPIPE",
+     ("brokenpipeerror",)),
+    (re.compile(r"SSLError|certificate verify failed", re.I),
+     "tls_error",
+     "check certificates / TLS configuration / system clock",
+     ("sslerror", "certificate verify failed")),
 ]
 
 
@@ -101,9 +140,16 @@ class Diagnosis:
 
 def classify(error_text: str) -> Diagnosis:
     """Match an error against the taxonomy. First match wins; no match is
-    an honest 'unknown', never a guess."""
+    an honest 'unknown', never a guess.
+
+    Fast path: each entry carries literal keywords — if none of an
+    entry's keywords appear in the text, its regex is never run. Most
+    error texts skip 90%+ of the patterns on substring checks alone."""
     text = error_text or ""
-    for rx, cause, suggestion in TAXONOMY:
+    tl = text.lower()
+    for rx, cause, suggestion, keywords in TAXONOMY:
+        if not any(k in tl for k in keywords):
+            continue
         m = rx.search(text)
         if m:
             return Diagnosis(cause, suggestion, rx.pattern,
@@ -142,7 +188,10 @@ class Healer:
     `recheck` re-runs the original check: recheck() -> (ok, error_text).
     Both are caller-supplied so the healer itself never mutates anything."""
 
-    def __init__(self, log: EventLog, fixer=None, recheck=None) -> None:
+    def __init__(self, log: EventLog,
+                 fixer: Callable[[Diagnosis, str], str] | None = None,
+                 recheck: Callable[[], tuple[bool, str]] | None = None
+                 ) -> None:
         self.log = log
         self.fixer = fixer
         self.recheck = recheck

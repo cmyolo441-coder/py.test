@@ -16,13 +16,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 import copy
 from ._foundation import get_logger
 
 _log = get_logger("cassette")
+
+# Bound the hot in-memory store: a long session with thousands of unique
+# requests must not grow RAM without limit. Evicted entries stay replayable
+# from the disk offset index (two-tier: hot LRU + cold disk).
+_MAX_HOT = 2048
 
 
 def _canonical(obj: Any) -> str:
@@ -45,7 +52,12 @@ def request_key(model: str, messages: list[dict],
 
 
 class Cassette:
-    """Record or replay model request/response pairs."""
+    """Record or replay model request/response pairs.
+
+    Two-tier storage: a bounded hot LRU in RAM plus a cold offset index
+    into the JSONL file, so replay never re-reads the whole file and a
+    huge cassette never blows up memory.
+    """
 
     def __init__(self, path: Path, mode: str = "off") -> None:
         """mode: 'off' | 'record' | 'replay'."""
@@ -54,17 +66,28 @@ class Cassette:
         self.path = Path(path)
         self.mode = mode
         self._lock = threading.Lock()
-        self._store: dict[str, dict] = {}
+        # hot tier: key -> response (LRU, bounded)
+        self._store: OrderedDict[str, dict] = OrderedDict()
+        # cold tier: key -> byte offset of the LAST line holding it
+        self._offsets: dict[str, int] = {}
         self.hits = 0
         self.misses = 0
+        self._fh = None  # persistent append handle (record mode)
         if mode in ("record", "replay") and self.path.exists():
             self._load()
 
     def _load(self) -> None:
+        """Build the offset index in ONE pass; load nothing eagerly.
+
+        Responses are faulted in from disk on first replay (lazy), so
+        opening a gigabyte cassette is instant and RAM stays flat."""
         with self.path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
+            while True:
+                off = f.tell()
+                line = f.readline()
                 if not line:
+                    break
+                if not line.strip():
                     continue
                 try:
                     pair = json.loads(line)
@@ -72,13 +95,63 @@ class Cassette:
                     continue
                 key = pair.get("key")
                 if key:
-                    self._store[key] = pair.get("response")
+                    # last occurrence wins (re-recorded pairs)
+                    self._offsets[key] = off
 
-    def _persist(self, key: str, response: dict) -> None:
+    def _read_at(self, off: int) -> dict | None:
+        """Fault one response in from disk by offset."""
+        try:
+            with self.path.open("r", encoding="utf-8") as f:
+                f.seek(off)
+                pair = json.loads(f.readline())
+                resp = pair.get("response")
+                return resp if isinstance(resp, dict) else None
+        except (OSError, ValueError):
+            return None
+
+    def _open_append(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps({"key": key, "response": response},
-                               ensure_ascii=False) + "\n")
+        self._fh = self.path.open("a", encoding="utf-8")
+
+    def _persist(self, line: str) -> None:
+        """Append one pre-serialized line through the persistent handle.
+
+        Flushes to the OS on every write (survives a process crash; only a
+        power loss can drop the tail). Reopens once if the handle died or
+        the directory vanished underneath us."""
+        try:
+            if self._fh is None:
+                self._open_append()
+            assert self._fh is not None
+            off_before = self._fh.tell()
+            self._fh.write(line)
+            self._fh.flush()
+            try:
+                os.fsync(self._fh.fileno())
+            except OSError:
+                pass
+        except (ValueError, OSError):
+            # handle closed/replaced, or directory deleted externally —
+            # reopen once and retry; a cassette must not take the app down
+            try:
+                self._fh = None
+                self._open_append()
+                assert self._fh is not None
+                off_before = self._fh.tell()
+                self._fh.write(line)
+                self._fh.flush()
+            except OSError:
+                # disk truly unwritable: report the offset as unknown;
+                # the hot tier still has the record for this session
+                return None
+        return off_before
+
+    def _store_put(self, key: str, response: dict) -> None:
+        """Insert into the hot LRU, evicting the coldest entry past cap."""
+        self._store[key] = response
+        self._store.move_to_end(key)
+        while len(self._store) > _MAX_HOT:
+            self._store.popitem(last=False)
 
     # -- record ---------------------------------------------------------------
 
@@ -89,12 +162,19 @@ class Cassette:
         if self.mode != "record":
             return
         key = request_key(model, messages, tools, effort_key)
+        # deep-copy IN: a caller mutating the response afterwards must
+        # not rewrite what the cassette recorded
+        stored = copy.deepcopy(response)
+        # serialize FIRST, before touching any state: if the response is
+        # not JSON-serializable we fail loudly here instead of diverging
+        # (hot tier updated, disk not) and losing the write on restart
+        line = json.dumps({"key": key, "response": stored},
+                          ensure_ascii=False, default=str) + "\n"
         with self._lock:
-            # deep-copy IN: a caller mutating the response afterwards must
-            # not rewrite what the cassette (and the JSONL) recorded
-            stored = copy.deepcopy(response)
-            self._store[key] = stored
-            self._persist(key, stored)
+            off = self._persist(line)
+            self._store_put(key, stored)
+            if off is not None:
+                self._offsets[key] = off
 
     # -- replay ---------------------------------------------------------------
 
@@ -111,14 +191,23 @@ class Cassette:
         with self._lock:
             if key in self._store:
                 self.hits += 1
+                self._store.move_to_end(key)  # LRU touch
                 # deep-copy OUT: annotating a replayed response must not
                 # corrupt every future replay of the same key
                 return copy.deepcopy(self._store[key])
+            off = self._offsets.get(key)
+            if off is not None:
+                resp = self._read_at(off)
+                if resp is not None:
+                    self.hits += 1
+                    self._store_put(key, resp)
+                    return copy.deepcopy(resp)
             self.misses += 1
             return None
 
     def __len__(self) -> int:
-        return len(self._store)
+        # total known pairs (hot + cold), not just the cached ones
+        return len(set(self._offsets) | set(self._store))
 
 
 # ---------------------------------------------------------------------------

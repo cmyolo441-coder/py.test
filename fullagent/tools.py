@@ -9,6 +9,7 @@ import os
 import queue
 import re
 import shutil
+import stat
 import subprocess
 import threading
 import time
@@ -37,15 +38,24 @@ class Tool:
     handler: Callable[..., str]
     risk: str = RISK_SAFE
 
+    # Module-level cache: schemas are identical for every call, so build
+    # once per tool name instead of re-serializing on every turn.
+    _schema_cache: dict = field(default_factory=dict, repr=False,
+                                compare=False)
+
     def openai_schema(self) -> dict:
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": self.parameters,
-            },
-        }
+        cached = self._schema_cache.get(self.name)
+        if cached is None:
+            cached = {
+                "type": "function",
+                "function": {
+                    "name": self.name,
+                    "description": self.description,
+                    "parameters": self.parameters,
+                },
+            }
+            self._schema_cache[self.name] = cached
+        return cached
 
 
 def _clip(text: str, limit: int = config.MAX_TOOL_OUTPUT_CHARS) -> str:
@@ -57,10 +67,53 @@ def _clip(text: str, limit: int = config.MAX_TOOL_OUTPUT_CHARS) -> str:
 
 
 def _resolve(path: str) -> Path:
-    p = Path(path).expanduser()
+    """Resolve a user-supplied path against the process cwd.
+
+    Raises ValueError on empty paths, null bytes, or path-traversal
+    attempts (``..``) — every file tool funnels through here, so a
+    malicious or mistaken ``../../etc/passwd`` can never escape.
+    """
+    p = validate_path(path)  # raises ValidationError on bad input
     if not p.is_absolute():
         p = Path.cwd() / p
     return p
+
+
+def _resolve_under(path: str, base: str | Path) -> Path:
+    """Like _resolve but against an explicit base directory (used by
+    apply_patch, which honors the live-shell session cwd)."""
+    p = validate_path(path)
+    if not p.is_absolute():
+        p = Path(base) / p
+    return p
+
+
+def _checked(path: str) -> tuple[Path | None, str | None]:
+    """_resolve without exceptions: (path, None) on success, or
+    (None, "ERROR: ...") — so tools fail fast with a clear message."""
+    try:
+        return _resolve(path), None
+    except Exception as e:  # ValidationError, TypeError, ...
+        return None, f"ERROR: invalid path: {e}"
+
+
+def _checked_under(path: str, base: str | Path,
+                   ) -> tuple[Path | None, str | None]:
+    try:
+        return _resolve_under(path, base), None
+    except Exception as e:
+        return None, f"ERROR: invalid path: {e}"
+
+
+def _coerce_int(value: Any, name: str, default: int, lo: int,
+                hi: int) -> tuple[int | None, str | None]:
+    """Coerce a model-supplied numeric argument, clamped to [lo, hi].
+    Returns (value, None) or (None, "ERROR: ...")."""
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return None, f"ERROR: {name} must be an integer, got {value!r}"
+    return max(lo, min(hi, v)), None
 
 
 def _diff_summary(old: str, new: str) -> tuple[int, int]:
@@ -103,28 +156,40 @@ def _line_numbered(text: str, start: int = 1) -> str:
 
 def _atomic_write_text(p: Path, text: str) -> None:
     """Write UTF-8 atomically: a crash mid-write can never leave a
-    truncated/corrupt file behind."""
+    truncated/corrupt file behind. The temp name carries pid+thread so two
+    concurrent writes to the same path can't clobber each other's temp."""
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_name(p.name + ".tmp")
+    tmp = p.with_name(
+        f"{p.name}.tmp-{os.getpid()}-{threading.get_ident()}")
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, p)
 
 
 def read_file(path: str, offset: int = 1, limit: int = 1000) -> str:
     """Read a text file with line numbers."""
-    p = _resolve(path)
-    if not p.exists():
+    p, err = _checked(path)
+    if err:
+        return err
+    offset, err = _coerce_int(offset, "offset", 1, 1, 10_000_000)
+    if err:
+        return err
+    limit, err = _coerce_int(limit, "limit", 1000, 1, 5000)
+    if err:
+        return err
+    try:
+        st = p.stat()  # single stat: proves existence + gives size
+    except OSError:
         return f"ERROR: file not found: {p}"
-    if p.is_dir():
+    if stat.S_ISDIR(st.st_mode):
         return f"ERROR: {p} is a directory (use list_dir)"
-    if p.stat().st_size > 2_000_000:
-        return f"ERROR: file is very large ({p.stat().st_size} bytes); use offset/limit"
+    if st.st_size > 2_000_000:
+        return (f"ERROR: file is very large ({st.st_size} bytes); "
+                "use offset/limit")
     try:
         text = p.read_text(encoding="utf-8", errors="replace")
     except OSError as e:
         return f"ERROR: {e}"
     lines = text.splitlines()
-    offset = max(1, offset)
     if offset > len(lines):
         return (f"[{p} — {len(lines)} lines total; offset {offset} is past the "
                 f"end of file]")
@@ -136,9 +201,26 @@ def read_file(path: str, offset: int = 1, limit: int = 1000) -> str:
 
 def write_file(path: str, content: str) -> str:
     """Create or overwrite a file (parents created automatically)."""
-    p = _resolve(path)
+    p, err = _checked(path)
+    if err:
+        return err
+    if not isinstance(content, str):
+        return f"ERROR: content must be a string, got {type(content).__name__}"
+    # Transmission-corruption guard: null bytes / stray control chars mean
+    # the content was mangled in flight — fail fast instead of writing a
+    # corrupt file the agent will then have to delete and rewrite.
+    if "\x00" in content:
+        return ("ERROR: content corrupted in transmission (null byte) — "
+                "please resend the write_file call")
+    for i, ch in enumerate(content):
+        o = ord(ch)
+        if o < 0x20 and ch not in "\n\r\t":
+            return ("ERROR: content corrupted in transmission "
+                    f"(control char U+{o:04X} at offset {i}) — please "
+                    "resend the write_file call")
     old = ""
-    if p.exists():
+    existed = p.exists()
+    if existed:
         try:
             old = p.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
@@ -147,8 +229,8 @@ def write_file(path: str, content: str) -> str:
         _atomic_write_text(p, content)
     except OSError as e:
         return f"ERROR: {e}"
-    if not p.exists() or old == "":
-        # brand-new file — a pure-addition report reads better
+    if not existed or old == "":
+        # brand-new (or previously empty) file — a pure-addition report
         adds = len(content.splitlines())
         return f"OK: created {p} with {adds} line(s) ({len(content)} chars)"
     adds, removes = _diff_summary(old, content)
@@ -159,7 +241,9 @@ def edit_file(path: str, old_string: str, new_string: str,
               replace_all: bool = False) -> str:
     """Replace an exact string in a file. old_string must match exactly once
     (or set replace_all=true to replace every occurrence)."""
-    p = _resolve(path)
+    p, err = _checked(path)
+    if err:
+        return err
     if not p.exists():
         return f"ERROR: file not found: {p}"
     if not old_string:
@@ -196,72 +280,114 @@ def edit_file(path: str, old_string: str, new_string: str,
 
 def list_dir(path: str = ".") -> str:
     """List a directory's contents (one level)."""
-    p = _resolve(path)
+    p, err = _checked(path)
+    if err:
+        return err
     if not p.is_dir():
         return f"ERROR: not a directory: {p}"
-    entries = sorted(p.iterdir(), key=lambda e: (e.is_file(), e.name.lower()))
-    lines = [f"[{p}]"]
-    for e in entries[:300]:
-        if e.is_dir():
-            lines.append(f"  {e.name}/")
+    # One stat per entry (not three): is_dir/is_file/size all derive from it.
+    rows: list[tuple[bool, str, str]] = []  # (is_file, sort_name, display)
+    try:
+        entries = list(p.iterdir())
+    except OSError as e:
+        return f"ERROR: cannot list {p}: {e}"
+    for e in entries:
+        try:
+            st = e.stat()
+        except OSError:
+            rows.append((True, e.name.lower(), f"  {e.name}  (unreadable)"))
+            continue
+        if stat.S_ISDIR(st.st_mode):
+            rows.append((False, e.name.lower(), f"  {e.name}/"))
         else:
-            try:
-                size = e.stat().st_size
-                lines.append(f"  {e.name}  ({size} bytes)")
-            except OSError:
-                # broken symlink or vanished entry — don't crash the listing
-                lines.append(f"  {e.name}  (unreadable)")
-    if len(entries) > 300:
-        lines.append(f"  … and {len(entries) - 300} more")
+            rows.append((True, e.name.lower(),
+                         f"  {e.name}  ({st.st_size} bytes)"))
+    rows.sort(key=lambda r: (r[0], r[1]))
+    lines = [f"[{p}]"] + [r[2] for r in rows[:300]]
+    if len(rows) > 300:
+        lines.append(f"  … and {len(rows) - 300} more")
     return "\n".join(lines) if len(lines) > 1 else f"[{p}] (empty)"
 
 
 def file_info(path: str) -> str:
     """Show metadata about a file or directory."""
-    p = _resolve(path)
-    if not p.exists():
+    p, err = _checked(path)
+    if err:
+        return err
+    try:
+        st = p.stat()
+    except OSError:
         return f"ERROR: not found: {p}"
-    st = p.stat()
-    kind = "directory" if p.is_dir() else "file"
+    kind = "directory" if stat.S_ISDIR(st.st_mode) else "file"
     return (f"{p}\n  type: {kind}\n  size: {st.st_size} bytes\n"
             f"  modified: {st.st_mtime}")
 
 
 def create_directory(path: str) -> str:
-    p = _resolve(path)
-    p.mkdir(parents=True, exist_ok=True)
+    """Create a directory (parents included). Never raises."""
+    p, err = _checked(path)
+    if err:
+        return err
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return f"ERROR: cannot create directory {p}: {e}"
     return f"OK: created directory {p}"
 
 
 def copy_path(src: str, dst: str) -> str:
-    s, d = _resolve(src), _resolve(dst)
+    """Copy a file or directory. Never raises."""
+    s, err = _checked(src)
+    if err:
+        return err
+    d, err = _checked(dst)
+    if err:
+        return err
     if not s.exists():
         return f"ERROR: source not found: {s}"
-    if s.is_dir():
-        shutil.copytree(s, d, dirs_exist_ok=True)
-    else:
-        d.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(s, d)
+    try:
+        if s.is_dir():
+            shutil.copytree(s, d, dirs_exist_ok=True)
+        else:
+            d.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(s, d)
+    except OSError as e:
+        return f"ERROR: copy failed: {e}"
     return f"OK: copied {s} -> {d}"
 
 
 def move_path(src: str, dst: str) -> str:
-    s, d = _resolve(src), _resolve(dst)
+    """Move/rename a file or directory. Never raises."""
+    s, err = _checked(src)
+    if err:
+        return err
+    d, err = _checked(dst)
+    if err:
+        return err
     if not s.exists():
         return f"ERROR: source not found: {s}"
-    d.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(s), str(d))
+    try:
+        d.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(s), str(d))
+    except OSError as e:
+        return f"ERROR: move failed: {e}"
     return f"OK: moved {s} -> {d}"
 
 
 def delete_path(path: str) -> str:
-    p = _resolve(path)
-    if not p.exists():
+    """Delete a file or directory permanently. Never raises."""
+    p, err = _checked(path)
+    if err:
+        return err
+    if not p.exists() and not p.is_symlink():
         return f"ERROR: not found: {p}"
-    if p.is_dir():
-        shutil.rmtree(p)
-    else:
-        p.unlink()
+    try:
+        if p.is_dir() and not p.is_symlink():
+            shutil.rmtree(p)
+        else:
+            p.unlink()
+    except OSError as e:
+        return f"ERROR: delete failed: {e}"
     return f"OK: deleted {p}"
 
 
@@ -269,11 +395,29 @@ def delete_path(path: str) -> str:
 # Search tools
 # ---------------------------------------------------------------------------
 
+# Files bigger than this are skipped by search_files — reading a 500MB log
+# into memory to regex it would blow the agent's RAM for zero benefit.
+_SEARCH_MAX_FILE_BYTES = 5_000_000
+
+
 def search_files(pattern: str, path: str = ".", glob_filter: str = "*",
                  max_results: int = 100) -> str:
     """Regex search through file contents (ripgrep-style), respecting common
     ignore dirs. Returns matching lines as path:line:content."""
-    root = _resolve(path)
+    if not isinstance(pattern, str) or not pattern:
+        return "ERROR: pattern must be a non-empty string"
+    root, err = _checked(path)
+    if err:
+        return err
+    max_results, err = _coerce_int(max_results, "max_results", 100, 1, 1000)
+    if err:
+        return err
+    if not isinstance(glob_filter, str) or not glob_filter:
+        return "ERROR: glob_filter must be a non-empty string"
+    try:
+        rx = re.compile(pattern)
+    except re.error as e:
+        return f"ERROR: bad regex: {e}"
     if root.is_file():
         files = [root]
         root = root.parent
@@ -288,17 +432,17 @@ def search_files(pattern: str, path: str = ".", glob_filter: str = "*",
                     files.append(Path(dirpath) / fn)
             if len(files) > 5000:
                 break
-    try:
-        rx = re.compile(pattern)
-    except re.error as e:
-        return f"ERROR: bad regex: {e}"
     hits: list[str] = []
     for f in files:
         try:
+            if f.stat().st_size > _SEARCH_MAX_FILE_BYTES:
+                continue  # huge binary/log — skip, don't OOM
             text = f.read_text(errors="replace")
         except OSError:
             continue
         for i, line in enumerate(text.splitlines(), 1):
+            if len(line) > 2000:
+                line = line[:2000]  # pathological one-line files
             if rx.search(line):
                 hits.append(f"{f}:{i}:{line.strip()[:200]}")
                 if len(hits) >= max_results:
@@ -308,10 +452,17 @@ def search_files(pattern: str, path: str = ".", glob_filter: str = "*",
 
 def glob_files(pattern: str, path: str = ".") -> str:
     """Find files by glob pattern (e.g. '**/*.py')."""
-    root = _resolve(path)
+    if not isinstance(pattern, str) or not pattern:
+        return "ERROR: pattern must be a non-empty string"
     if pattern.startswith("/"):
         # Path.glob() rejects absolute patterns outright
         return "ERROR: pattern must be relative to the search path"
+    if ".." in Path(pattern).parts:
+        # Path.glob("..") escapes the search root — reject like _resolve
+        return "ERROR: pattern must not contain '..'"
+    root, err = _checked(path)
+    if err:
+        return err
     try:
         matches = sorted(str(p) for p in root.glob(pattern)
                          if p.is_file())[:300]
@@ -378,6 +529,22 @@ def _pump_process(proc: "subprocess.Popen", timeout: float,
     return out_lines, err_lines
 
 
+def _validate_shell_args(command: str, timeout: int,
+                         ) -> tuple[str | None, float | None, str | None]:
+    """Shared validation for run_command/live_shell. Returns
+    (command, timeout_seconds, None) or (None, None, "ERROR: ...")."""
+    if not isinstance(command, str) or not command.strip():
+        return None, None, "ERROR: command must be a non-empty string"
+    try:
+        secs = float(timeout)
+    except (TypeError, ValueError):
+        return None, None, \
+            f"ERROR: timeout must be a number, got {timeout!r}"
+    if secs <= 0:
+        return None, None, "ERROR: timeout must be positive"
+    return command, min(secs, 600.0), None  # hard cap: 10 minutes
+
+
 def run_command(command: str, timeout: int = 120,
                 on_output: "Callable[[str, str], None] | None" = None) -> str:
     """Run a shell command via bash and return exit code + output.
@@ -386,6 +553,9 @@ def run_command(command: str, timeout: int = 120,
     System32\\bash.exe is the WSL stub and fails when no distro is
     installed, so Git Bash is probed and preferred. If `on_output` is
     provided, each output line is streamed to it live as it appears."""
+    command, secs, err = _validate_shell_args(command, timeout)
+    if err:
+        return err
     from .judge import resolve_shell
     argv = resolve_shell()
     if argv is None:
@@ -400,9 +570,9 @@ def run_command(command: str, timeout: int = 120,
         )
     except OSError as e:
         return f"ERROR: {e}"
-    pumped = _pump_process(proc, timeout, on_output)
+    pumped = _pump_process(proc, secs, on_output)
     if pumped is None:
-        return f"ERROR: command timed out after {timeout}s"
+        return f"ERROR: command timed out after {secs:g}s"
     out_lines, err_lines = pumped
     stdout = "".join(out_lines)
     stderr = "".join(err_lines)
@@ -437,11 +607,26 @@ def live_shell(command: str, timeout: int = 120,
     State is shared process-wide and guarded by a lock so two callers can
     never interleave their commands into the same session. If `on_output`
     is provided, each output line is streamed to it live as it appears."""
+    command, secs, err = _validate_shell_args(command, timeout)
+    if err:
+        return err
     from .judge import resolve_shell
     argv = resolve_shell()
     if argv is None:
         return ("ERROR: no POSIX shell available — install Git Bash "
                 "(windows) or bash (posix)")
+    # The lock covers the WHOLE command, not just the state update: cwd/env
+    # are session-global, so a second command starting mid-flight would
+    # read a cwd/env that the first command is about to change — the
+    # interleaving this lock exists to prevent.
+    with _SHELL_LOCK:
+        return _live_shell_locked(argv, command, secs, on_output)
+
+
+def _live_shell_locked(argv: list[str], command: str, timeout: float,
+                       on_output: "Callable[[str, str], None] | None"
+                       ) -> str:
+    """live_shell body; the caller must hold _SHELL_LOCK."""
     cwd = _SHELL_STATE["cwd"] or os.getcwd()
     # Wrap so the command's own exit code survives, and the FINAL cwd +
     # environment are reported back on marker lines we strip before
@@ -502,7 +687,7 @@ def live_shell(command: str, timeout: int = 120,
         return f"ERROR: {e}"
     pumped = _pump_process(proc, timeout, relay)
     if pumped is None:
-        return f"ERROR: command timed out after {timeout}s (cwd={cwd})"
+        return f"ERROR: command timed out after {timeout:g}s (cwd={cwd})"
     out_lines, err_lines = pumped
     stdout = "".join(out_lines)
     stderr = "".join(err_lines)
@@ -522,11 +707,11 @@ def live_shell(command: str, timeout: int = 120,
     if j >= 0:
         new_cwd = stdout[j + len("__FA_CWD__"):].strip() or cwd
         stdout = stdout[:j].rstrip("\n")
-    with _SHELL_LOCK:
-        if os.path.isdir(new_cwd):
-            _SHELL_STATE["cwd"] = new_cwd
-        if new_env:
-            _SHELL_STATE["env"] = new_env
+    # Already under _SHELL_LOCK (see live_shell) — no extra locking needed.
+    if os.path.isdir(new_cwd):
+        _SHELL_STATE["cwd"] = new_cwd
+    if new_env:
+        _SHELL_STATE["env"] = new_env
     parts = [f"cwd: {_SHELL_STATE['cwd']}", f"exit code: {proc.returncode}"]
     if stdout:
         parts.append("--- stdout ---\n" + stdout)
@@ -556,72 +741,89 @@ def apply_patch(patch: str) -> str:
     Relative paths resolve against the persistent live_shell cwd if a
     session is active (so `live_shell("cd src")` followed by a patch on
     `a/main.py` does the intuitive thing)."""
-    if not (patch or "").strip():
-        return "ERROR: empty patch"
+    if not isinstance(patch, str) or not patch.strip():
+        return "ERROR: patch must be a non-empty string"
     base = _SHELL_STATE["cwd"] or os.getcwd()
-    # -- parse the patch into per-file hunks ------------------------------
-    files: dict[str, dict] = {}
+    # -- parse the patch into per-file sections ---------------------------
+    # A section is: --- <old> / +++ <new> / @@ hunks. Either side may be
+    # /dev/null (new file / deleted file). Hunks always belong to the
+    # section whose headers precede them — the old code kept attaching a
+    # deletion's hunks to the PREVIOUS file's entry, silently corrupting it.
+    sections: list[dict] = []
     cur: dict | None = None
+
+    def strip_name(raw: str) -> str:
+        name = raw.split("\t")[0].strip()
+        if name.startswith("a/") or name.startswith("b/"):
+            name = name[2:]
+        return name
+
     for line in patch.splitlines():
-        if line.startswith(("--- ", "+++ ")) \
-                and not line.startswith(("--- \t", "+++ \t")):
-            name = line[4:].split("\t")[0].strip()
-            if name.startswith("a/") or name.startswith("b/"):
-                name = name[2:]
-            if name == "/dev/null":
-                continue
-            side_is_new = line.startswith("+++ ")
-            key = name
-            if cur is None or cur.get("_pending") != key or not side_is_new:
-                pass
-            entry = files.setdefault(key, {"old": "", "new": "",
-                                           "_seen_new": False})
-            if side_is_new:
-                entry["_seen_new"] = True
-                cur = entry
+        if line.startswith("--- ") and not line.startswith("--- \t"):
+            cur = {"old_name": strip_name(line[4:]), "new_name": None,
+                   "hunks": []}
+            sections.append(cur)
+            continue
+        if line.startswith("+++ ") and not line.startswith("+++ \t"):
+            if cur is None:
+                # +++ without --- — start a section anyway, be lenient
+                cur = {"old_name": "/dev/null", "new_name": None,
+                       "hunks": []}
+                sections.append(cur)
+            cur["new_name"] = strip_name(line[4:])
             continue
         if line.startswith("@@"):
             if cur is not None:
-                cur.setdefault("hunks", []).append(
-                    {"lines": [], "old_start": 1, "new_start": 1})
-                h = cur["hunks"][-1]
                 m = re.match(
                     r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
-                if m:
-                    h["old_start"] = int(m.group(1))
-                    h["new_start"] = int(m.group(3))
+                cur["hunks"].append(
+                    {"lines": [],
+                     "old_start": int(m.group(1)) if m else 1,
+                     "new_start": int(m.group(3)) if m else 1})
             continue
-        if cur is not None and cur.get("hunks"):
+        if cur is not None and cur["hunks"]:
             h = cur["hunks"][-1]
-            if line.startswith("+") or line.startswith("-") \
-                    or line.startswith(" ") or line == "":
+            if line.startswith(("+", "-", " ")) or line == "":
                 h["lines"].append(line if line else " ")
-    if not files or not any(f.get("hunks") for f in files.values()):
+            # "\ No newline at end of file" and friends: ignored
+    sections = [s for s in sections if s["hunks"]]
+    if not sections:
         return ("ERROR: no hunks found — expected '@@' headers "
                 "(unified diff format)")
-    # -- load old contents -------------------------------------------------
-    for name, entry in files.items():
-        p = Path(name).expanduser()
-        if not p.is_absolute():
-            p = base / p
-        if p.exists():
-            try:
-                entry["old"] = p.read_text(encoding="utf-8",
-                                           errors="replace")
-            except OSError as e:
-                return f"ERROR: cannot read {p}: {e}"
-    # -- apply each file's hunks -------------------------------------------
+    # -- resolve + validate every target path BEFORE touching anything -----
+    targets: list[tuple[dict, Path, bool]] = []  # (section, path, deleted)
+    for s in sections:
+        old_null = s["old_name"] == "/dev/null"
+        new_null = s["new_name"] == "/dev/null"
+        name = s["new_name"] if not new_null else s["old_name"]
+        if not name or name == "/dev/null":
+            return "ERROR: patch section has no usable file path"
+        p, err = _checked_under(name, base)
+        if err:
+            return err  # path traversal / absolute escape blocked here
+        targets.append((s, p, new_null and not old_null))
+    # -- apply ---------------------------------------------------------------
     reports: list[str] = []
-    for name, entry in files.items():
-        if not entry.get("hunks"):
+    for s, p, deleted in targets:
+        if deleted:
+            if p.exists():
+                try:
+                    p.unlink()
+                except OSError as e:
+                    return f"ERROR: cannot delete {p}: {e}"
+                reports.append(f"Deleted {p}")
+            else:
+                reports.append(f"Skipped delete of missing {p}")
             continue
-        p = Path(name).expanduser()
-        if not p.is_absolute():
-            p = base / p
-        old_lines = entry["old"].splitlines()
+        try:
+            old_text = p.read_text(encoding="utf-8",
+                                   errors="replace") if p.exists() else ""
+        except OSError as e:
+            return f"ERROR: cannot read {p}: {e}"
+        old_lines = old_text.splitlines()
         new_lines = list(old_lines)
         # apply hunks bottom-up so earlier offsets stay valid
-        for hunk in sorted(entry["hunks"],
+        for hunk in sorted(s["hunks"],
                            key=lambda h: h["old_start"], reverse=True):
             ctx: list[tuple[str, str]] = []   # (tag, text)
             for raw in hunk["lines"]:
@@ -645,7 +847,7 @@ def apply_patch(patch: str) -> str:
                 if matched:
                     break
             if not matched:
-                return (f"ERROR: hunk context mismatch in {name} near "
+                return (f"ERROR: hunk context mismatch in {p} near "
                         f"line {hunk['old_start']} — file changed since "
                         "the diff was made; regenerate the diff and retry")
             # rebuild: keep everything before, splice the new-side lines,
@@ -653,14 +855,13 @@ def apply_patch(patch: str) -> str:
             new_side = [x for t, x in ctx if t in (" ", "+")]
             new_lines = (new_lines[:pos] + new_side
                          + new_lines[pos + len(old_side):])
-        new_text = "\n".join(new_lines) + ("\n" if entry["old"].endswith(
+        new_text = "\n".join(new_lines) + ("\n" if old_text.endswith(
             "\n") or new_lines else "")
-        adds, removes = _diff_summary(entry["old"], new_text)
         try:
             _atomic_write_text(p, new_text)
         except OSError as e:
             return f"ERROR: writing {p}: {e}"
-        reports.append(_edit_report(p, entry["old"], new_text))
+        reports.append(_edit_report(p, old_text, new_text))
     return "\n".join(reports)
 
 
@@ -671,6 +872,17 @@ def apply_patch(patch: str) -> str:
 def web_fetch(url: str) -> str:
     """Fetch a URL and return its text content."""
     import requests
+    import urllib.parse
+    if not isinstance(url, str) or not url.strip():
+        return "ERROR: url must be a non-empty string"
+    try:
+        scheme = urllib.parse.urlparse(url.strip()).scheme.lower()
+    except ValueError:
+        return f"ERROR: malformed URL: {url[:80]}"
+    if scheme not in ("http", "https"):
+        # SSRF guard: no file://, gopher://, or cloud-metadata endpoints
+        # reached through exotic schemes
+        return f"ERROR: only http(s) URLs are allowed, got {scheme or 'no'} scheme"
     try:
         resp = requests.get(url, timeout=30, headers={
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) FullAgent/1.0"})
@@ -766,7 +978,16 @@ def web_search(query: str) -> str:
 _STR = {"type": "string"}
 
 
+_REGISTRY: dict[str, Tool] | None = None
+
+
 def build_registry() -> dict[str, Tool]:
+    """Build (once) and return the tool registry. The registry is a
+    module-level singleton: rebuilding 17 Tool dataclasses + schema dicts
+    on every agent turn is pure waste."""
+    global _REGISTRY
+    if _REGISTRY is not None:
+        return _REGISTRY
     tools: list[Tool] = [
         Tool("read_file",
              "Read a text file with line numbers. Use offset/limit for large files.",
@@ -861,7 +1082,8 @@ def build_registry() -> dict[str, Tool]:
              {"type": "object", "properties": {"query": _STR}, "required": ["query"]},
              web_search),
     ]
-    return {t.name: t for t in tools}
+    _REGISTRY = {t.name: t for t in tools}
+    return _REGISTRY
 
 
 def parse_tool_arguments(raw: Any) -> dict:

@@ -113,16 +113,45 @@ class RacingUniverses:
                 if time.monotonic() >= deadline:
                     break
                 started = time.monotonic()
-                try:
-                    out = self.runner(s, task, cancel)
+                # Run the lane in a worker thread and join with the
+                # REMAINING deadline: the old code called the runner
+                # directly, so a hung runner that never consults `cancel`
+                # blocked the race forever despite the timer. Now a hung
+                # lane loses by timeout instead of wedging the agent.
+                lane_out: dict = {}
+
+                def _lane(strategy=s, cancel_ev=cancel):
+                    try:
+                        lane_out["result"] = self.runner(
+                            strategy, task, cancel_ev)
+                    except Exception as e:  # a crashing universe loses
+                        lane_out["error"] = e
+
+                worker = threading.Thread(target=_lane, daemon=True,
+                                          name=f"race:{s['id']}")
+                worker.start()
+                remaining = max(0.0, deadline - time.monotonic())
+                worker.join(remaining if remaining > 0 else 0.01)
+                elapsed_ms = int((time.monotonic() - started) * 1000)
+                if worker.is_alive():
+                    # hung lane: it stays leaked (daemon) but the race
+                    # moves on — sealed as a timeout loss
+                    cancel.set()
                     outcome = UniverseOutcome(
-                        strategy=s["id"], result=str(out or ""),
-                        elapsed_ms=int((time.monotonic() - started) * 1000))
-                except Exception as e:    # a crashing universe just loses
+                        strategy=s["id"],
+                        result="TIMEOUT: lane exceeded the race deadline",
+                        elapsed_ms=elapsed_ms)
+                elif "error" in lane_out:
+                    e = lane_out["error"]
                     outcome = UniverseOutcome(
                         strategy=s["id"],
                         result=f"ERROR: {e}",
-                        elapsed_ms=int((time.monotonic() - started) * 1000))
+                        elapsed_ms=elapsed_ms)
+                else:
+                    outcome = UniverseOutcome(
+                        strategy=s["id"],
+                        result=str(lane_out.get("result") or ""),
+                        elapsed_ms=elapsed_ms)
                 if cancel.is_set() and \
                         time.monotonic() >= deadline:
                     result.outcomes.append(outcome)

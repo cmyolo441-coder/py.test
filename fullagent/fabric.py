@@ -72,6 +72,10 @@ class KnowledgeFabric:
     def __init__(self, log: EventLog) -> None:
         self.log = log
         self.facts: list[Fact] = []
+        # index: (subject, predicate) -> [facts]. assert_fact/query used
+        # to scan the whole fact list per call — O(n) that hurt once the
+        # fabric grew past a few thousand facts.
+        self._sp_index: dict[tuple[str, str], list[Fact]] = {}
 
     # -- writes -----------------------------------------------------------------
 
@@ -91,10 +95,11 @@ class KnowledgeFabric:
         fact = Fact(subject=subject, predicate=predicate, obj=obj,
                     valid_from=start, txn_time=now,
                     confidence=confidence)
-        # expire contradictory live predecessors
-        for old in self.facts:
-            if (old.subject, old.predicate) == (subject, predicate) \
-                    and old.obj != obj and old.live(max(now, start)) \
+        # expire contradictory live predecessors — via the index, not a
+        # full scan
+        key = (subject, predicate)
+        for old in self._sp_index.get(key, ()):
+            if old.obj != obj and old.live(max(now, start)) \
                     and old.valid_to == _INFINITY:
                 old.valid_to = max(now, start)
                 old.superseded_by = fact.fid
@@ -103,6 +108,7 @@ class KnowledgeFabric:
                                  "reason": "superseded",
                                  "by": fact.fid}, actor="kernel")
         self.facts.append(fact)
+        self._sp_index.setdefault(key, []).append(fact)
         self.log.append("fabric.assert", fact.to_dict(),
                         actor="sovereign")
         return fact
@@ -113,9 +119,8 @@ class KnowledgeFabric:
               at: float | None = None) -> list[Fact]:
         """Live facts for (s, p) — now, or as of a valid-time."""
         return sorted(
-            [f for f in self.facts
-             if f.subject == subject and f.predicate == predicate
-             and f.live(at)],
+            [f for f in self._sp_index.get((subject, predicate), ())
+             if f.live(at)],
             key=lambda f: f.valid_from)
 
     def ask(self, subject: str, predicate: str,
@@ -147,9 +152,7 @@ class KnowledgeFabric:
     # -- reporting ---------------------------------------------------------------------
 
     def history(self, subject: str, predicate: str) -> str:
-        rows = sorted([f for f in self.facts
-                       if f.subject == subject
-                       and f.predicate == predicate],
+        rows = sorted(self._sp_index.get((subject, predicate), ()),
                       key=lambda f: f.valid_from)
         if not rows:
             return f"no history for {subject}·{predicate}"

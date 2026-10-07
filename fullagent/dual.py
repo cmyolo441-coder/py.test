@@ -26,6 +26,7 @@ fraction of work genuinely needed deep thought.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import time
 from collections import OrderedDict
@@ -80,6 +81,16 @@ class DualProcess:
         self.stats = {"system1": 0, "system2": 0, "cache_hits": 0,
                       "escalations": 0}
 
+    @staticmethod
+    def _cache_key(question: str) -> str:
+        """Cache key for a question. The old key truncated to the first
+        200 chars — two different long questions sharing a 200-char
+        prefix collided and returned each other's answers. The full
+        question is hashed; a short prefix is kept for debuggability."""
+        q = question.lower().strip()
+        digest = hashlib.sha256(q.encode("utf-8")).hexdigest()[:16]
+        return f"{q[:64]}#{digest}"
+
     def _cache_put(self, key: str, value: tuple[str, float, bool]) -> None:
         """Insert/update with LRU semantics and a hard cap. Prevents the
         cache from growing without bound (DoS via unique-questions loop)."""
@@ -100,8 +111,14 @@ class DualProcess:
         complexity = len(_COMPLEXITY.findall(question))
         conf -= 0.06 * min(complexity, 4)
         if self.brain is not None:
-            known = self.brain.recall(question, k=3)
-            has_memory = len(self.brain.memories) > 0
+            try:
+                known = self.brain.recall(question, k=3)
+            except Exception:
+                known = []
+            # a duck-typed brain may not expose .memories — treat a
+            # missing attribute as "no novelty signal", not a crash
+            memories = getattr(self.brain, "memories", None)
+            has_memory = bool(memories) and len(memories) > 0
             if known:
                 conf += 0.10             # familiar, reinforced domain
             elif has_memory:
@@ -122,7 +139,7 @@ class DualProcess:
         if not question:
             return RouteDecision2(1, "", 0.0, "empty question")
 
-        key = question.lower().strip()[:200]
+        key = self._cache_key(question)
         cached = self.cache.get(key)
         if cached is not None:
             answer, sealed_at, from_slow = cached

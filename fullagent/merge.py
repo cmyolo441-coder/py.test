@@ -139,24 +139,27 @@ class TimelineMerger:
         # multiset matching: identical payloads are matched ONE-TO-ONE.
         # Membership-only matching collapsed legitimate repeats (a user
         # message sent twice) into a single merged event.
+        # The payload key is hashed ONCE per event — the old code
+        # re-hashed every event up to three times (count + classify +
+        # recount), each hash a sha256 over the full payload.
+        keys_a = [_payload_key(e) for e in evs_a]
+        keys_b = [_payload_key(e) for e in evs_b]
         count_b: dict[str, int] = {}
-        for e in evs_b:
-            count_b[_payload_key(e)] = count_b.get(_payload_key(e), 0) + 1
+        for key in keys_b:
+            count_b[key] = count_b.get(key, 0) + 1
 
         # classify: shared (identical payload) vs exclusive
-        for ev in evs_a:
-            key = _payload_key(ev)
+        for ev, key in zip(evs_a, keys_a):
             if count_b.get(key, 0) > 0:
                 result.shared.append(ev)
                 count_b[key] -= 1
             else:
                 result.only_a.append(ev)
         count_a: dict[str, int] = {}
-        for e in evs_a:
-            count_a[_payload_key(e)] = count_a.get(_payload_key(e), 0) + 1
+        for key in keys_a:
+            count_a[key] = count_a.get(key, 0) + 1
         result.only_b = []
-        for e in evs_b:
-            key = _payload_key(e)
+        for e, key in zip(evs_b, keys_b):
             if count_a.get(key, 0) > 0:
                 count_a[key] -= 1  # twin already classified on the A side
             else:
@@ -189,15 +192,13 @@ class TimelineMerger:
         # materialise the merged branch: replay logical events in a
         # deterministic interleave — A-exclusive, B-exclusive, shared —
         # each once, content types only (structural events would be lies)
-        fork_at = self.ancestor(a, b)
+        fork_at = anc  # already computed above — no second ancestor walk
         merge_branch = result.branch
         # fork the merge branch from A at the ancestor, carrying A's base
         # (fork seeds the branch; the shared ancestor events are already
         # on it through A's chain)
         self.log._heads[merge_branch] = self.log._event_at(
             a, fork_at).id if fork_at >= 0 else None
-        if merge_branch not in self.log.branches():
-            self.log._heads.setdefault(merge_branch, None)
         replay = []
         for ev in result.only_a + result.only_b + result.shared:
             # every classified copy replays — duplicates are REAL history

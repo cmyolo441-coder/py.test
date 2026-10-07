@@ -63,6 +63,10 @@ class CIPilot:
         self.records: list[RunRecord] = []
         self.streak_green = 0
         self.streak_red = 0
+        # test-file text cache: impacted_tests() used to re-read EVERY
+        # test file on every change — keyed by (path, mtime, size) so
+        # unchanged files are never re-read.
+        self._test_text_cache: dict[str, tuple[tuple[float, int], str]] = {}
 
     # -- the file map -----------------------------------------------------------
 
@@ -82,29 +86,46 @@ class CIPilot:
             pass
         return out
 
+    def _test_text(self, rel: str) -> str:
+        """Test file contents, cached by (mtime, size) — unchanged files
+        are never re-read from disk."""
+        p = self.root / rel
+        try:
+            st = p.stat()
+            sig = (st.st_mtime, st.st_size)
+        except OSError:
+            return ""
+        cached = self._test_text_cache.get(rel)
+        if cached is not None and cached[0] == sig:
+            return cached[1]
+        try:
+            text = p.read_text(errors="replace")
+        except OSError:
+            text = ""
+        self._test_text_cache[rel] = (sig, text)
+        return text
+
     def impacted_tests(self, changed: list[str]) -> list[str]:
-        """Map changed source files to their test files: name twins,
-        importers of the changed module, and same-directory tests.
-        Paths are posix-normalised everywhere (Windows-safe)."""
+        """Map changed source files to their test files: name twins
+        (test_x.py AND x_test.py), importers of the changed module, and
+        same-directory tests. Paths are posix-normalised everywhere
+        (Windows-safe)."""
         tests = {p.relative_to(self.root).as_posix()
-                 for p in self.root.rglob("test_*.py")}
+                 for p in self.root.rglob("*.py")
+                 if _TEST_NAME.match(p.name)}
         if not tests:
             return []
         picked: set[str] = set()
-        test_text: dict[str, str] = {}
-        for t in tests:
-            try:
-                test_text[t] = (self.root / t).read_text(
-                    errors="replace")
-            except OSError:
-                test_text[t] = ""
+        test_text = {t: self._test_text(t) for t in tests}
         for path in changed:
             path = Path(str(path).replace("\\", "/"))
             mod = path.stem
             for t in tests:
                 if t.endswith("/test_" + path.name) or \
                         t == f"test_{mod}.py" or \
-                        t.endswith(f"/test_{mod}.py"):
+                        t.endswith(f"/test_{mod}.py") or \
+                        t == f"{mod}_test.py" or \
+                        t.endswith(f"/{mod}_test.py"):
                     picked.add(t)
             for t, text in test_text.items():
                 if mod and mod in text:

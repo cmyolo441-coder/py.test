@@ -41,7 +41,7 @@ from ._foundation import get_logger
 _log = get_logger("goal")
 from dataclasses import dataclass, field
 
-from .kernel import EventLog, fold
+from .kernel import Event, EventLog, fold
 
 # ---------------------------------------------------------------------------
 # §37.3 clause kinds and §39.3 proof confidence
@@ -176,6 +176,9 @@ class GoalContract:
         if closing_rule not in CLOSING_RULES:
             raise GoalContractError(
                 f"closing_rule must be one of {CLOSING_RULES}")
+        if not isinstance(anti, list) or not isinstance(invariants, list):
+            raise GoalContractError(
+                "anti-clauses and invariants must be lists")
         norm: list[dict] = []
         total = 0.0
         seen_ids: set[str] = set()
@@ -212,7 +215,12 @@ class GoalContract:
                         f"clause {cid}: model_judgement cannot be the only "
                         "evidence — pair it with a deterministic proof or "
                         "mark the clause advisory")
-            weight = float(c.get("weight", 1.0))
+            weight = c.get("weight", 1.0)
+            try:
+                weight = float(weight)
+            except (TypeError, ValueError):
+                raise GoalContractError(
+                    f"clause {cid}: weight must be numeric, got {weight!r}")
             if weight < 0:
                 raise GoalContractError(f"clause {cid}: negative weight")
             total += weight
@@ -245,6 +253,12 @@ class GoalContract:
         anti = list(anti or [])
         invariants = list(invariants or [])
         norm = self.validate(clauses, anti, invariants, closing_rule)
+        try:
+            threshold_f = float(threshold)
+            autonomy_i = int(autonomy_ceiling)
+        except (TypeError, ValueError):
+            raise GoalContractError(
+                "threshold and autonomy_ceiling must be numeric")
         contract = {
             "id": _contract_id(statement, norm),
             "statement": str(statement),
@@ -253,8 +267,8 @@ class GoalContract:
             "invariant_clauses": invariants,
             "budget": dict(budget or {}),
             "closing_rule": closing_rule,
-            "threshold": float(threshold),
-            "autonomy_ceiling": int(autonomy_ceiling),
+            "threshold": threshold_f,
+            "autonomy_ceiling": autonomy_i,
             "version": 1,
             "created_ts": time.time(),
         }
@@ -327,6 +341,28 @@ class GoalContract:
 
     # -- anti-clauses & invariants (§37.4) --------------------------------------
 
+    def _is_regressed_open(self, clause_id: str) -> bool:
+        """Is there an un-cleared clause.regressed for this clause in the
+        current contract? check_anti_clauses()/check_invariants() run
+        after every write event — without this, a persistent violation
+        seals a duplicate regressed event per write (pure log spam; the
+        fold only ever reads the latest one)."""
+        evs = self.log.events()
+        last_set = -1
+        for ev in evs:
+            if ev.type == "goal.set":
+                last_set = ev.seq
+        for ev in reversed(evs):
+            if ev.seq <= last_set:
+                break
+            if ev.type == "clause.regressed" and \
+                    ev.data.get("clause") == clause_id:
+                return True
+            if ev.type in ("clause.proven", "clause.waived") and \
+                    ev.data.get("clause") == clause_id:
+                return False
+        return False
+
     def check_anti_clauses(self) -> list[dict]:
         """Re-check every anti-clause NOW. Called after every write event.
         An anti-clause's check describes the condition that must HOLD; if
@@ -341,11 +377,14 @@ class GoalContract:
                 continue
             verdict = self.judge.check(check)
             if not verdict.passed:
-                violations.append({"clause": anti.get("id", "?"),
+                cid = anti.get("id", "?")
+                violations.append({"clause": cid,
                                    "text": anti.get("text", ""),
                                    "detail": verdict.detail})
+                if self._is_regressed_open(cid):
+                    continue  # already recorded and still open — no dup
                 self.log.append("clause.regressed",
-                                {"clause": anti.get("id", "?"),
+                                {"clause": cid,
                                  "anti": True,
                                  "reason": verdict.detail},
                                 actor="judge", provenance="tool_output")
@@ -363,11 +402,14 @@ class GoalContract:
                 continue
             verdict = self.judge.check(check)
             if not verdict.passed:
-                violations.append({"clause": inv.get("id", "?"),
+                cid = inv.get("id", "?")
+                violations.append({"clause": cid,
                                    "text": inv.get("text", ""),
                                    "detail": verdict.detail})
+                if self._is_regressed_open(cid):
+                    continue  # already recorded and still open — no dup
                 self.log.append("clause.regressed",
-                                {"clause": inv.get("id", "?"),
+                                {"clause": cid,
                                  "invariant": True,
                                  "reason": verdict.detail},
                                 actor="judge", provenance="tool_output")
@@ -402,6 +444,9 @@ class GoalContract:
         """Score every open clause at rung 1 (§40.1). The highest-gravity
         clause becomes the focus; everything re-aims at it."""
         st = self.status()
+        # SPEED: the fold ran once per clause (inside the loop) — hoisted.
+        regressed_ids = {r.get("clause")
+                         for r in fold(self.log).clause_regressed}
         scores: dict[str, float] = {}
         for c in st.clauses:
             if c.state in ("PROVEN", "WAIVED"):
@@ -412,11 +457,7 @@ class GoalContract:
             est_cost = max(0.05, c.attributed_cost or 0.05)
             unblocked = 1.0
             # freshness penalty: recently regressed clauses pull less
-            freshness = 1.0
-            for reg in reversed(fold(self.log).clause_regressed):
-                if reg.get("clause") == c.id:
-                    freshness = 0.5
-                    break
+            freshness = 0.5 if c.id in regressed_ids else 1.0
             scores[c.id] = (weight * feasibility * (1.0 / est_cost)
                             * unblocked * freshness)
         return scores
@@ -478,10 +519,11 @@ class GoalContract:
 
     # -- closure (§42) ---------------------------------------------------------------
 
-    def closure_check(self) -> tuple[str, list[str]]:
+    def closure_check(self, st: GoalStatus | None = None
+                      ) -> tuple[str, list[str]]:
         """Compute the terminal state from proof events — never declared by
         a model (§42.1). Returns (state, reasons)."""
-        st = self.status()
+        st = st if st is not None else self.status()
         if not st.active:
             return ABANDONED, ["no active contract"]
         reasons: list[str] = []
@@ -527,21 +569,25 @@ class GoalContract:
                     self.prove_by_predicate(c.id)
             self.check_anti_clauses()
             self.check_invariants()
-        state, reasons = self.closure_check()
+            # the re-proofs sealed new events — the pre-loop status is
+            # stale; refresh once and reuse it below (was: status()
+            # recomputed separately by closure_check and evidence_bundle)
+            st = self.status()
+        state, reasons = self.closure_check(st)
         self.log.append("goal.closed", {"state": state, "reasons": reasons},
                         actor="kernel")
         return {"state": state, "reasons": reasons,
-                "bundle": self.evidence_bundle()}
+                "bundle": self.evidence_bundle(st)}
 
-    def evidence_bundle(self) -> str:
+    def evidence_bundle(self, st: GoalStatus | None = None) -> str:
         """§42.3 — the deliverable of Goal Mode: a proof per clause with
         event ids, not a paragraph claiming success."""
-        st = self.status()
+        st = st if st is not None else self.status()
         if not st.active:
             return "no active contract"
         # The header must agree with the closure state (§42.1), which is
         # stricter than `complete` (it also demands proof confidence).
-        state, _ = self.closure_check()
+        state, _ = self.closure_check(st)
         lines = [f"GOAL {state} — contract {st.contract_id}",
                  f'  "{st.statement}"', ""]
         for c in st.clauses:
@@ -577,14 +623,22 @@ class GoalContract:
         # wins; a regression AFTER a proof reopens the clause (§42.4).
         # Only events AFTER the current goal.set count — proofs from a
         # previous contract must not leak into this one.
+        # SPEED: one log walk collects last_set_seq + buffers the small
+        # set of goal-relevant events; the filter then runs over the
+        # buffer, not the log (was: three full log walks).
         last_set_seq = -1
+        relevant: list[Event] = []
         for ev in self.log.events():
             if ev.type == "goal.set":
                 last_set_seq = ev.seq
+            elif ev.type in ("clause.proven", "clause.regressed",
+                             "clause.waived", "goal.focus"):
+                relevant.append(ev)
         proven: dict[str, tuple[int, dict]] = {}
         regressed_after: dict[str, int] = {}
         waived: set[str] = set()
-        for ev in self.log.events():
+        focus_history: list[str] = []
+        for ev in relevant:
             if ev.seq <= last_set_seq:
                 continue
             d = ev.data
@@ -598,6 +652,8 @@ class GoalContract:
                                            ev.seq)
             elif ev.type == "clause.waived":
                 waived.add(d.get("clause", ""))
+            elif ev.type == "goal.focus" and d.get("to"):
+                focus_history.append(d.get("to"))
 
         clauses: list[ClauseState] = []
         for raw in clauses_raw:
@@ -632,12 +688,8 @@ class GoalContract:
         if isinstance(velocity, (int, float)) and velocity > 1e-6:
             eta = int(distance / (velocity / 10.0))
 
-        # focus history — scoped to the current contract like the proofs
-        # (fold entries carry no seq, so filter on the event walk)
-        focus_history = [ev.data.get("to") for ev in self.log.events()
-                         if ev.type == "goal.focus"
-                         and ev.seq > last_set_seq
-                         and ev.data.get("to")]
+        # focus = latest goal.focus in the current contract (already
+        # collected in the single merged walk above)
         focus = focus_history[-1] if focus_history else None
 
         # drift: >=30% of attributed cost on the lowest-weight open clause

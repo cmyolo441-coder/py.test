@@ -227,12 +227,23 @@ class WorkflowEngine:
                                elapsed_ms=int(rep.get("elapsed_ms", 0)))
                 if r.status == "done" and step.expect is not None \
                         and self.judge is not None:
-                    verdict = self.judge.check(step.expect)
-                    r.check = verdict.detail
-                    if not verdict.passed:
+                    # BUG FIX: a judge crash used to kill the whole run
+                    # with an unsealed traceback. The predicate is the
+                    # thing being verified — its failure to even run is
+                    # a BLOCK, not a run-killer.
+                    try:
+                        verdict = self.judge.check(step.expect)
+                    except Exception as e:  # noqa: BLE001
                         r.status = "blocked"
-                        r.summary = (r.summary + f"\nEXPECT FAILED: "
-                                     f"{verdict.detail}").strip()
+                        r.check = f"judge crashed: {type(e).__name__}: {e}"
+                        r.summary = (r.summary + "\nEXPECT ERROR: "
+                                     + r.check).strip()
+                    else:
+                        r.check = verdict.detail
+                        if not verdict.passed:
+                            r.status = "blocked"
+                            r.summary = (r.summary + f"\nEXPECT FAILED: "
+                                         f"{verdict.detail}").strip()
                 self.log.append("workflow.step",
                                 {"name": wf.name, "phase": phase_num,
                                  **r.to_dict()},
@@ -285,7 +296,14 @@ class WorkflowEngine:
             rep = out or {"status": "error", "summary": "empty report"}
         rep.setdefault("elapsed_ms",
                        int((time.monotonic() - started) * 1000))
-        rep.setdefault("status", "done")
+        # BUG FIX: a step that returns no status must NOT silently pass.
+        # StepResult defaults a missing status to "error", and the engine's
+        # hard rule is "never silently skipped" — defaulting to "done"
+        # here let a forgetful executor green-light the whole workflow.
+        if not rep.get("status"):
+            rep["status"] = "error"
+            rep["summary"] = (str(rep.get("summary", ""))
+                              + " [no status reported by executor]").strip()
         rep.setdefault("summary", "")
         return rep
 

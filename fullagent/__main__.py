@@ -72,7 +72,13 @@ def _headless(argv: list[str]) -> int:
         if len(argv) < 2:
             print("usage: rewind <seq>", file=sys.stderr)
             return 2
-        new_head, kept = agent.rewind_to(int(argv[1]))
+        try:
+            seq = int(argv[1])
+        except ValueError:
+            print(f"rewind: seq must be an integer, got {argv[1]!r}",
+                  file=sys.stderr)
+            return 2
+        new_head, kept = agent.rewind_to(seq)
         print(f"rewound to seq {new_head} — {kept} message(s) kept")
         return 0
 
@@ -80,7 +86,13 @@ def _headless(argv: list[str]) -> int:
         if len(argv) < 2:
             print("usage: revert <seq>", file=sys.stderr)
             return 2
-        result = agent.revert_files_to(int(argv[1]))
+        try:
+            seq = int(argv[1])
+        except ValueError:
+            print(f"revert: seq must be an integer, got {argv[1]!r}",
+                  file=sys.stderr)
+            return 2
+        result = agent.revert_files_to(seq)
         if "error" in result:
             print(f"error: {result['error']}", file=sys.stderr)
             return 1
@@ -101,7 +113,12 @@ def _headless(argv: list[str]) -> int:
         if len(argv) < 2:
             print("usage: why <seq>", file=sys.stderr)
             return 2
-        seq = int(argv[1])
+        try:
+            seq = int(argv[1])
+        except ValueError:
+            print(f"why: seq must be an integer, got {argv[1]!r}",
+                  file=sys.stderr)
+            return 2
         target = next((e for e in agent.log.events() if e.seq == seq), None)
         if target is None:
             print(f"no event at seq {seq}", file=sys.stderr)

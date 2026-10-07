@@ -202,6 +202,21 @@ class Crew:
             raise CrewError("cannot spawn a subagent without a task")
         if role not in ROLES:
             role = DEFAULT_ROLE
+        # BUG FIX: build the opening conversation BEFORE touching the
+        # roster. mastermind.dispatch() can raise — the old order left a
+        # "running" agent registered that was never enqueued, so wait()
+        # hung until timeout on a ghost.
+        user = (f"Shared context:\n{context}\n\nYOUR TASK: {task}"
+                if context else f"YOUR TASK: {task}")
+        opening: list[dict] = []
+        if self.mastermind is not None:
+            opening, _ = self.mastermind.gate.dispatch(
+                f"worker:{role}", opening)
+        else:
+            systemprompt.with_system(opening,
+                                     systemprompt.worker(role,
+                                                         self.max_agents))
+        opening.append({"role": "user", "content": user})
         with self._lock:
             live = sum(1 for a in self._agents.values()
                        if a.state == "running")
@@ -218,21 +233,12 @@ class Crew:
                 nickname = f"{nickname}-{self._counter}"
             agent = CrewAgent(id=agent_id, nickname=nickname, role=role,
                               task=task, read_only=bool(read_only))
+            agent.messages = opening
             override = model_by_id(str(model_id or "")) if model_id else None
             if override is not None:
                 agent.model_id = override.id
             self._agents[agent_id] = agent
             self._order.append(agent_id)
-
-        user = (f"Shared context:\n{context}\n\nYOUR TASK: {task}"
-                if context else f"YOUR TASK: {task}")
-        if self.mastermind is not None:
-            agent.messages, _ = self.mastermind.gate.dispatch(
-                f"worker:{role}", agent.messages)
-        else:
-            systemprompt.with_system(agent.messages,
-                                     systemprompt.worker(role, self.max_agents))
-        agent.messages.append({"role": "user", "content": user})
 
         self.log.append("crew.spawn",
                         {"id": agent.id, "nickname": agent.nickname,
@@ -489,31 +495,50 @@ class Crew:
                                      "tools": tool_names[:6]},
                                     actor=f"crew:{agent.id}")
             final = (result.content if result is not None else "") or ""
+        except Exception as e:  # noqa: BLE001 — a failing agent never kills the crew
+            final = None
+            loop_error: Exception | None = e
+        else:
+            loop_error = None
+        # BUG FIX: the whole landing sequence used to run without the
+        # agent mutex — a sovereign send()/close()/resume() in this exact
+        # window could resurrect a closed agent, clobber "closed" back to
+        # "done", or park a follow-up in pending_messages that was then
+        # never delivered (crew.done sealed without draining it). One
+        # atomic critical section now: the worker's verdict, the
+        # in_loop flag, pending delivery and the terminal event.
+        with agent.mutex:
+            agent.in_loop = False
             if agent.state == "closed":
                 # retired mid-loop — keep the closed state, never resurrect
+                agent.pending_messages.clear()
                 return
-            state, summary = parse_worker_final(final)
-            agent.summary = summary[:1800]
-            agent.state = state if state in ("done", "blocked") else "done"
-            if not final.strip():
-                agent.error = "subagent returned an empty reply"
+            if loop_error is not None:
                 agent.state = "error"
-        except Exception as e:  # noqa: BLE001 — a failing agent never kills the crew
-            agent.state = "error"
-            agent.error = f"{type(e).__name__}: {e}"
-        agent.finished_at = time.time()
-        # deliver queued follow-ups, if any arrived mid-loop — back of
-        # the SAME serial queue, so nothing ever overlaps
-        if agent.pending_messages and agent.state != "closed":
-            queued = agent.pending_messages.pop(0)
-            agent.messages.append({"role": "user",
-                                   "content": f"FOLLOW-UP: {queued}"})
-            agent.state = "running"
-            agent.finished_at = 0.0
-            self._enqueue(agent, read_only, MAX_SEND_STEPS)
-            return
-        self.log.append("crew.done", agent.to_dict(),
-                        actor=f"crew:{agent.id}")
+                agent.error = (f"{type(loop_error).__name__}: "
+                               f"{loop_error}")
+            else:
+                state, summary = parse_worker_final(final or "")
+                agent.summary = summary[:1800]
+                agent.state = (state if state in ("done", "blocked")
+                               else "done")
+                if not (final or "").strip():
+                    agent.error = "subagent returned an empty reply"
+                    agent.state = "error"
+            agent.finished_at = time.time()
+            # deliver queued follow-ups, if any arrived mid-loop — back of
+            # the SAME serial queue, so nothing ever overlaps
+            if agent.pending_messages:
+                queued = agent.pending_messages.pop(0)
+                agent.messages.append({"role": "user",
+                                       "content": f"FOLLOW-UP: {queued}"})
+                agent.state = "running"
+                agent.error = ""
+                agent.finished_at = 0.0
+                self._enqueue(agent, read_only, MAX_SEND_STEPS)
+                return
+            self.log.append("crew.done", agent.to_dict(),
+                            actor=f"crew:{agent.id}")
 
 
 # ---------------------------------------------------------------------------

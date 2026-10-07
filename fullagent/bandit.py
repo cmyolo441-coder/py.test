@@ -37,23 +37,27 @@ _log = get_logger("bandit")
 CONTEXTS = ("code", "write", "research", "run", "chat")
 _PRIOR = (1.0, 1.0)          # uniform Beta prior — no arm is presumed
 
+# precompiled: _context_of runs on every recommend(), and recompiling
+# four patterns per call is pure waste on a hot path
+_CTX_PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
+    ("run", re.compile(r"\b(run|execute|command|build|install|deploy|"
+                       r"benchmark)\b")),
+    ("code", re.compile(r"\b(bug|fix|code|implement|refactor|function|class|"
+                        r"test|error|stack|trace)\b")),
+    ("write", re.compile(r"\b(write|document|readme|docs?|blog|letter|essay|"
+                         r"email)\b")),
+    ("research", re.compile(r"\b(research|latest|news|compare|find|who|"
+                            r"what is|search)\b")),
+)
+
 
 def _context_of(task: str) -> str:
     """Bucket a request by its dominant verb/noun signature (execution
     verbs outrank nouns — 'run the test suite' is a run, not a test)."""
     t = str(task or "").lower()
-    if re.search(r"\b(run|execute|command|build|install|deploy|"
-                 r"benchmark)\b", t):
-        return "run"
-    if re.search(r"\b(bug|fix|code|implement|refactor|function|class|"
-                 r"test|error|stack|trace)\b", t):
-        return "code"
-    if re.search(r"\b(write|document|readme|docs?|blog|letter|essay|"
-                 r"email)\b", t):
-        return "write"
-    if re.search(r"\b(research|latest|news|compare|find|who|what is|"
-                 r"search)\b", t):
-        return "research"
+    for ctx, rx in _CTX_PATTERNS:
+        if rx.search(t):
+            return ctx
     return "chat"
 
 
@@ -155,11 +159,21 @@ class BanditRouter:
                          "alpha": round(a, 3), "beta": round(b, 3)})
 
     def policy(self) -> dict[str, dict[str, float]]:
-        """Expected value per (context, arm) — the learned policy."""
+        """Expected value per (context, arm) — the learned policy.
+
+        Includes arms that received updates but were not in the
+        original arm list: silently dropping learned data made the
+        policy lie about what was actually tried."""
+        arms = list(self.arms)
+        seen = {arm for ctx, arm in self.alpha} | \
+            {arm for ctx, arm in self.beta}
+        for arm in sorted(seen):
+            if arm and arm not in arms:
+                arms.append(arm)
         out: dict[str, dict[str, float]] = {}
         for ctx in CONTEXTS:
             out[ctx] = {}
-            for arm in self.arms:
+            for arm in arms:
                 a, b = self._posterior(ctx, arm)
                 out[ctx][arm] = round(a / (a + b), 3)
         return out

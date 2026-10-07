@@ -200,18 +200,34 @@ class DebateTournament:
     def _fuse(self, finals: list[tuple[Position, str]]
               ) -> tuple[str, str, list[list[str]], list[str]]:
         """Cluster the final answers by cosine similarity; weight each
-        cluster by Σ calibration; champion = strongest member of the
-        strongest cluster. Dissent = best answer outside the champion
-        cluster."""
-        vecs = [(p, text, _vector(text)) for p, text in finals]
+        cluster by Σ calibration; champion = the calibration-weighted
+        medoid of the strongest cluster (the most representative answer,
+        not just the most-trusted model's). Dissent = best answer outside
+        the champion cluster."""
+        # an empty answer must never become the verdict — drop them before
+        # clustering (empty vectors have zero similarity to everything,
+        # so they'd otherwise form phantom singleton clusters)
+        vecs = [(p, text, _vector(text)) for p, text in finals
+                if text.strip()]
+        if not vecs:
+            return "", "", [], []
+
+        # pairwise similarities, cached — the clustering loop and the
+        # weight computation share them instead of recomputing
+        _sim: dict[tuple[int, int], float] = {}
+
+        def sim(a: int, b: int) -> float:
+            key = (a, b) if a < b else (b, a)
+            if key not in _sim:
+                _sim[key] = cosine(vecs[a][2], vecs[b][2])
+            return _sim[key]
 
         # single-link clustering over the similarity threshold
         clusters: list[list[int]] = []
         for i in range(len(vecs)):
             placed = False
             for c in clusters:
-                if any(cosine(vecs[i][2], vecs[j][2])
-                       >= _CLUSTER_THRESHOLD for j in c):
+                if any(sim(i, j) >= _CLUSTER_THRESHOLD for j in c):
                     c.append(i)
                     placed = True
                     break
@@ -223,8 +239,7 @@ class DebateTournament:
             mass = sum(self.calibration(vecs[i][0].model_id) for i in c)
             if len(c) < 2:
                 return mass
-            sims = [cosine(vecs[a][2], vecs[b][2])
-                    for a in c for b in c if a < b]
+            sims = [sim(a, b) for a in c for b in c if a < b]
             tight = sum(sims) / len(sims) if sims else 1.0
             return mass * (0.5 + tight / 2)
 
@@ -236,9 +251,14 @@ class DebateTournament:
             for i in c:
                 vecs[i][0].cluster = ci
 
-        # champion member: highest calibration in the winning cluster
-        best = max(champion_cluster,
-                   key=lambda i: self.calibration(vecs[i][0].model_id))
+        # champion member: calibration-weighted medoid — the answer with
+        # the highest trust-weighted similarity to its cluster-mates.
+        # Pure calibration argmax could crown an outlier that happens to
+        # come from a trusted model; the medoid stays representative.
+        def medoid_score(i: int) -> float:
+            return sum(self.calibration(vecs[j][0].model_id) * sim(i, j)
+                       for j in champion_cluster)
+        best = max(champion_cluster, key=medoid_score)
         verdict = vecs[best][1]
         dissent: list[str] = []
         if len(clusters) > 1:

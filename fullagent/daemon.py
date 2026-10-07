@@ -142,21 +142,24 @@ class Daemon:
                         actor="daemon")
 
         if failed and step.attempts > self.max_retries:
-            # retries exhausted — the mission blocks here, visibly
+            # retries exhausted — the mission blocks here, visibly.
+            # _patch_state already seals the checkpoint; a second one
+            # would just be a duplicate event in the log.
             step.state = "FAILED"
             self._patch_state(m, "BLOCKED")
-            self._checkpoint(m)
             return {"mission_id": mission_id, "step": step.id,
                     "state": "BLOCKED", "result": result,
                     "progress": round(m.progress(), 3)}
 
         if failed:
             step.state = "PENDING"  # retry on the next tick
-        self._checkpoint(m)
         if m.pending() is None and not failed:
+            # last step done — seal daemon.done directly; a checkpoint
+            # immediately before it would be a redundant event
             self._close(m, "DONE")
             return {"mission_id": mission_id, "step": step.id,
                     "state": "DONE", "result": result, "progress": 1.0}
+        self._checkpoint(m)
         return {"mission_id": mission_id, "step": step.id,
                 "state": "RUNNING", "result": result,
                 "progress": round(m.progress(), 3)}
@@ -190,24 +193,45 @@ class Daemon:
                         actor="daemon")
 
     def _close(self, m: Mission, state: str) -> None:
+        # the done event carries the final step states, so resume()
+        # rebuilds correctly without a redundant checkpoint first
         m.state = state
         self.log.append("daemon.done",
                         {"mission_id": m.mission_id, "state": state,
                          "ticks": m.ticks,
+                         "steps": [s.to_dict() for s in m.steps],
                          "progress": round(m.progress(), 3)},
                         actor="daemon")
+
+    def _mission_index(self) -> dict[str, list[dict]]:
+        """One pass over the fold's daemon events -> {mission_id: events}.
+
+        SPEED: resume()/missions() used to re-scan every daemon event per
+        mission (O(missions x events)); the index is built once and each
+        mission replays only its own events."""
+        index: dict[str, list[dict]] = {}
+        for e in fold(self.log).daemon_events:
+            mid = e.get("mission_id")
+            if mid:
+                index.setdefault(mid, []).append(e)
+        return index
 
     def resume(self, mission_id: str) -> Mission | None:
         """Rebuild a mission purely from the fold — the daemon's crash
         recovery. Latest checkpoint wins; ticks replay step states."""
-        evs = fold(self.log).daemon_events
+        return self._resume_from(self._mission_index().get(mission_id))
+
+    def _resume_from(self, evs: list[dict] | None) -> Mission | None:
+        if not evs:
+            return None
         base = None
         for e in evs:
-            if e.get("type") == "daemon.mission" and \
-                    e.get("mission_id") == mission_id:
+            if e.get("type") == "daemon.mission":
                 base = e
+                break  # mission ids are unique; first seal is the base
         if base is None:
             return None
+        mission_id = str(base.get("mission_id", ""))
         steps = [Step(id=s["id"], task=s["task"], state=s.get("state"),
                       attempts=int(s.get("attempts", 0)),
                       result=s.get("result", ""))
@@ -216,8 +240,6 @@ class Daemon:
                     state="RUNNING")
         # replay checkpoints and ticks in sealed order
         for e in evs:
-            if e.get("mission_id") != mission_id:
-                continue
             if e.get("type") == "daemon.checkpoint":
                 m.ticks = int(e.get("ticks", m.ticks))
                 m.state = str(e.get("state", m.state))
@@ -230,20 +252,27 @@ class Daemon:
                         s.result = by_id[s.id].get("result", s.result)
             elif e.get("type") == "daemon.done":
                 m.state = str(e.get("state", m.state))
+                # the done event carries the terminal step states (sealed
+                # instead of a redundant final checkpoint)
+                by_id = {s["id"]: s for s in e.get("steps") or []}
+                for s in m.steps:
+                    if s.id in by_id:
+                        s.state = by_id[s.id].get("state", s.state)
+                        s.attempts = int(by_id[s.id].get("attempts",
+                                                         s.attempts))
+                        s.result = by_id[s.id].get("result", s.result)
         return m
 
     def missions(self) -> list[dict]:
         """One summary row per mission, newest first."""
-        evs = fold(self.log).daemon_events
-        ids: list[str] = []
-        for e in evs:
-            if e.get("type") == "daemon.mission":
-                mid = e.get("mission_id", "")
-                if mid and mid not in ids:
-                    ids.append(mid)
+        index = self._mission_index()
+        # newest first: mission ids embed the head seq at creation
+        # ("mission-<seq>"), so reverse-sealed-order == newest first
+        ids = [mid for mid, evs in index.items()
+               if any(e.get("type") == "daemon.mission" for e in evs)]
         rows = []
         for mid in reversed(ids):
-            m = self.resume(mid)
+            m = self._resume_from(index[mid])
             if m is None:
                 continue
             rows.append({"mission_id": mid, "statement": m.statement,

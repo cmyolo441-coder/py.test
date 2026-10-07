@@ -50,7 +50,7 @@ class Symbol:
 class GraphIndex:
     """The parsed view of a repo: symbols + edges."""
     symbols: dict[str, Symbol] = field(default_factory=dict)   # key -> Symbol
-    calls: dict[str, set[str]] = field(default_factory=dict)   # caller_key -> {callee names}
+    calls: dict[str, list[str]] = field(default_factory=dict)  # path -> [callee names, one per call SITE]
     imports: dict[str, set[str]] = field(default_factory=dict) # path -> {module names}
     file_hashes: dict[str, str] = field(default_factory=dict)  # path -> content hash
     errors: dict[str, str] = field(default_factory=dict)       # path -> parse error
@@ -61,6 +61,14 @@ class Nexus:
 
     def __init__(self) -> None:
         self.idx = GraphIndex()
+        # reverse call index: callee name -> {path: site count}.
+        # Rebuilt lazily and invalidated on every (re)index — makes
+        # callers()/transitive_callers() O(1)-ish instead of scanning
+        # the whole calls dict per query.
+        self._callers_idx: dict[str, dict[str, int]] | None = None
+        # __init__.py contents per package dir — _is_exported() used to
+        # re-read from disk on every symbol
+        self._init_cache: dict[str, str | None] = {}
 
     # -- indexing --------------------------------------------------------------
 
@@ -86,6 +94,9 @@ class Nexus:
         if self.idx.file_hashes.get(str(p)) == h:
             return False  # unchanged — never reparsed
         self._drop_file(str(p))
+        if p.name == "__init__.py":
+            # the export heuristic caches this file's contents
+            self._init_cache.pop(str(p.parent), None)
         self.idx.file_hashes[str(p)] = h
         try:
             tree = ast.parse(text)
@@ -101,10 +112,11 @@ class Nexus:
         self.idx.calls.pop(path, None)
         self.idx.imports.pop(path, None)
         self.idx.errors.pop(path, None)
+        self._callers_idx = None  # reverse index is stale now
 
     def _extract(self, path: Path, tree: ast.Module) -> None:
         pstr = str(path)
-        self.idx.calls.setdefault(pstr, set())
+        self.idx.calls.setdefault(pstr, [])
         self.idx.imports.setdefault(pstr, set())
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -122,7 +134,11 @@ class Nexus:
             elif isinstance(node, ast.Call):
                 name = self._call_name(node)
                 if name:
-                    self.idx.calls[pstr].add(name)
+                    # one entry PER CALL SITE (a list, not a set) — the
+                    # old set collapsed "called 5 times in this file"
+                    # into "called once", so callers() always reported
+                    # count 1 per file
+                    self.idx.calls[pstr].append(name)
             elif isinstance(node, ast.Import):
                 for alias in node.names:
                     self.idx.imports[pstr].add(alias.name.split(".")[0])
@@ -146,19 +162,32 @@ class Nexus:
         definitions' answer."""
         return [s for s in self.idx.symbols.values() if s.name == name]
 
+    def _reverse_index(self) -> dict[str, dict[str, int]]:
+        """callee name -> {path: call-site count}. Built lazily, cached
+        until the next index mutation."""
+        if self._callers_idx is None:
+            idx: dict[str, dict[str, int]] = {}
+            for path, names in self.idx.calls.items():
+                for name in names:
+                    per_path = idx.setdefault(name, {})
+                    per_path[path] = per_path.get(path, 0) + 1
+            self._callers_idx = idx
+        return self._callers_idx
+
     def callers(self, name: str) -> list[tuple[str, int]]:
-        """Direct call sites of `name`: (path, count)."""
-        out: list[tuple[str, int]] = []
-        for path, names in self.idx.calls.items():
-            n = sum(1 for x in names if x == name)
-            if n:
-                out.append((path, n))
-        return sorted(out)
+        """Direct call sites of `name`: (path, count) — real site counts."""
+        hits = self._reverse_index().get(name, {})
+        return sorted(hits.items())
 
     def transitive_callers(self, name: str, max_depth: int = 3) -> set[str]:
         """Symbols that call `name` directly or transitively (via symbols
         defined in the calling files)."""
-        direct = {p for p, _ in self.callers(name)}
+        rev = self._reverse_index()
+        # symbol name -> paths defining it (built once per call)
+        def_paths: dict[str, set[str]] = {}
+        for sym in self.idx.symbols.values():
+            def_paths.setdefault(sym.name, set()).add(sym.path)
+        direct = set(rev.get(name, {}))
         frontier = set(direct)
         seen = set(direct)
         for _ in range(max_depth - 1):
@@ -167,7 +196,7 @@ class Nexus:
                 # symbols defined in this file that call into the frontier
                 for sym in self.idx.symbols.values():
                     if sym.path == path:
-                        for caller_path, _ in self.callers(sym.name):
+                        for caller_path in rev.get(sym.name, {}):
                             if caller_path not in seen:
                                 seen.add(caller_path)
                                 next_frontier.add(caller_path)
@@ -205,15 +234,19 @@ class Nexus:
         }
 
     def _is_exported(self, sym: Symbol) -> bool:
-        """Heuristic: exported via an __init__.py in the same package."""
-        pkg_init = Path(sym.path).parent / "__init__.py"
-        if not pkg_init.exists():
-            return False
-        try:
-            text = pkg_init.read_text(errors="replace")
-        except OSError:
-            return False
-        return sym.name in text
+        """Heuristic: exported via an __init__.py in the same package.
+        File contents are cached per package dir — the old code re-read
+        __init__.py from disk for every symbol."""
+        pkg_dir = str(Path(sym.path).parent)
+        if pkg_dir not in self._init_cache:
+            pkg_init = Path(pkg_dir) / "__init__.py"
+            try:
+                self._init_cache[pkg_dir] = pkg_init.read_text(
+                    errors="replace") if pkg_init.exists() else None
+            except OSError:
+                self._init_cache[pkg_dir] = None
+        text = self._init_cache[pkg_dir]
+        return text is not None and sym.name in text
 
     @staticmethod
     def _risk_score(public: bool, n_transitive: int, coverage: float,

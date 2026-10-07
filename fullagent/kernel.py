@@ -245,6 +245,43 @@ class EventLog:
         self._writes_since_sync = 0
         self._load()
 
+    # -- lifecycle ---------------------------------------------------------
+    # BUG FIX (resource cleanup): the append handle was never closed —
+    # every EventLog leaked one fd for the process lifetime, and the
+    # last < _SYNC_EVERY events were never fsync'd on clean shutdown.
+    # close() flushes + fsyncs + closes; the context-manager form makes
+    # it mechanical. __del__ is a last-resort best effort only.
+
+    def close(self) -> None:
+        """Flush, fsync and close the append handle. Idempotent."""
+        with self._lock:
+            fh, self._fh = self._fh, None
+            if fh is not None:
+                try:
+                    fh.flush()
+                    try:
+                        os.fsync(fh.fileno())
+                    except OSError:
+                        pass
+                finally:
+                    try:
+                        fh.close()
+                    except OSError:
+                        pass
+            self._writes_since_sync = 0
+
+    def __enter__(self) -> "EventLog":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:  # noqa: D105 — best-effort finalizer
+        try:
+            self.close()
+        except Exception:
+            pass
+
     # -- persistence -------------------------------------------------------
 
     # SPEED: writes go through ONE persistent append handle; a full disk
@@ -391,20 +428,29 @@ class EventLog:
         return chain
 
     def _event_at(self, branch: str, seq: int) -> Event | None:
-        """The newest event on the branch's chain with e.seq <= seq."""
+        """The newest event on the branch's chain with e.seq <= seq.
+
+        The chain is seq-ascending, so this is a single forward scan
+        with early exit — no full pass needed."""
         if seq < 0:
             return None
         best: Event | None = None
         for ev in self._chain(branch):
-            if ev.seq <= seq and (best is None or ev.seq > best.seq):
-                best = ev
+            if ev.seq > seq:
+                break
+            best = ev
         return best
 
     # -- queries -----------------------------------------------------------
 
     def events(self, branch: str | None = None,
                upto_seq: int | None = None) -> list[Event]:
-        """Events of a branch up to (and including) a seq horizon."""
+        """Events of a branch up to (and including) a seq horizon.
+
+        CONTRACT: the returned list may be the branch's SHARED cached
+        chain — treat it as read-only. Mutating it (append/sort/pop)
+        corrupts the cache and every later fold. Build a new list if
+        you need to transform it."""
         br = branch or self.branch
         evs = self._chain(br)
         if upto_seq is None:

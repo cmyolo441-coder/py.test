@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import random
 import re
 import time
 from dataclasses import dataclass, field, replace
@@ -18,6 +19,9 @@ _log = get_logger("client")
 
 RETRY_STATUSES = {408, 429, 500, 502, 503, 504}
 MAX_RETRIES = 3
+# Fail fast on TCP/TLS connect; the (long) read budget stays untouched for
+# slow streams. A dead provider hangs 10s here, not the full 300s timeout.
+CONNECT_TIMEOUT = 10.0
 
 class APIError(Exception):
     def __init__(self, message: str, status: int | None = None):
@@ -45,17 +49,56 @@ def _http() -> requests.Session:
     return _SESSION
 
 
+def _timeouts(timeout: float) -> tuple[float, float]:
+    """Split (connect, read) timeouts. Connect fails fast; the read budget
+    stays long because a healthy stream can legitimately take minutes."""
+    return (min(CONNECT_TIMEOUT, timeout), timeout)
+
+
+def _backoff(attempt: int) -> float:
+    """Retry delay: fast first retry, then escalate, with jitter so a fleet
+    of agents doesn't thundering-herd a recovering provider."""
+    base = 0.5 if attempt == 0 else 2.0 * attempt
+    return base * random.uniform(0.8, 1.2)
+
+
+def _base_headers(provider: Provider, stream: bool) -> dict[str, str]:
+    """The per-request headers. Built from one place so every call path
+    (streaming, blocking, overflow-retry) sends the identical set."""
+    headers = {
+        "Authorization": f"Bearer {provider.api_key}",
+        "Content-Type": "application/json",
+    }
+    if stream:
+        headers["Accept"] = "text/event-stream"
+    return headers
+
+
+# -- prewarm: skip redundant warmups -----------------------------------------
+# The warmup's value is the pooled TCP+TLS connection, not the /models body
+# (which nobody reads). Warming the same provider twice within the TTL is a
+# wasted round-trip, so remember per-base_url warm times.
+_warm_at: dict[str, float] = {}
+_PREWARM_TTL = 120.0
+
+
 def prewarm_connection(provider) -> None:
     """SPEED: establish the TCP+TLS connection to the provider at startup
     (or model switch), so the first model call doesn't pay the handshake
     cost. Runs in a background thread — never blocks the UI. The connection
-    sits in the pool ready for the first real request."""
+    sits in the pool ready for the first real request. Warmups for the same
+    provider within the TTL are skipped (no redundant API calls)."""
     import threading
 
     def _warm():
+        key = provider.base_url
+        now = time.monotonic()
+        if now - _warm_at.get(key, 0.0) < _PREWARM_TTL:
+            return
+        _warm_at[key] = now
         try:
             url = provider.base_url.rstrip("/") + "/models"
-            _http().get(url, timeout=5,
+            _http().get(url, timeout=_timeouts(5),
                         headers={"Authorization": f"Bearer {provider.api_key}"})
         except Exception:
             pass  # prewarming is best-effort, never a crash path
@@ -165,19 +208,21 @@ def build_payload(model: Model, effort: Effort, messages: list[dict],
     if effort.max_tokens:
         # The request must fit in the window: input + max_tokens <= window,
         # otherwise the backend rejects it wholesale.
-        windowed = _window_max_tokens(model, effort, messages, tools)
+        # The input estimate is computed ONCE and shared by the clamp and
+        # the hard invariant below — previously the whole conversation was
+        # JSON-serialized up to 4 extra times per request.
+        input_tokens = _input_tokens(model, messages, tools)
+        windowed = _window_max_tokens(model, effort, messages, tools,
+                                      input_tokens)
         payload["max_tokens"] = _clamp_max_tokens(model.provider, windowed)
         # HARD INVARIANT — the last mechanical gate before the wire. No
         # request may leave with estimated input + max_tokens over the
         # window. If any earlier layer drifted, clamp again here rather
         # than send a doomed request.
         window = effective_window(model)
-        est_input = estimate_tokens(messages, model.id)
-        if tools and model.supports_tools:
-            est_input += estimate_tokens(tools, model.id)
-        if est_input + payload["max_tokens"] > window:
+        if input_tokens + payload["max_tokens"] > window:
             payload["max_tokens"] = max(
-                _MIN_COMPLETION_TOKENS, window - est_input - CONTEXT_MARGIN)
+                _MIN_COMPLETION_TOKENS, window - input_tokens - CONTEXT_MARGIN)
     if tools and model.supports_tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
@@ -341,8 +386,20 @@ CONTEXT_MARGIN = 8_192
 _MIN_COMPLETION_TOKENS = 1_024    # never clamp max_tokens below this
 
 
+def _input_tokens(model: Model, messages: list[dict],
+                  tools: list[dict] | None) -> int:
+    """Estimated prompt tokens for the exact request about to be sent.
+    Computed once per attempt and shared by the clamp and the hard
+    invariant, so the conversation isn't re-serialized for every check."""
+    n = estimate_tokens(messages, model.id)
+    if tools and model.supports_tools:
+        n += estimate_tokens(tools, model.id)
+    return n
+
+
 def _window_max_tokens(model: Model, effort: Effort, messages: list[dict],
-                       tools: list[dict] | None) -> int:
+                       tools: list[dict] | None,
+                       input_tokens: int | None = None) -> int:
     """Clamp the requested max_tokens so that input + max_tokens fits in
     the model's context window. Backends reject the whole request when
     the sum exceeds the window (e.g. 'maximum context length of 262144
@@ -355,9 +412,8 @@ def _window_max_tokens(model: Model, effort: Effort, messages: list[dict],
     if not requested:
         return 0
     window = effective_window(model)
-    input_tokens = estimate_tokens(messages, model.id)
-    if tools and model.supports_tools:
-        input_tokens += estimate_tokens(tools, model.id)
+    if input_tokens is None:
+        input_tokens = _input_tokens(model, messages, tools)
     # margin grows with the prompt: ~1 extra token of headroom per 32
     # estimated input tokens, on top of the fixed floor
     margin = CONTEXT_MARGIN + input_tokens // 32
@@ -585,13 +641,39 @@ def chat_stream(provider: Provider, model: Model, effort: Effort,
     that goes out always satisfies input + max_tokens <= window."""
     _check_api_key(provider)
     url = provider.base_url.rstrip("/") + "/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {provider.api_key}",
-        "Content-Type": "application/json",
-        "Accept": "text/event-stream",
-    }
+    headers = _base_headers(provider, stream=True)
     current_effort = effort
     shrinks_used = 0
+
+    # Tracks whether ANY output reached the UI during the current attempt.
+    # A retry replays the WHOLE request — once tokens/tool-args have been
+    # shown, retrying would duplicate the completion on screen, so
+    # post-output failures surface immediately instead of being retried.
+    streamed = {"out": False}
+
+    def _mark_emitted(cb):
+        if cb is None:
+            return None
+
+        def _wrapped(piece: str) -> None:
+            streamed["out"] = True
+            cb(piece)
+
+        return _wrapped
+
+    def _mark_emitted_args(cb):
+        if cb is None:
+            return None
+
+        def _wrapped(name: str, chunk: str) -> None:
+            streamed["out"] = True
+            cb(name, chunk)
+
+        return _wrapped
+
+    on_token_w = _mark_emitted(on_token)
+    on_reasoning_w = _mark_emitted(on_reasoning)
+    on_tool_args_w = _mark_emitted_args(on_tool_args)
 
     for overflow_attempt in range(OVERFLOW_RETRIES + OVERFLOW_SHRINKS + 1):
         sent_chars = _prompt_chars(messages, tools)
@@ -608,13 +690,16 @@ def chat_stream(provider: Provider, model: Model, effort: Effort,
             raise
         try:
             result = _chat_stream_with_retries(
-                url, headers, payload, on_token, on_reasoning, on_tool_start,
-                on_tool_args, should_cancel, timeout)
+                url, headers, payload, on_token_w, on_reasoning_w,
+                on_tool_start, on_tool_args_w, should_cancel, timeout)
             _learn_from_usage(result.usage, sent_chars, model.id)
             return result
         except APIError as e:
-            # reasoning_content validation — heal history and retry once
+            # reasoning_content validation — heal history and retry once,
+            # but NEVER after output already streamed (see `streamed`)
             if _is_reasoning_content_error(e):
+                if streamed["out"]:
+                    raise
                 if _sanitize_messages(messages):
                     continue
                 # already sanitized but provider still rejects — try
@@ -625,6 +710,11 @@ def chat_stream(provider: Provider, model: Model, effort: Effort,
                     f"{e} — history was sanitized but provider still "
                     f"rejects. Try /new or /rewind to clear the stale "
                     f"thinking turn.") from e
+            if streamed["out"]:
+                # _chat_stream_with_retries only raises post-output for
+                # non-retryable failures; healing or shrinking now would
+                # replay the request on top of the partial output
+                raise
             healed = _heal_overflow(model, current_effort, e,
                                     overflow_attempt, sent_chars)
             if healed is not None:
@@ -669,10 +759,14 @@ def _heal_overflow(model: Model, effort: Effort, error: APIError,
     return replace(effort, max_tokens=fitted)
 
 
-def _chat_stream_with_retries(url: str, headers: dict, payload: dict,
-                               on_token, on_reasoning, on_tool_start,
-                               on_tool_args, should_cancel,
-                               timeout: float) -> StreamResult:
+def _chat_stream_with_retries(
+        url: str, headers: dict, payload: dict,
+        on_token: Callable[[str], None] | None,
+        on_reasoning: Callable[[str], None] | None,
+        on_tool_start: Callable[[str], None] | None,
+        on_tool_args: Callable[[str, str], None] | None,
+        should_cancel: Callable[[], bool] | None,
+        timeout: float) -> StreamResult:
     """The plain retry loop (rate limits, timeouts, connection errors).
 
     A retry restarts the WHOLE request — once any token has already been
@@ -712,18 +806,21 @@ def _chat_stream_with_retries(url: str, headers: dict, payload: dict,
             if e.status in RETRY_STATUSES and attempt < MAX_RETRIES - 1:
                 # fast first retry, then escalate — rate limits resolve
                 # quickly on free tiers; never stall the UI for seconds
-                wait = 0.5 if attempt == 0 else 2.0 * attempt
-                time.sleep(wait)
+                time.sleep(_backoff(attempt))
                 attempt += 1
                 continue
             raise
         except requests.exceptions.Timeout as e:
             last_error = e
             if attempt < MAX_RETRIES - 1 and not emitted["out"]:
-                time.sleep(0.5)
+                time.sleep(_backoff(attempt))
                 attempt += 1
                 continue
-            raise APIError(f"request timed out after {timeout}s") from e
+            if emitted["out"]:
+                raise APIError(
+                    f"stream stalled: no data for {timeout:g}s after output "
+                    f"began — /retry to resend") from e
+            raise APIError(f"request timed out after {timeout:g}s") from e
         except (requests.exceptions.ConnectionError,
                 requests.exceptions.ChunkedEncodingError) as e:
             # ChunkedEncodingError is the typical MID-STREAM disconnect
@@ -731,23 +828,31 @@ def _chat_stream_with_retries(url: str, headers: dict, payload: dict,
             # it here it bypasses the retry budget entirely
             last_error = e
             if attempt < MAX_RETRIES - 1 and not emitted["out"]:
-                time.sleep(0.5)
+                time.sleep(_backoff(attempt))
                 attempt += 1
                 continue
             raise APIError(f"connection failed: {e}") from e
+        except requests.exceptions.RequestException as e:
+            # Anything else requests can raise (TooManyRedirects,
+            # InvalidURL, ...): not retryable, but surface it as a clean
+            # APIError instead of a raw requests exception.
+            raise APIError(f"request failed: {e}") from e
     raise APIError(str(last_error))
 
 
 def _chat_stream_once(url: str, headers: dict, payload: dict,
-                      on_token, on_reasoning, on_tool_start,
-                      on_tool_args, should_cancel,
+                      on_token: Callable[[str], None] | None,
+                      on_reasoning: Callable[[str], None] | None,
+                      on_tool_start: Callable[[str], None] | None,
+                      on_tool_args: Callable[[str, str], None] | None,
+                      should_cancel: Callable[[], bool] | None,
                       timeout: float) -> StreamResult:
     result = StreamResult()
     tc_acc: dict[int, ToolCallDelta] = {}
     announced_tools: set[int] = set()
 
     resp = _http().post(url, headers=headers, json=payload,
-                        stream=True, timeout=timeout)
+                        stream=True, timeout=_timeouts(timeout))
     if resp.status_code != 200:
         body = resp.text
         raise APIError(_extract_error_message(body), status=resp.status_code)
@@ -760,7 +865,13 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
             # Some providers return a non-streamed JSON body even when
             # stream=true was requested — parse it like blocking mode
             # instead of silently dropping the whole completion.
-            data = resp.json()
+            try:
+                data = resp.json()
+            except ValueError as e:
+                raise APIError(
+                    f"provider returned invalid JSON "
+                    f"(status {resp.status_code}): {str(e)[:200]}",
+                    status=resp.status_code) from e
             return _result_from_json(data, str(data.get("model") or ""))
         for event in _iter_sse_events(resp):
             if should_cancel is not None and should_cancel():
@@ -828,6 +939,13 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
 def _result_from_json(data: dict, model_id: str) -> StreamResult:
     """Parse a non-streamed chat.completion JSON body into a StreamResult
     (shared by blocking mode and the stream-mode JSON fallback)."""
+    # Providers occasionally return a JSON array/string instead of the
+    # chat.completion object — without this guard `data.get` raises a raw
+    # AttributeError that bypasses every error handler upstream.
+    if not isinstance(data, dict):
+        raise APIError(
+            f"provider returned unexpected JSON shape "
+            f"({type(data).__name__}): {str(data)[:200]}")
     result = StreamResult(model=data.get("model", model_id),
                           usage=data.get("usage"))
     choices = data.get("choices") or []
@@ -848,6 +966,60 @@ def _result_from_json(data: dict, model_id: str) -> StreamResult:
     return result
 
 
+def _post_blocking(url: str, headers: dict, payload: dict,
+                   timeout: float) -> dict:
+    """POST with the same retry policy as the streaming path (rate limits,
+    timeouts, connection errors). Blocking calls have no partial output,
+    so every attempt is replay-safe — unlike the stream path there is no
+    emitted-output guard here.
+
+    The response is ALWAYS closed (try/finally): leaking it would pin a
+    pooled connection and eventually starve the session pool."""
+    last_error: Exception | None = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = _http().post(url, headers=headers, json=payload,
+                                timeout=_timeouts(timeout))
+        except requests.exceptions.Timeout as e:
+            last_error = e
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(_backoff(attempt))
+                continue
+            raise APIError(f"request timed out after {timeout:g}s") from e
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.ChunkedEncodingError) as e:
+            last_error = e
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(_backoff(attempt))
+                continue
+            raise APIError(f"connection failed: {e}") from e
+        try:
+            if resp.status_code != 200:
+                raise APIError(_extract_error_message(resp.text),
+                               status=resp.status_code)
+            try:
+                data = resp.json()
+            except ValueError as e:
+                raise APIError(
+                    f"provider returned invalid JSON "
+                    f"(status {resp.status_code}): {str(e)[:200]}",
+                    status=resp.status_code) from e
+            if not isinstance(data, dict):
+                raise APIError(
+                    f"provider returned unexpected JSON shape "
+                    f"({type(data).__name__}): {str(data)[:200]}",
+                    status=resp.status_code)
+            return data
+        except APIError as e:
+            if e.status in RETRY_STATUSES and attempt < MAX_RETRIES - 1:
+                time.sleep(_backoff(attempt))
+                continue
+            raise
+        finally:
+            resp.close()
+    raise APIError(str(last_error))  # unreachable, keeps type checkers calm
+
+
 def chat_blocking(provider: Provider, model: Model, effort: Effort,
                   messages: list[dict], tools: list[dict] | None,
                   on_overflow: Callable[[], bool] | None = None,
@@ -859,10 +1031,7 @@ def chat_blocking(provider: Provider, model: Model, effort: Effort,
     itself is too big) caller-driven shrink-and-retry via on_overflow."""
     _check_api_key(provider)
     url = provider.base_url.rstrip("/") + "/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {provider.api_key}",
-        "Content-Type": "application/json",
-    }
+    headers = _base_headers(provider, stream=False)
     current_effort = effort
     shrinks_used = 0
 
@@ -880,11 +1049,7 @@ def chat_blocking(provider: Provider, model: Model, effort: Effort,
                 continue
             raise
         try:
-            resp = _http().post(url, headers=headers, json=payload,
-                                timeout=timeout)
-            if resp.status_code != 200:
-                raise APIError(_extract_error_message(resp.text),
-                               status=resp.status_code)
+            data = _post_blocking(url, headers, payload, timeout)
         except APIError as err:
             if _is_reasoning_content_error(err):
                 if _sanitize_messages(messages):
@@ -902,7 +1067,6 @@ def chat_blocking(provider: Provider, model: Model, effort: Effort,
                 shrinks_used += 1
                 continue
             raise
-        data = resp.json()
         result = _result_from_json(data, model.id)
         _learn_from_usage(result.usage, sent_chars, model.id)
         return result

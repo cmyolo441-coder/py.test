@@ -143,22 +143,62 @@ class KnowledgeGraph:
         self._relations: list[Relation] = []
         self._out: dict[str, list[Relation]] = {}
         self._in: dict[str, list[Relation]] = {}
+        # SPEED: O(1) duplicate-edge check — the old linear scan over
+        # _out[src] made indexing quadratic on large codebases.
+        self._seen_edges: set[tuple[str, str, str]] = set()
+        # name index for find(): lowercase name -> entity ids
+        self._name_index: dict[str, set[str]] = {}
+        # relations contributed by each indexed module, so re-indexing a
+        # module first retracts its stale edges (no ghost calls/imports
+        # from an older version of the source)
+        self._module_edges: dict[str, list[tuple[str, str, str]]] = {}
+
+    def _add_entity(self, e: Entity) -> None:
+        old = self._entities.get(e.id)
+        if old is not None and old.name.lower() != e.name.lower():
+            self._name_index.get(old.name.lower(), set()).discard(e.id)
+        self._entities[e.id] = e
+        self._name_index.setdefault(e.name.lower(), set()).add(e.id)
 
     # -- building --------------------------------------------------------------
 
     def index_code(self, sources: dict[str, str]) -> int:
         """Index modules {name: source}. Returns entity count."""
         for name, src in sources.items():
+            # retract this module's previous edges before re-adding:
+            # otherwise a re-index keeps stale calls/imports forever
+            self._retract_module(name)
             ents, rels = extract_code(name, src)
+            new_keys: list[tuple[str, str, str]] = []
             for e in ents:
-                self._entities[e.id] = e
+                self._add_entity(e)
             for r in rels:
-                self._add_relation(r)
+                if self._add_relation(r):
+                    new_keys.append((r.src, r.rel, r.dst))
+            self._module_edges[name] = new_keys
         self.log.append("graph.entity",
                         {"entities": len(self._entities),
                          "relations": len(self._relations)},
                         actor="librarian")
         return len(self._entities)
+
+    def _retract_module(self, name: str) -> None:
+        """Remove every edge previously contributed by module `name`."""
+        keys = self._module_edges.pop(name, None)
+        if not keys:
+            return
+        dead = set(keys)
+        self._seen_edges -= dead
+        self._relations = [r for r in self._relations
+                           if (r.src, r.rel, r.dst) not in dead]
+        for idx in (self._out, self._in):
+            for k in list(idx.keys()):
+                kept = [r for r in idx[k]
+                        if (r.src, r.rel, r.dst) not in dead]
+                if kept:
+                    idx[k] = kept
+                else:
+                    del idx[k]
 
     def index_log(self) -> int:
         """Add session entities/relations from the event fold."""
@@ -167,9 +207,9 @@ class KnowledgeGraph:
         if st.goal and st.goal.get("statement"):
             gid = f"goal:{st.goal.get('id', 'current')}"
             if gid not in self._entities:
-                self._entities[gid] = Entity(gid, "goal",
-                                             str(st.goal.get("statement",
-                                                             ""))[:80])
+                self._add_entity(Entity(gid, "goal",
+                                        str(st.goal.get("statement",
+                                                        ""))[:80]))
                 added += 1
             for clause in st.goal.get("clauses") or []:
                 proof = clause.get("proof") or {}
@@ -177,31 +217,33 @@ class KnowledgeGraph:
                 if p:
                     fid = f"file:{p}"
                     if fid not in self._entities:
-                        self._entities[fid] = Entity(fid, "file", str(p))
+                        self._add_entity(Entity(fid, "file", str(p)))
                         added += 1
                     self._add_relation(Relation(gid, "touches", fid))
         for i, ep in enumerate(st.episodes):
             eid = f"episode:{i}"
             if eid not in self._entities:
-                self._entities[eid] = Entity(eid, "episode",
-                                             str(ep.get("goal", ""))[:80])
+                self._add_entity(Entity(eid, "episode",
+                                        str(ep.get("goal", ""))[:80]))
                 added += 1
             for fact in ep.get("facts") or []:
                 fid = f"fact:{str(fact)[:40]}"
                 if fid not in self._entities:
-                    self._entities[fid] = Entity(fid, "fact", str(fact)[:80])
+                    self._add_entity(Entity(fid, "fact", str(fact)[:80]))
                     added += 1
                 self._add_relation(Relation(eid, "learned", fid))
         return added
 
-    def _add_relation(self, r: Relation) -> None:
+    def _add_relation(self, r: Relation) -> bool:
+        """Add an edge unless it already exists. Returns True if new."""
         key = (r.src, r.rel, r.dst)
-        for existing in self._out.get(r.src, []):
-            if (existing.src, existing.rel, existing.dst) == key:
-                return
+        if key in self._seen_edges:
+            return False
+        self._seen_edges.add(key)
         self._relations.append(r)
         self._out.setdefault(r.src, []).append(r)
         self._in.setdefault(r.dst, []).append(r)
+        return True
 
     # -- queries (real graph operations) ----------------------------------------
 
@@ -209,11 +251,23 @@ class KnowledgeGraph:
         return self._entities.get(entity_id)
 
     def find(self, name: str, kind: str | None = None) -> list[Entity]:
-        """Entities whose name matches (substring), optionally by kind."""
+        """Entities whose name matches (substring), optionally by kind.
+
+        SPEED: the name index narrows candidates to entities sharing the
+        query as a substring of their lowercased name; only those are
+        scanned instead of the whole graph.
+        """
         low = name.lower()
-        return [e for e in self._entities.values()
-                if low in e.name.lower()
-                and (kind is None or e.kind == kind)]
+        cands: set[str] = set()
+        for indexed_name, ids in self._name_index.items():
+            if low in indexed_name:
+                cands.update(ids)
+        out = []
+        for eid in cands:
+            e = self._entities.get(eid)
+            if e is not None and (kind is None or e.kind == kind):
+                out.append(e)
+        return out
 
     def out_edges(self, entity_id: str, rel: str | None = None
                   ) -> list[Relation]:
@@ -226,12 +280,12 @@ class KnowledgeGraph:
                 if rel is None or r.rel == rel]
 
     def callers_of(self, func_name: str) -> list[str]:
-        """Which functions call a given function name (reverse lookup)."""
-        out = []
-        for r in self._relations:
-            if r.rel == "calls" and r.dst == f"call:{func_name}":
-                out.append(r.src)
-        return sorted(set(out))
+        """Which functions call a given function name (reverse lookup).
+
+        SPEED: O(1) index lookup on the call pseudo-node instead of a
+        full scan of every relation in the graph.
+        """
+        return sorted({r.src for r in self._in.get(f"call:{func_name}", [])})
 
     def reachable(self, start: str, rel: str | None = None,
                   max_depth: int = 6) -> list[str]:

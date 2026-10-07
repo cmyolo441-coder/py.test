@@ -37,30 +37,32 @@ class Oracle:
     # -- post-run analysis (§24.1) --------------------------------------------
 
     def analyze(self) -> dict:
-        """Mine the current session's log into a structured report."""
+        """Mine the current session's log into a structured report.
+
+        Single pass over the events: wasted-step counting and cost
+        attribution ride the same iteration instead of walking the log
+        twice."""
         st = fold(self.log)
         wasted = 0
-        for ev in self.log.events():
-            if ev.type == "tool.result" and ev.data.get("status") == "error":
-                wasted += 1
-        dead_ends_hit = len(st.dead_ends)
-        facts_learned = len(st.facts)
         cost_by_clause: dict[str, float] = {}
         unattributed_usd = 0.0
         for ev in self.log.events():
-            if ev.type != "cost.incurred":
-                continue
-            usd = float(ev.data.get("usd", 0.0))
-            if ev.correlation_id:
-                cost_by_clause[ev.correlation_id] = \
-                    cost_by_clause.get(ev.correlation_id, 0.0) + usd
-            else:
-                # keep the unattributed tail visible instead of dropping
-                # it on the floor — without this sentinel the report
-                # claims cost_usd equals sum(cost_by_clause.values()),
-                # which is a lie whenever any cost event has no
-                # correlation_id (e.g. a preflight probe, an idle tick)
-                unattributed_usd += usd
+            t = ev.type
+            if t == "tool.result" and ev.data.get("status") == "error":
+                wasted += 1
+            elif t == "cost.incurred":
+                usd = float(ev.data.get("usd", 0.0))
+                if ev.correlation_id:
+                    cost_by_clause[ev.correlation_id] = \
+                        cost_by_clause.get(ev.correlation_id, 0.0) + usd
+                else:
+                    # keep the unattributed tail visible instead of
+                    # dropping it on the floor — without this sentinel
+                    # the report claims cost_usd equals
+                    # sum(cost_by_clause.values()), which is a lie
+                    # whenever any cost event has no correlation_id
+                    # (e.g. a preflight probe, an idle tick)
+                    unattributed_usd += usd
         if unattributed_usd > 0:
             cost_by_clause["__unattributed__"] = round(unattributed_usd, 6)
         cal = self.calibrate()
@@ -69,8 +71,8 @@ class Oracle:
             "tool_calls": st.tool_calls,
             "tool_errors": st.tool_errors,
             "wasted_steps": wasted,
-            "dead_ends_hit": dead_ends_hit,
-            "facts_learned": facts_learned,
+            "dead_ends_hit": len(st.dead_ends),
+            "facts_learned": len(st.facts),
             "cost_usd": st.cost_usd,
             "cost_by_clause": cost_by_clause,
             "calibration_error": cal.get("mean_abs_error"),

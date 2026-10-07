@@ -142,11 +142,14 @@ class Speculator:
 
     def speculate(self, user_text: str, recent_tools: list[dict]) -> int:
         """Predict + prefetch in a background pool. Returns # prefetched."""
-        self.turn += 1
-        self._expire()
+        with self._lock:
+            self.turn += 1
+            self._expire_locked()
         preds = predict(user_text, recent_tools)
         with self._lock:
-            fresh = [p for p in preds if p.key() not in self._cache]
+            fresh = [p for p in preds
+                     if p.tool in SPECULATIVE_TOOLS
+                     and p.key() not in self._cache]
         if not fresh or self.runner is None:
             return 0
 
@@ -204,13 +207,20 @@ class Speculator:
 
     def _expire(self) -> None:
         with self._lock:
-            stale = [k for k, e in self._cache.items()
-                     if self.turn - e.born_turn > CACHE_TTL_TURNS]
-            for k in stale:
-                del self._cache[k]
-            if stale:
-                self.log.append("spec.evict", {"count": len(stale)},
-                                actor="speculator")
+            self._expire_locked()
+
+    def _expire_locked(self) -> None:
+        """Evict stale entries. Caller must hold self._lock (lets
+        speculate() bump the turn and expire atomically — two threads
+        racing speculate() could otherwise interleave turn increments
+        with expiry and resurrect stale entries)."""
+        stale = [k for k, e in self._cache.items()
+                 if self.turn - e.born_turn > CACHE_TTL_TURNS]
+        for k in stale:
+            del self._cache[k]
+        if stale:
+            self.log.append("spec.evict", {"count": len(stale)},
+                            actor="speculator")
 
     def stats(self) -> dict:
         evs = fold(self.log).spec_events

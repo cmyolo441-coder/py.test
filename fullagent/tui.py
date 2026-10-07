@@ -27,6 +27,7 @@ import re
 import sys
 import threading
 import time
+import unicodedata
 from html import escape as html_escape
 from pathlib import Path
 from typing import Callable
@@ -162,6 +163,46 @@ STYLE = Style.from_dict({
 
 EFFORT_COLORS = {e.key: e.color for e in EFFORTS}
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+# ---------------------------------------------------------------------------
+# Display-width helpers.
+#
+# The prompt box borders must NEVER exceed the terminal width: if the
+# closing ╮/╯ wraps to the next line, prompt_toolkit's cursor math breaks
+# and the whole render corrupts. len() counts codepoints, not columns —
+# emoji like 🎯 occupy TWO columns, so every border-length computation in
+# this file must go through _disp_width, and every truncation through
+# _truncate_w (a naive s[:n] can split a wide char in half, printing a
+# replacement glyph and throwing the border off by one).
+# ---------------------------------------------------------------------------
+
+_WIDE_CATS = ("W", "F")
+
+
+def _disp_width(s: str) -> int:
+    """Terminal column width of s (wide East-Asian chars count double)."""
+    w = 0
+    for ch in s:
+        w += 2 if unicodedata.east_asian_width(ch) in _WIDE_CATS else 1
+    return w
+
+
+def _truncate_w(s: str, maxw: int) -> str:
+    """Truncate s to at most maxw columns, appending … when truncated.
+    Never splits a wide character."""
+    if maxw <= 0:
+        return ""
+    if _disp_width(s) <= maxw:
+        return s
+    out: list[str] = []
+    w = 0
+    for ch in s:
+        cw = 2 if unicodedata.east_asian_width(ch) in _WIDE_CATS else 1
+        if w + cw > maxw - 1:  # reserve one column for the ellipsis
+            break
+        out.append(ch)
+        w += cw
+    return "".join(out) + "…"
 
 # ---------------------------------------------------------------------------
 # Rich markdown rendering tweaks (used for non-streamed output)
@@ -416,17 +457,25 @@ class _LiveWrite:
 
     def feed(self, chunk: str) -> list:
         """Feed a new argument chunk; returns the complete content lines that
-        became available as a result."""
+        became available as a result.
+
+        SPEED: the buffer grows to the full file being written. Slicing
+        self.buf[self.content_start:] on every chunk re-copied ALL content
+        received so far (O(n^2) over a streamed file); we now slice only
+        the unconsumed tail. The content-key regex likewise resumes near
+        the new tail instead of re-scanning from zero — a 128-char overlap
+        covers any key spanning the chunk boundary."""
         self.buf += chunk
         if self.done:
             return []  # content fully captured; ignore the rest of the JSON
         if self.content_start < 0:
-            m = self._CONTENT_KEY.search(self.buf)
+            search_from = max(0, len(self.buf) - len(chunk) - 128)
+            m = self._CONTENT_KEY.search(self.buf, search_from)
             if not m:
                 return []
             self.content_start = m.end()
-        raw = self.buf[self.content_start:]
-        text, consumed, done = self._unescape(raw[self.raw_pos:])
+        tail = self.buf[self.content_start + self.raw_pos:]
+        text, consumed, done = self._unescape(tail)
         self.raw_pos += consumed
         self.done = done
         self.pending += text
@@ -472,9 +521,18 @@ class _LiveWrite:
                     break  # incomplete \\uXXXX — wait for more
                 hexs = s[i + 2:i + 6]
                 try:
-                    out.append(chr(int(hexs, 16)))
+                    cp = int(hexs, 16)
                 except ValueError:
                     out.append('\\u' + hexs)
+                    i += 6
+                    continue
+                if 0xD800 <= cp <= 0xDFFF:
+                    # lone surrogate — emitting it would produce a char the
+                    # terminal cannot encode (UnicodeEncodeError on print);
+                    # keep the literal escape instead
+                    out.append('\\u' + hexs)
+                else:
+                    out.append(chr(cp))
                 i += 6
             else:
                 mapping = {'n': '\n', 't': '\t', 'r': '\r', 'b': '\b',
@@ -506,6 +564,17 @@ class OverlayList:
         self.footer = footer
         self.visible = False
         self._top = max(0, self.index - self.WINDOW // 2)
+        # SPEED: fragments() runs on every render frame while the overlay
+        # is open — parsing the per-item HTML on each frame was the
+        # hottest cost in the picker. Precompute the plain text once.
+        self._plain = [self._strip_html(h) for h, _ in items]
+
+    @staticmethod
+    def _strip_html(html: str) -> str:
+        # prompt_toolkit parses HTML() with an XML parser — raw text is
+        # already escaped by callers (see open_history); this only strips
+        # the <style> tags back to plain text for width math.
+        return fragment_list_to_text(to_formatted_text(HTML(html)))
 
     def open(self) -> None:
         self.visible = True
@@ -532,29 +601,32 @@ class OverlayList:
             self.on_select(idx)
 
     def fragments(self, width: int) -> list:
+        # items are fixed at construction, but rebuild the cache if a
+        # caller ever mutates them afterwards — stale widths would
+        # misalign the box
+        if len(self._plain) != len(self.items):
+            self._plain = [self._strip_html(h) for h, _ in self.items]
         inner = max(30, width - 2)
         frags: list = []
-        title = f" {self.title} "
+        title = _truncate_w(f" {self.title} ", inner)
         frags.append(("class:overlay.border",
-                      f"╔{title}{'═' * max(0, inner - len(title))}╗\n"))
+                      f"╔{title}{'═' * max(0, inner - _disp_width(title))}╗\n"))
         shown = self.items[self._top:self._top + self.WINDOW]
         for i, (html, meta) in enumerate(shown):
             real_i = self._top + i
             selected = real_i == self.index
             marker = "▶ " if selected else "  "
-            text = fragment_list_to_text(to_formatted_text(HTML(html)))
-            line = f"{marker}{text}"
-            if len(line) > inner - 2:
-                line = line[:inner - 3] + "…"
+            line = _truncate_w(f"{marker}{self._plain[real_i]}",
+                               inner - 2)
+            pad = inner - _disp_width(line)
             style = ("class:overlay.item.selected" if selected
                      else "class:overlay.item")
-            frags.append((style, f"║{line}{' ' * max(0, inner - len(line))}║\n"))
-        foot = (self.footer or
-                "↑↓ PgUp PgDn Tab move · Enter select · Esc close")
-        if len(foot) > inner:
-            foot = foot[:inner]
+            frags.append((style, f"║{line}{' ' * max(0, pad)}║\n"))
+        foot = _truncate_w(self.footer or
+                           "↑↓ PgUp PgDn Tab move · Enter select · Esc close",
+                           inner)
         frags.append(("class:overlay.footer",
-                      f"╚{foot}{'═' * max(0, inner - len(foot))}╝"))
+                      f"╚{foot}{'═' * max(0, inner - _disp_width(foot))}╝"))
         return frags
 
 
@@ -724,8 +796,11 @@ class UI:
         segs.append((f" ⌛ session: {self.agent.session_id} ", "class:box.session"))
 
         # fixed = corners (2) + first dash (1) + "──" before each later seg
+        # NOTE: display width, not len() — emoji (🎯) are two columns;
+        # underestimating lets the closing ╮ wrap and corrupt the render
         def fixed_len(segs: list) -> int:
-            return sum(len(t) for t, _ in segs) + 3 + 2 * (len(segs) - 1)
+            return (sum(_disp_width(t) for t, _ in segs)
+                    + 3 + 2 * (len(segs) - 1))
 
         # drop trailing segments (session, effort, …) if the terminal is
         # too narrow — never let the border exceed the terminal width or the
@@ -747,11 +822,12 @@ class UI:
 
         if self._approve_request is not None:
             tool = self._approve_request[0]
-            name = tool.name[: max(1, inner - 34)]
+            name = _truncate_w(tool.name, max(1, inner - 34))
             head = f" ⚠ approve {name}? "
             y, n, a = " [y]es ", " [n]o ", " [a]lways "
-            plain = head + y.strip() + " " + n.strip() + " " + a.strip()
-            fill = "─" * max(0, inner - len(head) - len(y) - len(n) - len(a))
+            fill = "─" * max(0, inner - _disp_width(head)
+                             - _disp_width(y) - _disp_width(n)
+                             - _disp_width(a))
             return ([("class:box", "╰"),
                      ("class:box.approve", head),
                      (f"bold {C['green']}", y),
@@ -768,9 +844,14 @@ class UI:
             if self._turn_start_ts:
                 elapsed = f" · {max(0, int(time.time() - self._turn_start_ts))}s"
             tail = " · Esc cancel "
-            max_status = max(0, inner - len(f" ⠹  ·  Esc cancel ") - len(elapsed) - 4)
-            status = self._status_text[:max_status]
-            bar_len = len(f" {frame} {status}{elapsed} {tail}")
+            # width-aware: the status preview may contain emoji/wide chars
+            # from the model; a codepoint slice could split one and the
+            # border would then be a column short
+            max_status = max(0, inner - _disp_width(f" ⠹ {elapsed} {tail}")
+                             - 4)
+            status = _truncate_w(self._status_text, max_status)
+            bar_len = (_disp_width(f" {frame} ") + _disp_width(status)
+                       + _disp_width(elapsed) + _disp_width(tail))
             return [("class:box", "╰"),
                     ("class:box.spinner", f" {frame} "),
                     ("class:box.status", status),
@@ -780,9 +861,10 @@ class UI:
 
         if self._flash:
             text, color = self._flash
-            hint = f" ✦ {text} "[:max(1, inner)]
+            hint = _truncate_w(f" ✦ {text} ", max(1, inner))
             return [("class:box", "╰"), (f"bold {color}", hint),
-                    ("class:box", "─" * max(0, inner - len(hint)) + "╯")]
+                    ("class:box",
+                     "─" * max(0, inner - _disp_width(hint)) + "╯")]
 
         # idle — styled keys, gracefully degrading on narrow terminals
         # NOTE: fragments are (style, text) tuples — keep this order.
@@ -802,7 +884,7 @@ class UI:
             segs = [(box, " ⏎ "), (key, "send"), (dim, " ")]
         frags: list = [(box, "╰")]
         frags.extend(segs)
-        used = 1 + sum(len(t) for _, t in segs)
+        used = 1 + sum(_disp_width(t) for _, t in segs)
         frags.append((box, "─" * max(0, inner - used) + "╯"))
         return frags
 
@@ -2738,7 +2820,25 @@ class UI:
         # a replay). on_tool_args feeds the growing JSON; a tracker pulls the
         # relevant string field; on_tool_update closes the block.
         live_f = {"kind": None, "tracker": None, "header": False,
-                  "count": 0, "held": [], "path": "", "old_emitted": False}
+                  "count": 0, "held": [], "path": "", "old_emitted": False,
+                  "batch": []}
+
+        # SPEED: one rich Console.print per streamed line meant thousands
+        # of render+write cycles for a big file. Lines are now batched
+        # (25 per print) — still looks live, ~25x fewer print calls.
+        _LF_BATCH = 25
+
+        def _lf_flush():
+            batch = live_f["batch"]
+            if not batch:
+                return
+            live_f["batch"] = []
+            t = Text()
+            for i, ln in enumerate(batch):
+                if i:
+                    t.append("\n")
+                t.append_text(ln)
+            self.console.print(t, soft_wrap=True)
 
         def _lf_write_line(ln: str):
             live_f["count"] += 1
@@ -2747,7 +2847,9 @@ class UI:
             t.append(f"{live_f['count']:>4} ", style=C["dim"])
             t.append("+  ", style=C["green"])
             t.append(ln, style=C["fg"])
-            self.console.print(t, soft_wrap=True)
+            live_f["batch"].append(t)
+            if len(live_f["batch"]) >= _LF_BATCH:
+                _lf_flush()
 
         def _lf_edit_line(ln: str, plus: bool):
             live_f["count"] += 1
@@ -2759,7 +2861,9 @@ class UI:
             else:
                 t.append("-  ", style=C["red"])
                 t.append(ln, style=C["red"])
-            self.console.print(t, soft_wrap=True)
+            live_f["batch"].append(t)
+            if len(live_f["batch"]) >= _LF_BATCH:
+                _lf_flush()
 
         def _lf_patch_line(ln: str):
             live_f["count"] += 1
@@ -2776,7 +2880,9 @@ class UI:
             else:
                 col = C["fg"]
             t.append(ln, style=col)
-            self.console.print(t, soft_wrap=True)
+            live_f["batch"].append(t)
+            if len(live_f["batch"]) >= _LF_BATCH:
+                _lf_flush()
 
         def _lf_emit(ln: str):
             k = live_f["kind"]
@@ -2870,6 +2976,7 @@ class UI:
                 live_f["count"] = 0
                 live_f["held"] = []
                 live_f["old_emitted"] = False
+                live_f["batch"] = []
             if ev.name in ("run_command", "live_shell", "apply_patch",
                            "write_file", "edit_file", "read_file"):
                 # live-action block header instead of the generic gear line.
@@ -2892,12 +2999,14 @@ class UI:
                     and ev.status in ("done", "error") \
                     and live_f["count"] > 0:
                 # change already streamed live — flush the last partial line
-                # and close the block; no replay cascade
+                # and the batched lines, then close the block; no replay
+                # cascade
                 tr = live_f["tracker"]
                 if tr is not None:
                     last = tr.flush()
                     if last is not None:
                         _lf_emit(last)
+                _lf_flush()
                 self.console.print(self._write_footer(ev, live_f["count"]))
             elif ev.name in ("write_file", "edit_file", "apply_patch") \
                     and ev.status in ("done", "error"):
@@ -2921,6 +3030,7 @@ class UI:
             live_f["count"] = 0
             live_f["held"] = []
             live_f["old_emitted"] = False
+            live_f["batch"] = []
             self._set_status("thinking…")
 
         def on_status(s: str):

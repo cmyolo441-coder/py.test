@@ -40,6 +40,21 @@ _LATENCY_MAX_MS = 20_000   # mean tool duration ceiling
 _LOOP_ALERTS_MAX = 3       # loop alerts in the window
 
 
+def _repair_name(repair: Callable[[], bool]) -> str:
+    """Human name for a repair callable. Plain functions and lambdas
+    have __name__; functools.partial and callable objects do not —
+    accessing __name__ blindly raised AttributeError and killed the
+    whole homeostasis check."""
+    name = getattr(repair, "__name__", None)
+    if name:
+        return name
+    # functools.partial: name the wrapped function
+    func = getattr(repair, "func", None)
+    if func is not None:
+        return getattr(func, "__name__", None) or "repair"
+    return type(repair).__name__ or "repair"
+
+
 @dataclass
 class Vital:
     name: str
@@ -97,6 +112,9 @@ class Homeostasis:
         self.log = log
         self.repairs = repairs or {}
         self.last_report: CheckReport | None = None
+        # head-seq cache: a check with no new events since the last one
+        # re-measures nothing — vitals are a pure function of the log
+        self._last_head: int | None = None
 
     # -- vitals ----------------------------------------------------------------
 
@@ -137,7 +155,14 @@ class Homeostasis:
 
     def check_and_repair(self) -> CheckReport:
         """One homeostatic cycle: measure, repair what breaches,
-        re-measure what was repaired."""
+        re-measure what was repaired.
+
+        Fast path: when the log has not grown since the previous check,
+        the vitals are provably identical — return the cached report
+        instead of re-measuring and re-sealing a duplicate check."""
+        head = self.log.head()
+        if self.last_report is not None and self._last_head == head:
+            return self.last_report
         report = CheckReport(vitals=self.vitals())
         vital_by_name = {v.name: v for v in report.vitals}
         for vital in report.vitals:
@@ -153,7 +178,7 @@ class Homeostasis:
             after = self._recheck(vital.name)
             helped = ran and after is not None and after.healthy
             record = RepairRecord(symptom=vital.name,
-                                  action=repair.__name__ or "repair",
+                                  action=_repair_name(repair),
                                   helped=helped, before=vital.value,
                                   after=after.value if after else
                                   vital.value)
@@ -172,6 +197,9 @@ class Homeostasis:
                         {"healthy": report.healthy,
                          "vitals": [v.to_dict() for v in report.vitals],
                          "repairs": len(report.repairs)}, actor="kernel")
+        # capture AFTER sealing: the next check compares against the
+        # head that already includes this check's own events
+        self._last_head = self.log.head()
         return report
 
     def _recheck(self, vital_name: str) -> Vital | None:

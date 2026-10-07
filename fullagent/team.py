@@ -189,7 +189,11 @@ def chat_with_retry(provider, model, effort, messages: list[dict],
     Also carries context-overflow protection: if a worker's own tool
     loop bloats its context past the window, the oldest tool results
     are truncated and the call retried — a worker never dies with a
-    context-length error."""
+    context-length error.
+
+    Raises the last APIError when retries are exhausted; any
+    non-rate-limit APIError (auth, bad request, …) is re-raised at once
+    without sleeping — retrying those can never succeed."""
     last_err: Exception | None = None
     for attempt in range(RATE_LIMIT_RETRIES):
         try:

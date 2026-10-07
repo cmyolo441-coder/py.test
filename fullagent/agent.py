@@ -23,7 +23,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import threading
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -33,7 +33,7 @@ from typing import Any, Callable
 
 from . import config
 from . import systemprompt
-from ._foundation import get_logger, AgentError, clamp
+from ._foundation import get_logger
 from .autopilot import AutoPilot, RouteDecision
 from .cassette import Cassette
 from .client import (APIError, TurnCancelled, assistant_message,
@@ -217,7 +217,6 @@ class Agent:
         self.tools = build_registry()
         self.session_id = uuid.uuid4().hex[:8]
         self.turns: list[Turn] = []
-        self._cancel_flag = threading.Event()  # Esc/Ctrl+C force stop flag
 
         # Temporal kernel + the nine subsystems
         config.ensure_dirs()
@@ -341,7 +340,6 @@ class Agent:
 
         # cassette: record/replay model calls (FULLAGENT_CASSETTE=path,
         # FULLAGENT_CASSETTE_MODE=record|replay|off)
-        import os
         cassette_path = os.environ.get("FULLAGENT_CASSETTE")
         cassette_mode = os.environ.get("FULLAGENT_CASSETTE_MODE", "off")
         self.cassette = (Cassette(Path(cassette_path), cassette_mode)
@@ -549,6 +547,15 @@ class Agent:
         # Use a user turn to keep the system instruction at position 0.
         sys_len = len(self.messages[0].get("content", "")) if self.messages else 0
         if sys_len > 50_000:
+            # BUGFIX: the nudge used to be appended on EVERY turn, so N
+            # turns piled up N stale copies — the exact token bloat it was
+            # meant to fight. Strip stale ones first; exactly one stays,
+            # right before this turn's user message.
+            self.messages = [
+                m for m in self.messages
+                if not (m.get("role") == "user"
+                        and isinstance(m.get("content"), str)
+                        and m["content"].startswith("[MANDATORY COMPLIANCE]"))]
             self.messages.append({
                 "role": "user",
                 "content": (
@@ -1198,8 +1205,10 @@ class Agent:
         keys = _PATH_ARG_TOOLS.get(tool_name, ())
         paths = [str(args[k]) for k in keys if args.get(k)]
         if tool_name == "run_command":
-            # commands can touch anything; snapshot the cwd tree shallowly
-            paths = [str(p) for p in Path.cwd().iterdir()
+            # commands can touch anything; snapshot the cwd tree shallowly.
+            # Sorted for determinism — unsorted iterdir() made snapshot
+            # contents order-dependent across runs.
+            paths = [str(p) for p in sorted(Path.cwd().iterdir())
                      if p.is_file()][:200]
         return paths
 
@@ -1249,20 +1258,24 @@ class Agent:
                 return
 
         # A2/I3: snapshot BEFORE any mutation — no write without a
-        # committed recovery path
+        # committed recovery path. A snapshot failure must never kill the
+        # turn: log it and proceed (the tool itself still runs).
         snapshot_tree = None
         if ev.name in _MUTATING_TOOLS:
-            paths = self._snapshot_paths(ev.name, ev.args)
-            if paths:
-                snap = self.store.take(paths)
-                snapshot_tree = snap["tree"]
-                self.log.append("snapshot.taken",
-                                {"tree": snap["tree"],
-                                 "paths": list(snap["paths"]),
-                                 "before_tool": ev.name},
-                                actor="kernel",
-                                causation_id=causation_id,
-                                correlation_id=clause_id)
+            try:
+                paths = self._snapshot_paths(ev.name, ev.args)
+                if paths:
+                    snap = self.store.take(paths)
+                    snapshot_tree = snap["tree"]
+                    self.log.append("snapshot.taken",
+                                    {"tree": snap["tree"],
+                                     "paths": list(snap["paths"]),
+                                     "before_tool": ev.name},
+                                    actor="kernel",
+                                    causation_id=causation_id,
+                                    correlation_id=clause_id)
+            except Exception as e:  # noqa: BLE001
+                _log.warning("snapshot before %s failed: %s", ev.name, e)
 
         self.log.append("tool.call", {"name": ev.name, "args": ev.args},
                         actor="sovereign", provenance="model",
@@ -1291,6 +1304,11 @@ class Agent:
             except Exception as e:  # noqa: BLE001 — tool errors go back to the LLM
                 ev.result = f"ERROR: {type(e).__name__}: {e}"
                 ev.status = "error"
+        # BUGFIX: handlers are contracted to return str, but a custom or
+        # forged tool may return anything — .startswith() below would raise
+        # AttributeError and kill the whole turn. Coerce once, here.
+        if not isinstance(ev.result, str):
+            ev.result = "" if ev.result is None else str(ev.result)
         # most handlers report failure as an "ERROR: …" string rather than
         # raising — count those as errors too, so the dead-end ledger works
         if ev.status == "done" and ev.result.startswith("ERROR:"):
@@ -1415,9 +1433,14 @@ class Agent:
                 # write unit for rework detection
                 writes["__apply_patch__"] = writes.get("__apply_patch__", 0) + 1
         rework = sum(1 for n in writes.values() if n > 1)
-        verdicts = [e for e in self.log.events()
-                    if e.type == "judge.verdict"
-                    and e.seq > self._turn_start_seq]
+        # SPEED: events are seq-ordered — scan back from the head and stop
+        # at the turn boundary instead of filtering the whole log.
+        verdicts = []
+        for e in reversed(self.log.events()):
+            if e.seq <= self._turn_start_seq:
+                break
+            if e.type == "judge.verdict":
+                verdicts.append(e)
         verified = sum(1 for v in verdicts if v.data.get("passed"))
         score = max(0, min(100, 100 - 20 * errors - 10 * rework))
         card = {"tool_calls": tool_calls, "errors": errors,
@@ -1443,8 +1466,7 @@ class Agent:
                     tools_used.append(name)
             if m.get("role") == "tool":
                 content = str(m.get("content", ""))
-                import re as _re
-                for match in _re.finditer(
+                for match in re.finditer(
                         r"OK: (?:wrote \d+ chars to|replaced .*? in) (\S+)",
                         content):
                     f = match.group(1)
@@ -1464,13 +1486,19 @@ class Agent:
     # -- enterprise: notifications ------------------------------------------------------
 
     def _flush_notifications(self) -> None:
-        """Emit any NOTIFY_EVENTS sealed since the last flush."""
+        """Emit any NOTIFY_EVENTS sealed since the last flush.
+
+        SPEED: scan back from the head and stop at the last flush mark —
+        the old full-log scan got slower every turn of a long session."""
         if not self.notifier.sink:
             self._notify_seq = self.log.head()
             return
-        for ev in self.log.events():
+        pending: list = []
+        for ev in reversed(self.log.events()):
             if ev.seq <= self._notify_seq:
-                continue
+                break
+            pending.append(ev)
+        for ev in reversed(pending):  # restore chronological order
             if ev.type in NOTIFY_EVENTS:
                 self.notifier.emit(ev.type, ev.data)
         self._notify_seq = self.log.head()

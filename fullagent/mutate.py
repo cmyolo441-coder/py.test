@@ -42,7 +42,14 @@ MAX_MUTANTS = 40          # cap per run so a suite never explodes
 # ---------------------------------------------------------------------------
 
 class _OperatorFlip(ast.NodeTransformer):
-    """Flip binary/comparison operators: + <-> -, * <-> /, == <-> !=, etc."""
+    """Flip binary/comparison operators: + <-> -, * <-> /, == <-> !=, etc.
+
+    Uses ONE shared site counter across BinOp and Compare. The previous
+    design kept separate per-kind counters but shared the caller's index
+    across both, so index #0 mutated the first BinOp AND the first
+    Compare in a single pass — a double-mutant that silently broke the
+    one-change-per-mutant invariant mutation scores depend on.
+    """
     BIN = {ast.Add: ast.Sub, ast.Sub: ast.Add, ast.Mult: ast.Div,
            ast.Div: ast.Mult, ast.Mod: ast.Mult}
     CMP = {ast.Eq: ast.NotEq, ast.NotEq: ast.Eq, ast.Lt: ast.GtE,
@@ -50,38 +57,28 @@ class _OperatorFlip(ast.NodeTransformer):
 
     def __init__(self, only_index: int) -> None:
         self.only_index = only_index
-        # SEPARATE counters per operator kind. Sharing a single `count`
-        # made the third "operator site" ambiguous: a BinOp and a Compare
-        # op both incremented the same variable, so requesting index #2
-        # might mutate a Compare op when the caller expected a BinOp
-        # (and vice versa). The mutation result was structurally wrong
-        # even though the AST walked cleanly.
-        self._bin_count = -1
-        self._cmp_count = -1
+        self.count = -1
+
+    def _maybe_flip(self, op, table: dict) -> tuple[bool, object]:
+        """If op is flippable, count the site; flip it when it is the
+        targeted index. Returns (was_counted, new_op)."""
+        repl = table.get(type(op))
+        if repl is None:
+            return False, op
+        self.count += 1
+        if self.count == self.only_index:
+            return True, repl()
+        return True, op
 
     def visit_BinOp(self, node: ast.BinOp) -> ast.BinOp:
         self.generic_visit(node)
-        repl = self.BIN.get(type(node.op))
-        if repl:
-            self._bin_count += 1
-            if self._bin_count == self.only_index:
-                node.op = repl()
+        _, node.op = self._maybe_flip(node.op, self.BIN)
         return node
 
     def visit_Compare(self, node: ast.Compare) -> ast.Compare:
         self.generic_visit(node)
-        # _flip uses the per-Compare counter; BinOp sites do not
-        # contaminate this path.
-        node.ops = [self._flip(o) for o in node.ops]
+        node.ops = [self._maybe_flip(o, self.CMP)[1] for o in node.ops]
         return node
-
-    def _flip(self, op: ast.cmpop) -> ast.cmpop:
-        repl = self.CMP.get(type(op))
-        if repl:
-            self._cmp_count += 1
-            if self._cmp_count == self.only_index:
-                return repl()
-        return op
 
 
 class _ConditionNegate(ast.NodeTransformer):
@@ -131,10 +128,9 @@ _MUTATORS = (
 
 def _count_sites(tree: ast.Module, cls) -> int:
     """Walk a probe instance over a deep copy and return the number of
-    mutation sites it found. Each mutator class exposes one or more
-    per-kind counters (``_bin_count``, ``_cmp_count``, ...); the
-    classic single ``count`` attribute is also accepted for legacy
-    mutators like ``_ConditionNegate``."""
+    mutation sites it found. Each mutator exposes a single ``count``
+    attribute incremented once per flippable site (sites whose operator
+    is not in the flip table are not counted and never mutated)."""
     probe = cls(only_index=-1)
     probe.visit(copy.deepcopy(tree))
     total = 0
@@ -251,8 +247,22 @@ class MutationTester:
                          "suite": self.suite_command},
                         actor="tester")
 
-        target = Path(self.mutant_path) if self.mutant_path else p
-        backup = original
+        # NEVER write mutants to the caller's real file: default to a
+        # temp sibling so a crash mid-run cannot leave the source
+        # corrupted. The old default (mutant_path=None -> write to p)
+        # violated the "real file is never touched" contract.
+        target = Path(self.mutant_path) if self.mutant_path else None
+        _tmp: Path | None = None
+        if target is None:
+            import tempfile
+            fd, tmppath = tempfile.mkstemp(prefix=p.stem + ".mutant_",
+                                           suffix=p.suffix,
+                                           dir=str(p.parent))
+            import os
+            os.close(fd)
+            _tmp = target = Path(tmppath)
+            target.write_text(original)
+        backup = target.read_text(errors="replace")
         try:
             for m in mutants:
                 res = MutantResult(m["kind"], m["description"])
@@ -273,7 +283,9 @@ class MutationTester:
                     report.survived += 1
                 report.results.append(res)
         finally:
-            target.write_text(backup)  # always restore the original
+            target.write_text(backup)  # always restore the target
+            if _tmp is not None:
+                _tmp.unlink(missing_ok=True)  # temp copy is disposable
 
         scored = report.killed + report.survived
         report.score = report.killed / scored if scored else 0.0

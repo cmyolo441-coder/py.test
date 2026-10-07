@@ -29,6 +29,7 @@ turn history alone.
 from __future__ import annotations
 
 import re
+from collections import deque
 from dataclasses import dataclass, field
 
 from .kernel import EventLog
@@ -84,6 +85,10 @@ class WorldModel:
         self.log = log
         self.root = root
         self.edges: dict[tuple[str, str], Edge] = {}
+        # adjacency cache: src -> [(dst, edge)]. predict_impact() used to
+        # scan ALL edges for every BFS node (O(V*E)) and pop(0) from a
+        # list (O(V^2)) — both fixed.
+        self._adj: dict[str, list[tuple[str, Edge]]] | None = None
         if root is not None:
             self._scan_imports()
 
@@ -124,7 +129,16 @@ class WorldModel:
         key = (src, dst)
         if key not in self.edges:
             self.edges[key] = Edge(src=src, dst=dst)
+            self._adj = None  # new edge — adjacency is stale
         return self.edges[key]
+
+    def _adjacency(self) -> dict[str, list[tuple[str, Edge]]]:
+        if self._adj is None:
+            adj: dict[str, list[tuple[str, Edge]]] = {}
+            for (src, dst), edge in self.edges.items():
+                adj.setdefault(src, []).append((dst, edge))
+            self._adj = adj
+        return self._adj
 
     # -- learned signals ------------------------------------------------------------
 
@@ -185,15 +199,16 @@ class WorldModel:
         """BFS over edges from `path`; every downstream file ranked by
         probability × hop decay."""
         path = str(path)
-        frontier = [(path, 0)]
+        adj = self._adjacency()
+        frontier: deque[tuple[str, int]] = deque([(path, 0)])
         seen = {path}
         ranked: dict[str, tuple[float, str]] = {}
         while frontier:
-            cur, hops = frontier.pop(0)
+            cur, hops = frontier.popleft()
             if hops >= _MAX_HOPS:
                 continue
-            for (src, dst), edge in self.edges.items():
-                if src != cur or dst in seen:
+            for dst, edge in adj.get(cur, ()):
+                if dst in seen:
                     continue
                 seen.add(dst)
                 p = edge.risk * (_DECAY ** hops)

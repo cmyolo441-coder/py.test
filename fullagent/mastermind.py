@@ -1,7 +1,4 @@
 """Mastermind — the coherence architecture for systemprompt.py.
-from ._foundation import get_logger
-
-_log = get_logger("mastermind")
 
 How does the agent follow the prompts in systemprompt.py *inevitably*,
 with zero enforcement, zero coercion, zero policing? By making the prompt
@@ -47,8 +44,11 @@ import hashlib
 from dataclasses import dataclass, field
 
 from . import systemprompt
-from .kernel import EventLog
+from .kernel import EventLog, fold
+from ._foundation import get_logger
 from .team import MAX_WORKERS
+
+_log = get_logger("mastermind")
 
 # ---------------------------------------------------------------------------
 # PromptVault — hash-sealed prompts, the only source of truth at runtime
@@ -120,13 +120,15 @@ class PromptVault:
     def verify(self, name: str, content: str) -> bool:
         """True if `content` still carries the sealed prompt for `name`.
 
-        Composed context legally FOLLOWS the sealed prompt, so we verify
-        the sealed text is an intact prefix — the prompt itself must be
-        byte-for-byte uncorrupted and first."""
+        Composed context legally FOLLOWS the sealed prompt, and long
+        prompts legally open with the sandwich's priority header — so
+        this delegates to the composer's integrity test instead of a
+        bare prefix check (which false-negatived on every composed
+        long prompt)."""
         sealed = self._sealed.get(name)
         if sealed is None:
             return False
-        return content.startswith(sealed)
+        return CoherenceComposer.intact_prefix(sealed, content)
 
 
 # ---------------------------------------------------------------------------
@@ -241,24 +243,27 @@ class CoherenceComposer:
         
         return result
     
-    @property
-    def tail(self) -> str:
-        """The suffix a composed document ends with when the sealed prompt
-        is present and the sandwich wraps it (long prompts). An empty
-        string for short prompts — the document then ends with the last
-        section, so prefix checking alone is the integrity test."""
-        return self._REINFORCEMENT
+    def tail_for(self, sealed_prompt: str) -> str:
+        """The suffix a composed document ends with for THIS prompt: the
+        reinforcement when the sandwich wraps it (long prompts), else
+        "" — the document then ends with the last context section."""
+        if len(sealed_prompt) > self._REINFORCE_THRESHOLD:
+            return self._REINFORCEMENT
+        return ""
 
-    def intact_prefix(self, sealed_prompt: str, content: str) -> bool:
+    @staticmethod
+    def intact_prefix(sealed_prompt: str, content: str) -> bool:
         """True if `content` opens with the sealed prompt, byte-for-byte
         — behind the priority header when the sandwich wraps a long
         prompt. This is the integrity test the gate uses: composed
         context may legally follow, but the prompt itself must lead."""
         if not content:
             return False
-        if (len(sealed_prompt) > self._REINFORCE_THRESHOLD
-                and content.startswith(self._PRIORITY_HEADER)):
-            return content.startswith(self._PRIORITY_HEADER + sealed_prompt)
+        if (len(sealed_prompt) > CoherenceComposer._REINFORCE_THRESHOLD
+                and content.startswith(
+                    CoherenceComposer._PRIORITY_HEADER)):
+            return content.startswith(
+                CoherenceComposer._PRIORITY_HEADER + sealed_prompt)
         return content.startswith(sealed_prompt)
 
     @staticmethod
@@ -324,13 +329,18 @@ class PromptGate:
         if sections is not None:
             desired = self.composer.compose(sealed, sections)
             report.sections = self.composer.manifest(sections)
-        else:
-            desired = sealed
-        if current_text != desired:
-            systemprompt.with_system(messages, desired)
-            if not prefix_intact:
-                report.restored = True
-                self.restorations += 1
+            if current_text != desired:
+                systemprompt.with_system(messages, desired)
+                if not prefix_intact:
+                    report.restored = True
+                    self.restorations += 1
+        elif not prefix_intact:
+            # no new context: an intact system message (even one carrying
+            # previously composed sections) stays exactly as it is — only
+            # a missing or shadowed prompt is re-seated
+            systemprompt.with_system(messages, sealed)
+            report.restored = True
+            self.restorations += 1
 
         self.dispatches += 1
         report.messages_guarded = len(messages)
@@ -368,7 +378,6 @@ class Mastermind:
 
     def status(self) -> MastermindState:
         """Live counts from the fold — the observation ledger."""
-        from .kernel import fold
         st = fold(self.log)
         counts: dict[str, int] = {}
         for d in st.prompt_dispatches:

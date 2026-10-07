@@ -120,6 +120,11 @@ class MeshNode:
         node = self
 
         class Handler(socketserver.StreamRequestHandler):
+            # a client that connects but never sends a newline would
+            # otherwise block readline() forever, tying up a handler
+            # thread per connection (trivial DoS)
+            timeout = 30
+
             def handle(self):
                 try:
                     line = self.rfile.readline(_RECV_LIMIT)
@@ -195,9 +200,14 @@ class MeshNode:
         return peer
 
     def heartbeat(self) -> dict[str, bool]:
-        """PING every peer; dead ones drop from the roster."""
+        """PING every peer; dead ones drop from the roster.
+
+        Peers are probed in parallel — the old serial loop took
+        N × timeout with N dead peers."""
         statuses: dict[str, bool] = {}
-        for name, peer in list(self.peers.items()):
+        lock = threading.Lock()
+
+        def _ping(name: str, peer: Peer) -> None:
             try:
                 reply = self._rpc(peer,
                                   {"verb": "PING", "from": self.node_id},
@@ -205,11 +215,20 @@ class MeshNode:
                 alive = bool(reply.get("pong"))
             except OSError:
                 alive = False
-            statuses[name] = alive
-            if alive:
-                peer.last_seen = time.time()
-            else:
-                del self.peers[name]
+            with lock:
+                statuses[name] = alive
+                if alive:
+                    peer.last_seen = time.time()
+                else:
+                    self.peers.pop(name, None)
+
+        threads = [threading.Thread(target=_ping, args=(name, peer),
+                                    name=f"mesh:ping:{name}", daemon=True)
+                   for name, peer in list(self.peers.items())]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10.0)
         return statuses
 
     def delegate(self, task: str, role: str = "",

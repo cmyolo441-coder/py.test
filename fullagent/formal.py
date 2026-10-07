@@ -27,7 +27,7 @@ lands between a write and its verification).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from itertools import permutations
+from itertools import islice, permutations
 
 from .kernel import EventLog
 from ._foundation import get_logger
@@ -168,33 +168,51 @@ def trace_from_events(events) -> list[set[str]]:
     return trace
 
 
+def _item_predicates(item: dict) -> list[set[str]]:
+    """The predicate sequence one plan item contributes: the mechanical
+    snapshot/verify the kernel inserts around writes, bracketing the
+    item's own write/read/delete step."""
+    seq: list[set[str]] = []
+    paths = item.get("paths") or []
+    writer = bool(paths)
+    if writer:
+        seq.append({"snapshot"})     # A2 is mechanical
+    kind = {"write"} if writer else {"read"}
+    if str(item.get("task", "")).lower().startswith("delete"):
+        kind = {"delete"}
+    seq.append(kind)
+    if writer:
+        seq.append({"verify"})
+    return seq
+
+
 def plan_traces(waves: list[list[dict]]) -> list[list[set[str]]]:
     """Enumerate the concrete executions a compiled plan (waves of
-    items) can produce — every interleave the wave structure permits,
+    items) can produce — every item ordering each wave permits (items in
+    a wave have no mutual dependencies, so any order is possible),
     capped combinatorially. Each item contributes its predicates
     (write/delete/read) plus the mechanical snapshot/verify the kernel
     would insert around writes."""
     per_wave: list[list[list[set[str]]]] = []
     for wave in waves:
+        seqs = [_item_predicates(item) for item in wave]
         variants: list[list[set[str]]] = []
-        for _ in range(1):                     # representative orderings
-            seq: list[set[str]] = []
-            for item in wave:
-                paths = item.get("paths") or []
-                writer = bool(paths)
-                if writer:
-                    seq.append({"snapshot"})     # A2 is mechanical
-                kind = {"write"} if writer else {"read"}
-                if item.get("task", "").lower().startswith("delete"):
-                    kind = {"delete"}
-                seq.append(kind)
-                if writer:
-                    seq.append({"verify"})
-            variants.append(seq)
-        # interleave variants: cap the permutation blow-up
-        if len(variants) > 1:
-            variants = variants[:_MAX_TRACES]
-        per_wave.append(variants)
+        # every item order the wave permits — this is what the
+        # (previously unused) permutations import was for
+        for perm in islice(permutations(range(len(seqs))), _MAX_TRACES):
+            trace: list[set[str]] = []
+            for i in perm:
+                trace.extend(seqs[i])
+            variants.append(trace)
+        # dedupe: a wave of pure readers yields identical traces
+        seen: set[tuple] = set()
+        uniq: list[list[set[str]]] = []
+        for v in variants:
+            key = tuple(frozenset(s) for s in v)
+            if key not in seen:
+                seen.add(key)
+                uniq.append(v)
+        per_wave.append(uniq or [[]])
 
     traces: list[list[set[str]]] = [[]]
     for variants in per_wave:

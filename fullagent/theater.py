@@ -23,6 +23,7 @@ scrubber is the TUI command; the projector is this module.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 
 from .kernel import EventLog, fold
@@ -79,8 +80,12 @@ class Theater:
 
     def frame(self, seq: int) -> Frame | None:
         """Full state reconstruction AT seq (inclusive)."""
-        target = next((e for e in self.log.events() if e.seq == seq), None)
-        if target is None:
+        # SPEED: _event_at walks the seq-ascending chain with early exit
+        # instead of materialising a full scan; the == seq check keeps the
+        # "no event at seq" contract (it returns the newest event with
+        # seq <= the target, so an exact match must be verified).
+        target = self.log._event_at(self.log.branch, seq)
+        if target is None or target.seq != seq:
             return None
         st = fold(self.log, upto_seq=seq)
         state = {"messages": st.messages, "tool_calls": st.tool_calls,
@@ -96,8 +101,8 @@ class Theater:
     def why(self, seq: int) -> str:
         """The causal proof tree behind the event at seq — from the
         sealed envelope, oldest cause first."""
-        target = next((e for e in self.log.events() if e.seq == seq), None)
-        if target is None:
+        target = self.log._event_at(self.log.branch, seq)
+        if target is None or target.seq != seq:
             return f"no event at seq {seq}"
         chain = self.log.why(target.id)
         lines = [f"WHY seq {seq} ({target.type}) — causal chain, root "
@@ -139,22 +144,14 @@ class Theater:
         the event at seq REMOVED. Returns the divergence report and the
         real branch name — the counterfactual can be checked out and
         worked on like any timeline."""
-        target = next((e for e in self.log.events() if e.seq == seq), None)
-        if target is None:
+        target = self.log._event_at(self.log.branch, seq)
+        if target is None or target.seq != seq:
             raise ValueError(f"no event at seq {seq}")
-        branch = name or f"cf/{seq}-{target.type}"
-        # never clobber an existing branch — a second counterfactual at
-        # the same seq would rewind the first one's head silently
-        existing = set(self.log.branches())
-        if branch in existing:
-            n = 2
-            while f"{branch}-{n}" in existing:
-                n += 1
-            branch = f"{branch}-{n}"
-        # fork from the event BEFORE the removed one
-        base = self.log._event_at(self.log.branch, seq - 1)
-        self.log._heads[branch] = base.id if base else None
-
+        # Use the kernel's public fork(): it sets the new head AND seals a
+        # kernel.branch marker (provenance), and its name-dedup can never
+        # clobber an existing branch. Fork from the event BEFORE the
+        # removed one so the replay starts clean.
+        branch = self.log.fork(at_seq=seq - 1, name=name or f"cf/{seq}-{target.type}")
         original_branch = self.log.branch
         before = fold(self.log, upto_seq=seq)          # state with the event
         replayed = 0
@@ -166,7 +163,10 @@ class Theater:
                     continue
                 if replayed >= _MAX_CF_REPLAY:
                     break
-                self.log.append(ev.type, ev.data, actor="cf",
+                # deepcopy: append() stores the data dict by reference —
+                # sharing one dict between the original and the replayed
+                # event would alias two branches' histories together
+                self.log.append(ev.type, deepcopy(ev.data), actor="cf",
                                 provenance=ev.provenance)
                 replayed += 1
         finally:

@@ -98,7 +98,7 @@ def _draft_prompt(goal: str) -> list[dict]:
     ]
 
 
-def default_drafter(provider, model, effort
+def default_drafter(provider: str, model: str, effort: str
                     ) -> Callable[[str], list[dict]]:
     """Production drafter: one blocking model call -> raw IR items."""
     from .client import chat_blocking
@@ -164,6 +164,7 @@ class IntentCompiler:
         merge into the kept twin — the work still happens exactly once."""
         seen: dict[str, dict] = {}
         out: list[dict] = []
+        out_ids: set[int] = set()  # id() of kept dicts — O(1), not O(n) scan
         for it in items:
             key = _item_key(it)
             if key in seen:
@@ -175,10 +176,11 @@ class IntentCompiler:
                 continue
             seen[key] = it
             out.append(it)
+            out_ids.add(id(it))
         # deps pointing at a dropped duplicate resolve to its kept twin
         remap = {}
         for it in items:
-            if it not in out:
+            if id(it) not in out_ids:
                 remap[it["id"]] = seen[_item_key(it)]["id"]
         for it in out:
             it["depends_on"] = [remap.get(d, d) for d in it["depends_on"]]
@@ -313,6 +315,12 @@ class IntentCompiler:
         lock paths. Seals compile.plan; returns the optimized plan."""
         goal = str(goal or "").strip()
         t0 = time.monotonic()
+        if not goal:
+            # fail fast: no point drafting/optimizing nothing
+            plan = CompiledPlan(goal="", waves=[], dropped=[],
+                                compile_ms=0)
+            self.log.append("compile.plan", plan.to_dict(), actor="kernel")
+            return plan
         items, dropped = self._parse(goal)
         self._remap_deps(items)          # ids resolve BEFORE dedupe shifts
         items = self._dedupe(items, dropped)
@@ -333,7 +341,11 @@ class IntentCompiler:
         """Run the plan wave by wave — each wave's items run in order
         through the executor (serially, one worker at a time); a wave's
         reports land before the next wave starts (dependencies are
-        satisfied by construction)."""
+        satisfied by construction).
+
+        A wave whose executor raises is recorded as error reports (one
+        per item) and execution CONTINUES with the next wave — a single
+        bad wave must not nuke the whole plan's results."""
         if self.executor is None:
             raise RuntimeError("no executor attached — plan compiled only")
         all_reports: list[dict] = []
@@ -342,7 +354,21 @@ class IntentCompiler:
                             {"index": i, "items": len(wave),
                              "roles": [it["role"] for it in wave]},
                             actor="kernel")
-            reports = self.executor(wave)
+            try:
+                reports = self.executor(wave)
+            except Exception as e:  # noqa: BLE001 — executor is user code
+                _log.warning("wave %d executor failed: %s", i, e)
+                reports = [{"task": it.get("task", "?"),
+                            "role": it.get("role", "?"),
+                            "status": "error",
+                            "error": f"executor raised {type(e).__name__}: {e}"}
+                           for it in wave]
+                self.log.append("compile.wave_error",
+                                {"index": i,
+                                 "error": f"{type(e).__name__}: {e}"},
+                                actor="kernel")
+            if not isinstance(reports, list):
+                reports = []
             all_reports.extend(reports)
         result = {"goal": plan.goal, "waves": len(plan.waves),
                   "items": len(all_reports),

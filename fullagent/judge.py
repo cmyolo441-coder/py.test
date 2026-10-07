@@ -111,7 +111,9 @@ def _shell_command() -> list[str] | None:
 
 def _run_shell(command: str, timeout: int):
     """Run a predicate command in the resolved shell. Returns
-    (returncode, combined_output) or None when no shell is available."""
+    (returncode, combined_output), None when no shell is available.
+    Raises subprocess.TimeoutExpired / OSError — callers translate
+    those into failed verdicts."""
     argv = _shell_command()
     if argv is None:
         return None
@@ -401,6 +403,7 @@ class Judge:
 
     def __init__(self, log: EventLog) -> None:
         self.log = log
+        self._verdicts_cache: tuple[int, list] | None = None  # (head, verdicts)
 
     def check(self, predicate: dict) -> Verdict:
         """Dispatch a predicate dict to the right deterministic checker,
@@ -421,10 +424,15 @@ class Judge:
         return all(v.passed for v in verdicts), verdicts
 
     def recent_verdicts(self, n: int = 10) -> list[dict]:
-        """Last n verdict dicts from the fold, newest first."""
+        """Last n verdict dicts from the fold, newest first. The verdict
+        list is cached against the log head — repeated status queries in
+        one turn don't re-walk the log."""
         if n <= 0:
             return []
-        verdicts = fold(self.log).verdicts
+        head = self.log.head()
+        if self._verdicts_cache is None or self._verdicts_cache[0] != head:
+            self._verdicts_cache = (head, fold(self.log).verdicts)
+        verdicts = self._verdicts_cache[1]
         return list(reversed(verdicts[-n:]))
 
     # -- structured failure (§19.2) ------------------------------------------

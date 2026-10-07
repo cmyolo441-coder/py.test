@@ -45,8 +45,9 @@ _STATEMENTS += (ast.Match,) if hasattr(ast, "Match") else ()  # py3.10+
 
 
 def executable_lines(source: str) -> set[int]:
-    """The set of line numbers that can execute (statements + the bodies
-    of defs/classes). Blanks, comments and pure docstrings excluded."""
+    """The set of line numbers that can execute (every statement's line,
+    including docstring Exprs — they do execute at def time). Blanks and
+    comments excluded."""
     try:
         tree = ast.parse(source)
     except SyntaxError:
@@ -99,12 +100,27 @@ class CoverageEngine:
 
         hit: set[int] = set()
         target_str = str(tp)
+        # resolved-path cache: the tracer fires on EVERY executed line of
+        # EVERY module — calling Path(fn).resolve() (a syscall) per line
+        # made large subjects measurably slower. Filenames repeat
+        # constantly, so resolve each one once.
+        resolved: dict[str, str] = {}
+
+        def _matches(fn: str) -> bool:
+            if fn == target_str:
+                return True
+            r = resolved.get(fn)
+            if r is None:
+                try:
+                    r = str(Path(fn).resolve())
+                except OSError:
+                    r = fn
+                resolved[fn] = r
+            return r == target_str
 
         def tracer(frame, event, arg):
-            if event == "line":
-                fn = frame.f_code.co_filename
-                if fn == target_str or Path(fn).resolve() == tp:
-                    hit.add(frame.f_lineno)
+            if event == "line" and _matches(frame.f_code.co_filename):
+                hit.add(frame.f_lineno)
             return tracer
 
         old_trace = sys.gettrace()

@@ -111,6 +111,11 @@ class TaskMarket:
         self.executor = executor
         self.trust: dict[str, float] = {}
         self.pace: dict[str, float] = dict(_PACE)
+        # role tool-whitelists, resolved once: _capability() used to
+        # rebuild these sets on every bid of every auction
+        self._role_tools: dict[str, frozenset[str]] = {
+            role: frozenset(info.get("tools", ()))
+            for role, info in ROLES.items()}
         self._load()
 
     # -- trust/pace persistence from the log --------------------------------
@@ -135,7 +140,7 @@ class TaskMarket:
         """Tool-fit: does the role's whitelist cover what the task
         demands? (web needs are a hard gate — a role without web tools
         bids 0 on a web task.)"""
-        tools = set(ROLES.get(role, {}).get("tools", ()))
+        tools = self._role_tools.get(role, frozenset())
         if "web" in needs and not (_TOOL_NEEDS["web"] & tools):
             return 0.0
         fit = 0.0
@@ -212,24 +217,27 @@ class TaskMarket:
         contract.report = report
         contract.status = status if status in ("done", "blocked",
                                                "error") else "error"
-        # trust EMA: done up, blocked slightly down, error hard down
+        # trust EMA: done up, blocked slightly down, error hard down.
+        # A contract with no awarded role (direct settle on an empty
+        # contract) has nobody to learn about — skip the trust update
+        # instead of polluting the table with a "" entry.
         role = contract.awarded
-        cur = self.trust_of(role)
-        if contract.status == "done":
-            target = _TRUST_CEIL
-        elif contract.status == "blocked":
-            target = cur
+        if role:
+            cur = self.trust_of(role)
+            if contract.status == "done":
+                new = cur + (_TRUST_CEIL - cur) * _TRUST_RATE
+            elif contract.status == "blocked":
+                new = max(_TRUST_FLOOR,
+                          min(_TRUST_CEIL, cur - 0.05))  # small honest dip
+            else:
+                new = cur + (_TRUST_FLOOR - cur) * _TRUST_RATE
+            self.trust[role] = new
         else:
-            target = _TRUST_FLOOR
-        new = cur + (target - cur) * _TRUST_RATE
-        if contract.status == "blocked":
-            new = max(_TRUST_FLOOR,
-                      min(_TRUST_CEIL, cur - 0.05))   # small honest dip
-        self.trust[role] = new
+            new = 0.5
         # pace recalibration: more tool calls than the prior assumed ->
         # the role is slower than we thought
         calls = int(report.get("tool_calls", 0) or 0)
-        if calls > 0:
+        if calls > 0 and role:
             p = self.pace.get(role, 1.0)
             self.pace[role] = max(0.5, min(2.0, p * 0.7 + 0.3 * (
                 calls / 10.0)))

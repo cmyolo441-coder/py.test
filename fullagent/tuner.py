@@ -32,6 +32,15 @@ _log = get_logger("tuner")
 
 _GAMMA = 0.25          # fraction of history counted as GOOD
 _EPSILON = 0.10        # uniform exploration probability
+_PATIENCE = 8          # stop if no improvement for this many trials
+
+
+def _config_key(config: dict) -> tuple:
+    """Hashable identity for a config (values are discrete knob choices)."""
+    try:
+        return tuple(sorted(config.items()))
+    except TypeError:
+        return tuple(sorted((k, repr(v)) for k, v in config.items()))
 
 
 @dataclass
@@ -58,16 +67,24 @@ class ParzenTuner:
     """TPE over discrete knob spaces."""
 
     def __init__(self, log: EventLog, space: dict[str, list],
-                 seed: int = 13, objective=None) -> None:
+                 seed: int = 13, objective=None,
+                 patience: int = _PATIENCE) -> None:
         """space: knob -> allowed values. objective(config) -> float —
         injectable (production: run a scored benchmark turn; tests: a
-        synthetic function)."""
+        synthetic function). patience: early-stop after this many trials
+        with no improvement to the best score."""
         self.log = log
         self.space = {k: list(v) for k, v in space.items() if v}
         self.rng = random.Random(seed)
         self.objective = objective
+        self.patience = patience
         self.history: list[Trial] = []
         self._n = 0
+        # Score cache: evaluating the same discrete config twice is pure
+        # waste — the objective is deterministic, so reuse the first
+        # score instead of burning another trial on it.
+        self._score_cache: dict[tuple, float] = {}
+        self._last_was_cached = False
 
     # -- TPE internals --------------------------------------------------------
 
@@ -127,11 +144,22 @@ class ParzenTuner:
                          "n": self._n}, actor="kernel")
 
     def step(self) -> Trial:
-        """Suggest → evaluate (objective) → observe. Returns the trial."""
+        """Suggest → evaluate (objective) → observe. Returns the trial.
+
+        A config seen before reuses its cached score instead of
+        re-running the objective — TPE exploitation revisits winners
+        often, and each repeat evaluation is a wasted trial."""
         if self.objective is None:
             raise RuntimeError("no objective attached")
         config = self.suggest()
-        score = float(self.objective(config))
+        key = _config_key(config)
+        if key in self._score_cache:
+            score = self._score_cache[key]
+            self._last_was_cached = True
+        else:
+            score = float(self.objective(config))
+            self._score_cache[key] = score
+            self._last_was_cached = False
         self.observe(config, score)
         return self.history[-1]
 
@@ -141,8 +169,32 @@ class ParzenTuner:
         return max(self.history, key=lambda t: t.score)
 
     def run(self, n: int = 20) -> TunerReport:
+        """Run up to n trials, stopping early on convergence.
+
+        Convergence for discrete TPE means the sampler has collapsed:
+        it keeps suggesting configs we have already evaluated. Those
+        trials are free (score cache) but pointless — further trials
+        will not discover anything new. We stop after `patience`
+        consecutive cache-hit trials. A stale *best score* alone is NOT
+        a stop signal: TPE legitimately explores for long stretches
+        (20+ trials) before its next improvement."""
+        dup_streak = 0
         for _ in range(n):
             self.step()
+            if self._last_was_cached:
+                dup_streak += 1
+                if dup_streak >= self.patience:
+                    self.log.append(
+                        "tuner.early_stop",
+                        {"trials": len(self.history),
+                         "distinct": len(self._score_cache),
+                         "patience": self.patience,
+                         "reason": "suggester converged to evaluated "
+                                   "configs"},
+                        actor="kernel")
+                    break
+            else:
+                dup_streak = 0
         b = self.best()
         assert b is not None
         distinct = len({tuple(sorted(t.config.items()))

@@ -88,12 +88,18 @@ class AttentionEconomy:
     def bid(self, section: str, text: str, query: str,
             fresh_ts: float | None = None) -> float:
         """Mechanical value of one section for this turn."""
+        return self._bid(section, text, _tokens(query), fresh_ts)
+
+    def _bid(self, section: str, text: str, qtokens: set[str],
+             fresh_ts: float | None = None) -> float:
+        """bid() with a pre-tokenized query — allocate() tokenizes the
+        query ONCE and reuses it for every section instead of
+        re-running the regex per section."""
         relevance = 0.0
-        q = _tokens(query)
-        if q:
+        if qtokens:
             t = _tokens(text)
-            overlap = len(q & t)
-            relevance = overlap / (len(q) + 2)
+            overlap = len(qtokens & t)
+            relevance = overlap / (len(qtokens) + 2)
         recency = 1.0
         if fresh_ts is not None:
             age_h = max(0.0, time.time() - fresh_ts) / 3600.0
@@ -116,7 +122,9 @@ class AttentionEconomy:
             self.last = result
             return result
 
-        bids = {s: self.bid(s, sections[s], query,
+        # tokenize the query once — _bid reuses it for every section
+        qtokens = _tokens(query)
+        bids = {s: self._bid(s, sections[s], qtokens,
                             (fresh or {}).get(s)) for s in names}
         total_bid = sum(bids.values()) or 1.0
         floor = int(budget * _FLOOR_FRAC)

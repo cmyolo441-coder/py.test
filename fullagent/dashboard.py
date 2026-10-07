@@ -33,10 +33,28 @@ class Dashboard:
 
     def __init__(self, log: EventLog) -> None:
         self.log = log
+        # SPEED: snapshot() folds the log plus a full event walk for the
+        # crew count. The fold itself is incrementally cached, but the
+        # walk is O(N) per call — cache the whole snapshot keyed by the
+        # log head so repeated renders (polling tickers) are O(1).
+        self._snap_cache: dict | None = None
+        self._snap_head: int = -2
 
     # -- snapshot (raw dict) ---------------------------------------------------
 
     def snapshot(self) -> dict:
+        head = self.log.head()
+        if self._snap_cache is not None and self._snap_head == head:
+            # Log unchanged since the last snapshot — the fold cache and
+            # every count below would recompute identically. Return a
+            # shallow copy so callers can't corrupt the cached entry.
+            return dict(self._snap_cache)
+        s = self._snapshot_uncached()
+        self._snap_cache = s
+        self._snap_head = head
+        return dict(s)
+
+    def _snapshot_uncached(self) -> dict:
         st = fold(self.log)
         goal = st.goal
         proven = len(st.goal_done)

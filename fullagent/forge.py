@@ -14,6 +14,7 @@ detects mid-session drift.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import locale
@@ -33,7 +34,12 @@ _log = get_logger("forge")
 _PROBED_TOOLS = ("git", "node", "docker", "gcc", "make")
 
 
+@functools.lru_cache(maxsize=1)
 def _tool_versions() -> dict[str, str]:
+    """Probe toolchain versions once per process: five subprocess spawns
+    on every digest() call is pure waste — versions don't change
+    mid-session often enough to matter, and digest() is called on every
+    PERCEIVE."""
     versions: dict[str, str] = {}
     for tool in _PROBED_TOOLS:
         exe = shutil.which(tool)
@@ -47,6 +53,13 @@ def _tool_versions() -> dict[str, str]:
         except (OSError, subprocess.TimeoutExpired):
             versions[tool] = "?"
     return versions
+
+
+def reprobe_tools() -> dict[str, str]:
+    """Clear the cached toolchain versions and re-probe (e.g. after a
+    mid-session toolchain install that drift() should notice)."""
+    _tool_versions.cache_clear()
+    return _tool_versions()
 
 
 def _lockfile_hash(cwd: Path) -> str | None:

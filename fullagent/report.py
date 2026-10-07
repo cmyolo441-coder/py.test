@@ -178,6 +178,7 @@ def export_html(log: EventLog, title: str = "FullAgent session report"
     md = export_markdown(log, title)
     body: list[str] = []
     in_table = False
+    table_rows = 0  # rows emitted for the current table
     for raw in md.splitlines():
         line = raw.rstrip()
         if line.startswith("# "):
@@ -188,12 +189,19 @@ def export_html(log: EventLog, title: str = "FullAgent session report"
             # split on unescaped pipes only; markdown-escaped "\|" is data
             parts = re.split(r"(?<!\\)\|", line)
             cells = [c.strip().replace("\\|", "|") for c in parts[1:-1]]
-            if all(set(c) <= set("-: ") for c in cells):
-                continue  # separator row
-            tag = "th" if not in_table else "td"
             if not in_table:
                 body.append("<table>")
                 in_table = True
+                table_rows = 0
+            # markdown tables are header / separator / data… — the
+            # separator is ALWAYS row 1, so only row 1 is ever skipped.
+            # The old check ate any data row whose cells happened to be
+            # all dashes/colons/spaces (e.g. a "---" detail cell).
+            if table_rows == 1 and cells and all(
+                    set(c) <= set("-: ") for c in cells):
+                table_rows += 1
+                continue  # separator row
+            tag = "th" if table_rows == 0 else "td"
             rendered = []
             for c in cells:
                 cls = ""
@@ -203,10 +211,12 @@ def export_html(log: EventLog, title: str = "FullAgent session report"
                     cls = ' class="fail"'
                 rendered.append(f"<{tag}{cls}>{html.escape(c)}</{tag}>")
             body.append("<tr>" + "".join(rendered) + "</tr>")
+            table_rows += 1
         else:
             if in_table:
                 body.append("</table>")
                 in_table = False
+                table_rows = 0
             if line.startswith("- "):
                 content = html.escape(line[2:])
                 content = content.replace("**", "")

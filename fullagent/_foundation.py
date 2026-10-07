@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -41,6 +42,7 @@ __all__ = [
 _LOG_FORMAT = "%(asctime)s │ %(levelname)-7s │ %(name)-18s │ %(message)s"
 _DATE_FORMAT = "%H:%M:%S"
 _configured = False
+_config_lock = threading.Lock()
 
 
 class Level(Enum):
@@ -51,19 +53,26 @@ class Level(Enum):
 
 
 def _configure_root() -> None:
-    """Configure the root FullAgent logger once (idempotent)."""
+    """Configure the root FullAgent logger once (idempotent, thread-safe).
+
+    The old double-checked read of _configured could let two threads both
+    configure, attaching two handlers and doubling every log line.
+    """
     global _configured
     if _configured:
         return
-    _configured = True
-    level_name = os.environ.get("FULLAGENT_LOG_LEVEL", "QUIET").upper()
-    level = getattr(Level, level_name, Level.QUIET).value
-    handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(logging.Formatter(_LOG_FORMAT, _DATE_FORMAT))
-    root = logging.getLogger("fullagent")
-    root.setLevel(level)
-    root.addHandler(handler)
-    root.propagate = False
+    with _config_lock:
+        if _configured:
+            return
+        _configured = True
+        level_name = os.environ.get("FULLAGENT_LOG_LEVEL", "QUIET").upper()
+        level = getattr(Level, level_name, Level.QUIET).value
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(logging.Formatter(_LOG_FORMAT, _DATE_FORMAT))
+        root = logging.getLogger("fullagent")
+        root.setLevel(level)
+        root.addHandler(handler)
+        root.propagate = False
 
 
 def get_logger(name: str) -> logging.Logger:

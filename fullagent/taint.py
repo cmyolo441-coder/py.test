@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 from .kernel import EventLog, fold
@@ -39,9 +40,30 @@ DEFAULT_SOURCES = frozenset(
 
 # Sinks: calls that are dangerous when fed tainted data.
 DEFAULT_SINKS = frozenset(
-    "eval exec compile os.system os.popen subprocess.run subprocess.call "
-    "subprocess.Popen pickle.loads yaml.load cursor.execute execute "
+    "eval exec compile os.system os.popen os.execv os.execve os.execl "
+    "os.execle os.execlp os.execvp os.spawnl os.spawnle os.spawnlp "
+    "os.spawnv os.spawnve os.spawnvp os.spawnvpe "
+    "subprocess.run subprocess.call subprocess.Popen subprocess.check_call "
+    "subprocess.check_output popen "
+    "pickle.loads yaml.load marshal.loads cursor.execute execute "
     "open write send sendall render_template".split())
+
+
+# ---------------------------------------------------------------------------
+# Speed: fast-path + caching
+# ---------------------------------------------------------------------------
+# _RISK_TOKENS is a cheap substring pre-scan. If NONE of these tokens
+# appears in the source, no source/sink can possibly match and the AST
+# parse is skipped entirely — obviously-safe inputs return instantly.
+_RISK_TOKENS = frozenset(
+    "eval exec compile system popen spawn subprocess pickle yaml marshal "
+    "cursor execute render_template input raw_input request environ getenv "
+    "argv open read recv urlopen fetch socket send".split())
+
+
+def _looks_risky(source: str) -> bool:
+    sl = source.lower()
+    return any(tok in sl for tok in _RISK_TOKENS)
 
 
 # ---------------------------------------------------------------------------
@@ -104,71 +126,129 @@ class TaintAnalyzer:
                  sinks: frozenset = DEFAULT_SINKS) -> None:
         self.sources = sources
         self.sinks = sinks
+        # verdict cache: repeated scans of the same source are O(1)
+        self._cache: dict[int, list[TaintFinding]] = {}
+
+    def _is_source_name(self, name: str) -> bool:
+        """Does a dotted call name resolve to a declared source?
+
+        Matches exact names, dotted prefixes (request.args.get via the
+        request.args source) and bare imported names (getenv via
+        os.getenv)."""
+        for s in self.sources:
+            if name == s or name.startswith(s + ".") \
+                    or name.endswith("." + s):
+                return True
+            if "." in s and s.endswith("." + name):
+                return True
+        return False
+
+    def _is_sink_name(self, name: str) -> bool:
+        for s in self.sinks:
+            if name == s or name.endswith("." + s):
+                return True
+        return False
 
     def analyze(self, source: str) -> list[TaintFinding]:
-        try:
-            tree = ast.parse(source)
-        except SyntaxError:
+        # fast path: obviously-safe input skips the AST parse entirely
+        if not _looks_risky(source):
             return []
-        # name -> (source_name, source_line, path)
-        tainted: dict[str, tuple[str, int, list[str]]] = {}
-        findings: list[TaintFinding] = []
-
-        def is_source_call(node: ast.expr) -> tuple[bool, str, int]:
-            for sub in ast.walk(node):
-                if isinstance(sub, ast.Call):
-                    name = _call_name(sub)
-                    if name in self.sources or any(
-                            name.endswith("." + s) for s in self.sources) \
-                            or any(s.endswith(name) for s in self.sources
-                                   if "." in s):
-                        return True, name, getattr(sub, "lineno", 0)
-            return False, "", 0
-
-        def tainted_names(node: ast.expr) -> list[str]:
-            return [n.id for n in ast.walk(node)
-                    if isinstance(n, ast.Name) and n.id in tainted]
-
-        # walk in SOURCE order, not BFS order: ast.walk visits nodes
-        # level-by-level, so a later re-assignment would be processed
-        # before an earlier sink call and report flows that never happen
-        stmts = sorted((n for n in ast.walk(tree)
-                        if isinstance(n, (ast.Assign, ast.Call))),
-                       key=lambda n: (getattr(n, "lineno", 0),
-                                      getattr(n, "col_offset", 0)))
-        for node in stmts:
-            if isinstance(node, ast.Assign):
-                ok, sname, sline = is_source_call(node.value)
-                if ok:
-                    for tgt in node.targets:
-                        if isinstance(tgt, ast.Name):
-                            tainted[tgt.id] = (sname, sline,
-                                               [f"{sname}@{sline}",
-                                                tgt.id])
-                else:
-                    # propagate: RHS uses a tainted name
-                    used = tainted_names(node.value)
-                    if used:
-                        base = tainted[used[0]]
-                        for tgt in node.targets:
-                            if isinstance(tgt, ast.Name):
-                                tainted[tgt.id] = (
-                                    base[0], base[1],
-                                    base[2] + [tgt.id])
-            elif isinstance(node, ast.Call):
-                name = _call_name(node)
-                if name in self.sinks:
-                    for arg in list(node.args) + \
-                            [kw.value for kw in node.keywords]:
-                        for tn in tainted_names(arg):
-                            src, sline, path = tainted[tn]
-                            findings.append(TaintFinding(
-                                sink=name,
-                                line=getattr(node, "lineno", 0),
-                                source=src, source_line=sline,
-                                path=path + [f"{name}()"]))
-                            break
+        key = hash((source, self.sources, self.sinks))
+        hit = self._cache.get(key)
+        if hit is not None:
+            return [TaintFinding(f.sink, f.line, f.source, f.source_line,
+                                 list(f.path)) for f in hit]
+        findings = _analyze_impl(source, self.sources, self.sinks,
+                                 self._is_source_name, self._is_sink_name)
+        # bound the cache: safety verdicts for hot files stay O(1)
+        # without unbounded memory growth on huge scans
+        if len(self._cache) < 512:
+            self._cache[key] = findings
         return findings
+
+
+def _analyze_impl(source: str, sources: frozenset, sinks: frozenset,
+                  is_source_name, is_sink_name) -> list[TaintFinding]:
+    """The real dataflow. Module-level so the logic is testable without
+    an analyzer instance."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    # name -> (source_name, source_line, path)
+    tainted: dict[str, tuple[str, int, list[str]]] = {}
+    findings: list[TaintFinding] = []
+
+    def is_source_call(node: ast.expr) -> tuple[bool, str, int]:
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Call):
+                name = _call_name(sub)
+                if is_source_name(name):
+                    return True, name, getattr(sub, "lineno", 0)
+        return False, "", 0
+
+    def tainted_names(node: ast.expr) -> list[str]:
+        return [n.id for n in ast.walk(node)
+                if isinstance(n, ast.Name) and n.id in tainted]
+
+    def note_sink(call: ast.Call, arg: ast.expr) -> None:
+        """Record one finding for a tainted argument reaching a sink,
+        either via a tainted NAME or via a direct SOURCE CALL such as
+        eval(input()) with no intermediate assignment."""
+        name = _call_name(call)
+        for tn in tainted_names(arg):
+            src, sline, path = tainted[tn]
+            findings.append(TaintFinding(
+                sink=name, line=getattr(call, "lineno", 0),
+                source=src, source_line=sline,
+                path=path + [f"{name}()"]))
+            return
+        ok, sname, sline = is_source_call(arg)
+        if ok:
+            findings.append(TaintFinding(
+                sink=name, line=getattr(call, "lineno", 0),
+                source=sname, source_line=sline,
+                path=[f"{sname}@{sline}", f"{name}()"]))
+
+    # walk in SOURCE order, not BFS order: ast.walk visits nodes
+    # level-by-level, so a later re-assignment would be processed
+    # before an earlier sink call and report flows that never happen
+    stmts = sorted((n for n in ast.walk(tree)
+                    if isinstance(n, (ast.Assign, ast.AnnAssign,
+                                      ast.AugAssign, ast.Call))),
+                   key=lambda n: (getattr(n, "lineno", 0),
+                                  getattr(n, "col_offset", 0)))
+    for node in stmts:
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            value = node.value
+            if value is None:      # bare annotation: x: int
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) \
+                else [node.target]
+            ok, sname, sline = is_source_call(value)
+            if ok:
+                for tgt in targets:
+                    if isinstance(tgt, ast.Name):
+                        tainted[tgt.id] = (sname, sline,
+                                           [f"{sname}@{sline}",
+                                            tgt.id])
+            else:
+                # propagate: RHS uses a tainted name
+                used = tainted_names(value)
+                if used:
+                    base = tainted[used[0]]
+                    for tgt in targets:
+                        if isinstance(tgt, ast.Name):
+                            tainted[tgt.id] = (
+                                base[0], base[1],
+                                base[2] + [tgt.id])
+        elif isinstance(node, ast.Call):
+            name = _call_name(node)
+            if is_sink_name(name):
+                for arg in list(node.args) + \
+                        [kw.value for kw in node.keywords]:
+                    note_sink(node, arg)
+    return findings
 
 
 # ---------------------------------------------------------------------------
@@ -196,21 +276,33 @@ def _own_nodes(fn: ast.AST):
 
 def cyclomatic(source: str) -> list[Complexity]:
     """Cyclomatic complexity per function: 1 + number of branch nodes."""
+    # fast path: no function definitions -> nothing to score, skip parse
+    if "def " not in source and "lambda" not in source:
+        return []
+    # cache: complexity is re-queried for the same files across
+    # analyze_file / hotspots / reports
+    return [Complexity(c[0], c[1], c[2], c[3], c[4])
+            for c in _cyclomatic_cached(source)]
+
+
+@lru_cache(maxsize=512)
+def _cyclomatic_cached(source: str) -> tuple:
+    """Cached core: returns plain tuples so the cache stays picklable
+    and free of mutable dataclass instances."""
     try:
         tree = ast.parse(source)
     except SyntaxError:
-        return []
-    out: list[Complexity] = []
+        return ()
+    out = []
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             branches = sum(1 for n in _own_nodes(node)
                            if isinstance(n, _BRANCHES))
             end = getattr(node, "end_lineno", node.lineno)
             nargs = len(node.args.args) + len(node.args.kwonlyargs)
-            out.append(Complexity(node.name, node.lineno,
-                                  1 + branches, end - node.lineno + 1,
-                                  nargs))
-    return out
+            out.append((node.name, node.lineno,
+                        1 + branches, end - node.lineno + 1, nargs))
+    return tuple(out)
 
 
 # ---------------------------------------------------------------------------
