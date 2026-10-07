@@ -121,13 +121,14 @@ python main.py
   approaches land in a dead-end ledger and are blocked deterministically
 - **Judge** — claims are verified against reality with deterministic
   predicates (exit codes, file checks, regex) — never the model's own word
-- **Crew** — Codex-style **persistent** subagents: `spawn_agent` queues
-  a background worker and returns instantly (the conversation stays
-  responsive), `send_to_agent` iterates on its LIVING context,
-  `wait_for_agents` collects results, `close_agent` / `resume_agent`
-  manage the lifecycle. Subagents run **one at a time** through a serial
-  queue — never in parallel. Live progress streams in the prompt border.
-  All subagents use Union Alpha through Kilo Code.
+- **Crew** — Codex-style **persistent** subagents with **true parallelism**:
+  `spawn_agent` launches a background worker instantly (the conversation stays
+  responsive), `spawn_parallel` fires up to 10 agents at once on a
+  ThreadPoolExecutor, `send_to_agent` iterates on its LIVING context,
+  `wait_for_agents` collects results as they finish, `close_agent` /
+  `resume_agent` manage the lifecycle. Subagents run **concurrently** —
+  each isolated, sharing only the thread-safe event log. Live progress
+  streams smoothly in the TUI panel with zero flicker.
 - **Focus Mode** — deep work: `/focus 10` arms auto-continuation and the
   agent keeps working turn after turn until the goal closes, progress
   stalls, or the budget pauses. Every continuation decision is a sealed
@@ -236,7 +237,7 @@ tokens, temperature, and reasoning effort.
 
 ## Models & providers
 
-Both **Kilo Code** and **Kios API** are available. The default model is
+Both **Kilo Code**, **Kios API**, and **OpenCode Zen** are available. The default model is
 Union Alpha; saved selections of removed models fall back to it. Custom
 providers and `models.json` loading are no longer supported.
 
@@ -244,6 +245,8 @@ providers and `models.json` loading are no longer supported.
   262,144 tokens; maximum completion 131,072 tokens; tool calling
   supported; reasoning parameters omitted
 - Kios — Base URL: `https://kiosapi.com/v1`; model `atria-dawn-preview`
+  (OpenAI-compatible chat + tool calling)
+- OpenCode — Base URL: `https://opencode.ai/zen/v1`; model `space-bunny-free`
   (OpenAI-compatible chat + tool calling)
 
 
@@ -257,8 +260,9 @@ python main.py
 |---|---|---|
 | Kilo Code | `https://api.kilo.ai/api/gateway` | `stealth/union-alpha` |
 | Kios API | `https://kiosapi.com/v1` | `atria-dawn-preview` |
+| OpenCode Zen | `https://opencode.ai/zen/v1` | `space-bunny-free` |
 
-`/models list` shows both models; `/model` or Ctrl+T opens the selector.
+`/models list` shows all models; `/model` or Ctrl+T opens the selector.
 The turn always runs on your selected model; failover happens only on a
 provider outage (see `/health`).
 Save the key instead in `~/.fullagent/kilo_api_key` or

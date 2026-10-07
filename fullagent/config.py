@@ -108,6 +108,13 @@ PROVIDERS: dict[str, Provider] = {
         api_key=_provider_api_key("kios"),
         color="#8be9fd",
     ),
+    "opencode": Provider(
+        key="opencode",
+        name="OpenCode Zen",
+        base_url="https://opencode.ai/zen/v1",
+        api_key=_provider_api_key("opencode"),
+        color="#ff79c6",
+    ),
 }
 
 MODELS: list[Model] = [
@@ -115,6 +122,8 @@ MODELS: list[Model] = [
           supports_tools=True, context_window=262_144),
     Model("atria-dawn-preview", "kios", "Atria Dawn Preview",
           tag="preview", supports_tools=True),
+    Model("space-bunny-free", "opencode", "Space Bunny Free",
+          tag="free", supports_tools=True, context_window=262_144),
 ]
 
 DEFAULT_MODEL_ID = "stealth/union-alpha"
