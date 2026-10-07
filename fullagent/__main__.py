@@ -187,6 +187,10 @@ def main() -> int:
     if argv:
         return _headless(argv)
 
+    # SPEED: print an instant banner BEFORE heavy init so the user
+    # sees something immediately (<10ms), not after 1-2s of silence.
+    print("◆ FullAgent — starting...", flush=True)
+
     from . import config
     from .agent import Agent
     from .config import Config

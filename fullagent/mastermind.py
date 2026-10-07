@@ -72,9 +72,8 @@ class PromptVault:
         self._sealed: dict[str, str] = {}
         self._seal("main", systemprompt.main())
         self._seal("master", systemprompt.get("master"))
-        for role in systemprompt.ROLE_BRIEFS:
-            self._seal(f"worker:{role}",
-                       systemprompt.worker(role, MAX_WORKERS))
+        # SPEED: worker role briefs are sealed on first use via resolve(),
+        # not at startup (saves ~150ms on launch).
 
     def _seal(self, name: str, text: str) -> None:
         self._sealed[name] = text
@@ -103,6 +102,14 @@ class PromptVault:
             if text is not None and text != self._sealed[name]:
                 self._seal(name, text)
             return self._sealed[name]
+        # Worker role prompts are generated on demand (not pre-sealed at
+        # startup for speed) — generate and seal on first request.
+        if name.startswith("worker:"):
+            role = name[len("worker:"):]
+            if role in systemprompt.ROLE_BRIEFS:
+                text = systemprompt.worker(role, MAX_WORKERS)
+                self._seal(name, text)
+                return self._sealed[name]
         if name not in systemprompt.PROMPTS:
             raise KeyError(f"prompt {name!r} is not registered in "
                            "systemprompt.py — it cannot be sealed")
@@ -423,6 +430,8 @@ if __name__ == "__main__":
             # -- vault: every prompt sealed, fingerprints stable ------------
             assert "main" in mm.vault.names()
             assert "master" in mm.vault.names()
+            # worker prompts seal on demand (not at init for speed)
+            assert mm.vault.resolve("worker:coder")
             assert "worker:coder" in mm.vault.names()
             assert mm.vault.verify("main", systemprompt.main())
             assert mm.vault.verify("main", systemprompt.main()
@@ -503,7 +512,7 @@ if __name__ == "__main__":
             assert s.dispatches == 6
             assert s.restorations == 4
             assert s.section_counts.get("goal") == 2
-            assert len(s.sealed) >= 8  # main, master + worker:* prompts
+            assert len(s.sealed) >= 2  # main, master (worker:* seal on demand)
             text = mm.format_status()
             assert "MASTERMIND" in text and "sealed prompts" in text
 
