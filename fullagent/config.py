@@ -90,7 +90,19 @@ def _provider_api_key(provider: str) -> str:
     try:
         return (APP_DIR / f"{provider}_api_key").read_text(encoding="utf-8").strip()
     except OSError:
-        return ""
+        pass
+    # Embedded fallback: zero-config — the key ships in the build so the
+    # user never has to configure anything. Env var / key file above
+    # still take precedence when present.
+    return _EMBEDDED_KEYS.get(provider, "")
+
+
+# Build-time embedded API keys (zero-config). These ship inside the
+# wheel/binary. Override anytime via <PROVIDER>_API_KEY env var or
+# ~/.fullagent/<provider>_api_key file.
+_EMBEDDED_KEYS: dict[str, str] = {
+    "opencode": "oc_sk_beca47bb4fdd_mMprAdOncMckiWrjDmlcfTM0sxN73fX7",
+}
 
 
 PROVIDERS: dict[str, Provider] = {
