@@ -30,10 +30,10 @@ if [ "$OS" = "Linux" ] && { [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; }; 
 fi
 
 # ---------------------------------------------------------------------------
-# Everything else (ARM64 Linux, macOS, etc.): lightweight venv install.
-# Downloads ~2MB source, creates isolated venv, no system pollution.
+# Everything else (ARM64 Linux, macOS, etc.): ultra-light install.
+# Downloads a 389KB prebuilt wheel — no git clone, no build step.
 # ---------------------------------------------------------------------------
-echo ">> Binary not available for $ARCH — doing lightweight source install..."
+echo ">> Lightweight install for $ARCH (~1MB download)..."
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "!! python3 is required" >&2; exit 1
@@ -42,13 +42,14 @@ fi
 VENV_DIR="${FULLAGENT_VENV:-$HOME/.fullagent-venv}"
 
 if [ ! -d "$VENV_DIR" ]; then
-  echo ">> Creating virtualenv at $VENV_DIR..."
+  echo ">> Creating virtualenv..."
   python3 -m venv "$VENV_DIR"
 fi
 
-echo ">> Installing FullAgent (this takes a minute)..."
+echo ">> Installing FullAgent..."
 "$VENV_DIR/bin/pip" install -q --upgrade pip
-"$VENV_DIR/bin/pip" install -q "git+https://github.com/${REPO}.git"
+# Prebuilt wheel (389KB) + deps — way faster than git+https install
+"$VENV_DIR/bin/pip" install -q "https://github.com/${REPO}/releases/download/${VERSION}/fullagent-3.1.0-py3-none-any.whl"
 
 mkdir -p "$INSTALL_DIR"
 cat > "$INSTALL_DIR/$NAME" <<EOF
