@@ -28,6 +28,96 @@ PANELS = ("cost", "goal", "agents", "router", "speculator", "memory",
           "health", "engineering", "stream")
 
 
+def _fold_crew_agents(log) -> list[dict]:
+    """Fold crew.* events into per-agent display rows.
+
+    Pure fold over the event log (no state kept): spawn order is stable,
+    running agents show step/elapsed, completed ones collapse to one line.
+    Defensive — handles crew.done without a prior crew.spawn.
+    """
+    agents: dict[str, dict] = {}
+    order: list[str] = []
+    for ev in log.events():
+        t, d = ev.type, ev.data or {}
+        if t == "crew.spawn":
+            aid = str(d.get("id", ""))
+            if aid and aid not in agents:
+                agents[aid] = {
+                    "id": aid,
+                    "name": str(d.get("nickname") or aid),
+                    "role": str(d.get("role") or ""),
+                    "task": str(d.get("task") or ""),
+                    "status": "running",
+                    "step": 0,
+                    "spawn_ts": getattr(ev, "ts", 0.0) or 0.0,
+                    "elapsed_ms": 0,
+                    "error": "",
+                    "files": 0,
+                }
+                order.append(aid)
+        elif t == "crew.progress":
+            aid = str(d.get("id", ""))
+            st = agents.get(aid)
+            if st is not None and st["status"] == "running":
+                try:
+                    st["step"] = int(d.get("step", st["step"]))
+                except (TypeError, ValueError):
+                    pass
+        elif t == "crew.done":
+            aid = str(d.get("id", ""))
+            st = agents.get(aid)
+            if st is None and aid:
+                st = {"id": aid,
+                      "name": str(d.get("nickname") or aid),
+                      "role": str(d.get("role") or ""),
+                      "task": str(d.get("task") or ""),
+                      "status": "running", "step": 0,
+                      "spawn_ts": 0.0, "elapsed_ms": 0,
+                      "error": "", "files": 0}
+                agents[aid] = st
+                order.append(aid)
+            if st is not None and st["status"] == "running":
+                err = str(d.get("error") or "")
+                st["status"] = "error" if err else "done"
+                st["error"] = err[:80]
+                try:
+                    st["elapsed_ms"] = int(d.get("elapsed_ms") or 0)
+                except (TypeError, ValueError):
+                    pass
+                files = d.get("files_touched") or []
+                st["files"] = len(files) if isinstance(files, list) else 0
+        elif t in ("crew.force_stop", "crew.closed"):
+            for aid in order:
+                st = agents[aid]
+                if st["status"] == "running":
+                    st["status"] = "stopped"
+                    st["error"] = "stopped"
+    import time as _time
+    now = _time.time()
+    out: list[dict] = []
+    for aid in order:
+        st = agents[aid]
+        if st["status"] == "running":
+            if st["spawn_ts"]:
+                secs = max(0, int(now - st["spawn_ts"]))
+            else:
+                secs = 0
+            step_bit = f" step {st['step']}" if st["step"] else ""
+            task = " ".join(st["task"].split())[:50]
+            row = (f"\u25cb {st['name']} \u00b7 {st['role']} {task}"
+                   f"{step_bit} \u00b7 {secs}s")
+        elif st["status"] == "done":
+            secs = st["elapsed_ms"] / 1000.0 if st["elapsed_ms"] else 0
+            row = (f"\u2713 {st['name']} \u00b7 done in {secs:.0f}s"
+                   + (f" \u00b7 {st['files']} files" if st["files"] else ""))
+        elif st["status"] == "error":
+            row = f"\u2717 {st['name']} \u00b7 {st['error'][:60]}"
+        else:
+            row = f"\u25a0 {st['name']} \u00b7 {st['error'][:60]}"
+        out.append({"id": aid, "status": st["status"], "row": row})
+    return out
+
+
 class Dashboard:
     """Read-only live projection of the event log. Never writes."""
 
@@ -100,8 +190,14 @@ class Dashboard:
                        if e.get("type") == "mutation.result"]
         mut_last = mut_reports[-1].get("score") if mut_reports else None
 
+        # parallel agents detail: per-agent rows from crew.* events.
+        # Fold is O(crew events) and runs once per log-head change thanks
+        # to the snapshot cache above.
+        crew_agents = _fold_crew_agents(self.log)
+
         return {
             "head_seq": st.head_seq,
+            "crew_agents": crew_agents,
             "cost_usd": st.cost_usd,
             "tokens_in": st.tokens_in,
             "tokens_out": st.tokens_out,
@@ -165,9 +261,14 @@ class Dashboard:
         else:
             lines.append(" GOAL   none active")
 
-        # agents panel
-        lines.append(f" AGENTS crew done {s['crew_done']}   "
-                     f"councils {s['councils']}")
+        # agents panel: per-agent rows (running with spinner step,
+        # completed collapsed to one line each)
+        agents = s.get("crew_agents") or []
+        running = sum(1 for a in agents if a["status"] == "running")
+        lines.append(f" AGENTS {running} running / {len(agents)} total   "
+                     f"crew done {s['crew_done']}   councils {s['councils']}")
+        for a in agents[:8]:  # cap: dashboard is a summary, not a ledger
+            lines.append(f"   {a['row']}")
 
         # router panel
         lines.append(f" ROUTER {s['routed']} routed   "

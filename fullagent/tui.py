@@ -159,6 +159,10 @@ STYLE = Style.from_dict({
     "completion-menu.multi-column-meta": "bg:#282a36 #6272a4",
     "scrollbar.background": "bg:#282a36",
     "scrollbar.button": "bg:#6272a4",
+    "crew.header": f"bold {C['accent']}",
+    "crew.running": C["fg"],
+    "crew.done": C["green"],
+    "crew.error": C["red"],
 })
 
 EFFORT_COLORS = {e.key: e.color for e in EFFORTS}
@@ -635,12 +639,328 @@ class OverlayList:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Parallel agents panel — live subagent tracking without flicker or jank
+# ---------------------------------------------------------------------------
+
+
+class ParallelAgentsPanel:
+    """Live tracker for parallel subagents, driven by crew.* events.
+
+    Smoothness and speed by design:
+    - O(1) per event: agents keyed by id in a dict; no log scans, ever.
+    - Dirty-row caching: only rows whose state changed are reformatted;
+      the rest are served from cache.
+    - Throttled: renders are rate-limited to 10/sec (100ms); callers ask
+      via maybe_render() which returns None when throttled.
+    - Stable ordering: agents are kept in spawn order (insertion order);
+      rows never jump around.
+    - Differential: ingest() returns True only when display state
+      actually changed, so the UI invalidates only on real changes.
+    - Spinner isolation: the animated spinner char is composed at render
+      time, NOT cached — so spinner ticks don't invalidate row caches.
+
+    Event contract (defensive — crew.py may or may not emit all of these):
+    - crew.spawn   {id, nickname, role, task}      -> agent starts
+    - crew.progress {id, step, tools}              -> step update
+    - crew.done     {id, nickname, state, error, elapsed_ms, ...} -> finished
+    - crew.force_stop {}                           -> running -> stopped
+    - crew.closed  {}                              -> running -> stopped
+    """
+
+    # max renders per second for the panel (smoothness throttle)
+    RENDER_INTERVAL = 0.1
+
+    # statuses
+    RUNNING = "running"
+    DONE = "done"
+    ERROR = "error"
+    STOPPED = "stopped"
+
+    def __init__(self) -> None:
+        # agent_id -> state dict. O(1) lookup, the hot path.
+        self._agents: dict[str, dict] = {}
+        # agent_ids in spawn order. Append-only; never re-sorted, so rows
+        # are stable and don't jump.
+        self._order: list[str] = []
+        # agent_id -> formatted row text (WITHOUT spinner prefix).
+        self._row_cache: dict[str, str] = {}
+        # agent_ids whose cached row is stale and must be reformatted.
+        self._dirty: set[str] = set()
+        # event-log cursor: highest seq ingested, so poll_log() only
+        # reads new events.
+        self._last_seq: int = -1
+        # throttle bookkeeping
+        self._last_emit: float = 0.0
+        # spinner frame, advanced by the caller on each tick
+        self._spin_i: int = 0
+        # structural change flag: set when agents are added or a status
+        # flips (forces a render even if throttle would skip it — status
+        # changes must never feel laggy).
+        self._structural: bool = False
+
+    # -- event ingestion (O(1) per event) ------------------------------------
+
+    def ingest(self, ev_type: str, data: dict, seq: int = -1) -> bool:
+        """Feed one crew event. Returns True if the display changed."""
+        if seq >= 0:
+            self._last_seq = max(self._last_seq, seq)
+        if ev_type == "crew.spawn":
+            return self._on_spawn(data)
+        if ev_type == "crew.progress":
+            return self._on_progress(data)
+        if ev_type == "crew.done":
+            return self._on_done(data)
+        if ev_type == "crew.force_stop":
+            return self._on_force_stop(data)
+        if ev_type == "crew.closed":
+            return self._on_closed(data)
+        return False
+
+    def poll_log(self, log) -> bool:
+        """Ingest all crew events since the last poll. O(new events)."""
+        changed = False
+        # Reverse-walk from the head and stop at the cursor: only new
+        # events are visited.
+        pending: list = []
+        for ev in reversed(log.events()):
+            if ev.seq <= self._last_seq:
+                break
+            if ev.type.startswith("crew."):
+                pending.append(ev)
+        for ev in reversed(pending):
+            if self.ingest(ev.type, ev.data or {}, ev.seq):
+                changed = True
+        return changed
+
+    def _on_spawn(self, data: dict) -> bool:
+        aid = str(data.get("id", ""))
+        if not aid or aid in self._agents:
+            return False
+        now = time.time()
+        self._agents[aid] = {
+            "id": aid,
+            "name": str(data.get("nickname") or aid),
+            "role": str(data.get("role") or ""),
+            "task": str(data.get("task") or ""),
+            "status": self.RUNNING,
+            "step": 0,
+            "tools": [],
+            "spawn_ts": now,
+            "elapsed_ms": 0,
+            "error": "",
+            "files": 0,
+        }
+        self._order.append(aid)
+        self._dirty.add(aid)
+        self._structural = True
+        return True
+
+    def _on_progress(self, data: dict) -> bool:
+        aid = str(data.get("id", ""))
+        st = self._agents.get(aid)
+        if st is None or st["status"] != self.RUNNING:
+            return False
+        step = data.get("step", st["step"])
+        try:
+            step = int(step)
+        except (TypeError, ValueError):
+            step = st["step"]
+        tools = data.get("tools") or []
+        if step == st["step"] and list(tools) == st["tools"]:
+            return False  # no visible change — skip reformat entirely
+        st["step"] = step
+        st["tools"] = list(tools)[:6]
+        self._dirty.add(aid)
+        return True
+
+    def _on_done(self, data: dict) -> bool:
+        aid = str(data.get("id", ""))
+        st = self._agents.get(aid)
+        if st is None:
+            # Defensive: a done for an agent we never saw spawn (e.g. the
+            # panel attached mid-run). Synthesize a minimal entry so the
+            # completion is still visible.
+            self._on_spawn({"id": aid,
+                            "nickname": data.get("nickname"),
+                            "role": data.get("role"),
+                            "task": data.get("task")})
+            st = self._agents.get(aid)
+            if st is None:
+                return False
+        if st["status"] != self.RUNNING:
+            return False
+        err = str(data.get("error") or "")
+        st["status"] = self.ERROR if err else self.DONE
+        st["error"] = err[:120]
+        try:
+            st["elapsed_ms"] = int(data.get("elapsed_ms") or 0)
+        except (TypeError, ValueError):
+            st["elapsed_ms"] = 0
+        files = data.get("files_touched") or []
+        st["files"] = len(files) if isinstance(files, list) else 0
+        self._dirty.add(aid)
+        self._structural = True
+        return True
+
+    def _on_force_stop(self, data: dict) -> bool:
+        return self._mark_stopped("stopped by user")
+
+    def _on_closed(self, data: dict) -> bool:
+        return self._mark_stopped("crew closed")
+
+    def _mark_stopped(self, reason: str) -> bool:
+        changed = False
+        for aid in self._order:
+            st = self._agents[aid]
+            if st["status"] == self.RUNNING:
+                st["status"] = self.STOPPED
+                st["error"] = reason
+                self._dirty.add(aid)
+                changed = True
+        if changed:
+            self._structural = True
+        return changed
+
+    # -- queries ---------------------------------------------------------------
+
+    @property
+    def active_count(self) -> int:
+        """Number of currently-running agents. O(n) but n is tiny (crew
+        capacity is bounded); cheap enough to not need caching."""
+        return sum(1 for aid in self._order
+                   if self._agents[aid]["status"] == self.RUNNING)
+
+    @property
+    def total_count(self) -> int:
+        return len(self._order)
+
+    def has_activity(self) -> bool:
+        return bool(self._order)
+
+    # -- rendering ---------------------------------------------------------------
+
+    def tick_spinner(self) -> None:
+        """Advance the spinner frame. Cheap: does NOT invalidate caches."""
+        self._spin_i = (self._spin_i + 1) % len(SPINNER_FRAMES)
+
+    def maybe_render(self, width: int, force: bool = False) -> list | None:
+        """Return prompt_toolkit fragments for the panel, or None if
+        throttled (no render needed right now).
+
+        Throttle rule: structural changes (spawn/done) always render
+        immediately; pure progress updates are capped at 10/sec.
+        """
+        if not self._order:
+            return None
+        now = time.time()
+        if not force and not self._structural:
+            if now - self._last_emit < self.RENDER_INTERVAL:
+                return None
+        self._last_emit = now
+        self._structural = False
+        return self._fragments(width)
+
+    def render_text(self, width: int = 80) -> list[str]:
+        """Plain-text rows (for dashboard / non-prompt_toolkit use)."""
+        self._reformat_dirty(width)
+        out: list[str] = []
+        spin = SPINNER_FRAMES[self._spin_i % len(SPINNER_FRAMES)]
+        for aid in self._order:
+            st = self._agents[aid]
+            row = self._row_cache.get(aid, "")
+            if st["status"] == self.RUNNING:
+                out.append(f"{spin} {row}")
+            else:
+                out.append(row)
+        return out
+
+    def _fragments(self, width: int) -> list:
+        """prompt_toolkit fragments. Only dirty rows are reformatted."""
+        self._reformat_dirty(width)
+        spin = SPINNER_FRAMES[self._spin_i % len(SPINNER_FRAMES)]
+        frags: list = []
+        n_running = self.active_count
+        header = (f" PARALLEL AGENTS \u2014 {n_running} running / "
+                  f"{len(self._order)} total ")
+        frags.append(("class:crew.header", _truncate_w(header, width) + "\n"))
+        for aid in self._order:
+            st = self._agents[aid]
+            row = self._row_cache.get(aid, "")
+            if st["status"] == self.RUNNING:
+                style = "class:crew.running"
+                text = f" {spin} {row}"
+            elif st["status"] == self.DONE:
+                style = "class:crew.done"
+                text = f" {row}"
+            else:
+                style = "class:crew.error"
+                text = f" {row}"
+            frags.append((style, _truncate_w(text, width) + "\n"))
+        return frags
+
+    def _reformat_dirty(self, width: int) -> None:
+        """Reformat only rows in the dirty set. O(dirty), not O(agents)."""
+        if not self._dirty:
+            return
+        now = time.time()
+        for aid in list(self._dirty):
+            st = self._agents.get(aid)
+            if st is not None:
+                self._row_cache[aid] = self._format_row(st, width, now)
+        self._dirty.clear()
+
+    def _format_row(self, st: dict, width: int, now: float) -> str:
+        """Format one row (no spinner — composed at render time)."""
+        name = st["name"]
+        role = st["role"]
+        task = " ".join(st["task"].split())  # collapse whitespace
+        status = st["status"]
+        if status == self.RUNNING:
+            elapsed = self._fmt_elapsed(now - st["spawn_ts"])
+            parts = [name]
+            if role:
+                parts.append(role)
+            if task:
+                parts.append(task[:60])
+            detail = " \u00b7 ".join(parts)
+            step_bit = f" \u00b7 step {st['step']}" if st["step"] else ""
+            tools = st["tools"]
+            tools_bit = f" \u00b7 {', '.join(tools[:3])}" if tools else ""
+            row = f"  {detail}{step_bit}{tools_bit} \u00b7 {elapsed}"
+        elif status == self.DONE:
+            elapsed = self._fmt_elapsed(st["elapsed_ms"] / 1000.0) \
+                if st["elapsed_ms"] else "\u2014"
+            files_bit = f" \u00b7 {st['files']} files" if st["files"] else ""
+            row = f"\u2713 {name} \u00b7 done in {elapsed}{files_bit}"
+        elif status == self.ERROR:
+            err = st["error"] or "failed"
+            row = f"\u2717 {name} \u00b7 {err[:60]}"
+        else:  # STOPPED
+            err = st["error"] or "stopped"
+            row = f"\u25a0 {name} \u00b7 {err[:60]}"
+        return _truncate_w(row, max(10, width - 2))
+
+    @staticmethod
+    def _fmt_elapsed(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        if seconds < 60:
+            return f"{seconds}s"
+        m, s = divmod(seconds, 60)
+        if m < 60:
+            return f"{m}m{s:02d}s"
+        h, m = divmod(m, 60)
+        return f"{h}h{m:02d}m"
+
+
 class UI:
     def __init__(self, cfg: Config, agent: Agent):
         self.cfg = cfg
         self.agent = agent
         self.console = make_console()
         self.overlay: OverlayList | None = None
+        # parallel subagent panel: live crew.* tracking, additive
+        self.crew_panel = ParallelAgentsPanel()
 
         # turn state
         self._busy = False
@@ -793,6 +1113,14 @@ class UI:
                      else C["red"])
         segs.append((f" ◉ ctx {self._ctx_cache}% ",
                      f"bold {ctx_color}"))
+        # parallel agents indicator — O(1) count from the crew panel; the
+        # full panel renders below the top bar while crew is active
+        try:
+            _crew_n = self.crew_panel.active_count
+        except Exception:
+            _crew_n = 0
+        if _crew_n:
+            segs.append((f" ⚡ {_crew_n} ", f"bold {C['accent']}"))
         segs.append((f" ⌛ session: {self.agent.session_id} ", "class:box.session"))
 
         # fixed = corners (2) + first dash (1) + "──" before each later seg
@@ -896,6 +1224,38 @@ class UI:
             return self.overlay.fragments(self._width())
         return []
 
+    # -- parallel agents panel ---------------------------------------------------------
+
+    def _crew_visible(self) -> bool:
+        # Show the panel while any crew activity exists. Completed agents
+        # stay visible (collapsed to one line each) so results aren't lost.
+        return self.crew_panel.has_activity()
+
+    def _crew_fragments(self) -> list:
+        # Poll for new crew events on every render frame — poll_log() is
+        # O(new events) and maybe_render() throttles to 10/sec, so this is
+        # cheap. Spinner ticks for smooth animation.
+        try:
+            self.crew_panel.poll_log(self.agent.log)
+        except Exception:
+            pass
+        self.crew_panel.tick_spinner()
+        frags = self.crew_panel.maybe_render(self._width())
+        return frags or []
+
+    def poll_crew(self) -> bool:
+        """Ingest pending crew events; True if the panel changed.
+
+        Called from background threads (e.g. the spinner tick) to keep
+        the panel live even when prompt_toolkit isn't rendering."""
+        try:
+            changed = self.crew_panel.poll_log(self.agent.log)
+        except Exception:
+            return False
+        if changed:
+            self._invalidate()
+        return changed
+
     # -- construction ----------------------------------------------------------------
 
     def _build(self) -> None:
@@ -941,6 +1301,12 @@ class UI:
         overlay_window = Window(
             FormattedTextControl(self._overlay_fragments),
             dont_extend_height=True)
+        # parallel agents panel: live crew.* rows, shown only while there
+        # is crew activity. ConditionalContainer show/hide is flicker-free;
+        # the panel itself throttles to 10 renders/sec.
+        crew_window = Window(
+            FormattedTextControl(self._crew_fragments),
+            dont_extend_height=True)
 
         root = FloatContainer(
             HSplit([
@@ -948,6 +1314,9 @@ class UI:
                     overlay_window,
                     filter=Condition(self._overlay_open)),
                 top_window,
+                ConditionalContainer(
+                    crew_window,
+                    filter=Condition(self._crew_visible)),
                 VSplit([left_window, input_window, right_window], padding=0),
                 bottom_window,
                 ConditionalContainer(self.search_toolbar,
@@ -3133,6 +3502,12 @@ class UI:
         def tick():
             while self._spinner_on and gen == self._spinner_gen:
                 self._spinner_i = (self._spinner_i + 1) % len(SPINNER_FRAMES)
+                # keep the parallel-agents panel live: poll crew events on
+                # the tick (O(new events); panel throttles renders to 10/s)
+                try:
+                    self.poll_crew()
+                except Exception:
+                    pass
                 self._invalidate()
                 time.sleep(0.09)
 
