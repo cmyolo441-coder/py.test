@@ -25,6 +25,7 @@ from __future__ import annotations
 import ast
 import copy
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -345,7 +346,7 @@ def add(a, b):
             "assert add(-1, 3) == -4\n" % str(td))
 
         tester = MutationTester(log,
-                                suite_command=f"python {suite}",
+                                suite_command=f"{sys.executable} {suite}",
                                 mutant_path=str(target))
         report = tester.run(str(target))
         assert report.total >= 3, report.total
