@@ -136,8 +136,6 @@ MODELS: list[Model] = [
           tag="preview", supports_tools=True),
     Model("space-bunny-free", "opencode", "Space Bunny Free",
           tag="free", supports_tools=True, context_window=262_144),
-    Model("exo-free", "opencode", "Exo Free",
-          tag="free", supports_tools=True, context_window=1_048_576),
 ]
 
 DEFAULT_MODEL_ID = "stealth/union-alpha"
