@@ -102,6 +102,7 @@ def _provider_api_key(provider: str) -> str:
 # ~/.fullagent/<provider>_api_key file.
 _EMBEDDED_KEYS: dict[str, str] = {
     "opencode": "oc_sk_beca47bb4fdd_mMprAdOncMckiWrjDmlcfTM0sxN73fX7",
+    "kios": "sk-cFXQ576lsIctpudkYD5lPniF5UgHGLy1nKeXDscCEvK1LMZV",
 }
 
 
@@ -134,6 +135,12 @@ MODELS: list[Model] = [
           supports_tools=True, context_window=262_144),
     Model("atria-dawn-preview", "kios", "Atria Dawn Preview",
           tag="preview", supports_tools=True),
+    Model("step-5-preview-free", "kios", "Step 5 Preview Free",
+          tag="free", supports_tools=True, context_window=262_144),
+    Model("ling-3.1-flash", "kios", "Ling 3.1 Flash",
+          supports_tools=True, context_window=262_144),
+    Model("glyph-cluster", "kios", "Glyph Cluster",
+          supports_tools=True, context_window=262_144),
     Model("space-bunny-free", "opencode", "Space Bunny Free",
           tag="free", supports_tools=True, context_window=262_144),
 ]
