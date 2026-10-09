@@ -184,6 +184,15 @@ def main() -> int:
         from . import __version__
         print(f"fullagent v{__version__}")
         return 0
+    # Feature: --resume/--continue flags (peeled before headless dispatch)
+    import argparse as _ap
+    _p = _ap.ArgumentParser()
+    _p.add_argument("--resume", nargs="?", const="latest", default=None,
+                    metavar="ID",
+                    help="resume a saved session (latest if no id)")
+    _p.add_argument("--continue", dest="continue_", action="store_true",
+                    help="resume the most recent session")
+    _ns, argv = _p.parse_known_args(argv)
     if argv:
         return _headless(argv)
 
@@ -199,6 +208,16 @@ def main() -> int:
     config.ensure_dirs()
     cfg = Config.load()
     agent = Agent(cfg)
+    # Feature: restore a saved session if requested
+    if _ns.continue_ or _ns.resume is not None:
+        from . import sessions
+        wanted = _ns.resume if _ns.resume not in (None, "latest") else None
+        data = sessions.load(wanted or "latest")
+        if data is not None:
+            print(sessions.resume_into(agent, data), flush=True)
+        else:
+            print(f"no saved session found"
+                  f"{' for ' + wanted if wanted else ''}", flush=True)
     ui = UI(cfg, agent)
 
     ui.print_banner()

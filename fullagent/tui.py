@@ -1337,6 +1337,16 @@ class UI:
             pass
         self.crew_panel.tick_spinner()
         frags = self.crew_panel.maybe_render(self._width())
+        # Feature: background task panel (bgsh shells) below crew panel
+        try:
+            from .bgtui import BackgroundPanel, has_activity
+            if getattr(self, "bg_panel", None) is None:
+                self.bg_panel = BackgroundPanel()
+            if has_activity(self.agent):
+                for line in self.bg_panel.refresh(self.agent):
+                    frags.append(("class:bg.line", line + "\n"))
+        except Exception:
+            pass
         return frags or []
 
     def poll_crew(self) -> bool:
@@ -1702,6 +1712,12 @@ class UI:
             self.print_error(f"{type(e).__name__}: {e}")
 
     def _route_slash(self, cmd: str, arg: str) -> None:
+        # Feature: command aliases (/h -> /help, etc.)
+        try:
+            from .help import resolve_alias
+            cmd = resolve_alias(cmd)
+        except Exception:
+            pass
         if cmd in ("/exit", "/quit", "/q"):
             self.print_info(f"bye — session {self.agent.session_id} saved",
                             C["dim"])
@@ -1719,33 +1735,33 @@ class UI:
                 pass
             self._invalidate()
         elif cmd == "/model":
-            arg = arg.split()[0] if arg else ""
-            if arg:
-                m = model_by_id(arg)
+            # Feature: fuzzy search + per-turn override via modelpick
+            from .modelpick import (list_models, format_model_list,
+                                    resolve_model, set_turn_model)
+            if arg.endswith(" --once"):
+                m = resolve_model(arg[:-7].strip())
                 if m is None:
-                    self.print_error(f"unknown model: {arg} — use /model to browse")
+                    self.print_error(
+                        f"unknown model: {arg} — use /model to browse")
+                elif set_turn_model(self.agent, m.id):
+                    self.print_info(f"✓ next turn uses {m.label} ({m.id})",
+                                    C["green"])
+            elif arg:
+                m = resolve_model(arg)
+                if m is None:
+                    self.print_error(
+                        f"unknown model: {arg} — use /model to browse")
                 else:
                     self.cfg.model_id = m.id
                     self.cfg.save()
-                    self.print_info(f"✓ model → {m.label} ({m.id})", C["green"])
+                    self.print_info(f"✓ model → {m.label} ({m.id})",
+                                    C["green"])
             else:
-                self.open_model_selector()
+                self.print_info(format_model_list(list_models()), C["cyan"])
         elif cmd == "/models":
-            sub = arg.strip().lower()
-            if sub in ("", "list"):
-                from .config import MODELS as _MODELS, PROVIDERS as _PROVS
-                lines = [f"MODELS ({len(_MODELS)}):"]
-                for m in _MODELS:
-                    p = _PROVS.get(m.provider)
-                    pname = p.name if p else "?"
-                    tag = f" [{m.tag}]" if m.tag else ""
-                    lines.append(f"  {m.id:<45} {m.label}{tag} · {pname}")
-                self.print_info("\n".join(lines), C["cyan"])
-            else:
-                self.print_info(
-                    "usage: /models list\n"
-                    "  Use /model to select an available model.",
-                    C["dim"])
+            from .modelpick import list_models, format_model_list
+            filt = arg.strip()
+            self.print_info(format_model_list(list_models(filt)), C["cyan"])
         elif cmd == "/effort":
             arg = arg.split()[0] if arg else ""
             if arg:
@@ -1760,7 +1776,86 @@ class UI:
             else:
                 self.open_effort_selector()
         elif cmd == "/help":
-            self.open_help()
+            from .help import format_help
+            self.print_info(format_help(), C["fg"])
+        elif cmd == "/init":
+            from .codeinit import run_init_command
+            run_init_command(self, arg)
+        elif cmd == "/review":
+            from .review import run_review_command
+            run_review_command(self, arg)
+        elif cmd == "/agents":
+            from . import agentscmd
+            self.print_info(agentscmd.handle(self, arg), C["fg"])
+        elif cmd == "/compact":
+            from .compact import do_compact
+            stats = do_compact(self.agent)
+            self.print_info(
+                f"Compacted: {stats['before_msgs']} → {stats['after_msgs']} "
+                f"messages, {stats['before_chars']} → {stats['after_chars']} "
+                "chars", C["green"])
+        elif cmd == "/sessions":
+            from . import sessions
+            items = sessions.list_sessions()
+            if not items:
+                self.print_info("no saved sessions", C["dim"])
+            else:
+                for s in items:
+                    self.print_info(
+                        f"  {s['id']}  {s['saved_at'][:19]}  "
+                        f"{s['model_id']}  ({s['msg_count']} msgs) "
+                        f"{s['preview'][:60]}", C["cyan"])
+        elif cmd == "/permissions":
+            from .permissions import PermissionManager, MODES
+            perms = getattr(self.agent, "permissions", None)
+            if perms is None:
+                perms = PermissionManager()
+                self.agent.permissions = perms
+            sub = arg.strip()
+            if sub:
+                try:
+                    perms.set_mode(sub)
+                    self.print_info(f"✓ {perms.describe()}", C["green"])
+                except ValueError as e:
+                    self.print_error(str(e))
+            else:
+                self.print_info(perms.describe(), C["fg"])
+                self.print_info("options: " + ", ".join(MODES), C["dim"])
+        elif cmd == "/output-style":
+            from . import outstyle
+            sub = arg.split()[0].lower() if arg else ""
+            if sub:
+                try:
+                    outstyle.set_style(self.agent, sub)
+                    self.print_info(f"✓ output style → {sub}", C["green"])
+                except ValueError:
+                    self.print_error("styles: " +
+                                     " · ".join(sorted(outstyle.STYLES)))
+            else:
+                self.print_info(
+                    "output styles: " +
+                    " · ".join(sorted(outstyle.STYLES)) +
+                    f"  (current: {outstyle.get_style(self.agent)})",
+                    C["fg"])
+        elif cmd == "/plan":
+            from .planmode import enter_plan_mode, exit_plan_mode
+            sub = arg.strip().lower()
+            if sub in ("exit", "off", "done"):
+                exit_plan_mode(self.agent)
+                self.print_info("✓ plan mode off", C["green"])
+            else:
+                enter_plan_mode(self.agent)
+                self.print_info(
+                    "✓ plan mode on — write your plan with the PlanWrite "
+                    "tool, then approve to execute", C["green"])
+        elif cmd == "/todos":
+            from .todos import todo_panel_lines
+            lines = todo_panel_lines()
+            if not lines:
+                self.print_info("no todos — use TodoWrite to track tasks",
+                                C["dim"])
+            else:
+                self.print_info("\n".join(lines), C["fg"])
         elif cmd == "/history":
             self.open_history()
         elif cmd == "/save":
@@ -1801,7 +1896,15 @@ class UI:
         elif cmd == "/notify":
             self._cmd_notify(arg)
         elif cmd == "/resume":
-            self._cmd_resume(arg)
+            # Feature: try session-file resume first, fall back to branch resume
+            from . import sessions as _sessions
+            target = arg.strip() or "latest"
+            data = _sessions.load(target)
+            if data is None:
+                self._cmd_resume(arg)
+            else:
+                self.print_info(_sessions.resume_into(self.agent, data),
+                                C["green"])
         elif cmd == "/state":
             self._cmd_state()
         elif cmd == "/rewind":
@@ -1914,7 +2017,13 @@ class UI:
             self.print_info("  python + prompt_toolkit + rich · "
                             + " · ".join(p.name for p in PROVIDERS.values()), C["dim"])
         else:
-            self.print_error(f"unknown command: {cmd} — try /help")
+            # Feature: custom user slash commands (~/.fullagent/commands/)
+            from .slashcmds import expand as _expand_custom
+            prompt = _expand_custom(cmd.lstrip("/"), arg)
+            if prompt:
+                self._dispatch(prompt)
+            else:
+                self.print_error(f"unknown command: {cmd} — try /help")
 
     # -- event-log commands ------------------------------------------------------
 
@@ -3575,6 +3684,22 @@ class UI:
                 else:
                     self.print_error(turn.error)
             self._print_turn_stats(turn)
+            # Feature: smart follow-up suggestions after each turn
+            try:
+                from .help import build_turn_summary, suggest_followups
+                for hint in suggest_followups(build_turn_summary(turn)):
+                    self.print_info(f"  › {hint}", C["dim"])
+            except Exception:
+                pass
+            # Feature: suggest /compact when context is nearly full
+            try:
+                from .compact import should_suggest_compact
+                if should_suggest_compact(self.agent):
+                    self.print_info(
+                        "  › context >80% full — run /compact to summarize",
+                        C["yellow"])
+            except Exception:
+                pass
             self.agent.save_session()
 
             # FOCUS MODE — the kernel decides whether work remains; the

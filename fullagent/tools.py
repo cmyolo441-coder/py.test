@@ -621,14 +621,25 @@ def _validate_shell_args(command: str, timeout: int,
 
 def run_command(command: str, timeout: int = 120,
                 on_output: "Callable[[str, str], None] | None" = None,
-                should_cancel: "Callable[[], bool] | None" = None) -> str:
+                should_cancel: "Callable[[], bool] | None" = None,
+                run_in_background: bool = False,
+                description: str = "") -> str:
     """Run a shell command via bash and return exit code + output.
 
     The shell is resolved once (judge.resolve_shell): on Windows,
     System32\\bash.exe is the WSL stub and fails when no distro is
     installed, so Git Bash is probed and preferred. If `on_output` is
     provided, each output line is streamed to it live as it appears.
-    If `should_cancel` returns True, the process is killed (Esc/Ctrl+C)."""
+    If `should_cancel` returns True, the process is killed (Esc/Ctrl+C).
+    If `run_in_background` is True, the command is launched via the
+    bgsh engine and this returns immediately with a task id — poll
+    with the BashOutput tool."""
+    if run_in_background:
+        from . import bgsh
+        task_id = bgsh.launch(command, description or command[:60],
+                              timeout=timeout)
+        return (f"background task started: {task_id}\n"
+                "poll with BashOutput using this task id.")
     command, secs, err = _validate_shell_args(command, timeout)
     if err:
         return err

@@ -349,6 +349,31 @@ class Agent:
         self._register_v4_tools()
         self._register_advanced_tools()
         self._register_persisted_skills()
+        self._register_feature_modules()
+
+    def _register_feature_modules(self) -> None:
+        """Register the Claude Code-parity feature modules.
+
+        Each module exposes register(agent). Wrapped individually so one
+        broken optional module can never kill agent startup.
+        """
+        for mod_name in (
+            "todos", "multiedit", "bgsh", "planmode", "codeinit",
+            "review", "notebook", "permissions", "outstyle",
+            "webfetch", "checkpoints", "hooks",
+        ):
+            try:
+                mod = __import__(f"fullagent.{mod_name}",
+                                 fromlist=["register"])
+                mod.register(self)
+            except Exception as e:  # noqa: BLE001 — optional feature
+                try:
+                    self.log.append("feature.register_failed",
+                                    {"module": mod_name,
+                                     "error": str(e)[:200]},
+                                    actor="system")
+                except Exception:
+                    pass
 
         # cassette: record/replay model calls (FULLAGENT_CASSETTE=path,
         # FULLAGENT_CASSETTE_MODE=record|replay|off)
@@ -484,6 +509,14 @@ class Agent:
                 "COMPACTED HISTORY — knowledge preserved from turns that "
                 "were compressed to fit the context window:\n- "
                 + "\n- ".join(self._compact_digests[-12:]))
+        # Feature: output style instruction beneath the sealed prompt
+        try:
+            from .outstyle import get_style, style_instruction
+            sections["output_style"] = (
+                f"Output style ({get_style(self)}): "
+                f"{style_instruction(self)}")
+        except Exception:
+            pass
         return sections
 
     def _tool_schemas(self) -> list[dict] | None:
@@ -534,7 +567,14 @@ class Agent:
                   on_tool_args: Callable[[str, str], None] | None = None,
                   ) -> Turn:
         """Run one user turn through the full agent loop."""
-        turn = Turn(user_text=user_text, model_id=self.model.id,
+        # Feature: per-turn model override (/model <name> --once)
+        try:
+            from .modelpick import get_effective_model, clear_turn_model
+            _eff_model = get_effective_model(self)
+            clear_turn_model(self)
+        except Exception:
+            _eff_model = self.model
+        turn = Turn(user_text=user_text, model_id=_eff_model.id,
                     effort=self.cfg.effort)
         started = time.time()
         self._turn_start_seq = self.log.head()
@@ -1342,6 +1382,44 @@ class Agent:
                             causation_id=causation_id)
             return
 
+        # Feature: plan mode gate — mutating tools blocked until plan approved
+        try:
+            from .planmode import should_block_mutating_tool
+            plan_blocked, plan_msg = should_block_mutating_tool(
+                tool.name, tool.risk)
+            if plan_blocked:
+                ev.status = "blocked"
+                ev.result = f"ERROR: blocked — {plan_msg}"
+                self.log.append("tool.blocked",
+                                {"name": ev.name, "reason": plan_msg},
+                                causation_id=causation_id)
+                return
+        except Exception:
+            pass
+
+        # Feature: PreToolUse hooks (can block or patch args)
+        if getattr(self, "hooks_enabled", False):
+            try:
+                from .hooks import run_pre_tool
+                allowed, patched, hook_msg = run_pre_tool(ev.name, ev.args)
+                if not allowed:
+                    ev.status = "blocked"
+                    ev.result = f"ERROR: blocked — {hook_msg}"
+                    self.log.append("tool.blocked",
+                                    {"name": ev.name, "reason": hook_msg},
+                                    causation_id=causation_id)
+                    return
+                ev.args = patched
+            except Exception:
+                pass
+
+        # Feature: auto-checkpoint before risky tools
+        try:
+            from .checkpoints import maybe_auto_checkpoint
+            maybe_auto_checkpoint(self, ev.name)
+        except Exception:
+            pass
+
         block = self._gate(tool, ev.args)
         if block and block != "ASK":
             ev.status = "blocked"
@@ -1476,6 +1554,14 @@ class Agent:
 
         # §13.4 exact-repeat detection over recent tool calls
         self.loop_det.detect()
+
+        # Feature: PostToolUse hooks (failures only log, never block)
+        if getattr(self, "hooks_enabled", False):
+            try:
+                from .hooks import run_post_tool
+                run_post_tool(ev.name, ev.args, ev.result)
+            except Exception:
+                pass
 
     # -- enterprise: workflows ----------------------------------------------------
 
