@@ -287,11 +287,15 @@ SLASH_COMMANDS = [
     ("/render", "toggle rendered-markdown replies — /render [on|off]"),
     ("/workflow", "saved pipelines — /workflow [list|run <name>|delete <name>]"),
     ("/export", "export conversation — /export [markdown|html] [path]"),
+    ("/backup", "backup ~/.fullagent — /backup [create|list]"),
+    ("/webhooks", "list incoming HTTP webhooks — WebhookAdd to register"),
+    ("/restore", "restore a backup — /restore <file> [--yes]"),
     ("/export-report", "enterprise audit report — /export-report [md|html]"),
     ("/forecast", "projection from measured velocity + usage"),
     ("/health", "provider health — model errors + failovers"),
     ("/notify", "event notifications — /notify <url|file:path|off>"),
     ("/resume", "resume a previous session — /resume [branch]"),
+    ("/resume-turn", "resume a crashed turn — /resume-turn [session-id]"),
     ("/state", "live projection of the event log (cost, goal, dead-ends)"),
     ("/rewind", "rewind timeline + files to a seq — /rewind <seq>"),
     ("/revert", "revert FILES only to a seq (agent keeps memory)"),
@@ -344,9 +348,11 @@ SLASH_COMMANDS = [
     ("/coverage", "line-coverage ledger — last measured runs"),
     ("/fuzz", "fuzzing ledger — runs, crashes, shrunk reproducers"),
     ("/mutate", "mutation testing — /mutate <file> <suite-command>"),
+    ("/cron", "cron scheduler — /cron [add \"<expr>\" \"<cmd>\"|list|remove <id>|log <id>]"),
     ("/help", "commands and key bindings"),
     ("/clear", "clear the screen"),
-    ("/new", "fresh conversation"),
+    ("/new", "new session — /new [name] (old session snapshotted)"),
+    ("/switch", "switch session — /switch <id> (bare: list)"),
     ("/history", "browse previous turns"),
     ("/save", "save session to disk"),
     ("/approve", "toggle auto-approve for tools"),
@@ -1360,6 +1366,14 @@ class UI:
                     frags.append(("class:bg.line", line + "\n"))
         except Exception:
             pass
+        # Feature: active progress bars (Progress* tools) below panels
+        try:
+            tracker = getattr(self.agent, "progress_tracker", None)
+            if tracker is not None:
+                for line in tracker.progress_bar_lines():
+                    frags.append(("class:bg.line", line + "\n"))
+        except Exception:
+            pass
         return frags or []
 
     def poll_crew(self) -> bool:
@@ -1724,6 +1738,101 @@ class UI:
         except Exception as e:  # noqa: BLE001 — the UI must survive
             self.print_error(f"{type(e).__name__}: {e}")
 
+    def _handle_cron(self, arg: str) -> None:
+        """``/cron`` — cron scheduler: list/add/remove/log.
+
+        Usage: /cron | /cron list | /cron add "<expr>" "<cmd>"
+               | /cron remove <id> | /cron log <id>
+        """
+        import shlex
+
+        sched = getattr(self.agent, "cron_scheduler", None)
+        if sched is None:
+            try:
+                from . import cronsched as _cs
+                sched = _cs.get_scheduler()
+            except Exception:
+                sched = None
+        if sched is None:
+            self.print_error("cron scheduler is not registered")
+            return
+        try:
+            parts = shlex.split(arg) if arg else []
+        except ValueError as e:
+            self.print_error(f"bad quoting: {e}")
+            return
+        sub = parts[0].lower() if parts else "list"
+
+        def _ok(text):
+            self.print_info(text, C["fg"])
+
+        if sub in ("", "list", "ls"):
+            rows = sched.list()
+            if not rows:
+                self.print_info(
+                    'no crons — /cron add "* * * * *" "echo hi"',
+                    C["dim"])
+            else:
+                from .cronsched import _fmt_ts
+                lines = []
+                for r in rows:
+                    state = "on " if r["enabled"] else "off"
+                    lines.append(
+                        f"#{r['id']} [{state}] `{r['cron_expr']}` → "
+                        f"{r['command']}  next: {_fmt_ts(r['next_run'])}")
+                _ok("\n".join(lines))
+        elif sub == "add":
+            if len(parts) < 3:
+                self.print_error(
+                    'usage: /cron add "<cron expr>" "<command>"')
+                return
+            expr, cmd = parts[1], " ".join(parts[2:])
+            try:
+                cid, nxt = sched.add(expr, cmd)
+            except ValueError as e:
+                self.print_error(f"error: {e}")
+                return
+            from .cronsched import _fmt_ts
+            self.print_info(
+                f"✓ cron #{cid} added — next run {_fmt_ts(nxt)}",
+                C["green"])
+        elif sub in ("remove", "rm", "del"):
+            if len(parts) < 2 or not parts[1].isdigit():
+                self.print_error("usage: /cron remove <id>")
+                return
+            if sched.remove(int(parts[1])):
+                self.print_info(f"✓ cron #{parts[1]} removed", C["green"])
+            else:
+                self.print_error(f"no cron with id {parts[1]}")
+        elif sub in ("log", "logs", "history"):
+            if len(parts) < 2 or not parts[1].isdigit():
+                self.print_error("usage: /cron log <id>")
+                return
+            row = sched._row(int(parts[1]))
+            if row is None:
+                self.print_error(f"no cron with id {parts[1]}")
+                return
+            runs = sched.runs(int(parts[1]))
+            if not runs:
+                self.print_info(f"cron #{parts[1]} has not run yet",
+                                C["dim"])
+            else:
+                lines = []
+                for r in runs:
+                    import datetime as _dt
+                    dt = _dt.datetime.fromtimestamp(r["started_at"])
+                    lines.append(
+                        f"{dt:%Y-%m-%d %H:%M:%S} exit={r['exit_code']}")
+                    tail = r["output_tail"].strip()
+                    if tail:
+                        lines.append("  " +
+                                     tail[-400:].replace("\n", "\n  "))
+                _ok("\n".join(lines))
+        else:
+            self.print_error(
+                "usage: /cron [list|add \"<expr>\" \"<cmd>\"|"
+                "remove <id>|log <id>]")
+
     def _route_slash(self, cmd: str, arg: str) -> None:
         # Feature: command aliases (/h -> /help, etc.)
         try:
@@ -1737,10 +1846,43 @@ class UI:
             self.agent.save_session()
             self.app.exit()
         elif cmd == "/new":
-            self.agent.reset()
-            self.print_info(
-                f"✓ new conversation started (session {self.agent.session_id})",
-                C["green"])
+            # Feature: multi-session (multisess) — /new [name] creates a
+            # fresh tracked session; the old one is snapshotted first.
+            if hasattr(self.agent, "create_session"):
+                try:
+                    sid = self.agent.create_session(arg)
+                    label = arg or sid
+                    self.print_info(
+                        f"✓ new session started — {label} ({sid})",
+                        C["green"])
+                except Exception as e:  # noqa: BLE001 — UI must survive
+                    self.print_error(f"could not create session: {e}")
+            else:
+                self.agent.reset()
+                self.print_info(
+                    f"✓ new conversation started (session {self.agent.session_id})",
+                    C["green"])
+        elif cmd == "/switch":
+            # Feature: multi-session (multisess) — /switch <id> swaps to
+            # another session; bare /switch lists them.
+            if not hasattr(self.agent, "switch_session"):
+                self.print_error("multi-session is not available")
+            elif not arg:
+                from .multisess import (format_session_list,
+                                        list_sessions as _list_sessions)
+                self.print_info(format_session_list(
+                    _list_sessions(self.agent)), C["cyan"])
+            else:
+                try:
+                    sid = self.agent.switch_session(arg)
+                    n = len([m for m in (self.agent.messages or [])
+                             if isinstance(m, dict)
+                             and m.get("role") in ("user", "assistant")])
+                    self.print_info(
+                        f"✓ switched to session {sid} "
+                        f"({n} messages restored)", C["green"])
+                except Exception as e:  # noqa: BLE001 — UI must survive
+                    self.print_error(str(e))
         elif cmd == "/clear":
             try:
                 self.app.renderer.clear()
@@ -1828,6 +1970,9 @@ class UI:
         elif cmd == "/cost":
             from .costtrack import handle_cost
             handle_cost(self, arg)
+        elif cmd == "/voice":
+            from .voicein import handle_voice
+            handle_voice(self, arg)
         elif cmd == "/pr-review":
             from .prreview import handle_pr_review
             handle_pr_review(self, arg)
@@ -1911,6 +2056,8 @@ class UI:
                                 C["dim"])
             else:
                 self.print_info("\n".join(lines), C["fg"])
+        elif cmd == "/cron":
+            self._handle_cron(arg)
         elif cmd == "/history":
             self.open_history()
         elif cmd == "/save":
@@ -1951,6 +2098,15 @@ class UI:
         elif cmd == "/export":
             from .export import handle_export
             handle_export(self, arg)
+        elif cmd == "/backup":
+            from .backup import handle_backup
+            handle_backup(self, arg)
+        elif cmd == "/webhooks":
+            from .webhook import handle_webhooks
+            handle_webhooks(self, arg)
+        elif cmd == "/restore":
+            from .backup import handle_restore
+            handle_restore(self, arg)
         elif cmd == "/export-report":
             self._cmd_export(arg)
         elif cmd == "/forecast":
@@ -1969,6 +2125,27 @@ class UI:
             else:
                 self.print_info(_sessions.resume_into(self.agent, data),
                                 C["green"])
+        elif cmd == "/resume-turn":
+            # Feature: turnresume — review / resume crashed turns
+            from .turnresume import (list_incomplete, resume_turn,
+                                     load_incomplete_turns)
+            inc = getattr(self.agent, "incomplete_turns", None)
+            if inc is None:  # module never registered — rescan on demand
+                inc = load_incomplete_turns()
+                self.agent.incomplete_turns = inc
+            if not arg:
+                self.print_info(list_incomplete(self.agent), C["fg"])
+            else:
+                parts = arg.split()
+                sid = parts[0]
+                if "--yes" in parts[1:]:
+                    self.print_info(resume_turn(self.agent, sid), C["green"])
+                else:
+                    self.print_info(
+                        f"resume turn from session {sid}? This re-injects "
+                        "the crashed turn's messages and tool history. "
+                        f"Re-run with --yes to confirm: "
+                        f"/resume-turn {sid} --yes", C["yellow"])
         elif cmd == "/state":
             self._cmd_state()
         elif cmd == "/rewind":
@@ -4030,7 +4207,8 @@ class UI:
             row("/replay", "replay the session log as a film"),
             row("/memory", "episodes + dead-end ledger"),
             row("/judge", "deterministic check (exit_code, file_exists, …)"),
-            row("/new", "fresh conversation"),
+            row("/new", "new session — /new [name]"),
+            row("/switch", "switch session — /switch <id>"),
             row("/history", "browse previous turns"),
             row("/save", "save session to disk"),
             row("/approve", "toggle auto-approve for tools"),
@@ -4162,6 +4340,22 @@ class UI:
         hints.append(" effort", style=C["dim"])
         self.console.print(hints)
         self.console.print()
+        # Feature: turnresume — offer /resume-turn when a previous session
+        # left crashed turns behind (set by fullagent.turnresume.register).
+        try:
+            inc = getattr(self.agent, "incomplete_turns", None) or []
+        except Exception:
+            inc = []
+        if inc:
+            note = Text()
+            note.append("   ⚠ ", style=f"bold {C['yellow']}")
+            note.append(f"{len(inc)} interrupted turn(s) from a previous "
+                        "session", style=f"bold {C['yellow']}")
+            note.append(" — ", style=C["dim"])
+            note.append("/resume-turn", style=f"bold {C['green']}")
+            note.append(" to review and resume", style=C["dim"])
+            self.console.print(note)
+            self.console.print()
 
     def _emit_user(self, text: str) -> None:
         t = Text()

@@ -366,7 +366,27 @@ class Agent:
             "permrules", "configcmd", "images", "export", "vimmode",
             "thinking", "undocmd", "diffpreview", "costtrack",
             "jsonout", "ctxmeter", "prreview", "smartctx",
-            "termsetup", "plugins",
+            "termsetup", "plugins", "supervise", "turnresume", "cronsched", "watch", "sshops", "streamlog", "voicein",
+            # browser automation (real Playwright, graceful degradation)
+            "browserauto",
+            # multi-session: SessionNew / SessionList / SessionSwitch
+            "multisess",
+            # Backup / restore (stdlib tarfile)
+            "backup",
+            # Sandboxed execution (bwrap → unshare → rlimit chain)
+            "sandbox",
+            "smartretry",
+            "progress",
+            "dockerops",
+            # Persistent background jobs (SQLite queue + crash recovery)
+            "jobs",
+            "dbtools", "emailops",
+            # Git automation (real git CLI via subprocess)
+            "gitops",
+            # Real desktop + webhook notifications (notify-send, optional hook URL)
+            "notify",
+            # Incoming HTTP webhooks (127.0.0.1 only, daemon thread)
+            "webhook",
         ):
             try:
                 mod = __import__(f"fullagent.{mod_name}",

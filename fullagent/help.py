@@ -16,6 +16,7 @@ from __future__ import annotations
 COMMANDS: dict[str, list[tuple[str, str]]] = {
     "Session": [
         ("/new", "fresh conversation (saves the old one)"),
+        ("/switch", "switch to another session by id"),
         ("/resume", "resume a previous session by id"),
         ("/sessions", "list saved sessions"),
         ("/save", "save current session to disk"),
@@ -32,6 +33,7 @@ COMMANDS: dict[str, list[tuple[str, str]]] = {
         ("/models", "list all models and providers"),
         ("/effort", "reasoning effort: low → ultrahigh"),
         ("/output-style", "concise · detailed · code-only output style"),
+        ("/voice", "record mic → real whisper transcription (needs faster-whisper)"),
     ],
     "Subagents": [
         ("/agents", "list / spawn / manage subagents (crew)"),
