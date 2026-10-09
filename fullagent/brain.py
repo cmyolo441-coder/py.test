@@ -23,14 +23,16 @@ Mechanics (all rung 1 — deterministic math, zero tokens):
     brain.forgotten — forgetting is an event, never silent loss)
 
 Persistence is a JSON file under the app dir; the event log carries the
-audit trail (remembered/recalled/consolidated/forgotten).
+audit trail (remembered/recalled/merged/consolidated/forgotten).
 """
 
 from __future__ import annotations
 
 import json
 import math
+import os
 import re
+import threading
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -123,38 +125,99 @@ class Brain:
         self.path = Path(path) if path else None
         self.memories: dict[str, Memory] = {}
         self._counter = 0
+        # The brain is shared across components (agent, dual-process
+        # router) and may be touched from worker threads: every compound
+        # read-modify-write and every persistence pass takes this lock.
+        # Lock order is always brain -> log, never the reverse.
+        self._lock = threading.RLock()
         if self.path is not None:
             self._load()
 
     # -- persistence ------------------------------------------------------------
 
     def _load(self) -> None:
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
+        with self._lock:
+            try:
+                raw = self.path.read_text(encoding="utf-8")
+            except OSError:
+                return  # no file yet — start fresh
+            try:
+                data = json.loads(raw)
+            except ValueError:
+                return  # corrupt JSON — start fresh, never brick startup
             if not isinstance(data, dict):
                 return  # valid JSON, wrong shape — start fresh
-            for d in data.get("memories", []):
+            stored = data.get("memories", [])
+            if not isinstance(stored, list):
+                return  # valid JSON, wrong shape — start fresh
+            skipped = 0
+            for d in stored:
                 try:
-                    m = Memory.from_dict(d)
-                except (TypeError, KeyError):
+                    m = self._memory_from_stored(d)
+                except (TypeError, KeyError, ValueError, AttributeError):
+                    m = None
+                if m is None:
+                    # one malformed entry must not kill the whole load,
+                    # and must never poison later arithmetic (importance
+                    # / retention assume numeric fields, str text, etc.)
+                    skipped += 1
                     continue
                 self.memories[m.id] = m
                 n = int(m.id[1:]) if m.id[1:].isdigit() else 0
                 self._counter = max(self._counter, n)
-        except (OSError, ValueError):
-            pass
+            if skipped:
+                _log.warning("brain load: skipped %d malformed entries "
+                             "in %s", skipped, self.path)
+            # a hand-grown or older file may exceed the per-store cap —
+            # enforce it on load so the file cannot grow without bound
+            # across restarts.
+            self._cap_all()
+
+    @staticmethod
+    def _memory_from_stored(d: object) -> "Memory | None":
+        """Validate one stored entry. Returns None for anything malformed:
+        non-dict entries, bad ids, unknown stores (which would evade the
+        per-store caps forever), non-string text, or non-numeric /
+        non-finite timestamps and strengths."""
+        if not isinstance(d, dict):
+            return None
+        m = Memory.from_dict(d)
+        if not isinstance(m.id, str) or not m.id:
+            return None
+        if m.store not in STORES:
+            return None
+        if not isinstance(m.text, str):
+            return None
+        for attr in ("created", "last_review", "strength"):
+            v = getattr(m, attr)
+            if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                    or not math.isfinite(v):
+                return None
+        if isinstance(m.reviews, bool) or not isinstance(m.reviews, int):
+            return None
+        if not isinstance(m.tags, list) or \
+                any(not isinstance(t, str) for t in m.tags):
+            return None
+        return m
 
     def _save(self) -> None:
         if self.path is None:
             return
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(
-                json.dumps({"memories": [m.to_dict() for m in
-                                         self.memories.values()]},
-                           indent=1), encoding="utf-8")
-        except OSError:
-            pass  # persistence is a convenience, never a crash path
+        with self._lock:
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                payload = json.dumps(
+                    {"memories": [m.to_dict() for m in
+                                  self.memories.values()]},
+                    indent=1)
+                # atomic replace: a crash mid-write (or a second writer)
+                # can never leave a torn brain.json behind. A torn file
+                # loads as zero memories — silent total loss on restart.
+                tmp = self.path.with_name(self.path.name + ".tmp")
+                tmp.write_text(payload, encoding="utf-8")
+                os.replace(tmp, self.path)
+            except Exception:
+                pass  # persistence is a convenience, never a crash path
 
     # -- write paths -------------------------------------------------------------
 
@@ -168,26 +231,27 @@ class Brain:
             raise ValueError("cannot remember empty text")
         if store not in STORES:
             raise ValueError(f"store must be one of {STORES}")
-        for m in self.memories.values():
-            if m.store == store and jaccard(m.text, text) >= \
-                    MERGE_SIMILARITY:
-                m.review()
-                m.verified = m.verified or verified
-                self.log.append("brain.remembered",
-                                {"id": m.id, "store": store,
-                                 "merged": True})
-                self._save()
-                return m
-        self._counter += 1
-        m = Memory(id=f"m{self._counter}", store=store, text=text,
-                   kind=kind, verified=verified, tags=tags or [])
-        self.memories[m.id] = m
-        self._cap(store)
-        self.log.append("brain.remembered",
-                        {"id": m.id, "store": store, "kind": kind,
-                         "verified": verified, "chars": len(text)})
-        self._save()
-        return m
+        with self._lock:
+            for m in self.memories.values():
+                if m.store == store and jaccard(m.text, text) >= \
+                        MERGE_SIMILARITY:
+                    m.review()
+                    m.verified = m.verified or verified
+                    self.log.append("brain.remembered",
+                                    {"id": m.id, "store": store,
+                                     "merged": True})
+                    self._save()
+                    return m
+            self._counter += 1
+            m = Memory(id=f"m{self._counter}", store=store, text=text,
+                       kind=kind, verified=verified, tags=tags or [])
+            self.memories[m.id] = m
+            self._cap(store)
+            self.log.append("brain.remembered",
+                            {"id": m.id, "store": store, "kind": kind,
+                             "verified": verified, "chars": len(text)})
+            self._save()
+            return m
 
     def ingest_kernel(self) -> int:
         """Pull episodic material from the event log: assistant summaries,
@@ -205,35 +269,40 @@ class Brain:
         last = max((_marker(e) for e in self.log.events()
                     if e.type == "brain.consolidated"), default=0)
         added = 0
-        for ev in self.log.events():
-            if ev.seq <= last:
-                continue
-            if ev.type == "fact.learned":
-                # BUGFIX: an empty fact ("") made remember() raise
-                # ValueError and abort the entire ingest mid-loop —
-                # half the events silently skipped. Skip empties.
-                fact = str(ev.data.get("fact", "")).strip()[:400]
-                if not fact:
+        # the scan and the ingest run under one lock hold so a
+        # concurrent sleep() cannot move the marker mid-pass and
+        # silently skip (or double-ingest) a window of events.
+        # remember() re-acquires the same RLock per event — safe.
+        with self._lock:
+            for ev in self.log.events():
+                if ev.seq <= last:
                     continue
-                self.remember(fact, store="semantic", kind="fact",
-                              verified=ev.data.get("kind") == "goal")
-                added += 1
-            elif ev.type == "deadend.recorded":
-                reason = str(ev.data.get("reason", "")).strip()
-                if not reason:
-                    continue
-                self.remember(f"dead end: {reason}"[:400],
-                              store="semantic", kind="dead_end")
-                added += 1
-            elif ev.type == "assistant.message":
-                text = str(ev.data.get("text", ""))
-                if len(text) > 120:            # substantive replies only
-                    snippet = text.strip()[:300]
-                    if not snippet:
+                if ev.type == "fact.learned":
+                    # BUGFIX: an empty fact ("") made remember() raise
+                    # ValueError and abort the entire ingest mid-loop —
+                    # half the events silently skipped. Skip empties.
+                    fact = str(ev.data.get("fact", "")).strip()[:400]
+                    if not fact:
                         continue
-                    self.remember(snippet, store="episodic",
-                                  kind="episode")
+                    self.remember(fact, store="semantic", kind="fact",
+                                  verified=ev.data.get("kind") == "goal")
                     added += 1
+                elif ev.type == "deadend.recorded":
+                    reason = str(ev.data.get("reason", "")).strip()
+                    if not reason:
+                        continue
+                    self.remember(f"dead end: {reason}"[:400],
+                                  store="semantic", kind="dead_end")
+                    added += 1
+                elif ev.type == "assistant.message":
+                    text = str(ev.data.get("text", ""))
+                    if len(text) > 120:            # substantive replies only
+                        snippet = text.strip()[:300]
+                        if not snippet:
+                            continue
+                        self.remember(snippet, store="episodic",
+                                      kind="episode")
+                        added += 1
         return added
 
     # -- read paths ----------------------------------------------------------------
@@ -243,25 +312,29 @@ class Brain:
         """Rank by (retention × importance × relevance) — only what the
         curve has kept alive can surface. A surfaced memory is REVIEWED."""
         q = _tokens(query)
-        scored: list[tuple[float, Memory]] = []
-        for m in self.memories.values():
-            if store and m.store != store:
-                continue
-            t = _tokens(m.text)
-            overlap = len(q & t)
-            relevance = overlap / (len(q) + 1) if q else 0.0
-            score = m.retention() * m.importance * (0.25 + relevance)
-            scored.append((score, m))
-        scored.sort(key=lambda p: -p[0])
-        top = [m for _, m in scored[:max(0, k)]]
-        for m in top:
-            m.review()
-        if top:
-            self.log.append("brain.recalled",
-                            {"query": query[:200],
-                             "ids": [m.id for m in top]})
-            self._save()
-        return top
+        # locked: the scan reviews winners and persists — a concurrent
+        # remember()/sleep() mutating the dict mid-scan used to raise
+        # "dictionary changed size during iteration".
+        with self._lock:
+            scored: list[tuple[float, Memory]] = []
+            for m in self.memories.values():
+                if store and m.store != store:
+                    continue
+                t = _tokens(m.text)
+                overlap = len(q & t)
+                relevance = overlap / (len(q) + 1) if q else 0.0
+                score = m.retention() * m.importance * (0.25 + relevance)
+                scored.append((score, m))
+            scored.sort(key=lambda p: -p[0])
+            top = [m for _, m in scored[:max(0, k)]]
+            for m in top:
+                m.review()
+            if top:
+                self.log.append("brain.recalled",
+                                {"query": query[:200],
+                                 "ids": [m.id for m in top]})
+                self._save()
+            return top
 
     def context_block(self, query: str = "", k: int = 4) -> str:
         """A compact recall block for the model's context."""
@@ -281,78 +354,99 @@ class Brain:
         """The consolidation pass. Merges near-duplicates, distills
         repeated episodes into semantic facts, promotes stable semantics
         to procedural skills, forgets what fell below the floor."""
-        now = time.time()
-        stats = {"merged": 0, "distilled": 0, "promoted": 0,
-                 "forgotten": 0}
+        # locked throughout: sleep deletes and rewrites memories — a
+        # concurrent recall()/remember() must not observe a half-
+        # consolidated store.
+        with self._lock:
+            now = time.time()
+            stats = {"merged": 0, "distilled": 0, "promoted": 0,
+                     "forgotten": 0}
 
-        # 1. forget what the curve has killed
-        dead = [m for m in self.memories.values()
-                if m.retention(now) < RETENTION_FLOOR and m.reviews == 0]
-        for m in dead:
-            del self.memories[m.id]
-            stats["forgotten"] += 1
-            self.log.append("brain.forgotten",
-                            {"id": m.id, "store": m.store,
-                             "text": m.text[:200]})
+            # 1. forget what the curve has killed. The retention floor
+            # applies to every memory — a memory the curve has killed
+            # stays dead no matter how many reviews it once had (each
+            # review already flattened its curve via strength growth).
+            dead = [m for m in self.memories.values()
+                    if m.retention(now) < RETENTION_FLOOR]
+            for m in dead:
+                del self.memories[m.id]
+                stats["forgotten"] += 1
+                self.log.append("brain.forgotten",
+                                {"id": m.id, "store": m.store,
+                                 "text": m.text[:200]})
 
-        # 2. merge near-duplicates within each store (keep the stronger)
-        for store in STORES:
-            items = sorted((m for m in self.memories.values()
-                            if m.store == store),
-                           key=lambda m: -m.strength)
-            kept: list[Memory] = []
-            for m in items:
-                if any(jaccard(m.text, k.text) >= MERGE_SIMILARITY
-                       for k in kept):
-                    del self.memories[m.id]
-                    stats["merged"] += 1
-                    continue
-                kept.append(m)
+            # 2. merge near-duplicates within each store (keep the stronger)
+            for store in STORES:
+                items = sorted((m for m in self.memories.values()
+                                if m.store == store),
+                               key=lambda m: -m.strength)
+                kept: list[Memory] = []
+                for m in items:
+                    match = next(
+                        (k for k in kept
+                         if jaccard(m.text, k.text) >= MERGE_SIMILARITY),
+                        None)
+                    if match is not None:
+                        # a repeated theme is stronger evidence, not a
+                        # second memory: reinforce the survivor (same as
+                        # remember()'s merge path) and keep its verified
+                        # flag. The merge is sealed as an event — memory
+                        # loss is never silent.
+                        match.review()
+                        match.verified = match.verified or m.verified
+                        del self.memories[m.id]
+                        stats["merged"] += 1
+                        self.log.append("brain.merged",
+                                        {"into": match.id, "from": m.id,
+                                         "store": store})
+                        continue
+                    kept.append(m)
 
-        # 3. distill: episodic themes repeated across >=3 distinct
-        # episodes become one semantic fact
-        episodes = [m for m in self.memories.values()
-                    if m.store == "episodic"]
-        seen: dict[str, int] = {}
-        for m in episodes:
-            for tag in (m.tags or _signature_tags(m.text)):
-                seen[tag] = seen.get(tag, 0) + 1
-        for tag, n in seen.items():
-            if n >= 3:
-                siblings = [m for m in episodes
-                            if tag in (m.tags or _signature_tags(m.text))]
-                digest = siblings[0].text[:160]
-                # a distilled fact stores "<prefix> <digest>" — compare
-                # against the digest itself, not the decorated text, or
-                # the similarity gate never fires and every sleep
-                # re-distills the same theme forever
-                exists = any(digest in m.text
-                             for m in self.memories.values()
-                             if m.store == "semantic")
-                if not exists:
-                    self._counter += 1
-                    fact = Memory(id=f"m{self._counter}", store="semantic",
-                                  text=f"[distilled from {n} episodes] "
-                                       f"{digest}",
-                                  kind="fact", strength=2.0,
-                                  reviews=n)
-                    self.memories[fact.id] = fact
-                    stats["distilled"] += 1
+            # 3. distill: episodic themes repeated across >=3 distinct
+            # episodes become one semantic fact
+            episodes = [m for m in self.memories.values()
+                        if m.store == "episodic"]
+            seen: dict[str, int] = {}
+            for m in episodes:
+                for tag in (m.tags or _signature_tags(m.text)):
+                    seen[tag] = seen.get(tag, 0) + 1
+            for tag, n in seen.items():
+                if n >= 3:
+                    siblings = [m for m in episodes
+                                if tag in (m.tags or _signature_tags(m.text))]
+                    digest = siblings[0].text[:160]
+                    # a distilled fact stores "<prefix> <digest>" — compare
+                    # against the digest itself, not the decorated text, or
+                    # the similarity gate never fires and every sleep
+                    # re-distills the same theme forever
+                    exists = any(digest in m.text
+                                 for m in self.memories.values()
+                                 if m.store == "semantic")
+                    if not exists:
+                        self._counter += 1
+                        fact = Memory(id=f"m{self._counter}",
+                                      store="semantic",
+                                      text=f"[distilled from {n} episodes] "
+                                           f"{digest}",
+                                      kind="fact", strength=2.0,
+                                      reviews=n)
+                        self.memories[fact.id] = fact
+                        stats["distilled"] += 1
 
-        # 4. promote: semantic memories with enough reviews become
-        # procedural skills (knowledge that has proven repeatedly useful)
-        for m in list(self.memories.values()):
-            if m.store == "semantic" and m.reviews >= PROMOTE_THRESHOLD:
-                m.store = "procedural"
-                m.kind = "skill"
-                stats["promoted"] += 1
+            # 4. promote: semantic memories with enough reviews become
+            # procedural skills (knowledge that has proven repeatedly useful)
+            for m in list(self.memories.values()):
+                if m.store == "semantic" and m.reviews >= PROMOTE_THRESHOLD:
+                    m.store = "procedural"
+                    m.kind = "skill"
+                    stats["promoted"] += 1
 
-        self._cap_all()
-        self.log.append("brain.consolidated",
-                        {**stats, "brain_marker": self.log.head(),
-                         "remaining": len(self.memories)})
-        self._save()
-        return stats
+            self._cap_all()
+            self.log.append("brain.consolidated",
+                            {**stats, "brain_marker": self.log.head(),
+                             "remaining": len(self.memories)})
+            self._save()
+            return stats
 
     def _cap(self, store: str) -> None:
         items = [m for m in self.memories.values() if m.store == store]
@@ -369,16 +463,17 @@ class Brain:
     # -- reporting ----------------------------------------------------------------------
 
     def stats(self) -> dict:
-        by_store: dict[str, int] = {s: 0 for s in STORES}
-        for m in self.memories.values():
-            by_store[m.store] = by_store.get(m.store, 0) + 1
-        alive = [m for m in self.memories.values()
-                 if m.retention() >= RETENTION_FLOOR]
-        return {"total": len(self.memories), "by_store": by_store,
-                "alive": len(alive),
-                "avg_retention": round(
-                    sum(m.retention() for m in self.memories.values())
-                    / max(1, len(self.memories)), 3)}
+        with self._lock:
+            by_store: dict[str, int] = {s: 0 for s in STORES}
+            for m in self.memories.values():
+                by_store[m.store] = by_store.get(m.store, 0) + 1
+            alive = [m for m in self.memories.values()
+                     if m.retention() >= RETENTION_FLOOR]
+            return {"total": len(self.memories), "by_store": by_store,
+                    "alive": len(alive),
+                    "avg_retention": round(
+                        sum(m.retention() for m in self.memories.values())
+                        / max(1, len(self.memories)), 3)}
 
     def format_stats(self) -> str:
         s = self.stats()

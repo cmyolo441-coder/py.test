@@ -123,6 +123,35 @@ ROLE_BRIEFS: dict[str, str] = {
     "analyst": ("a DATA / SYSTEMS analyst. Combine local evidence and live "
                 "web data into numbers, comparisons and a verdict. Never "
                 "modify anything."),
+    "architect": ("a SOFTWARE ARCHITECT. Design module boundaries, "
+                  "interfaces and data flow with file:line evidence. You "
+                  "may scaffold new files and directories for the design, "
+                  "but never rewrite existing modules."),
+    "debugger": ("a DEBUGGER. Reproduce the failure first, then isolate "
+                 "the root cause with exact evidence (file:line, exit "
+                 "codes, minimal reproduction). Run commands to reproduce "
+                 "and probe; never modify source files."),
+    "devops": ("a DEVOPS engineer. Build, deploy and operate: write "
+               "configs, scripts and pipelines, run commands to verify "
+               "each step, and report exact exit codes. Keep every change "
+               "minimal and reversible."),
+    "documenter": ("a DOCUMENTER. Write clear, accurate documentation from "
+                   "the code as it actually is — never invent APIs or "
+                   "behavior. Cite file:line for every claim."),
+    "integrator": ("a SYSTEMS INTEGRATOR. Wire components together: read "
+                   "both sides, make minimal connecting changes, and "
+                   "verify the join end to end with real runs."),
+    "optimizer": ("a PERFORMANCE OPTIMIZER. Measure first: profile and "
+                  "benchmark with real runs and report exact numbers "
+                  "before and after. Never modify source files; propose "
+                  "the precise change with file:line evidence."),
+    "planner": ("a PLANNER. Break the mission into ordered, verifiable "
+                "steps, grounding each assumption with file:line evidence. "
+                "Never modify anything — produce the plan, not the code."),
+    "refactorer": ("a REFACTORING specialist. Restructure code without "
+                   "changing behavior: read before you write, keep "
+                   "existing style and conventions, make minimal surgical "
+                   "edits."),
 }
 
 
@@ -230,6 +259,12 @@ if __name__ == "__main__":
     assert main() and scout()
     for role in ROLE_BRIEFS:
         assert worker(role, 8)
+    # every role team.py can spawn must have a brief — otherwise the vault
+    # raises KeyError on resolve("worker:<role>") and worker() silently
+    # serves another role's brief
+    from .team import ROLES as _TEAM_ROLES
+    _missing = [r for r in _TEAM_ROLES if r not in ROLE_BRIEFS]
+    assert not _missing, f"roles without briefs: {_missing}"
     msgs = [{"role": "user", "content": "hi"}]
     with_system(msgs, main())
     assert msgs[0]["role"] == "system" and msgs[0]["content"] == MAIN

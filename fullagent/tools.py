@@ -9,6 +9,7 @@ import os
 import queue
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import threading
@@ -119,11 +120,19 @@ def _coerce_int(value: Any, name: str, default: int, lo: int,
 def _diff_summary(old: str, new: str) -> tuple[int, int]:
     """(additions, removals) line counts between two versions."""
     adds = removes = 0
-    for line in difflib.unified_diff(
-            old.splitlines(), new.splitlines(), lineterm="", n=0):
-        if line.startswith("+") and not line.startswith("+++"):
+    lines = difflib.unified_diff(
+        old.splitlines(), new.splitlines(), lineterm="", n=0)
+    for i, line in enumerate(lines):
+        # Skip the "---"/"+++" file headers positionally (first two
+        # lines): a removed "-- x" line renders as "--- x" and must be
+        # counted as a removal, not mistaken for the header.
+        if i < 2 and (line.startswith("---") or line.startswith("+++")):
+            continue
+        if line.startswith("@@"):
+            continue
+        if line.startswith("+"):
             adds += 1
-        elif line.startswith("-") and not line.startswith("---"):
+        elif line.startswith("-"):
             removes += 1
     return adds, removes
 
@@ -161,7 +170,15 @@ def _atomic_write_text(p: Path, text: str) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_name(
         f"{p.name}.tmp-{os.getpid()}-{threading.get_ident()}")
-    tmp.write_text(text, encoding="utf-8")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+    except BaseException:
+        # don't litter a half-written temp file next to the target
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     os.replace(tmp, p)
 
 
@@ -437,7 +454,7 @@ def search_files(pattern: str, path: str = ".", glob_filter: str = "*",
         try:
             if f.stat().st_size > _SEARCH_MAX_FILE_BYTES:
                 continue  # huge binary/log — skip, don't OOM
-            text = f.read_text(errors="replace")
+            text = f.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
         for i, line in enumerate(text.splitlines(), 1):
@@ -475,6 +492,39 @@ def glob_files(pattern: str, path: str = ".") -> str:
 # Shell
 # ---------------------------------------------------------------------------
 
+def _kill_process_tree(proc: "subprocess.Popen") -> None:
+    """Kill proc AND its children.
+
+    Shell commands are run as ``bash -c <cmd>``: the Popen handle is the
+    bash wrapper, but the real work usually happens in forked children
+    (``sleep 60``, compilers, servers, test runners...). Killing only the
+    wrapper orphans those children — they keep running (and holding
+    ports/files) after Esc/timeout. New sessions are started in their own
+    process group (see _popen_kwargs), so killpg takes the whole tree.
+    """
+    try:
+        if os.name == "posix":
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        else:  # Windows: no process groups — best effort on the wrapper
+            proc.kill()
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    try:
+        proc.wait()
+    except Exception:
+        pass
+
+
+# start_new_session puts the child in its own process group so
+# _kill_process_tree can kill the whole tree on cancel/timeout.
+# (POSIX-only; on Windows the kwarg is unsupported so we omit it.)
+_popen_kwargs: dict = {"start_new_session": True} if os.name == "posix" \
+    else {}
+
+
 def _pump_process(proc: "subprocess.Popen", timeout: float,
                   on_output: "Callable[[str, str], None] | None" = None,
                   should_cancel: "Callable[[], bool] | None" = None,
@@ -507,15 +557,26 @@ def _pump_process(proc: "subprocess.Popen", timeout: float,
     open_streams = 2
     deadline = time.monotonic() + timeout
     cancelled = False
+
+    def _cancel_requested() -> bool:
+        # A raising should_cancel must never take down the tool — treat
+        # it as "not cancelled" and keep pumping.
+        if should_cancel is None:
+            return False
+        try:
+            return bool(should_cancel())
+        except Exception:
+            _log.warning("should_cancel callback raised; ignoring")
+            return False
+
     while open_streams > 0:
         # Esc/Ctrl+C: kill the process immediately
-        if should_cancel is not None and should_cancel():
+        if _cancel_requested():
             cancelled = True
             break
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            proc.kill()
-            proc.wait()
+            _kill_process_tree(proc)
             return None
         try:
             tag, line = q.get(timeout=min(0.25, max(0.01, remaining)))
@@ -534,11 +595,7 @@ def _pump_process(proc: "subprocess.Popen", timeout: float,
             except Exception:  # noqa: BLE001 — never break the tool
                 pass
     if cancelled:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        proc.wait()
+        _kill_process_tree(proc)
         # Mark as cancelled so the caller can report it properly
         out_lines.append("\n[CANCELLED by user (Esc/Ctrl+C)]\n")
         return out_lines, err_lines
@@ -586,6 +643,7 @@ def run_command(command: str, timeout: int = 120,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace",
             cwd=os.getcwd(),
+            **_popen_kwargs,
         )
     except OSError as e:
         return f"ERROR: {e}"
@@ -654,11 +712,17 @@ def _live_shell_locked(argv: list[str], command: str, timeout: float,
     # environment are reported back on marker lines we strip before
     # returning. Replaying the env on the next call is what makes
     # `export FOO=...` stick across calls despite fresh processes.
+    # The markers carry a per-call token: a command whose own output
+    # contains the literal text "__FA_CWD__"/"__FA_ENV__" must not be
+    # mistaken for our bookkeeping lines.
+    _tok = f"{os.getpid()}-{threading.get_ident()}-{time.monotonic_ns()}"
+    _cwd_mark = f"__FA_CWD_{_tok}__"
+    _env_mark = f"__FA_ENV_{_tok}__"
     wrapped = (
         command + "\n"
         "__fa_rc=$?\n"
-        'printf "\\n__FA_CWD__%s" "$PWD"\n'
-        'printf "\\n__FA_ENV__"\n'
+        f'printf "\\n{_cwd_mark}%s" "$PWD"\n'
+        f'printf "\\n{_env_mark}"\n'
         "env -0\n"
         "exit $__fa_rc\n")
     extra_env = _SHELL_STATE["env"]
@@ -675,8 +739,8 @@ def _live_shell_locked(argv: list[str], command: str, timeout: float,
         if on_output is None:
             return
         if stream == "out":
-            if "__FA_CWD__" in line:
-                pre, _, _ = line.partition("__FA_CWD__")
+            if _cwd_mark in line:
+                pre, _, _ = line.partition(_cwd_mark)
                 cutoff["hit"] = True
                 pending_blanks["n"] = 0
                 if not pre:
@@ -704,6 +768,7 @@ def _live_shell_locked(argv: list[str], command: str, timeout: float,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace",
             cwd=cwd, env=extra_env,
+            **_popen_kwargs,
         )
     except OSError as e:
         return f"ERROR: {e}"
@@ -714,9 +779,9 @@ def _live_shell_locked(argv: list[str], command: str, timeout: float,
     stdout = "".join(out_lines)
     stderr = "".join(err_lines)
     new_cwd, new_env = cwd, extra_env
-    idx = stdout.rfind("__FA_ENV__")
+    idx = stdout.rfind(_env_mark)
     if idx >= 0:
-        blob = stdout[idx + len("__FA_ENV__"):]
+        blob = stdout[idx + len(_env_mark):]
         env_map: dict[str, str] = {}
         for pair in blob.split("\0"):
             if "=" in pair:
@@ -725,9 +790,9 @@ def _live_shell_locked(argv: list[str], command: str, timeout: float,
         if env_map:
             new_env = env_map
         stdout = stdout[:idx].rstrip("\n")
-    j = stdout.rfind("__FA_CWD__")
+    j = stdout.rfind(_cwd_mark)
     if j >= 0:
-        new_cwd = stdout[j + len("__FA_CWD__"):].strip() or cwd
+        new_cwd = stdout[j + len(_cwd_mark):].strip() or cwd
         stdout = stdout[:j].rstrip("\n")
     # Already under _SHELL_LOCK (see live_shell) — no extra locking needed.
     if os.path.isdir(new_cwd):
@@ -744,9 +809,13 @@ def _live_shell_locked(argv: list[str], command: str, timeout: float,
 
 def live_shell_reset() -> str:
     """Reset the persistent shell session back to the process cwd/env."""
-    prev = _SHELL_STATE["cwd"]
-    _SHELL_STATE["cwd"] = None
-    _SHELL_STATE["env"] = None
+    # Take the session lock: without it a reset racing an in-flight
+    # command would be silently overwritten when that command writes its
+    # (stale) cwd/env back into _SHELL_STATE.
+    with _SHELL_LOCK:
+        prev = _SHELL_STATE["cwd"]
+        _SHELL_STATE["cwd"] = None
+        _SHELL_STATE["env"] = None
     return f"OK: session reset ({prev} -> {os.getcwd()})"
 
 
@@ -765,7 +834,10 @@ def apply_patch(patch: str) -> str:
     `a/main.py` does the intuitive thing)."""
     if not isinstance(patch, str) or not patch.strip():
         return "ERROR: patch must be a non-empty string"
-    base = _SHELL_STATE["cwd"] or os.getcwd()
+    # Read session cwd under the lock — an in-flight live_shell command
+    # may be updating it concurrently.
+    with _SHELL_LOCK:
+        base = _SHELL_STATE["cwd"] or os.getcwd()
     # -- parse the patch into per-file sections ---------------------------
     # A section is: --- <old> / +++ <new> / @@ hunks. Either side may be
     # /dev/null (new file / deleted file). Hunks always belong to the
@@ -781,6 +853,32 @@ def apply_patch(patch: str) -> str:
         return name
 
     for line in patch.splitlines():
+        # Inside a hunk body? The @@ counts say exactly how many old/new
+        # lines the body holds — consume them here, BEFORE the header
+        # checks below. A removed "-- comment" renders as "--- comment"
+        # in the diff; without this it would be mistaken for a new file's
+        # "---" header and derail the whole parse (same for added "++ x"
+        # vs "+++"). Valid diffs never have a bare header-looking line
+        # inside a hunk body (body lines always carry their prefix), so
+        # this is strictly more correct.
+        if cur is not None and cur["hunks"]:
+            h = cur["hunks"][-1]
+            if h["old_need"] is not None and (
+                    h["old_got"] < h["old_need"]
+                    or h["new_got"] < h["new_need"]):
+                if line.startswith(("+", "-", " ")) or line == "":
+                    tag = line[0] if line else " "
+                    h["lines"].append(line if line else " ")
+                    if tag in (" ", "-"):
+                        h["old_got"] += 1
+                    if tag in (" ", "+"):
+                        h["new_got"] += 1
+                # "\ No newline at end of file" and friends: ignored —
+                # they are not body lines, so they consume nothing
+                continue
+            # body complete (or malformed header with old_need=None,
+            # which keeps the legacy header-first behavior) — fall
+            # through to the header checks
         if line.startswith("--- ") and not line.startswith("--- \t"):
             cur = {"old_name": strip_name(line[4:]), "new_name": None,
                    "hunks": []}
@@ -798,12 +896,23 @@ def apply_patch(patch: str) -> str:
             if cur is not None:
                 m = re.match(
                     r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
+                if m:
+                    old_need: int | None = (int(m.group(2))
+                                            if m.group(2) else 1)
+                    new_need: int | None = (int(m.group(4))
+                                            if m.group(4) else 1)
+                else:
+                    old_need = new_need = None  # malformed: legacy
                 cur["hunks"].append(
                     {"lines": [],
                      "old_start": int(m.group(1)) if m else 1,
-                     "new_start": int(m.group(3)) if m else 1})
+                     "new_start": int(m.group(3)) if m else 1,
+                     "old_need": old_need, "new_need": new_need,
+                     "old_got": 0, "new_got": 0})
             continue
         if cur is not None and cur["hunks"]:
+            # legacy path: malformed @@ header (no counts) — consume
+            # body-looking lines until the next header, as before
             h = cur["hunks"][-1]
             if line.startswith(("+", "-", " ")) or line == "":
                 h["lines"].append(line if line else " ")

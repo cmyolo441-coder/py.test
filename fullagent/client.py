@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import queue
 import random
 import re
+import threading
 import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterator
@@ -35,17 +37,23 @@ class APIError(Exception):
 # follow-up. A turn that makes a dozen model calls saves a full handshake
 # on each — this is the single biggest latency cut.
 _SESSION: requests.Session | None = None
+_SESSION_LOCK = threading.Lock()
 
 
 def _http() -> requests.Session:
     global _SESSION
+    # Double-checked locking: prewarm_connection runs on a background
+    # thread, so two threads can otherwise build a pooled Session each and
+    # silently drop one (leaking its pool/sockets until GC).
     if _SESSION is None:
-        s = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(
-            pool_connections=8, pool_maxsize=16, max_retries=0)
-        s.mount("https://", adapter)
-        s.mount("http://", adapter)
-        _SESSION = s
+        with _SESSION_LOCK:
+            if _SESSION is None:
+                s = requests.Session()
+                adapter = requests.adapters.HTTPAdapter(
+                    pool_connections=8, pool_maxsize=16, max_retries=0)
+                s.mount("https://", adapter)
+                s.mount("http://", adapter)
+                _SESSION = s
     return _SESSION
 
 
@@ -88,8 +96,6 @@ def prewarm_connection(provider) -> None:
     cost. Runs in a background thread — never blocks the UI. The connection
     sits in the pool ready for the first real request. Warmups for the same
     provider within the TTL are skipped (no redundant API calls)."""
-    import threading
-
     def _warm():
         key = provider.base_url
         now = time.monotonic()
@@ -309,10 +315,15 @@ def _save_calibration() -> None:
     """Persist calibration so the next process starts already tuned."""
     try:
         config.ensure_dirs()
-        _CALIBRATION_FILE.write_text(json.dumps({
+        # Atomic write (tmp + rename): concurrent savers from worker
+        # threads can otherwise interleave and tear the JSON, silently
+        # losing all calibration on the next load.
+        tmp = _CALIBRATION_FILE.with_name(_CALIBRATION_FILE.name + ".tmp")
+        tmp.write_text(json.dumps({
             "ratios": _ratio_samples,
             "windows": _learned_windows,
         }))
+        tmp.replace(_CALIBRATION_FILE)
     except OSError:
         pass  # persistence is an optimisation, never a failure path
 
@@ -441,21 +452,95 @@ def _clamp_max_tokens(provider_key: str, value: int) -> int:
 
 
 def _iter_sse_events(resp: requests.Response) -> Iterator[dict]:
-    """Yield parsed JSON data objects from an SSE stream."""
-    for raw_line in resp.iter_lines(decode_unicode=True):
-        if not raw_line:
-            continue
-        if raw_line.startswith(":"):  # comment / keepalive
-            continue
-        if not raw_line.startswith("data:"):
-            continue
-        data = raw_line[len("data:"):].strip()
-        if data == "[DONE]":
-            return
+    """Yield parsed JSON data objects from an SSE stream.
+
+    Proper SSE framing: an event ends at a blank line, and multiple
+    `data:` lines inside one event are joined with newline before the
+    JSON parse (the old code treated every `data:` line as a complete
+    event, so a multi-line data field was split into fragments that
+    each failed to parse and were silently dropped). Lines are decoded
+    from bytes with errors replaced, so one corrupt chunk can never
+    crash the turn with a raw UnicodeDecodeError.
+    """
+    data_lines: list[str] = []
+
+    def _dispatch() -> Any:
+        """Parse the accumulated event. Returns "done", a parsed object,
+        or None when there is nothing (or nothing parseable) to emit."""
+        text = "\n".join(data_lines).strip()
+        del data_lines[:]
+        if not text:
+            return None
+        if text == "[DONE]":
+            return "done"
         try:
-            yield json.loads(data)
+            return json.loads(text)
         except ValueError:
+            return None
+
+    for raw in resp.iter_lines():
+        line = raw.decode("utf-8", errors="replace")
+        if line.startswith("\ufeff"):
+            line = line.lstrip("\ufeff")
+        if not line.strip():
+            # blank line: end of event — dispatch what accumulated
+            ev = _dispatch()
+            if ev == "done":
+                return
+            if ev is not None:
+                yield ev
             continue
+        if line.startswith(":"):  # comment / keepalive
+            continue
+        if line.startswith("data:"):
+            data_lines.append(line[len("data:"):].strip())
+    # stream ended without a trailing blank line — flush the last event
+    ev = _dispatch()
+    if ev is not None and ev != "done":
+        yield ev
+
+
+def _iter_sse_events_cancellable(
+        resp: requests.Response,
+        should_cancel: Callable[[], bool] | None) -> Iterator[dict]:
+    """Yield SSE events, honouring should_cancel even while the provider
+    stalls. A stalled stream blocks inside iter_lines until the (long)
+    read timeout — without this, Esc/Ctrl+C does nothing for up to
+    DEFAULT_TIMEOUT (300s) while no chunks arrive. A daemon producer
+    thread keeps consuming; this thread polls with a short timeout and
+    checks cancellation between polls. Producer exceptions (e.g.
+    ChunkedEncodingError on a mid-stream disconnect) are re-raised here
+    with their original type so the retry layer still sees them."""
+    q: queue.Queue = queue.Queue()
+    _END = object()
+
+    def _produce() -> None:
+        try:
+            for event in _iter_sse_events(resp):
+                q.put(event)
+        except Exception as e:  # noqa: BLE001 — re-raised in the consumer
+            q.put(e)
+        finally:
+            q.put(_END)
+
+    thread = threading.Thread(target=_produce, daemon=True,
+                              name="sse-producer")
+    thread.start()
+    while True:
+        try:
+            item = q.get(timeout=0.25)
+        except queue.Empty:
+            if should_cancel is not None and should_cancel():
+                # _chat_stream_once's finally closes resp, which unblocks
+                # the producer's socket read; the daemon thread then exits
+                # on its own.
+                raise TurnCancelled()
+            continue
+        if item is _END:
+            return
+        if isinstance(item, Exception):
+            raise item
+        yield item
 
 
 def _extract_error_message(body: str) -> str:
@@ -840,6 +925,30 @@ def _chat_stream_with_retries(
     raise APIError(str(last_error))
 
 
+def _sse_error_status(err: Any) -> int | None:
+    """Best-effort HTTP status for an SSE-embedded error object, so the
+    retry layer can treat a streamed 429 like a real 429 (and never retry
+    a streamed 401). OpenAI-style error objects carry a numeric `code`;
+    some gateways send it as a string or a "rate_limit_exceeded" slug."""
+    if not isinstance(err, dict):
+        return None
+    code = err.get("code")
+    if code is None:
+        code = err.get("status")
+    if isinstance(code, bool):
+        return None
+    if isinstance(code, int):
+        return code if 100 <= code < 600 else None
+    if isinstance(code, str):
+        low = code.strip().lower()
+        if low.isdigit():
+            n = int(low)
+            return n if 100 <= n < 600 else None
+        if "rate" in low and "limit" in low:
+            return 429
+    return None
+
+
 def _chat_stream_once(url: str, headers: dict, payload: dict,
                       on_token: Callable[[str], None] | None,
                       on_reasoning: Callable[[str], None] | None,
@@ -855,9 +964,8 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
                         stream=True, timeout=_timeouts(timeout))
     if resp.status_code != 200:
         body = resp.text
+        resp.close()  # release the pooled connection on the error path too
         raise APIError(_extract_error_message(body), status=resp.status_code)
-    # requests defaults text/* without charset to ISO-8859-1; the API speaks UTF-8
-    resp.encoding = "utf-8"
 
     try:
         ctype = (resp.headers.get("Content-Type") or "").lower()
@@ -872,8 +980,15 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
                     f"provider returned invalid JSON "
                     f"(status {resp.status_code}): {str(e)[:200]}",
                     status=resp.status_code) from e
-            return _result_from_json(data, str(data.get("model") or ""))
-        for event in _iter_sse_events(resp):
+            # NB: the isinstance check must happen BEFORE data.get — a
+            # provider returning a JSON array/string here used to escape
+            # as a raw AttributeError instead of a clean APIError.
+            model_id = data.get("model") if isinstance(data, dict) else None
+            return _result_from_json(data, str(model_id or ""))
+        events = (_iter_sse_events_cancellable(resp, should_cancel)
+                  if should_cancel is not None
+                  else _iter_sse_events(resp))
+        for event in events:
             if should_cancel is not None and should_cancel():
                 raise TurnCancelled()
             if not isinstance(event, dict):
@@ -885,7 +1000,7 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
             if event.get("error"):
                 err = event["error"]
                 msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-                raise APIError(msg)
+                raise APIError(msg, status=_sse_error_status(err))
             choices = event.get("choices") or []
             if not choices:
                 continue
@@ -993,6 +1108,12 @@ def _post_blocking(url: str, headers: dict, payload: dict,
                 time.sleep(_backoff(attempt))
                 continue
             raise APIError(f"connection failed: {e}") from e
+        except requests.exceptions.RequestException as e:
+            # Same contract as the streaming path: anything else requests
+            # can raise (TooManyRedirects, InvalidURL, InvalidHeader, ...)
+            # surfaces as a clean APIError, never a raw requests
+            # exception.
+            raise APIError(f"request failed: {e}") from e
         try:
             if resp.status_code != 200:
                 raise APIError(_extract_error_message(resp.text),

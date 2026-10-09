@@ -183,10 +183,13 @@ class Nexus:
         """Symbols that call `name` directly or transitively (via symbols
         defined in the calling files)."""
         rev = self._reverse_index()
-        # symbol name -> paths defining it (built once per call)
-        def_paths: dict[str, set[str]] = {}
+        # path -> symbol names defined there, inverted once per call.
+        # (The old code built this map and then ignored it, scanning
+        # every symbol for every frontier path on every depth —
+        # O(paths x symbols x depth).)
+        path_symbols: dict[str, set[str]] = {}
         for sym in self.idx.symbols.values():
-            def_paths.setdefault(sym.name, set()).add(sym.path)
+            path_symbols.setdefault(sym.path, set()).add(sym.name)
         direct = set(rev.get(name, {}))
         frontier = set(direct)
         seen = set(direct)
@@ -194,12 +197,11 @@ class Nexus:
             next_frontier: set[str] = set()
             for path in frontier:
                 # symbols defined in this file that call into the frontier
-                for sym in self.idx.symbols.values():
-                    if sym.path == path:
-                        for caller_path in rev.get(sym.name, {}):
-                            if caller_path not in seen:
-                                seen.add(caller_path)
-                                next_frontier.add(caller_path)
+                for sym_name in path_symbols.get(path, ()):
+                    for caller_path in rev.get(sym_name, {}):
+                        if caller_path not in seen:
+                            seen.add(caller_path)
+                            next_frontier.add(caller_path)
             if not next_frontier:
                 break
             frontier = next_frontier

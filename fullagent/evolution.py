@@ -42,7 +42,6 @@ _log = get_logger("evolution")
 DEPLOY_MARGIN = 0.10
 MAX_GENERATIONS_PER_SESSION = 5
 EVAL_WINDOW = 12          # recent reports per role for fitness
-BENCHMARK_TIMEOUT = 240.0
 
 # Roles the engine refuses to touch even if they appear in ROLE_BRIEFS.
 _PROTECTED_ROLES = frozenset({"main", "master"})
@@ -108,7 +107,11 @@ class EvolutionEngine:
         # Candidate score cache: the evaluator runs a REAL worker per
         # candidate (expensive). A brief evaluated in an earlier
         # generation keeps its score — re-running it is pure waste.
-        self._eval_cache: dict[str, float] = {}
+        # Keyed by (role, brief): the same text scored under a different
+        # role's benchmark is a different measurement, so a bare-brief
+        # key would poison later generations with the wrong role's
+        # score.
+        self._eval_cache: dict[tuple[str, str], float] = {}
         # Fitness cache: fitness() rescans the event log (O(events)).
         # The log only grows, so (event_count -> fitness) is a valid
         # cache key — no recompute unless new events arrived.
@@ -148,7 +151,9 @@ class EvolutionEngine:
                 2.0 if i >= len(vals) // 2 else 1.0
                 for i in range(len(vals)))
         self._fitness_cache = (n_events, out)
-        return out
+        # Return a copy: `out` is the object stored in the cache, and a
+        # caller mutating the result would corrupt the cached fitness.
+        return dict(out)
 
     def weakest_role(self) -> str | None:
         """The evolvable role with the worst trailing fitness (and at
@@ -163,10 +168,11 @@ class EvolutionEngine:
         """Evaluate a brief, reusing a cached score when this exact brief
         was scored before. The evaluator spins up a real worker, so a
         repeat evaluation is the most expensive waste in the loop."""
-        if brief in self._eval_cache:
-            return "", self._eval_cache[brief]
+        key = (role, brief)
+        if key in self._eval_cache:
+            return "", self._eval_cache[key]
         reply, score = self.evaluator(role, brief)
-        self._eval_cache[brief] = float(score)
+        self._eval_cache[key] = float(score)
         return reply, float(score)
 
     # -- one generation -------------------------------------------------------
@@ -185,10 +191,37 @@ class EvolutionEngine:
             return Generation(self.generations, role or "?", 0.0,
                               reason="no role history to evolve on yet")
         self.generations += 1
+        # The benchmark task is the yardstick this generation is scored
+        # against. It is resolved here and sealed into every generation
+        # event, so the audit trail records exactly what the candidates
+        # were measured on. (A custom benchmark passed to the
+        # constructor used to be silently ignored — the engine never
+        # called it.)
+        task = self.benchmark(role)
         incumbent = systemprompt.ROLE_BRIEFS[role]
-        incumbent_reply, incumbent_score = self._evaluated(role, incumbent)
+        try:
+            _, incumbent_score = self._evaluated(role, incumbent)
+        except Exception as e:          # an evaluator hiccup on the
+            # incumbent must not kill the run — record it and stop
+            gen = Generation(self.generations, role, 0.0,
+                             reason=f"incumbent evaluation failed: "
+                                    f"{type(e).__name__}: {e}")
+            self.log.append("evolution.generation",
+                            {**gen.to_dict(), "benchmark": task},
+                            actor="kernel")
+            return gen
 
-        candidates = [c for c in self.mutator(role, incumbent, 3)
+        try:
+            raw_candidates = self.mutator(role, incumbent, 3) or []
+        except Exception as e:          # a dead mutator never kills a run
+            gen = Generation(self.generations, role, incumbent_score,
+                             reason=f"mutator failed: "
+                                    f"{type(e).__name__}: {e}")
+            self.log.append("evolution.generation",
+                            {**gen.to_dict(), "benchmark": task},
+                            actor="kernel")
+            return gen
+        candidates = [c for c in raw_candidates
                       if c and c != incumbent]
         gen = Generation(self.generations, role, incumbent_score)
         best_text, best_score = "", incumbent_score
@@ -203,7 +236,8 @@ class EvolutionEngine:
             gen.reason = (f"champion {best_score:.2f} did not clear "
                           f"incumbent {incumbent_score:.2f} + margin "
                           f"{self.margin:.2f} — incumbent kept")
-            self.log.append("evolution.generation", gen.to_dict(),
+            self.log.append("evolution.generation",
+                            {**gen.to_dict(), "benchmark": task},
                             actor="kernel")
             return gen
 
@@ -220,8 +254,10 @@ class EvolutionEngine:
         self.log.append("evolution.deployed",
                         {"gen": gen.gen, "role": role,
                          "old": incumbent, "new": best_text,
-                         "score": best_score}, actor="kernel")
-        self.log.append("evolution.generation", gen.to_dict(),
+                         "score": best_score, "benchmark": task},
+                        actor="kernel")
+        self.log.append("evolution.generation",
+                        {**gen.to_dict(), "benchmark": task},
                         actor="kernel")
         return gen
 

@@ -117,29 +117,38 @@ class TreeSearch:
         stale = 0
         while it < iterations and time.monotonic() - t0 < deadline_s:
             it += 1
-            node = root
+            try:
+                node = root
 
-            # SELECT — descend fully-expanded nodes by UCB1
-            while not node.untried and node.children:
-                node = node.best_child()
+                # SELECT — descend fully-expanded nodes by UCB1
+                while not node.untried and node.children:
+                    node = node.best_child()
 
-            # EXPAND — one untried (item, strategy) choice
-            if node.untried:
-                idx = self.rng.randrange(len(node.untried))
-                item, strat = node.untried.pop(idx)
-                child = StrategyNode(
-                    assignment={**node.assignment, item: strat},
-                    parent=node,
-                    untried=capped_moves(item + 1)
-                    if item + 1 < len(items) else [])
-                node.children.append(child)
-                node = child
+                # EXPAND — one untried (item, strategy) choice
+                if node.untried:
+                    idx = self.rng.randrange(len(node.untried))
+                    item, strat = node.untried.pop(idx)
+                    child = StrategyNode(
+                        assignment={**node.assignment, item: strat},
+                        parent=node,
+                        untried=capped_moves(item + 1)
+                        if item + 1 < len(items) else [])
+                    node.children.append(child)
+                    node = child
 
-            # SIMULATE — random completion of the remaining items
-            assignment = dict(node.assignment)
-            for i in range(len(assignment), len(items)):
-                assignment[i] = self.rng.choice(strategies)
-            score = self.evaluator(assignment)
+                # SIMULATE — random completion of the remaining items
+                assignment = dict(node.assignment)
+                for i in range(len(assignment), len(items)):
+                    assignment[i] = self.rng.choice(strategies)
+                score = self.evaluator(assignment)
+            except Exception:
+                # One bad rollout must not kill the whole search: the
+                # evaluator scores a real (cheap) worker run in
+                # production, and those can fail. Drop the iteration
+                # and carry on. The iteration budget is still consumed
+                # and the deadline still bounds the loop, so a
+                # permanently broken evaluator cannot spin forever.
+                continue
 
             # BACKPROPAGATE
             walk = node
@@ -181,14 +190,6 @@ class TreeSearch:
                                              * 1000))
         self.log.append("mcts.search", report.to_dict(), actor="kernel")
         return report
-
-
-def _walk(root: StrategyNode):
-    stack = [root]
-    while stack:
-        n = stack.pop()
-        yield n
-        stack.extend(n.children)
 
 
 # ---------------------------------------------------------------------------

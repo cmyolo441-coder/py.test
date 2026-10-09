@@ -77,11 +77,18 @@ class AlwaysAfter:
     b: str
 
     def check(self, trace: list[set[str]]) -> str | None:
-        for i, s in enumerate(trace):
-            if self.a in s:
-                if not any(self.b in t for t in trace[i + 1:]):
-                    return f"{self.a} at position {i} never followed " \
-                           f"by {self.b}"
+        # single reverse pass: a position's `a` is satisfied iff a `b`
+        # was seen strictly later. (The old code re-sliced trace[i+1:]
+        # per `a` — O(n^2) on long histories; audit_log() walks the
+        # whole kernel log.)
+        seen_b = False
+        for i in range(len(trace) - 1, -1, -1):
+            s = trace[i]
+            if self.a in s and not seen_b:
+                return f"{self.a} at position {i} never followed " \
+                       f"by {self.b}"
+            if self.b in s:
+                seen_b = True
         return None
 
 
@@ -92,14 +99,21 @@ class AlwaysBetween:
     b: str
 
     def check(self, trace: list[set[str]]) -> str | None:
+        # single forward pass: the interval between two `b`s is open at
+        # both ends, so a co-located `a` must NOT satisfy it — the `b`
+        # arm runs first and resets seen_a before the `a` arm can set it.
+        # (The old code re-scanned trace[last_b+1:i] per `b`: O(n^2).)
         last_b = -1
+        seen_a = False
         for i, s in enumerate(trace):
             if self.b in s:
-                if last_b >= 0 and not any(
-                        self.a in t for t in trace[last_b + 1:i]):
+                if last_b >= 0 and not seen_a:
                     return f"no {self.a} between {self.b} at positions " \
                            f"{last_b}..{i}"
                 last_b = i
+                seen_a = False
+            elif self.a in s:
+                seen_a = True
         return None
 
 

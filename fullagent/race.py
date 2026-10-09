@@ -80,7 +80,15 @@ class RacingUniverses:
         self.log = log
         self.runner = runner
         self.verifier = verifier
-        self.strategies = list(strategies or DEFAULT_STRATEGIES)
+        strategies = list(strategies or DEFAULT_STRATEGIES)
+        for s in strategies:
+            # lane ids are used for thread names, log payloads, and the
+            # outcomes map — a strategy without one dies later with a
+            # bare KeyError deep inside the race loop
+            if not isinstance(s, dict) or "id" not in s:
+                raise ValueError(
+                    f"each strategy must be a dict with an 'id': {s!r}")
+        self.strategies = strategies
 
     def race(self, task: str, timeout: float = 300.0) -> RaceResult:
         """Run the strategies ONE AT A TIME in lane order — no parallel
@@ -90,6 +98,11 @@ class RacingUniverses:
         result = RaceResult(task=task)
         if not task or not self.strategies:
             return result
+        # None was never a documented timeout — coerce it to the default
+        # instead of dying with TypeError on `t0 + timeout` below
+        if timeout is None:
+            timeout = 300.0
+        timeout = float(timeout)
         t0 = time.monotonic()
         self.log.append("race.start",
                         {"task": task[:300],

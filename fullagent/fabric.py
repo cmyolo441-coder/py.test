@@ -95,13 +95,20 @@ class KnowledgeFabric:
         fact = Fact(subject=subject, predicate=predicate, obj=obj,
                     valid_from=start, txn_time=now,
                     confidence=confidence)
-        # expire contradictory live predecessors — via the index, not a
-        # full scan
+        # Expire contradictory predecessors — via the index, not a full
+        # scan. A predecessor expires only when the new fact's window opens
+        # strictly after the predecessor's began, and it is closed at the
+        # NEW fact's valid_from (the documented contract) — never at "now".
+        # Closing a backdated assert at now would leave [start, now]
+        # double-covered by both facts: a phantom contradiction in as-of
+        # queries. A predecessor whose window hasn't opened yet
+        # (future-dated) or that shares the exact start timestamp keeps its
+        # window, so genuine overlaps still surface via contradictions().
         key = (subject, predicate)
         for old in self._sp_index.get(key, ()):
-            if old.obj != obj and old.live(max(now, start)) \
-                    and old.valid_to == _INFINITY:
-                old.valid_to = max(now, start)
+            if old.obj != obj and old.valid_to == _INFINITY \
+                    and old.valid_from < start:
+                old.valid_to = start
                 old.superseded_by = fact.fid
                 self.log.append("fabric.retract",
                                 {"retracted": old.to_dict(),
@@ -118,6 +125,10 @@ class KnowledgeFabric:
     def query(self, subject: str, predicate: str,
               at: float | None = None) -> list[Fact]:
         """Live facts for (s, p) — now, or as of a valid-time."""
+        # reads normalize exactly like assert_fact's writes — otherwise a
+        # padded query ("api ") silently misses the stored fact ("api")
+        subject = str(subject).strip()
+        predicate = str(predicate).strip()
         return sorted(
             [f for f in self._sp_index.get((subject, predicate), ())
              if f.live(at)],
@@ -152,6 +163,8 @@ class KnowledgeFabric:
     # -- reporting ---------------------------------------------------------------------
 
     def history(self, subject: str, predicate: str) -> str:
+        subject = str(subject).strip()
+        predicate = str(predicate).strip()
         rows = sorted(self._sp_index.get((subject, predicate), ()),
                       key=lambda f: f.valid_from)
         if not rows:
@@ -198,6 +211,10 @@ if __name__ == "__main__":
             "flask"
         # before anything: unknown
         assert fabric.ask("api", "framework", at=t1 - 1) is None
+        # the backdated fastapi assert closed flask AT t2 (its valid_from),
+        # not at "now" — no phantom double-covered window, hence no
+        # contradiction anywhere in (t2, now)
+        assert fabric.contradictions(at=t2 + 86400) == []
 
         # non-conflicting facts on different predicates coexist
         fabric.assert_fact("api", "language", "python",

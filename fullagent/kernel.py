@@ -95,18 +95,46 @@ class Event:
         seq = d["seq"]
         if not isinstance(seq, int) or isinstance(seq, bool):
             raise ValueError(f"event seq is not an int: {seq!r}")
+        # BUG FIX (corrupt-line hardening): id/parent/branch/ts and the
+        # causal-link fields are used as dict keys and in the Merkle walk.
+        # A corrupt line with a non-string id, a dict/list parent, or a
+        # non-numeric ts used to load fine and then crash _chain()/why()
+        # with TypeError (unhashable type) — or silently hijack the branch
+        # head. Reject such lines here so _load skips them like any other
+        # corrupt line.
+        eid = d["id"]
+        if not isinstance(eid, str):
+            raise ValueError(f"event id is not a string: {eid!r}")
+        parent = d.get("parent")
+        if parent is not None and not isinstance(parent, str):
+            raise ValueError(f"event parent is not a string: {parent!r}")
+        branch = d.get("branch", "main")
+        if not isinstance(branch, str):
+            raise ValueError(f"event branch is not a string: {branch!r}")
+        ts = d.get("ts", 0.0)
+        if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+            raise ValueError(f"event ts is not a number: {ts!r}")
+        causation_id = d.get("causation_id")
+        if causation_id is not None and not isinstance(causation_id, str):
+            raise ValueError(
+                f"event causation_id is not a string: {causation_id!r}")
+        correlation_id = d.get("correlation_id")
+        if correlation_id is not None and not isinstance(correlation_id,
+                                                         str):
+            raise ValueError(
+                f"event correlation_id is not a string: {correlation_id!r}")
         data = d.get("data", {})
         if not isinstance(data, dict):
             raise ValueError("event data is not an object")
         if not isinstance(d.get("type"), str):
             raise ValueError("event type is not a string")
-        return cls(seq=seq, id=d["id"], parent=d.get("parent"),
-                   branch=d.get("branch", "main"), ts=d.get("ts", 0.0),
+        return cls(seq=seq, id=eid, parent=parent,
+                   branch=branch, ts=ts,
                    type=d["type"], data=data,
                    session=d.get("session", ""),
                    actor=d.get("actor", "system"),
-                   causation_id=d.get("causation_id"),
-                   correlation_id=d.get("correlation_id"),
+                   causation_id=causation_id,
+                   correlation_id=correlation_id,
                    provenance=d.get("provenance", "system"))
 
     @staticmethod
@@ -301,7 +329,15 @@ class EventLog:
                     continue
                 try:
                     ev = Event.from_dict(json.loads(line))
-                except (ValueError, KeyError):
+                except (ValueError, KeyError, TypeError) as exc:
+                    # BUG FIX (load resilience): the old except clause missed
+                    # TypeError, so a single non-dict JSON line ("[1,2]",
+                    # "42", '"str"') raised from d["seq"] and killed the
+                    # ENTIRE log load — every event lost. One bad line must
+                    # never take down the log; skip it (torn writes and
+                    # hand-edits land here too) and keep going.
+                    _log.warning("kernel: skipping corrupt log line %r: %s",
+                                 line[:120], exc)
                     continue
                 self._events.append(ev)
                 self._by_id[ev.id] = ev
@@ -450,9 +486,17 @@ class EventLog:
         CONTRACT: the returned list may be the branch's SHARED cached
         chain — treat it as read-only. Mutating it (append/sort/pop)
         corrupts the cache and every later fold. Build a new list if
-        you need to transform it."""
+        you need to transform it.
+
+        BUG FIX (concurrency): _chain() mutates the per-branch cache
+        (self._chains[branch] = ...), but events() used to call it with no
+        lock held — two threads folding/reading concurrently could race on
+        the cache assignment and publish a torn or stale chain. The lock
+        is held for the cache lookup/build; the returned list itself is
+        never mutated in place afterwards, so handing it out is safe."""
         br = branch or self.branch
-        evs = self._chain(br)
+        with self._lock:
+            evs = self._chain(br)
         if upto_seq is None:
             return evs
         return [e for e in evs if e.seq <= upto_seq]

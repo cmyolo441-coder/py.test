@@ -64,6 +64,14 @@ _QUESTION_RE = re.compile(
 _WEB_TRIGGER_RE = re.compile(
     r"\b(?:" + "|".join(re.escape(t) for t in _WEB_TRIGGERS) + r")\b")
 
+# Weak temporal triggers: in an imperative they are urgency/deadline
+# adverbs or plain adjectives ("fix it now", "ship it today", "the
+# current code") — not a request for live facts. They only count as
+# web triggers inside a question ("what is the price now?"), where the
+# interrogative context disambiguates them toward live data.
+_WEAK_WEB_TRIGGERS = frozenset(
+    {"now", "right now", "today", "current", "abhi", "aaj"})
+
 
 @dataclass
 class RouteDecision:
@@ -101,15 +109,24 @@ class AutoPilot:
               autonomy: int = 3) -> RouteDecision:
         """Inspect the user message and decide what to enable."""
         d = RouteDecision()
+        text = str(text or "")
         if not self.enabled or not text.strip():
             return d
 
         low = text.lower()
-        is_question = (text.strip().endswith("?")
-                       or _QUESTION_RE.match(low) is not None)
+        stripped = text.strip()
+        # match the question-word regex against stripped text: leading
+        # whitespace used to defeat the ^ anchor, so "  what is the best
+        # fix" (a question) was misrouted into goal mode.
+        is_question = (stripped.endswith("?")
+                       or _QUESTION_RE.match(stripped.lower()) is not None)
 
         # 1. real-time web — questions about live data
         hits = _WEB_TRIGGER_RE.findall(low)
+        if not is_question:
+            # weak temporal triggers are urgency/deadline adverbs in
+            # imperatives ("fix it now") — only questions earn them
+            hits = [h for h in hits if h not in _WEAK_WEB_TRIGGERS]
         if hits:
             d.use_web = True
             d.reasons.append("real-time web: live-data trigger(s) "

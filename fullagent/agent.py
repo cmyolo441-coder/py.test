@@ -21,6 +21,7 @@ Wired here (all enforced mechanically, rung 1 — never as prompt advice):
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -230,6 +231,12 @@ class Agent:
         # Built before messages so the very first system prompt is sealed
         # and dispatched through the gate, not assembled by hand.
         self.mastermind = Mastermind(self.log)
+        # Crew: parallel subagents (Claude Code-style Task tool). The LLM
+        # can spawn subagents via the Task tool; they run concurrently
+        # and stream progress to the TUI panel via crew.* events.
+        from .crew import Crew
+        self.crew = Crew(self.log, self.provider, self.model,
+                         self.cfg.effort, mastermind=self.mastermind)
         self.messages: list[dict] = []
         self._reseat_system_prompt()
         self.store = SnapshotStore(config.APP_DIR / "store")
@@ -494,6 +501,26 @@ class Agent:
         self._schemas_tool_count = n
         return schemas
 
+    def _seal_pending_tool_calls(self, note: str) -> None:
+        """Pairing repair: every assistant tool_call must be followed by a
+        tool response with the same id. When a turn dies mid-tool-batch
+        (Esc, Ctrl+C, unexpected error), the calls that never ran would
+        leave the conversation permanently unbalanced — and every later
+        model call would fail with a tool/response pairing error. Seal
+        each unanswered call with a synthetic response instead, so the
+        session survives the interruption."""
+        answered = {m.get("tool_call_id") for m in self.messages
+                    if m.get("role") == "tool" and m.get("tool_call_id")}
+        for m in reversed(self.messages):
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                for tc in m["tool_calls"]:
+                    cid = tc.get("id")
+                    if cid and cid not in answered:
+                        self.messages.append({
+                            "role": "tool", "tool_call_id": cid,
+                            "content": note})
+                        answered.add(cid)
+
     def run_turn(self, user_text: str,
                  on_token: Callable[[str], None],
                  on_reasoning: Callable[[str], None],
@@ -514,6 +541,21 @@ class Agent:
         self._failed_over = False
         # Fresh turn: clear any stale cancellation from a previous turn
         self._cancel_flag.clear()
+        # Unify the two cancellation doors: the caller-supplied
+        # should_cancel callback and the Esc/Ctrl+C flag are the same
+        # signal. When the callback fires, latch the flag too — shell
+        # tools (run_command/live_shell) only watch the flag, so without
+        # this a callback-only caller could never stop a running command.
+        _outer_cancel = should_cancel
+
+        def _cancel_requested() -> bool:
+            if self._cancel_flag.is_set():
+                return True
+            if _outer_cancel is not None and _outer_cancel():
+                self._cancel_flag.set()
+                return True
+            return False
+        should_cancel = _cancel_requested
 
         # AUTOPILOT: the agent decides for itself which powers this turn
         # needs — goal mode, real-time web — and enables
@@ -672,6 +714,10 @@ class Agent:
                     f"task into smaller steps."
                 )
         except APIError as e:
+            # the status pipe must never outlive the turn — a stale
+            # callback would receive the NEXT turn's (or a crew thread's)
+            # status lines after this one died
+            self._turn_status = None
             turn.error = str(e)
             # only drop this turn's user prompt when nothing else was
             # appended after it (failed first complete). After tool calls,
@@ -681,17 +727,43 @@ class Agent:
                 self.messages.pop()
             self.log.append("turn.error", {"error": str(e)})
         except TurnCancelled:
+            self._turn_status = None
             turn.error = "cancelled"
+            # the turn may have died between tool calls, leaving
+            # tool_calls with no responses — seal them so the session
+            # stays usable
+            self._seal_pending_tool_calls(
+                "CANCELLED by user (Esc/Ctrl+C) before execution — do "
+                "not retry automatically; ask before re-running.")
             self.messages.append(
                 {"role": "assistant",
                  "content": turn.assistant_text or "(cancelled by user)"})
             self.log.append("turn.cancelled", {})
         except KeyboardInterrupt:
+            self._turn_status = None
             turn.error = "interrupted"
+            self._seal_pending_tool_calls(
+                "INTERRUPTED by user before execution — do not retry "
+                "automatically; ask before re-running.")
             self.messages.append(
                 {"role": "assistant",
                  "content": turn.assistant_text or "(interrupted)"})
             self.log.append("turn.cancelled", {})
+        except Exception as e:  # noqa: BLE001 — a turn must never die
+            # silently and take the session down with it: record the
+            # failure on the turn and keep going.
+            self._turn_status = None
+            turn.error = f"{type(e).__name__}: {e}"
+            self._seal_pending_tool_calls(
+                f"tool call never executed — the turn died with "
+                f"{type(e).__name__}: {e}")
+            if self.messages and self.messages[-1].get("role") == "user":
+                self.messages.pop()
+            try:
+                self.log.append("turn.error",
+                                {"error": f"{type(e).__name__}: {e}"[:500]})
+            except Exception:
+                pass
 
         self._turn_status = None
         turn.duration = time.time() - started
@@ -704,6 +776,10 @@ class Agent:
         except Exception:
             pass
         self.turns.append(turn)
+        # bound memory: a Turn holds full tool outputs, and this list is
+        # only live UI state — the event log is the durable record
+        if len(self.turns) > 500:
+            del self.turns[:-500]
         return turn
 
     def _fit_budget(self) -> int:
@@ -814,24 +890,26 @@ class Agent:
     def _trim_oldest_assistant(self, budget: int) -> None:
         """Shrink the oldest assistant messages (they are the least
         actionable once their tool results are gone) until under budget."""
-        while (estimate_tokens(self.messages, self.model.id) > budget
-               and len(self.messages) > 2):
-            # find the oldest assistant message with real content
+        # Walk EVERY long assistant message, oldest first. (The old code
+        # re-found the same message on every pass and returned after a
+        # single trim, so over-budget context stayed over budget and the
+        # overflow retry loop could never converge.)
+        while estimate_tokens(self.messages, self.model.id) > budget:
             target = None
-            for i, m in enumerate(self.messages):
-                if m.get("role") == "assistant" and m.get("content"):
-                    target = i
+            for m in self.messages:
+                content = m.get("content")
+                if (m.get("role") == "assistant"
+                        and isinstance(content, str)
+                        and len(content) > 400):
+                    target = m
                     break
             if target is None:
                 return
-            content = str(self.messages[target]["content"])
-            if len(content) > 400:
-                self.messages[target]["content"] = (
-                    content[:300]
-                    + f"\n[… trimmed by the kernel — {len(content):,} "
-                      f"chars originally]")
-            else:
-                return
+            content = str(target["content"])
+            target["content"] = (
+                content[:300]
+                + f"\n[… trimmed by the kernel — {len(content):,} "
+                  f"chars originally]")
 
     def _emergency_compact(self) -> None:
         """Hard compaction used when a request was ALREADY rejected for
@@ -1219,6 +1297,26 @@ class Agent:
                      if p.is_file()][:200]
         return paths
 
+    @staticmethod
+    def _check_tool_args(tool: Tool, args: dict,
+                         extra: dict) -> str | None:
+        """Pre-validate keyword binding so a *binding* TypeError is
+        reported as bad arguments, while a TypeError raised *inside*
+        the handler keeps its real identity. (It used to be caught by
+        the same `except TypeError` and misreported as bad arguments —
+        after two occurrences the dead-end ledger recorded a bogus
+        'bad arguments' reason and blocked that call shape for the
+        whole session.)"""
+        try:
+            sig = inspect.signature(tool.handler)
+        except (TypeError, ValueError):
+            return None  # can't introspect — let the call itself decide
+        try:
+            sig.bind(**args, **extra)
+        except TypeError as e:
+            return str(e)
+        return None
+
     def _execute_tool(self, ev: ToolEvent,
                       approve: Callable[[Tool, dict], bool],
                       on_status: Callable[[str], None],
@@ -1305,15 +1403,18 @@ class Agent:
             # Esc/Ctrl+C: let shell tools kill their subprocess promptly
             if ev.name in ("run_command", "live_shell"):
                 extra["should_cancel"] = self._cancel_flag.is_set
-            try:
-                ev.result = tool.handler(**ev.args, **extra)
-                ev.status = "done"
-            except TypeError as e:
-                ev.result = f"ERROR: bad arguments for {ev.name}: {e}"
+            bind_error = self._check_tool_args(tool, ev.args, extra)
+            if bind_error is not None:
+                ev.result = (f"ERROR: bad arguments for {ev.name}: "
+                             f"{bind_error}")
                 ev.status = "error"
-            except Exception as e:  # noqa: BLE001 — tool errors go back to the LLM
-                ev.result = f"ERROR: {type(e).__name__}: {e}"
-                ev.status = "error"
+            else:
+                try:
+                    ev.result = tool.handler(**ev.args, **extra)
+                    ev.status = "done"
+                except Exception as e:  # noqa: BLE001 — tool errors go back to the LLM
+                    ev.result = f"ERROR: {type(e).__name__}: {e}"
+                    ev.status = "error"
         # BUGFIX: handlers are contracted to return str, but a custom or
         # forged tool may return anything — .startswith() below would raise
         # AttributeError and kill the whole turn. Coerce once, here.
@@ -1344,6 +1445,9 @@ class Agent:
             if h:
                 hist = self._file_hashes.setdefault(p, [])
                 hist.append(h)
+                # bound the per-path history — only recent flips matter
+                # for oscillation detection
+                del hist[:-20]
                 if self.loop_det.oscillation(p, hist):
                     self.log.append("loop.alert",
                                     {"kind": "oscillation", "path": p,
@@ -1510,7 +1614,11 @@ class Agent:
             pending.append(ev)
         for ev in reversed(pending):  # restore chronological order
             if ev.type in NOTIFY_EVENTS:
-                self.notifier.emit(ev.type, ev.data)
+                if not self.notifier.emit(ev.type, ev.data):
+                    # sink is down — stop, don't stall the turn 5s per
+                    # event retrying a dead webhook (a failed emit is
+                    # already recorded on the notifier)
+                    break
         self._notify_seq = self.log.head()
 
     # -- enterprise: session resume -------------------------------------------------------
@@ -1651,6 +1759,135 @@ class Agent:
                 "name": {"type": "string"},
                 "path": {"type": "string"}}, "required": ["name"]},
             code_impact)
+
+        self._register_task_tool()
+
+    def _register_task_tool(self) -> None:
+        """Claude Code-style Task tool: spawn parallel subagents.
+
+        The LLM calls this to delegate work to subagents that run
+        concurrently. Each subagent streams progress to the TUI via
+        crew.* events, so the user sees live parallel activity —
+        exactly like Claude Code's Task tool with its subagent list.
+        """
+        crew = self.crew
+
+        def task(description: str, prompt: str, subagent_type: str = "general",
+                 run_in_background: bool = False) -> str:
+            """Spawn a subagent to handle a task.
+
+            Args:
+                description: Short (3-5 word) description of the task.
+                prompt: The full task for the subagent to perform.
+                subagent_type: The type of subagent (general, coder,
+                    researcher, reviewer).
+                run_in_background: If True, don't wait — return immediately
+                    and let it run while you continue.
+            """
+            role_map = {
+                "general": "researcher",
+                "coder": "coder",
+                "researcher": "researcher",
+                "reviewer": "reviewer",
+            }
+            role = role_map.get(subagent_type.lower(), "researcher")
+            try:
+                handle = crew.spawn(task=prompt, role=role,
+                                    name=description[:40])
+            except Exception as e:
+                return f"ERROR: could not spawn subagent: {e}"
+            agent_id = handle.id
+            if run_in_background:
+                return (f"Subagent '{description}' launched in background "
+                        f"(id: {agent_id}). Use TaskOutput to check it.")
+            # Foreground: wait for completion and return the result
+            try:
+                crew.wait([agent_id], timeout=600,
+                          should_cancel=self._cancel_flag.is_set)
+                agent = crew.get(agent_id)
+            except Exception as e:
+                return f"ERROR: subagent failed: {e}"
+            if agent is None:
+                return f"ERROR: subagent {agent_id} not found"
+            summary = agent.summary or "(no summary)"
+            return f"Subagent '{description}' [{agent.state}]:\n{summary}"
+
+        def task_output(task_id: str, timeout: int = 60) -> str:
+            """Check the output of a background subagent.
+
+            Args:
+                task_id: The subagent id returned by Task.
+                timeout: Max seconds to wait for completion.
+            """
+            try:
+                crew.wait([task_id], timeout=timeout,
+                          should_cancel=self._cancel_flag.is_set)
+                agent = crew.get(task_id)
+            except Exception as e:
+                return f"ERROR: {e}"
+            if agent is None:
+                return f"ERROR: subagent {task_id} not found"
+            summary = agent.summary or "(no summary)"
+            return f"Subagent {task_id} [{agent.state}]:\n{summary}"
+
+        def task_list() -> str:
+            """List all running subagents and their status."""
+            agents = crew.list()
+            if not agents:
+                return "No subagents running."
+            lines = []
+            for a in agents:
+                task = (a.task or "")[:60]
+                lines.append(f"- {a.id} [{a.state}] {a.nickname}: {task}")
+            return "\n".join(lines)
+
+        def task_stop(task_id: str) -> str:
+            """Force-stop a running subagent.
+
+            Args:
+                task_id: The subagent id to stop.
+            """
+            try:
+                crew.close(task_id)
+                return f"Subagent {task_id} stopped."
+            except Exception as e:
+                return f"ERROR: {e}"
+
+        self.tools["Task"] = Tool(
+            "Task",
+            "Spawn a subagent to handle a task independently. Use for "
+            "parallel work, codebase exploration, or delegating subtasks. "
+            "Args: description (short), prompt (full task), "
+            "subagent_type (general/coder/researcher/reviewer), "
+            "run_in_background (bool).",
+            {"type": "object", "properties": {
+                "description": {"type": "string"},
+                "prompt": {"type": "string"},
+                "subagent_type": {"type": "string"},
+                "run_in_background": {"type": "boolean"}},
+             "required": ["description", "prompt"]},
+            task)
+        self.tools["TaskOutput"] = Tool(
+            "TaskOutput",
+            "Get the output of a background subagent. "
+            "Args: task_id, timeout (seconds).",
+            {"type": "object", "properties": {
+                "task_id": {"type": "string"},
+                "timeout": {"type": "integer"}},
+             "required": ["task_id"]},
+            task_output)
+        self.tools["TaskList"] = Tool(
+            "TaskList",
+            "List all running subagents and their status. No args.",
+            {"type": "object", "properties": {}},
+            lambda: task_list())
+        self.tools["TaskStop"] = Tool(
+            "TaskStop",
+            "Force-stop a running subagent. Args: task_id.",
+            {"type": "object", "properties": {
+                "task_id": {"type": "string"}},
+             "required": ["task_id"]},
+            task_stop)
 
     def _register_v4_tools(self) -> None:
         """Add the deterministic v4 engineering tools (rung 2-4) to the

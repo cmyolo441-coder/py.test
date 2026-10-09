@@ -207,12 +207,20 @@ class TaskMarket:
                report: dict | None = None) -> Contract:
         """Run (or record) the outcome, update trust and pace priors."""
         if report is None:
-            try:
-                report = self.executor(contract.task, contract.awarded) \
-                    or {}
-            except Exception as e:  # a failing worker never kills the market
-                report = {"status": "error", "summary": str(e),
+            if self.executor is None:
+                # "run (or record) the outcome" — with no executor and
+                # no report there is nothing to run; record the error
+                # instead of surfacing "'NoneType' object is not callable"
+                report = {"status": "error",
+                          "summary": "no executor attached",
                           "tool_calls": 0}
+            else:
+                try:
+                    report = self.executor(contract.task,
+                                           contract.awarded) or {}
+                except Exception as e:  # a failing worker never kills the market
+                    report = {"status": "error", "summary": str(e),
+                              "tool_calls": 0}
         status = str(report.get("status", "error"))
         contract.report = report
         contract.status = status if status in ("done", "blocked",
@@ -236,7 +244,10 @@ class TaskMarket:
             new = 0.5
         # pace recalibration: more tool calls than the prior assumed ->
         # the role is slower than we thought
-        calls = int(report.get("tool_calls", 0) or 0)
+        try:
+            calls = int(report.get("tool_calls", 0) or 0)
+        except (TypeError, ValueError):
+            calls = 0                      # malformed report, not a crash
         if calls > 0 and role:
             p = self.pace.get(role, 1.0)
             self.pace[role] = max(0.5, min(2.0, p * 0.7 + 0.3 * (
@@ -245,7 +256,7 @@ class TaskMarket:
                         {"task": contract.task[:200], "role": role,
                          "status": contract.status,
                          "trust": round(new, 4),
-                         "pace": round(self.pace[role], 4),
+                         "pace": round(self.pace.get(role, 1.0), 4),
                          "summary": str(report.get("summary", ""))[:300]})
         return contract
 

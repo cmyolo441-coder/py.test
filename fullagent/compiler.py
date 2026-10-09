@@ -132,7 +132,11 @@ class IntentCompiler:
     def _parse(self, goal: str) -> tuple[list[dict], list[dict]]:
         """Validate the draft ONCE: keep well-formed items (with their raw
         dependencies preserved under _raw_deps), drop the rest."""
-        raw = self.drafter(goal)
+        drafted = self.drafter(goal)
+        # the drafter is injectable user/LLM code — never trust its shape:
+        # None, a dict, or any other non-list degrades to an empty draft,
+        # never a TypeError traceback mid-turn.
+        raw = drafted if isinstance(drafted, list) else []
         items: list[dict] = []
         dropped: list[dict] = []
         for draft_idx, entry in enumerate(raw[:_MAX_ITEMS]):
@@ -150,7 +154,11 @@ class IntentCompiler:
             raw_paths = entry.get("paths")
             if not isinstance(raw_paths, (list, tuple)):
                 raw_paths = []          # scalar/garbage — drop, never crash
-            paths = [str(p) for p in raw_paths if str(p).strip()]
+            # only real strings survive: str(None) -> "None" would forge a
+            # phantom path that collides in the lock pass and splits waves
+            # for nothing.
+            paths = [p.strip() for p in raw_paths
+                     if isinstance(p, str) and p.strip()]
             raw_deps = entry.get("depends_on")
             if not isinstance(raw_deps, (list, tuple)):
                 raw_deps = []
@@ -230,8 +238,10 @@ class IntentCompiler:
                     break
 
     def _prune_unreachable(self, items: list[dict]) -> list[dict]:
-        """Drop items nothing can reach: dependencies naming no surviving
-        item are removed first (they can never be satisfied)."""
+        """Strip dependencies that name no surviving item — they can never
+        be satisfied, so the dependent item is released to run rather than
+        wedged forever. (Nothing is deleted here: malformed entries were
+        already dropped in _parse, duplicates merged in _dedupe.)"""
         ids = {it["id"] for it in items}
         for it in items:
             it["depends_on"] = [d for d in it["depends_on"] if d in ids]
@@ -262,10 +272,16 @@ class IntentCompiler:
                           for it in remaining])
         return waves
 
-    def _lockpass(self, waves: list[list[dict]]) -> list[list[dict]]:
+    def _lockpass(self, waves: list[list[dict]]
+                  ) -> tuple[list[list[dict]], list[dict]]:
         """I7 write-exclusivity: within a wave, two items with overlapping
         write-path sets cannot coexist — push the later one to the next
-        wave (creating waves as needed)."""
+        wave (creating waves as needed).
+
+        Returns (waves, dropped): items that could not be placed without a
+        path collision inside the wave budget are returned as dropped so
+        the plan reports them — the old code only sealed a log event and
+        left plan.dropped / format() under-reporting the loss."""
         out: list[list[dict]] = [[] for _ in waves]
         locked: list[set[str]] = [set() for _ in waves]
         dropped: list[dict] = []
@@ -308,7 +324,7 @@ class IntentCompiler:
         if dropped:
             for d in dropped:
                 self.log.append("plan.dropped", d, actor="compiler")
-        return [w for w in out if w]
+        return [w for w in out if w], dropped
 
     def compile(self, goal: str) -> CompiledPlan:
         """Full pipeline: draft → validate → dedupe → prune → layer →
@@ -326,7 +342,9 @@ class IntentCompiler:
         items = self._dedupe(items, dropped)
         items = self._prune_unreachable(items)
         waves = self._layers(items)
-        waves = self._lockpass(waves)
+        waves, lock_dropped = self._lockpass(waves)
+        dropped.extend(lock_dropped)     # plan reports every loss, not
+                                         # just parse/dedupe ones
         plan = CompiledPlan(
             goal=goal, waves=waves, dropped=dropped,
             est_cost=sum(_ROLE_COST.get(it["role"], 5)

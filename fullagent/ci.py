@@ -113,6 +113,11 @@ class CIPilot:
         tests = {p.relative_to(self.root).as_posix()
                  for p in self.root.rglob("*.py")
                  if _TEST_NAME.match(p.name)}
+        # prune the text cache: entries for test files that no longer
+        # exist would otherwise pin their contents forever on a
+        # long-running watch
+        for stale in set(self._test_text_cache) - tests:
+            del self._test_text_cache[stale]
         if not tests:
             return []
         picked: set[str] = set()
@@ -183,6 +188,10 @@ class CIPilot:
         """Begin the watch loop in the background."""
         if self._thread is not None:
             return
+        # a previous stop() leaves the flag set — clear it so a
+        # start() after stop() actually restarts the loop instead of
+        # spawning a thread that exits immediately
+        self._stop.clear()
         self._snapshot = self._scan()
         self.log.append("ci.watch",
                         {"root": str(self.root),

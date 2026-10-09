@@ -106,16 +106,24 @@ class ProgramSynthesizer:
             tree = ast.parse(textwrap.dedent(source))
         except SyntaxError as e:
             return "", f"syntax error: {e.msg}"
-        fns = [n for n in ast.walk(tree)
-               if isinstance(n, ast.FunctionDef)]
-        if len(fns) != 1:
-            return "", f"exactly one function expected, found {len(fns)}"
-        fn = fns[0]
-        if fn.name != name:
-            return "", f"function must be named {name!r}, got {fn.name!r}"
         if _FORBIDDEN_NAMES.search(source):
             hit = _FORBIDDEN_NAMES.search(source).group(0)
             return "", f"forbidden name {hit!r} in generated code"
+        # the module must be EXACTLY one function definition — module-level
+        # statements execute at exec() time OUTSIDE the per-example timeout,
+        # so a draft like `while True: pass` at top level would hang the
+        # agent instead of failing as a non-terminating example
+        top_defs = [n for n in tree.body
+                    if isinstance(n, (ast.FunctionDef,
+                                      ast.AsyncFunctionDef))]
+        if len(tree.body) != 1 or len(top_defs) != 1:
+            return "", (f"exactly one function expected, found "
+                        f"{len(top_defs)} top-level definition(s)")
+        fn = top_defs[0]
+        if not isinstance(fn, ast.FunctionDef):
+            return "", "async functions are not supported"
+        if fn.name != name:
+            return "", f"function must be named {name!r}, got {fn.name!r}"
         for node in ast.walk(tree):
             if isinstance(node, _FORBIDDEN_NODES):
                 return "", "imports are not allowed in synthesized tools"
@@ -191,10 +199,14 @@ class ProgramSynthesizer:
         if not spec.examples:
             return SynthResult(False, spec.name,
                                "at least one example is required")
-        source = self.generator(spec)
+        # normalize ONCE: validate_source() parses the dedented text,
+        # so exec() must run the same string — otherwise an indented
+        # draft passes validation and then dies with IndentationError
+        raw = self.generator(spec)
+        source = textwrap.dedent(raw or "")
         self.log.append("synth.tool.drafted",
                         {"name": spec.name,
-                         "chars": len(source or "")}, actor="sovereign")
+                         "chars": len(source)}, actor="sovereign")
         fn_name, problem = self.validate_source(source, spec.name)
         if not fn_name:
             self.log.append("synth.tool.tested",

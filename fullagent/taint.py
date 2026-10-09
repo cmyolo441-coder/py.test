@@ -23,9 +23,11 @@ auditable and replayable. Pure stdlib, deterministic, no model calls.
 from __future__ import annotations
 
 import ast
+import re
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
+from typing import Iterator
 
 from .kernel import EventLog, fold
 from ._foundation import get_logger
@@ -127,7 +129,14 @@ class TaintAnalyzer:
         self.sources = sources
         self.sinks = sinks
         # verdict cache: repeated scans of the same source are O(1)
-        self._cache: dict[int, list[TaintFinding]] = {}
+        self._cache: dict[tuple, list[TaintFinding]] = {}
+
+    @staticmethod
+    def _copy(findings: list[TaintFinding]) -> list[TaintFinding]:
+        # findings are mutable — hand out copies so a caller can never
+        # corrupt the cached verdict
+        return [TaintFinding(f.sink, f.line, f.source, f.source_line,
+                             list(f.path)) for f in findings]
 
     def _is_source_name(self, name: str) -> bool:
         """Does a dotted call name resolve to a declared source?
@@ -153,18 +162,19 @@ class TaintAnalyzer:
         # fast path: obviously-safe input skips the AST parse entirely
         if not _looks_risky(source):
             return []
-        key = hash((source, self.sources, self.sinks))
+        # key by the values, not hash(): two different sources with a
+        # hash collision would otherwise return each other's findings
+        key = (source, self.sources, self.sinks)
         hit = self._cache.get(key)
         if hit is not None:
-            return [TaintFinding(f.sink, f.line, f.source, f.source_line,
-                                 list(f.path)) for f in hit]
+            return self._copy(hit)
         findings = _analyze_impl(source, self.sources, self.sinks,
                                  self._is_source_name, self._is_sink_name)
         # bound the cache: safety verdicts for hot files stay O(1)
         # without unbounded memory growth on huge scans
         if len(self._cache) < 512:
             self._cache[key] = findings
-        return findings
+        return self._copy(findings)
 
 
 def _analyze_impl(source: str, sources: frozenset, sinks: frozenset,
@@ -233,15 +243,23 @@ def _analyze_impl(source: str, sources: frozenset, sinks: frozenset,
                                            [f"{sname}@{sline}",
                                             tgt.id])
             else:
-                # propagate: RHS uses a tainted name
+                # propagate: RHS uses a tainted name -> the target is
+                # tainted too. But a PLAIN re-assignment from a clean
+                # RHS clears the taint — otherwise `x = input();
+                # x = "safe"; eval(x)` would be a false positive.
+                # (AugAssign merges into the old value, so it keeps
+                # whatever taint the target already had.)
                 used = tainted_names(value)
-                if used:
-                    base = tainted[used[0]]
-                    for tgt in targets:
-                        if isinstance(tgt, ast.Name):
-                            tainted[tgt.id] = (
-                                base[0], base[1],
-                                base[2] + [tgt.id])
+                for tgt in targets:
+                    if not isinstance(tgt, ast.Name):
+                        continue
+                    if used:
+                        base = tainted[used[0]]
+                        tainted[tgt.id] = (
+                            base[0], base[1],
+                            base[2] + [tgt.id])
+                    elif not isinstance(node, ast.AugAssign):
+                        tainted.pop(tgt.id, None)
         elif isinstance(node, ast.Call):
             name = _call_name(node)
             if is_sink_name(name):
@@ -254,6 +272,8 @@ def _analyze_impl(source: str, sources: frozenset, sinks: frozenset,
 # ---------------------------------------------------------------------------
 # Complexity
 # ---------------------------------------------------------------------------
+
+_FUNC_LIKE = re.compile(r"\bdef\b|\blambda\b")
 
 _BRANCHES = (ast.If, ast.For, ast.While, ast.ExceptHandler, ast.With,
              ast.BoolOp, ast.IfExp, ast.comprehension, ast.Assert)
@@ -276,8 +296,9 @@ def _own_nodes(fn: ast.AST):
 
 def cyclomatic(source: str) -> list[Complexity]:
     """Cyclomatic complexity per function: 1 + number of branch nodes."""
-    # fast path: no function definitions -> nothing to score, skip parse
-    if "def " not in source and "lambda" not in source:
+    # fast path: no function definitions -> nothing to score, skip parse.
+    # (A word-boundary regex: "def " misses `def\tf():`, which is legal.)
+    if not _FUNC_LIKE.search(source):
         return []
     # cache: complexity is re-queried for the same files across
     # analyze_file / hotspots / reports
@@ -338,27 +359,41 @@ def import_cycles(sources: dict[str, str]) -> list[list[str]]:
     seen_cycles: set[tuple[str, ...]] = set()
     WHITE, GRAY, BLACK = 0, 1, 2
     color = {m: WHITE for m in graph}
-    stack: list[str] = []
 
-    def dfs(u: str) -> None:
-        color[u] = GRAY
-        stack.append(u)
-        for v in sorted(graph.get(u, ())):
-            if color.get(v, BLACK) == GRAY:
-                # found a cycle: slice the stack from v
-                idx = stack.index(v)
-                cyc = tuple(sorted(stack[idx:]))
-                if cyc not in seen_cycles:
-                    seen_cycles.add(cyc)
-                    cycles.append(list(stack[idx:]))
-            elif color.get(v, BLACK) == WHITE:
-                dfs(v)
-        stack.pop()
-        color[u] = BLACK
-
-    for m in sorted(graph):
-        if color[m] == WHITE:
-            dfs(m)
+    # genuinely iterative DFS with an explicit stack — the recursive
+    # version hit RecursionError on deep import graphs, contradicting
+    # this function's contract. Each stack entry is (node,
+    # neighbor-iterator); `path` mirrors the stack for cycle slicing.
+    for root in sorted(graph):
+        if color[root] != WHITE:
+            continue
+        color[root] = GRAY
+        path = [root]
+        stack: list[tuple[str, Iterator[str]]] = [
+            (root, iter(sorted(graph.get(root, ()))))]
+        while stack:
+            node, it = stack[-1]
+            descended = False
+            for nxt in it:
+                c = color.get(nxt, BLACK)
+                if c == GRAY:
+                    # found a cycle: slice the stack from nxt
+                    idx = path.index(nxt)
+                    cyc = tuple(sorted(path[idx:]))
+                    if cyc not in seen_cycles:
+                        seen_cycles.add(cyc)
+                        cycles.append(list(path[idx:]))
+                elif c == WHITE:
+                    color[nxt] = GRAY
+                    path.append(nxt)
+                    stack.append(
+                        (nxt, iter(sorted(graph.get(nxt, ())))))
+                    descended = True
+                    break  # resume this iterator when the child returns
+            if not descended:
+                stack.pop()
+                path.pop()
+                color[node] = BLACK
     return cycles
 
 
@@ -402,7 +437,10 @@ class StaticAnalyzer:
     def analyze_tree(self, root: str, glob_filter: str = "*.py",
                      max_files: int = 100) -> dict:
         rp = Path(root).expanduser()
-        files = sorted(rp.glob(glob_filter))[:max_files] \
+        # rglob, not glob: a tree scan must descend into subdirectories —
+        # glob("*.py") only matched the top level and silently missed
+        # every nested file's findings
+        files = sorted(rp.rglob(glob_filter))[:max_files] \
             if rp.is_dir() else [rp]
         sources: dict[str, str] = {}
         all_taint: list[dict] = []

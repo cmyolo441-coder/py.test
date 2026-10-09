@@ -47,7 +47,7 @@ def _tool_versions() -> dict[str, str]:
             continue
         try:
             out = subprocess.run([exe, "--version"], capture_output=True,
-                                 text=True, timeout=5)
+                                 text=True, timeout=5, errors="replace")
             first = (out.stdout or out.stderr or "").splitlines()
             versions[tool] = first[0][:80] if first else "?"
         except (OSError, subprocess.TimeoutExpired):
@@ -80,7 +80,15 @@ class Forge:
 
     def __init__(self, log: EventLog, cwd: str | Path | None = None) -> None:
         self.log = log
-        self.cwd = Path(cwd or os.getcwd()).resolve()
+        if cwd is None:
+            try:
+                cwd = os.getcwd()
+            except OSError:
+                # the process's cwd was deleted out from under it
+                # (unusual env) — fall back to home instead of crashing
+                # probe() at startup
+                cwd = os.path.expanduser("~")
+        self.cwd = Path(cwd).resolve()
 
     def digest(self) -> dict:
         """Compute the EnvironmentDigest (§18.1)."""
@@ -97,7 +105,11 @@ class Forge:
             "cwd": str(self.cwd),
             "lockfile_hash": _lockfile_hash(self.cwd),
             "env": {k: os.environ.get(k, "") for k in env_allowlist},
-            "tools": _tool_versions(),
+            # copy: _tool_versions() is a process-wide lru_cache and
+            # EventLog.append stores data by reference — handing out the
+            # cached dict would let any later mutation of the sealed
+            # event poison every future digest
+            "tools": dict(_tool_versions()),
             "case_sensitive": os.name != "nt",
         }
         payload = json.dumps(record, sort_keys=True, ensure_ascii=False,
@@ -123,8 +135,20 @@ class Forge:
         prev, cur = digests[-2], digests[-1]
         if prev.get("digest") == cur.get("digest"):
             return None
-        changed = {k for k in ("os", "python", "lockfile_hash", "cwd")
+        # every digest input that can change the hash must be able to
+        # show up here — otherwise a real change (locale, LANG, python
+        # implementation, ...) yields a delta that claims NOTHING
+        # changed while the digests differ
+        changed = {k for k in ("os", "arch", "kernel", "python",
+                               "implementation", "locale", "encoding",
+                               "lockfile_hash", "cwd")
                    if prev.get(k) != cur.get(k)}
+        env_changed = {k for k in set(prev.get("env", {})) |
+                       set(cur.get("env", {}))
+                       if prev.get("env", {}).get(k) !=
+                       cur.get("env", {}).get(k)}
+        if env_changed:
+            changed.add("env:" + ",".join(sorted(env_changed)))
         tools_changed = {t for t in set(prev.get("tools", {})) |
                          set(cur.get("tools", {}))
                          if prev.get("tools", {}).get(t) !=

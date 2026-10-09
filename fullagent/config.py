@@ -84,13 +84,25 @@ class Model:
 
 
 def _provider_api_key(provider: str) -> str:
-    key = os.environ.get(f"{provider.upper()}_API_KEY")
-    if key is not None:
-        return key.strip()
+    # Priority: env var > key file > embedded fallback. An empty or
+    # whitespace-only value does NOT count as "present" — it falls
+    # through to the next source instead of shadowing the embedded
+    # zero-config key with a dead empty string (e.g. KIOS_API_KEY=""
+    # left in a shell or docker env would otherwise silently break
+    # authentication).
+    key = os.environ.get(f"{provider.upper()}_API_KEY", "").strip()
+    if key:
+        return key
     try:
-        return (APP_DIR / f"{provider}_api_key").read_text(encoding="utf-8").strip()
-    except OSError:
-        pass
+        key = (APP_DIR / f"{provider}_api_key").read_text(
+            encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        # OSError: missing/unreadable file. UnicodeDecodeError: file
+        # has non-UTF-8 bytes — must not propagate here, this runs at
+        # module import and would kill the whole app at startup.
+        key = ""
+    if key:
+        return key
     # Embedded fallback: zero-config — the key ships in the build so the
     # user never has to configure anything. Env var / key file above
     # still take precedence when present.
@@ -262,4 +274,34 @@ def ensure_dirs() -> None:
             d.mkdir(parents=True, exist_ok=True)
         except OSError:
             pass
+
+
+def _self_check() -> None:
+    """Verify config invariants. Run with: python3 -m fullagent.config"""
+    assert PROVIDERS, "no providers defined"
+    for key, p in PROVIDERS.items():
+        assert key == p.key, f"provider dict key {key!r} != Provider.key {p.key!r}"
+        assert p.base_url.startswith(("https://", "http://")), \
+            f"provider {key!r} has bad base_url {p.base_url!r}"
+    seen: set[str] = set()
+    for m in MODELS:
+        assert m.provider in PROVIDERS, \
+            f"model {m.id!r} references unknown provider {m.provider!r}"
+        assert m.id not in seen, f"duplicate model id {m.id!r}"
+        seen.add(m.id)
+        assert m.context_window > 0, f"model {m.id!r} has bad context_window"
+    assert model_by_id(DEFAULT_MODEL_ID) is not None, \
+        f"DEFAULT_MODEL_ID {DEFAULT_MODEL_ID!r} not in MODELS"
+    assert effort_by_key(DEFAULT_EFFORT) is not None, \
+        f"DEFAULT_EFFORT {DEFAULT_EFFORT!r} not in EFFORTS"
+    # round-trip: save/load must preserve values and heal bad input
+    cfg = Config.load()
+    assert model_by_id(cfg.model_id) is not None
+    assert effort_by_key(cfg.effort) is not None
+    print(f"OK: {len(PROVIDERS)} providers, {len(MODELS)} models, "
+          f"default={DEFAULT_MODEL_ID!r}/{DEFAULT_EFFORT!r}")
+
+
+if __name__ == "__main__":
+    _self_check()
 

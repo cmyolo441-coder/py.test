@@ -102,6 +102,16 @@ class CrewAgent:
     # would need the mutex on the hot path — an Event is lock-free.
     stop_event: threading.Event = field(default_factory=threading.Event,
                                         repr=False, compare=False)
+    # Iteration generation. Every submit (spawn, follow-up re-submit,
+    # queued-follow-up re-submit) bumps this under the agent mutex, and
+    # the pool entry point carries the generation it was submitted with.
+    # A loop iteration that lost a race — e.g. send() re-submitted a new
+    # iteration while the old one's landing was still queued on the
+    # mutex — sees a stale generation and must NOT finalise: finalising
+    # would clobber the new iteration's "running" back to "done", emit a
+    # duplicate crew.done, and leave the follow-up running invisibly in
+    # the background while the UI shows "done".
+    generation: int = 0
     # Per-agent mutex. Pool threads run agents concurrently, while the
     # *sovereign* thread (TUI, workflow executor, council) can call
     # `crew.send`, `crew.close`, `crew.resume` at any moment. Without
@@ -164,7 +174,12 @@ class Crew:
         self._chat = chat or chat_with_retry
         self._agents: dict[str, CrewAgent] = {}
         self._order: list[str] = []
-        self._lock = threading.Lock()       # protects roster + _futures
+        self._lock = threading.RLock()  # protects roster + _futures.
+        # Re-entrant on purpose: spawn_parallel() holds it across its
+        # atomic check-and-spawn loop while spawn()/_submit() acquire it
+        # again on the same thread. No path ever takes agent.mutex and
+        # then self._lock while holding the mutex, so _lock -> mutex
+        # nesting stays deadlock-free.
         self._names = itertools.cycle(_CALLSIGNS)
         self._counter = 0
         # role tool whitelists carved from the main registry (read-only
@@ -187,26 +202,43 @@ class Crew:
     # -- internal ---------------------------------------------------------------
 
     def _submit(self, agent: CrewAgent, read_only: bool,
-                max_steps: int) -> None:
-        """Submit one loop iteration to the pool (thread-safe)."""
+                max_steps: int, gen: int) -> bool:
+        """Submit one loop iteration to the pool (thread-safe).
+
+        Returns False when the crew is shut down — the caller must then
+        settle the agent itself; it must never be left "running" with no
+        future behind it (wait() would hang to timeout on a ghost)."""
         with self._lock:
             if self._shutdown:
-                return
+                return False
             self._futures[agent.id] = self._pool.submit(
-                self._execute, agent, read_only, max_steps)
+                self._execute, agent, read_only, max_steps, gen)
+            return True
 
     def _execute(self, agent: CrewAgent, read_only: bool,
-                 max_steps: int) -> None:
+                 max_steps: int, gen: int) -> None:
         """Pool entry point. Never raises: a crash here must not poison
-        the pool or the other agents."""
+        the pool or the other agents — it lands as an error report."""
         try:
-            if agent.state == "closed" or agent.stop_event.is_set():
-                # retired before its thread started — never run it
-                return
-            self._run_loop(agent, read_only, max_steps)
-        except Exception as e:  # noqa: BLE001 — absolute last resort
+            with agent.mutex:
+                if gen != agent.generation:
+                    # Superseded before its thread even started (a newer
+                    # iteration was submitted) — never run it.
+                    return
+                if agent.state == "closed" or agent.stop_event.is_set():
+                    # retired before its thread started — never run it
+                    return
+            self._run_loop(agent, read_only, max_steps, gen)
+        except BaseException as e:  # noqa: BLE001 — absolute last resort
+            # BaseException, not just Exception: anything escaping the
+            # loop (KeyboardInterrupt, SystemExit, ...) would otherwise
+            # sit unretrieved on the Future and the subagent would die
+            # invisibly. Record it instead.
             try:
                 with agent.mutex:
+                    if gen != agent.generation:
+                        # a newer iteration owns the state now
+                        return
                     agent.state = "error"
                     agent.error = f"{type(e).__name__}: {e}"
                     agent.finished_at = time.time()
@@ -265,6 +297,8 @@ class Crew:
                                                          self.max_agents))
         opening.append({"role": "user", "content": user})
         with self._lock:
+            if self._shutdown:
+                raise CrewError("crew is shut down — cannot spawn a subagent")
             if self._live_count() >= self.max_agents:
                 raise CrewError(
                     f"crew is at capacity ({self.max_agents} agents "
@@ -278,6 +312,7 @@ class Crew:
             agent = CrewAgent(id=agent_id, nickname=nickname, role=role,
                               task=task, read_only=bool(read_only))
             agent.messages = opening
+            agent.generation = 1  # first loop iteration
             override = model_by_id(str(model_id or "")) if model_id else None
             if override is not None:
                 agent.model_id = override.id
@@ -290,7 +325,17 @@ class Crew:
                          "read_only": bool(read_only),
                          "model": agent.model_id or self.model.id},
                         actor="sovereign")
-        self._submit(agent, read_only, MAX_WORKER_STEPS)
+        if not self._submit(agent, read_only, MAX_WORKER_STEPS,
+                            agent.generation):
+            # shutdown() raced us between registration and submit — settle
+            # the agent instead of leaving a "running" ghost with no future
+            with agent.mutex:
+                agent.state = "error"
+                agent.error = "crew shut down before the subagent started"
+                agent.finished_at = time.time()
+            self.log.append("crew.done", agent.to_dict(),
+                            actor="sovereign")
+            raise CrewError("crew is shut down — cannot spawn a subagent")
         return agent
 
     def spawn_parallel(self, tasks: list[dict | str],
@@ -313,24 +358,41 @@ class Crew:
             return []
         if role not in ROLES:
             role = DEFAULT_ROLE
-        with self._lock:
-            if self._live_count() + len(items) > self.max_agents:
-                raise CrewError(
-                    f"spawn_parallel of {len(items)} would exceed crew "
-                    f"capacity ({self.max_agents} running) — "
-                    f"{self._live_count()} already running")
-        agents = []
+        # Normalise + validate BEFORE touching the roster: a bad item must
+        # fail the whole batch, never leave a partially-spawned one behind.
+        prepared: list[dict] = []
         for item in items:
             if isinstance(item, str):
                 item = {"task": item}
-            agents.append(self.spawn(
+            if not isinstance(item, dict):
+                raise CrewError(
+                    "spawn_parallel items must be task strings or dicts, "
+                    f"got {type(item).__name__} — nothing spawned")
+            if not str(item.get("task", "")).strip():
+                raise CrewError(
+                    "spawn_parallel item is missing its task — "
+                    "nothing spawned")
+            prepared.append(item)
+        # One lock hold across the capacity check AND every spawn: the
+        # batch is atomic — either all items spawn or none does. A plain
+        # check-then-loop would let a concurrent spawn() slip in between
+        # and turn a later item's CrewError into a partial batch.
+        # (self._lock is an RLock, so spawn()'s own acquisition on this
+        # thread re-enters safely.)
+        with self._lock:
+            if self._live_count() + len(prepared) > self.max_agents:
+                raise CrewError(
+                    f"spawn_parallel of {len(prepared)} would exceed crew "
+                    f"capacity ({self.max_agents} running) — "
+                    f"{self._live_count()} already running")
+            return [self.spawn(
                 task=item.get("task", ""),
                 role=item.get("role", role),
                 name=item.get("name", ""),
                 context=item.get("context", context),
                 read_only=item.get("read_only", read_only),
-                model_id=item.get("model_id", model_id)))
-        return agents
+                model_id=item.get("model_id", model_id))
+                for item in prepared]
 
     def send(self, agent_id: str, message: str,
              interrupt: bool = False) -> CrewAgent:
@@ -340,9 +402,8 @@ class Crew:
         message appended (full history preserved) — the iteration is
         submitted to the pool and runs concurrently. A running agent
         gets the message queued — it is delivered the moment the
-        current loop finishes (interrupt=True clears the agent's
-        pending summary so the follow-up takes priority in the next
-        reply)."""
+        current loop finishes (interrupt=True jumps the queue: it is
+        delivered before older pending follow-ups)."""
         agent = self._require(agent_id)
         message = str(message or "").strip()
         if not message:
@@ -350,6 +411,9 @@ class Crew:
         # Decide under the agent mutex; submit AFTER releasing it, so
         # lock ordering stays flat (never mutex -> pool-lock nesting).
         resubmit = False
+        gen = 0
+        prev_state = ""
+        prev_error = ""
         with agent.mutex:
             if agent.state == "closed":
                 raise CrewError(
@@ -359,8 +423,15 @@ class Crew:
                              "interrupt": bool(interrupt)},
                             actor="sovereign")
             if agent.state == "running":
-                agent.pending_messages.append(message)
+                if interrupt:
+                    # priority: delivered first when the current loop
+                    # lands, instead of queueing behind older follow-ups
+                    agent.pending_messages.insert(0, message)
+                else:
+                    agent.pending_messages.append(message)
             else:
+                prev_state = agent.state
+                prev_error = agent.error
                 if interrupt:
                     agent.summary = ""
                 agent.messages.append({"role": "user",
@@ -368,11 +439,21 @@ class Crew:
                 agent.state = "running"
                 agent.error = ""
                 agent.stop_event.clear()
+                agent.generation += 1
+                gen = agent.generation
                 resubmit = True
         if resubmit:
             # keep the spawn-time tool restriction — a read-only subagent
             # must never gain write tools through a follow-up
-            self._submit(agent, agent.read_only, MAX_SEND_STEPS)
+            if not self._submit(agent, agent.read_only, MAX_SEND_STEPS, gen):
+                # shutdown() raced the re-submit — roll back to the settled
+                # state instead of stranding the agent "running" with no
+                # future (the FOLLOW-UP stays in history as a record)
+                with agent.mutex:
+                    agent.state = prev_state
+                    agent.error = prev_error
+                raise CrewError(
+                    "crew is shut down — follow-up not sent")
         return agent
 
     def wait(self, ids: list[str] | None = None,
@@ -444,17 +525,23 @@ class Crew:
         with self._lock:
             agents = list(self._agents.values())
             futs = dict(self._futures)
+        stopped = 0
         for agent in agents:
             with agent.mutex:
                 if agent.state == "running":
                     agent.state = "closed"
                     agent.error = "force-stopped by user"
                     agent.stop_event.set()
+                    agent.finished_at = time.time()
+                    stopped += 1
             fut = futs.get(agent.id)
             if fut is not None and not fut.done():
                 fut.cancel()  # no-op if already running; harmless
-        self.log.append("crew.force_stop", {"reason": "user_interrupt"},
-                        actor="sovereign")
+        if stopped:
+            self.log.append("crew.force_stop",
+                            {"reason": "user_interrupt",
+                             "stopped": stopped},
+                            actor="sovereign")
 
     def close(self, agent_id: str) -> CrewAgent:
         """Retire a subagent. A running agent is aborted promptly (its
@@ -468,6 +555,7 @@ class Crew:
             agent.state = "closed"
             if prev == "running":
                 agent.stop_event.set()
+                agent.finished_at = time.time()
         with self._lock:
             fut = self._futures.get(agent_id)
         if fut is not None and not fut.done():
@@ -567,7 +655,7 @@ class Crew:
     # -- the worker loop ----------------------------------------------------------
 
     def _run_loop(self, agent: CrewAgent, read_only: bool,
-                  max_steps: int) -> None:
+                  max_steps: int, gen: int) -> None:
         """One subagent's bounded tool loop. Never raises: every failure
         lands in the agent's report and is sealed as crew.done. Runs on
         a pool thread, concurrently with the other agents."""
@@ -653,9 +741,12 @@ class Crew:
                                      "tools": tool_names[:6]},
                                     actor=f"crew:{agent.id}")
             final = (result.content if result is not None else "") or ""
-        except Exception as e:  # noqa: BLE001 — a failing agent never kills the crew
+        except BaseException as e:  # noqa: BLE001 — a failing agent never kills the crew
+            # BaseException, not just Exception: anything escaping the loop
+            # must land as a visible error report, never an unretrieved
+            # Future exception with the subagent dying invisibly.
             final = None
-            loop_error: Exception | None = e
+            loop_error: BaseException | None = e
         else:
             loop_error = None
         # The whole landing sequence runs under the agent mutex: a
@@ -665,10 +756,24 @@ class Crew:
         # never delivered. The re-submit (if any) happens AFTER the
         # mutex is released, keeping lock ordering flat.
         resubmit = False
+        submit_gen = 0
         with agent.mutex:
+            if gen != agent.generation:
+                # Superseded: send() submitted a newer iteration while
+                # this landing was queued on the mutex. That iteration
+                # owns the state now — finalising here would clobber its
+                # "running" back to "done" and seal a duplicate crew.done
+                # while the follow-up still runs invisibly. Our loop's
+                # messages stay in history; only the verdict is skipped.
+                return
             if agent.state == "closed":
                 # retired mid-loop — keep the closed state, never resurrect
                 agent.pending_messages.clear()
+            elif agent.state != "running":
+                # Settled by a racing sovereign op (e.g. close() followed
+                # by resume()) after our loop bailed — don't clobber its
+                # verdict with a second crew.done.
+                pass
             else:
                 if loop_error is not None:
                     agent.state = "error"
@@ -691,13 +796,24 @@ class Crew:
                     agent.state = "running"
                     agent.error = ""
                     agent.finished_at = 0.0
+                    agent.generation += 1
+                    submit_gen = agent.generation
                     resubmit = True
                 else:
                     agent.pending_messages.clear()
                     self.log.append("crew.done", agent.to_dict(),
                                     actor=f"crew:{agent.id}")
         if resubmit:
-            self._submit(agent, read_only, MAX_SEND_STEPS)
+            if not self._submit(agent, read_only, MAX_SEND_STEPS,
+                                submit_gen):
+                # shutdown() raced the re-submit — settle as an error
+                # instead of stranding the agent "running" with no future
+                with agent.mutex:
+                    agent.state = "error"
+                    agent.error = "crew shut down with a follow-up pending"
+                    agent.finished_at = time.time()
+                self.log.append("crew.done", agent.to_dict(),
+                                actor=f"crew:{agent.id}")
 
 
 # ---------------------------------------------------------------------------

@@ -214,8 +214,8 @@ class CausalEngine:
         usable = 0
         for ckey, arms in by_confounder.items():
             on, off = arms.get(1, []), arms.get(0, [])
-            if len(on) < 2 or len(off) < 2:
-                continue                  # an arm too thin to compare
+            if len(on) < _MIN_STRATUM or len(off) < _MIN_STRATUM:
+                continue                  # an arm too thin to trust
             n_stratum = len(on) + len(off)
             diff = (sum(o.outcome for o in on) / len(on)
                     - sum(o.outcome for o in off) / len(off))

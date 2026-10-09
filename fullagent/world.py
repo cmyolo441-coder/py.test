@@ -28,9 +28,11 @@ turn history alone.
 
 from __future__ import annotations
 
+import os
 import re
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .kernel import EventLog
 from ._foundation import get_logger
@@ -83,7 +85,9 @@ class WorldModel:
     def __init__(self, log: EventLog, root=None) -> None:
         """root: optional project path for the static import scan."""
         self.log = log
-        self.root = root
+        # accept str or Path — the scan only uses Path operations, and a
+        # bare str root used to die with AttributeError on first access
+        self.root = Path(root) if root is not None else None
         self._edges: dict[tuple[str, str], Edge] = {}
         # adjacency cache: src -> [(dst, edge)]. predict_impact() used to
         # scan ALL edges for every BFS node (O(V*E)) and pop(0) from a
@@ -102,6 +106,7 @@ class WorldModel:
     @edges.setter
     def edges(self, value: dict[tuple[str, str], Edge]) -> None:
         self._edges = value
+        self._adj = None  # replaced wholesale — adjacency is stale
 
     def _ensure_scanned(self) -> None:
         if not self._scanned and self.root is not None:
@@ -113,15 +118,26 @@ class WorldModel:
     def _scan_imports(self) -> None:
         """Static import edges: file A imports module B (same project).
         Pure regex — fast, language-tolerant, no execution."""
+        files: list[Path] = []
         try:
-            files = [p for p in self.root.rglob("*.py")
-                     if ".git" not in p.parts]
+            # os.walk (unlike rglob) skips unreadable directories and
+            # keeps going instead of aborting the whole scan mid-tree:
+            # one bad permission/mount must not nuke the world model.
+            # followlinks=False (default) — no symlink-loop risk.
+            for dirpath, dirnames, filenames in os.walk(self.root):
+                dirnames[:] = [d for d in dirnames if d != ".git"]
+                files.extend(Path(dirpath, fn) for fn in filenames
+                             if fn.endswith(".py"))
         except OSError:
             return
+        files.sort()  # deterministic: rglob/scandir order is OS-dependent
         modules = {}
         for p in files:
             try:
-                modules[p.stem] = p.relative_to(self.root).as_posix()
+                # first (sorted) path wins on stem collisions — stable
+                # across machines instead of whichever rglob yielded last
+                modules.setdefault(p.stem,
+                                   p.relative_to(self.root).as_posix())
             except ValueError:
                 continue
         for f in files:
@@ -151,9 +167,7 @@ class WorldModel:
     def _adjacency(self) -> dict[str, list[tuple[str, Edge]]]:
         # Lazy scan: the filesystem walk happens on first actual use,
         # not at construction (saves ~400ms on startup).
-        if not self._scanned and self.root is not None:
-            self._scan_imports()
-            self._scanned = True
+        self._ensure_scanned()
         if self._adj is None:
             adj: dict[str, list[tuple[str, Edge]]] = {}
             for (src, dst), edge in self._edges.items():

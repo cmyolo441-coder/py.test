@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import ast
 import sys
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -90,6 +91,12 @@ class CoverageEngine:
         """Run `subject()` under a trace that records lines executed in
         `target_path`. Returns the CoverageResult. The previous trace
         function is always restored, even if the subject raises."""
+        # fail fast on a caller bug — a non-callable subject would raise
+        # TypeError inside the try below and be swallowed as 0% coverage
+        if not callable(subject):
+            raise TypeError(
+                f"subject must be callable, got "
+                f"{type(subject).__name__}")
         tp = Path(target_path).expanduser().resolve()
         result = CoverageResult(path=str(tp))
         if not tp.is_file():
@@ -124,9 +131,14 @@ class CoverageEngine:
             return tracer
 
         old_trace = sys.gettrace()
+        old_thread_trace = threading.gettrace()
         self.log.append("coverage.run", {"path": str(tp)}, actor="tester")
         try:
             sys.settrace(tracer)
+            # sys.settrace only covers the current thread — without this,
+            # lines executed by threads the subject spawns are silently
+            # missed and coverage undercounts
+            threading.settrace(tracer)
             try:
                 subject()
             except Exception:
@@ -134,6 +146,7 @@ class CoverageEngine:
                 pass
         finally:
             sys.settrace(old_trace)
+            threading.settrace(old_thread_trace)
 
         executed = {ln for ln in hit if ln in exec_lines}
         result.hit = len(executed)

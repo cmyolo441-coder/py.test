@@ -97,6 +97,9 @@ class Hippocampus:
         (a signature string, or a dict with signature/reason/scope/confidence)."""
         # validate first: no partial writes
         validated_dead_ends = self._validate_dead_ends(list(dead_ends or []))
+        for de in validated_dead_ends:
+            if not de["reason"]:
+                de["reason"] = f"failed while pursuing: {goal}"
         record = {
             "goal": goal,
             "approach": approach,
@@ -105,14 +108,17 @@ class Hippocampus:
             "artifacts": list(artifacts or []),
             "facts": [str(f) for f in (facts or [])],
             "lesson": lesson,
-            "dead_ends": list(dead_ends or []),
+            # the NORMALIZED entries — not the caller's raw input, so the
+            # record always holds dicts (never bare signature strings)
+            # and always agrees with the sealed deadend.recorded events.
+            # Reasons are filled BEFORE the episode is appended so the
+            # in-memory event and the bytes on disk never diverge.
+            "dead_ends": validated_dead_ends,
             "cost_usd": float(cost_usd),
             "steps": int(steps),
         }
         self.log.append("memory.episode", record)
         for de in validated_dead_ends:
-            if not de["reason"]:
-                de["reason"] = f"failed while pursuing: {goal}"
             self.log.append("deadend.recorded", de)
         return record
 
@@ -145,6 +151,15 @@ class Hippocampus:
     def is_dead_end(self, signature: str) -> bool:
         """Deterministic check (no LLM): is this signature in the ledger?
         Fold the log and scan State.dead_ends."""
+        signature = (signature or "").strip()
+        if not signature:
+            # an empty query must never match: a hand-edited or older log
+            # could carry an empty-signature entry, and matching it would
+            # freeze the agent into thinking "everything has failed" —
+            # the same reason record_dead_end refuses to seal one.
+            # (Stored signatures are stripped at write time, so the
+            # stripped query is the faithful comparison.)
+            return False
         st = fold(self.log)
         return any(d.get("signature") == signature for d in st.dead_ends)
 

@@ -18,6 +18,7 @@ Design (pure Python, stdlib only — no numpy, no model calls):
 
 from __future__ import annotations
 
+import copy
 import functools
 import hashlib
 import math
@@ -108,6 +109,10 @@ class SemanticMemory:
         self._items: list[MemoryItem] = []
         self._indexed = 0
         self._indexed_head = -1   # log head at last reindex
+        # event id of the branch head at the last reindex — the incremental
+        # _items/_seen state is only valid while the chain still contains
+        # this head (see reindex())
+        self._indexed_head_id: str | None = None
         # (kind, text) of every item already embedded — the incremental
         # index only embeds NEW records instead of re-hashing the corpus
         self._seen: set[tuple[str, str]] = set()
@@ -145,6 +150,25 @@ class SemanticMemory:
         at each other forever (unbounded log growth from reads).
         Returns total item count."""
         st = fold(self.log)
+        # Chain-divergence check: _items/_seen are incremental, so they
+        # are only valid while the branch chain still contains the head we
+        # last indexed. A rewind (or checking out a forked branch) drops
+        # events off the chain — without a rebuild, recall would keep
+        # returning records that no longer exist in the log (stale cache).
+        # Parent links are immutable, so if the old head id IS on the
+        # current chain the prefix is intact and incremental collection of
+        # the delta is still correct.
+        chain = self.log.events()
+        head_id = chain[-1].id if chain else None
+        if (self._indexed_head_id is not None
+                and head_id != self._indexed_head_id
+                and not any(e.id == self._indexed_head_id
+                            for e in chain)):
+            _log.info("semantic: chain diverged since last index "
+                      "(rewind/checkout) — rebuilding from the fold")
+            self._items.clear()
+            self._seen.clear()
+        self._indexed_head_id = head_id
         new = self._collect_new(st)
         if new:
             self._items.extend(new)
@@ -183,8 +207,13 @@ class SemanticMemory:
         for sim, it in scored[:k]:
             if sim < min_similarity:
                 break
+            # the payload aliases the kernel's SHARED cached fold state,
+            # which is contractually read-only — hand out a copy so a
+            # caller can never mutate the index (or the fold cache) through
+            # a recall hit
             out.append({"kind": it.kind, "similarity": round(sim, 3),
-                        "text": it.text[:300], "payload": it.payload})
+                        "text": it.text[:300],
+                        "payload": copy.deepcopy(it.payload)})
         return out
 
     def recall_block(self, query: str, k: int = 3) -> str:
@@ -269,5 +298,11 @@ if __name__ == "__main__":
 
         s = sem.stats()
         assert s["items"] == 3 and s["kinds"]["episode"] == 2
+
+        # rewind resilience: records that fall off the chain must leave
+        # the index — recall after a rewind returns nothing stale
+        log.rewind(-1)
+        assert sem.recall("csv parser crash", k=2) == []
+        assert sem.stats()["items"] == 0
 
     print("SEMANTIC SELF-TEST PASS")

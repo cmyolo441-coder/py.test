@@ -121,11 +121,13 @@ class RouteChoice:
     reason: str
     escalated: bool = False
     est_cost: float = 0.0
+    est_tokens: int = 1500  # token estimate the cost was computed from
 
     def to_dict(self) -> dict:
         return {"model": self.model_id, "difficulty": round(self.difficulty, 3),
                 "reason": self.reason, "escalated": self.escalated,
-                "est_cost": round(self.est_cost, 6)}
+                "est_cost": round(self.est_cost, 6),
+                "est_tokens": self.est_tokens}
 
 
 class Router:
@@ -181,7 +183,8 @@ class Router:
                 choice = RouteChoice(prefer, diff.score,
                                      f"pinned '{prefer}' is capable",
                                      escalated=False,
-                                     est_cost=self._cost(prefer, est_tokens))
+                                     est_cost=self._cost(prefer, est_tokens),
+                                     est_tokens=est_tokens)
                 self._seal(task, diff, choice)
                 return choice
             # pinned model can't do it — escalate past it
@@ -202,7 +205,8 @@ class Router:
                 choice = RouteChoice(self._strongest, diff.score,
                                      "no models in routing table — "
                                      f"defaulting to '{self._strongest}'",
-                                     escalated=True, est_cost=0.0)
+                                     escalated=True, est_cost=0.0,
+                                     est_tokens=est_tokens)
                 self._seal(task, diff, choice)
                 return choice
             candidates = list(self.table)
@@ -221,7 +225,8 @@ class Router:
                   f"'{best}' (cap {spec['capability']:.2f})")
         choice = RouteChoice(best, diff.score, reason,
                              escalated=escalated or best == self._strongest,
-                             est_cost=self._cost(best, est_tokens))
+                             est_cost=self._cost(best, est_tokens),
+                             est_tokens=est_tokens)
         self._seal(task, diff, choice)
         return choice
 
@@ -244,7 +249,13 @@ class Router:
             return {"routed": 0, "est_spent": 0.0, "strongest_cost": 0.0,
                     "saved": 0.0}
         spent = sum(float(d.get("est_cost", 0.0)) for d in decs)
-        strongest = sum(self._cost(self._strongest, 1500) for _ in decs)
+        # strongest_cost must use each decision's OWN token estimate —
+        # the old hardcoded 1500 made `saved` wrong whenever choose()
+        # was called with a non-default est_tokens (1500 fallback keeps
+        # pre-fix events comparable).
+        strongest = sum(self._cost(self._strongest,
+                                   int(d.get("est_tokens", 1500)))
+                        for d in decs)
         return {"routed": len(decs), "est_spent": round(spent, 6),
                 "strongest_cost": round(strongest, 6),
                 "saved": round(max(0.0, strongest - spent), 6)}

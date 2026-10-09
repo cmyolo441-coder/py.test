@@ -82,23 +82,37 @@ class PromptVault:
                          "chars": len(text)},
                         actor="kernel")
 
+    def _upstream_text(self, name: str) -> str | None:
+        """The live source of truth for a sealed name. worker:{role}
+        prompts are GENERATED from systemprompt.ROLE_BRIEFS (not read
+        from the registry), so their upstream is the regenerated text;
+        everything else tracks the PROMPTS registry. resolve() re-seals
+        against this so the first-seal and re-seal paths can never
+        disagree on what a prompt's text is."""
+        if name.startswith("worker:"):
+            role = name[len("worker:"):]
+            if role in systemprompt.ROLE_BRIEFS:
+                return systemprompt.worker(role, MAX_WORKERS)
+        return systemprompt.PROMPTS.get(name)
+
     def get(self, name: str) -> str | None:
         return self._sealed.get(name)
 
     def resolve(self, name: str) -> str:
         """Sealed text for `name`, sealing on demand from systemprompt.py.
 
-        Already-sealed prompts (main, master, worker:* — sealed at
-        vault init) are served straight from the cache. Prompts registered
-        at runtime (systemprompt.register) are sealed the first time they
-        are requested — the vault stays the only source a model ever reads
-        a prompt from, without needing a restart. If a registered prompt's
-        text changed since it was sealed, it is re-sealed so the vault
-        never serves a stale copy. A name that is neither sealed nor in
-        the registry cannot be sealed and raises."""
+        Already-sealed prompts are served straight from the cache. Worker
+        role prompts (worker:{role}, generated from ROLE_BRIEFS) and
+        prompts registered at runtime (systemprompt.register) are sealed
+        the first time they are requested — the vault stays the only
+        source a model ever reads a prompt from, without needing a
+        restart. If a prompt's live text changed since it was sealed, it
+        is re-sealed so the vault never serves a stale copy. A name that
+        is neither sealed nor resolvable cannot be sealed and raises."""
         if name in self._sealed:
-            # re-sync with the registry in case the text changed upstream
-            text = systemprompt.PROMPTS.get(name)
+            # re-sync with the live source in case the text changed
+            # upstream — the vault never serves a stale copy
+            text = self._upstream_text(name)
             if text is not None and text != self._sealed[name]:
                 self._seal(name, text)
             return self._sealed[name]
@@ -433,6 +447,39 @@ if __name__ == "__main__":
             # worker prompts seal on demand (not at init for speed)
             assert mm.vault.resolve("worker:coder")
             assert "worker:coder" in mm.vault.names()
+            # every role team.py can spawn resolves — no KeyError — and
+            # carries its OWN brief (never another role's via fallback)
+            from .team import ROLES as _TEAM_ROLES
+            for _role in _TEAM_ROLES:
+                _text = mm.vault.resolve(f"worker:{_role}")
+                assert _role in systemprompt.ROLE_BRIEFS
+                assert systemprompt.ROLE_BRIEFS[_role] in _text
+                assert mm.vault.fp(f"worker:{_role}") == fingerprint(_text)
+            # fingerprints are stable across resolves
+            assert mm.vault.fp("worker:coder") == \
+                fingerprint(systemprompt.worker("coder", MAX_WORKERS))
+            # verify() works for on-demand sealed prompts
+            assert mm.vault.verify(
+                "worker:coder", systemprompt.worker("coder", MAX_WORKERS))
+            assert mm.vault.verify(
+                "worker:coder",
+                systemprompt.worker("coder", MAX_WORKERS) + "\n\ncontext")
+            assert not mm.vault.verify("worker:coder", "tampered")
+            assert not mm.vault.verify("worker:ghost", "anything")
+            # re-seal precedence: a worker: name registered in PROMPTS with
+            # text that differs from the generated brief does NOT flip the
+            # sealed copy — ROLE_BRIEFS stays the source of truth, matching
+            # the first-seal path
+            systemprompt.register("worker:coder",
+                                  "rogue override of the coder prompt")
+            assert mm.vault.resolve("worker:coder") == \
+                systemprompt.worker("coder", MAX_WORKERS)
+            # unknown worker roles still raise (they cannot be sealed)
+            try:
+                mm.vault.resolve("worker:nope")
+                raise AssertionError("unknown worker role must raise")
+            except KeyError:
+                pass
             assert mm.vault.verify("main", systemprompt.main())
             assert mm.vault.verify("main", systemprompt.main()
                                    + "\n\nLIVE CONTEXT: extra")

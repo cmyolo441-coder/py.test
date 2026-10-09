@@ -218,7 +218,9 @@ class AttentionEconomy:
         lines = [f"ATTENTION AUCTION — budget {r.budget:,} chars, "
                  f"used {r.used:,}"]
         for a in r.allocations:
-            bar = "█" * max(1, int(a.limit / r.budget * 20))
+            # a zero budget is legal (allocate() degrades to all-zero
+            # limits) — guard the ratio so reporting never divides by zero
+            bar = "█" * max(1, int(a.limit / (r.budget or 1) * 20))
             cut = " ✂" if a.trimmed else ""
             lines.append(f"  {a.section:<14} bid {a.bid:.2f} → "
                          f"{a.limit:,}{cut} {bar}")
@@ -286,6 +288,12 @@ if __name__ == "__main__":
 
         # empty sections are dropped; empty input is clean
         assert eco.allocate({}).allocations == []
+        # a zero budget is legal — allocate degrades to zero limits and
+        # reporting must not divide by zero
+        eco0 = AttentionEconomy(log, budget_chars=0)
+        r0 = eco0.allocate({"a": "hello world"})
+        assert all(a.limit == 0 for a in r0.allocations)
+        assert "ATTENTION AUCTION" in eco0.format_last()
         # the auction is sealed and auditable
         kinds = [e.type for e in log.events()]
         assert kinds.count("attention.auction") >= 2

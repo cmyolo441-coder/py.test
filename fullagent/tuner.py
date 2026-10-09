@@ -38,7 +38,9 @@ _PATIENCE = 8          # stop if no improvement for this many trials
 def _config_key(config: dict) -> tuple:
     """Hashable identity for a config (values are discrete knob choices)."""
     try:
-        return tuple(sorted(config.items()))
+        key = tuple(sorted(config.items()))
+        hash(key)          # sortable values may still be unhashable
+        return key
     except TypeError:
         return tuple(sorted((k, repr(v)) for k, v in config.items()))
 
@@ -73,8 +75,14 @@ class ParzenTuner:
         injectable (production: run a scored benchmark turn; tests: a
         synthetic function). patience: early-stop after this many trials
         with no improvement to the best score."""
+        space = space or {}
+        for k, v in space.items():
+            if not v:
+                raise ValueError(f"tuner knob {k!r} has no allowed values")
+        if not space:
+            raise ValueError("tuner space must define at least one knob")
         self.log = log
-        self.space = {k: list(v) for k, v in space.items() if v}
+        self.space = {k: list(v) for k, v in space.items()}
         self.rng = random.Random(seed)
         self.objective = objective
         self.patience = patience
@@ -134,6 +142,18 @@ class ParzenTuner:
                 for k in self.space}
 
     def observe(self, config: dict, score: float) -> None:
+        # a config that does not match the space (missing knobs, unknown
+        # knobs, or values outside the allowed lists) would poison the
+        # per-knob histograms and crash suggest() with a KeyError —
+        # reject it loudly instead of corrupting the history
+        if set(config) != set(self.space):
+            raise ValueError(
+                f"config knobs {sorted(config)} do not match space knobs "
+                f"{sorted(self.space)}")
+        for k, v in config.items():
+            if v not in self.space[k]:
+                raise ValueError(f"value {v!r} for knob {k!r} is not in "
+                                 f"{self.space[k]}")
         self._n += 1
         self.history.append(Trial(config=dict(config),
                                   score=float(score),
@@ -178,6 +198,8 @@ class ParzenTuner:
         consecutive cache-hit trials. A stale *best score* alone is NOT
         a stop signal: TPE legitimately explores for long stretches
         (20+ trials) before its next improvement."""
+        if n < 1:
+            raise ValueError(f"run() needs n >= 1, got {n}")
         dup_streak = 0
         for _ in range(n):
             self.step()
@@ -197,8 +219,7 @@ class ParzenTuner:
                 dup_streak = 0
         b = self.best()
         assert b is not None
-        distinct = len({tuple(sorted(t.config.items()))
-                        for t in self.history})
+        distinct = len({_config_key(t.config) for t in self.history})
         report = TunerReport(b.config, b.score, len(self.history),
                              distinct)
         self.log.append("tuner.best", report.to_dict())

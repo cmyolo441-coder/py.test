@@ -21,6 +21,7 @@ Hard rules (mechanical):
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -87,28 +88,68 @@ class Daemon:
         self.log = log
         self.executor = executor
         self.max_retries = max(0, int(max_retries))
+        # BUG FIX (races): mission ids embed log.head(), and the
+        # head-read + seal-append were not atomic — two concurrent
+        # start() calls minted the SAME mission id, and resume() then
+        # merged both missions' events into one corrupted record.
+        # _start_lock makes id minting + sealing atomic.
+        self._start_lock = threading.Lock()
+        # BUG FIX (races): two concurrent tick() calls on the same
+        # mission both resumed the same pending step and executed it
+        # TWICE (double side effects, double-counted attempts). Each
+        # mission gets its own lock; tick() takes it non-blocking and
+        # the loser reports instead of running. Non-blocking (not
+        # blocking) so a hung executor can never deadlock a second
+        # caller, and an executor that calls back into tick() gets an
+        # error dict instead of a deadlock.
+        self._locks_lock = threading.Lock()
+        self._tick_locks: dict[str, threading.Lock] = {}
 
     # -- mission lifecycle -----------------------------------------------------
+
+    def _tick_lock(self, mission_id: str) -> threading.Lock:
+        with self._locks_lock:
+            return self._tick_locks.setdefault(mission_id,
+                                               threading.Lock())
 
     def start(self, statement: str, tasks: list[str]) -> Mission:
         """Seal a new mission. Step ids are M1..Mn."""
         # SPEED-EXPOSURE FIX: the old millisecond-clock id could collide
         # when missions are started back-to-back (now that everything
         # runs faster); seq is strictly monotonic, so this never can.
-        mission_id = f"mission-{self.log.head() + 1}"
-        steps = [Step(id=f"M{i + 1}", task=t) for i, t in enumerate(tasks)]
-        self.log.append("daemon.mission",
-                        {"mission_id": mission_id, "statement": statement,
-                         "steps": [s.to_dict() for s in steps],
-                         "state": "RUNNING"},
-                        actor="daemon")
+        # ...as long as the head-read and the seal are atomic: without
+        # the lock, two threads starting missions at once read the same
+        # head and minted duplicate ids.
+        with self._start_lock:
+            mission_id = f"mission-{self.log.head() + 1}"
+            steps = [Step(id=f"M{i + 1}", task=t)
+                     for i, t in enumerate(tasks)]
+            self.log.append("daemon.mission",
+                            {"mission_id": mission_id, "statement": statement,
+                             "steps": [s.to_dict() for s in steps],
+                             "state": "RUNNING"},
+                            actor="daemon")
         return Mission(mission_id, statement, steps)
 
     def tick(self, mission_id: str) -> dict:
         """Execute the next pending step, seal the outcome, checkpoint.
 
         Returns {mission_id, step, state, result, progress}. A step that
-        exhausts its retries BLOCKS the mission — it is never skipped."""
+        exhausts its retries BLOCKS the mission — it is never skipped.
+        If another tick is already in flight for this mission, this call
+        reports {"error": "tick already in progress"} instead of
+        executing the step a second time."""
+        lock = self._tick_lock(mission_id)
+        if not lock.acquire(blocking=False):
+            return {"mission_id": mission_id,
+                    "error": "tick already in progress for this mission"}
+        try:
+            return self._tick(mission_id)
+        finally:
+            lock.release()
+
+    def _tick(self, mission_id: str) -> dict:
+        """One serialized tick — see tick() for the contract."""
         m = self.resume(mission_id)
         if m is None:
             return {"mission_id": mission_id, "error": "no such mission"}
@@ -165,14 +206,27 @@ class Daemon:
                 "progress": round(m.progress(), 3)}
 
     def abandon(self, mission_id: str, reason: str = "") -> bool:
-        m = self.resume(mission_id)
-        if m is None or m.state == "DONE":
+        # BUG FIX (race): abandoning while a tick is mid-flight let the
+        # tick seal RUNNING step state AFTER us and resurrect the
+        # mission. Take the mission's tick lock (non-blocking — a hung
+        # executor must not wedge abandon); on contention report False
+        # so the caller retries once the tick lands.
+        lock = self._tick_lock(mission_id)
+        if not lock.acquire(blocking=False):
+            _log.warning("abandon deferred: tick in flight for %s",
+                         mission_id)
             return False
-        self._patch_state(m, "ABANDONED")
-        self.log.append("daemon.done",
-                        {"mission_id": mission_id, "state": "ABANDONED",
-                         "reason": reason}, actor="human")
-        return True
+        try:
+            m = self.resume(mission_id)
+            if m is None or m.state == "DONE":
+                return False
+            self._patch_state(m, "ABANDONED")
+            self.log.append("daemon.done",
+                            {"mission_id": mission_id, "state": "ABANDONED",
+                             "reason": reason}, actor="human")
+            return True
+        finally:
+            lock.release()
 
     # -- checkpoints + resume ----------------------------------------------------
 
@@ -394,5 +448,55 @@ if __name__ == "__main__":
         types = {e["type"] for e in evs}
         assert {"daemon.mission", "daemon.checkpoint", "daemon.tick",
                 "daemon.done"} <= types
+
+        # concurrent start() calls mint UNIQUE mission ids (the head-read
+        # + seal used to race and mint duplicates)
+        import threading as _th
+        d4 = Daemon(log, executor)
+        ids: list[str] = []
+        _start_barrier = _th.Barrier(8)
+
+        def _start_one(i: int) -> None:
+            _start_barrier.wait()
+            ids.append(d4.start(f"race {i}", ["s"]).mission_id)
+
+        _starters = [_th.Thread(target=_start_one, args=(i,))
+                       for i in range(8)]
+        for t in _starters:
+            t.start()
+        for t in _starters:
+            t.join()
+        assert len(set(ids)) == 8, ids
+
+        # concurrent tick() calls on one mission execute the step ONCE —
+        # the loser reports instead of double-running side effects
+        ran = _th.Event()
+        calls = {"n": 0}
+        _tick_barrier = _th.Barrier(4)
+
+        def slow_executor(task: str) -> str:
+            calls["n"] += 1
+            ran.wait(5)
+            return "OK: slow"
+
+        d5 = Daemon(log, slow_executor)
+        m6 = d5.start("tick race", ["only"])
+        tick_results: list[dict] = []
+
+        def _tick_one() -> None:
+            _tick_barrier.wait()
+            tick_results.append(d5.tick(m6.mission_id))
+
+        _tickers = [_th.Thread(target=_tick_one) for _ in range(4)]
+        for t in _tickers:
+            t.start()
+        ran.wait(2)  # let the winner get deep into the executor...
+        ran.set()     # ...then release it
+        for t in _tickers:
+            t.join()
+        assert calls["n"] == 1, calls
+        assert sum(1 for r in tick_results
+                   if r.get("error") == "tick already in progress "
+                   "for this mission") == 3, tick_results
 
     print("DAEMON SELF-TEST PASS")

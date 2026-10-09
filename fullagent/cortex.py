@@ -190,24 +190,54 @@ class BudgetGovernor:
         self.budget = budget or Budget()
         self.baseline_seq = -1  # reset() anchor: ignore events <= this
         self._last_reason = ""  # dedupe budget.event spam while paused
-        self._session_cache: tuple[int, int] | None = None  # (head, start)
+        # (branch, head, start): where the latest session.start scan ended
+        self._session_cache: tuple[str, int, int] | None = None
 
     def _session_start(self) -> int:
         """seq of the latest session.start (-1 if none) — where the current
         session's spend begins. -1 (not 0) so seq-0 events still count.
 
-        Cached against the log head: session.start events are rare and
-        the latest one sits near the head, so we scan backwards and stop
-        at the first hit instead of walking the whole log every spend()."""
+        Cached against (branch, head). Steady-state appends only move the
+        head forward, so we rescan just the delta appended since the
+        cached head (O(delta), reversed, stopping at the cached head)
+        instead of walking the whole session backwards on every spend() —
+        the old code did the full walk on every call, and enforce()
+        runs per turn-loop iteration, so this was O(session) per turn.
+        A rewind seals a kernel.rewind MARKER (the head moves forward
+        while the chain moves back), so a rewind marker in the delta, a
+        backwards-moving head, or a branch switch all fall back to the
+        full backward scan."""
+        branch = self.log.branch
         head = self.log.head()
-        if self._session_cache is not None and self._session_cache[0] == head:
-            return self._session_cache[1]
+        cached = self._session_cache
+        if cached is not None:
+            c_branch, c_head, c_start = cached
+            if c_branch == branch and c_head == head:
+                return c_start
+            if c_branch == branch and head > c_head:
+                start = c_start
+                full_rescan = False
+                # reversed: newest first, stop at the cached head
+                for ev in reversed(self.log.events()):
+                    if ev.seq <= c_head:
+                        break
+                    if ev.type == "kernel.rewind":
+                        full_rescan = True
+                        break
+                    if ev.type == "session.start":
+                        start = max(start, ev.seq)
+                if not full_rescan:
+                    self._session_cache = (branch, head, start)
+                    return start
+            # head moved backwards, the branch switched, or a rewind
+            # marker appeared in the delta: the cached scan no longer
+            # covers this chain
         start = -1
         for ev in reversed(self.log.events()):
             if ev.type == "session.start":
                 start = ev.seq
                 break
-        self._session_cache = (head, start)
+        self._session_cache = (branch, head, start)
         return start
 
     def spend(self) -> dict:

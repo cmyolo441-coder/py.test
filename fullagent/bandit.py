@@ -90,6 +90,18 @@ def _beta_draw(alpha: float, beta: float,
     return x / (x + y) if (x + y) > 0 else 0.5
 
 
+def _safe_float(value, default: float) -> float:
+    """float() that survives corrupt log data — one bad sealed event
+    must not brick router construction at startup. NaN/inf are also
+    rejected: a NaN posterior would silently poison every later draw
+    (all comparisons false, argmax stuck on the first arm)."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    return v if math.isfinite(v) else default
+
+
 @dataclass
 class Recommendation:
     arm: str
@@ -117,8 +129,10 @@ class BanditRouter:
                 continue
             key = (str(ev.data.get("context", "chat")),
                    str(ev.data.get("arm", "")))
-            self.alpha[key] = float(ev.data.get("alpha", _PRIOR[0]))
-            self.beta[key] = float(ev.data.get("beta", _PRIOR[1]))
+            self.alpha[key] = _safe_float(ev.data.get("alpha"),
+                                          _PRIOR[0])
+            self.beta[key] = _safe_float(ev.data.get("beta"),
+                                         _PRIOR[1])
 
     def _posterior(self, context: str, arm: str) -> tuple[float, float]:
         return (self.alpha.get((context, arm), _PRIOR[0]),
@@ -145,6 +159,16 @@ class BanditRouter:
     def update(self, arm: str, reward: float, context: str = "") -> None:
         """Feed one outcome (0..1) into the posterior. Rewards outside
         0..1 are clamped; a hard failure is reward 0."""
+        arm = str(arm or "")
+        if arm not in self.arms:
+            # Stale or unknown model id (a model removed from the
+            # config, or a typo): tracking it would grow the posterior
+            # tables with dead arms and let policy() surface a model
+            # that recommend() can never pick. Refuse, loudly — the
+            # caller is holding a model id that no longer exists.
+            _log.warning("bandit.update: unknown arm %r ignored "
+                         "(not in configured arms)", arm)
+            return
         reward = max(0.0, min(1.0, float(reward)))
         context = context or "chat"
         a, b = self._posterior(context, arm)

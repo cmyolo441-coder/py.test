@@ -23,6 +23,7 @@ authoritative state); index events are sealed into the log.
 from __future__ import annotations
 
 import ast
+import hashlib
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -152,6 +153,10 @@ class KnowledgeGraph:
         # module first retracts its stale edges (no ghost calls/imports
         # from an older version of the source)
         self._module_edges: dict[str, list[tuple[str, str, str]]] = {}
+        # entity ids contributed by each indexed module, so re-indexing
+        # also retracts entities that no longer exist (no ghost
+        # functions/classes surviving a rename or delete)
+        self._module_entities: dict[str, set[str]] = {}
 
     def _add_entity(self, e: Entity) -> None:
         old = self._entities.get(e.id)
@@ -165,17 +170,21 @@ class KnowledgeGraph:
     def index_code(self, sources: dict[str, str]) -> int:
         """Index modules {name: source}. Returns entity count."""
         for name, src in sources.items():
-            # retract this module's previous edges before re-adding:
-            # otherwise a re-index keeps stale calls/imports forever
+            # retract this module's previous edges AND entities before
+            # re-adding: otherwise a re-index keeps stale calls/imports
+            # (and ghost functions/classes) forever
             self._retract_module(name)
             ents, rels = extract_code(name, src)
             new_keys: list[tuple[str, str, str]] = []
+            new_eids: set[str] = set()
             for e in ents:
                 self._add_entity(e)
+                new_eids.add(e.id)
             for r in rels:
                 if self._add_relation(r):
                     new_keys.append((r.src, r.rel, r.dst))
             self._module_edges[name] = new_keys
+            self._module_entities[name] = new_eids
         self.log.append("graph.entity",
                         {"entities": len(self._entities),
                          "relations": len(self._relations)},
@@ -183,22 +192,32 @@ class KnowledgeGraph:
         return len(self._entities)
 
     def _retract_module(self, name: str) -> None:
-        """Remove every edge previously contributed by module `name`."""
-        keys = self._module_edges.pop(name, None)
-        if not keys:
-            return
+        """Remove every edge and entity previously contributed by module
+        `name`. Entity ids are namespaced per module
+        (module:/function:/class: prefixes), so this never touches
+        entities owned by other modules or by index_log."""
+        keys = self._module_edges.pop(name, [])
         dead = set(keys)
-        self._seen_edges -= dead
-        self._relations = [r for r in self._relations
-                           if (r.src, r.rel, r.dst) not in dead]
-        for idx in (self._out, self._in):
-            for k in list(idx.keys()):
-                kept = [r for r in idx[k]
-                        if (r.src, r.rel, r.dst) not in dead]
-                if kept:
-                    idx[k] = kept
-                else:
-                    del idx[k]
+        if dead:
+            self._seen_edges -= dead
+            self._relations = [r for r in self._relations
+                               if (r.src, r.rel, r.dst) not in dead]
+            for idx in (self._out, self._in):
+                for k in list(idx.keys()):
+                    kept = [r for r in idx[k]
+                            if (r.src, r.rel, r.dst) not in dead]
+                    if kept:
+                        idx[k] = kept
+                    else:
+                        del idx[k]
+        for eid in self._module_entities.pop(name, set()):
+            ent = self._entities.pop(eid, None)
+            if ent is not None:
+                bucket = self._name_index.get(ent.name.lower())
+                if bucket is not None:
+                    bucket.discard(eid)
+                    if not bucket:
+                        del self._name_index[ent.name.lower()]
 
     def index_log(self) -> int:
         """Add session entities/relations from the event fold."""
@@ -227,7 +246,10 @@ class KnowledgeGraph:
                                         str(ep.get("goal", ""))[:80]))
                 added += 1
             for fact in ep.get("facts") or []:
-                fid = f"fact:{str(fact)[:40]}"
+                # hash the full text for the id: truncating to N chars
+                # merged distinct facts that shared a prefix
+                fid = ("fact:" + hashlib.sha256(
+                    str(fact).encode("utf-8", "replace")).hexdigest()[:16])
                 if fid not in self._entities:
                     self._add_entity(Entity(fid, "fact", str(fact)[:80]))
                     added += 1
@@ -282,10 +304,17 @@ class KnowledgeGraph:
     def callers_of(self, func_name: str) -> list[str]:
         """Which functions call a given function name (reverse lookup).
 
-        SPEED: O(1) index lookup on the call pseudo-node instead of a
-        full scan of every relation in the graph.
+        Matches both bare call sites (`call:<name>`, from `name(...)`)
+        and qualified ones (`call:<mod>.<name>`, from `mod.name(...)`).
         """
-        return sorted({r.src for r in self._in.get(f"call:{func_name}", [])})
+        target = f"call:{func_name}"
+        out: set[str] = set()
+        for key, rels in self._in.items():
+            if not key.startswith("call:"):
+                continue
+            if key == target or key.rsplit(".", 1)[-1] == func_name:
+                out.update(r.src for r in rels)
+        return sorted(out)
 
     def reachable(self, start: str, rel: str | None = None,
                   max_depth: int = 6) -> list[str]:
@@ -307,13 +336,15 @@ class KnowledgeGraph:
     def _reverse_keys(self, entity_id: str) -> list[str]:
         """Lookup keys for incoming edges of an entity. A function entity
         `function:<mod>.<name>` is also reached through the call
-        pseudo-nodes call sites target — both the bare `call:<name>` and
-        the qualified `call:<mod>.<name>` forms."""
+        pseudo-nodes call sites target — both the bare `call:<name>`
+        (from `name(...)`) and the qualified `call:<mod>.<name>` (from
+        `mod.name(...)`) forms."""
         keys = [entity_id]
-        if entity_id.startswith("function:") and "." in entity_id:
-            qual = entity_id.split(".", 1)[1]
-            keys.append(f"call:{qual}")
-            keys.append(f"call:{qual.split('.')[-1]}")
+        if entity_id.startswith("function:"):
+            rest = entity_id[len("function:"):]  # "<mod>.<name>"
+            if "." in rest:
+                keys.append(f"call:{rest}")
+                keys.append(f"call:{rest.rsplit('.', 1)[-1]}")
         return keys
 
     def impact(self, entity_id: str) -> list[str]:

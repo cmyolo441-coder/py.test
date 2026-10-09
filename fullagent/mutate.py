@@ -206,8 +206,14 @@ class MutationTester:
     """Generate mutants of a file and run the suite against each.
 
     `suite_command` runs the tests; a NON-ZERO exit code means the suite
-    caught the mutant (killed). The mutant source is written to `mutant_path`
-    (a temp copy the suite imports) so the real file is never touched."""
+    caught the mutant (killed). Each mutant is written to `mutant_path`
+    — a scratch copy the suite imports — or, by default, to the file
+    under test itself: it is backed up first and restored in a
+    `finally`, so even a crash mid-run cannot leave it corrupted. The
+    mutant MUST be written where the suite actually imports the module
+    from; a temp sibling with a different name is never imported, so
+    the suite would test the original code and every mutant would
+    silently "survive"."""
 
     def __init__(self, log: EventLog, suite_command: str,
                  mutant_path: str | None = None,
@@ -247,21 +253,14 @@ class MutationTester:
                          "suite": self.suite_command},
                         actor="tester")
 
-        # NEVER write mutants to the caller's real file: default to a
-        # temp sibling so a crash mid-run cannot leave the source
-        # corrupted. The old default (mutant_path=None -> write to p)
-        # violated the "real file is never touched" contract.
-        target = Path(self.mutant_path) if self.mutant_path else None
-        _tmp: Path | None = None
-        if target is None:
-            import tempfile
-            fd, tmppath = tempfile.mkstemp(prefix=p.stem + ".mutant_",
-                                           suffix=p.suffix,
-                                           dir=str(p.parent))
-            import os
-            os.close(fd)
-            _tmp = target = Path(tmppath)
-            target.write_text(original)
+        # Mutants must be written where the suite actually imports the
+        # module from. The default is the file under test itself: it is
+        # backed up first and restored in the `finally` below, so even
+        # a crash mid-run cannot leave it corrupted. (A temp sibling
+        # was tried here before — the suite imports the original
+        # module path, so the mutants were never exercised and every
+        # mutant silently "survived" with a 0.0 score.)
+        target = Path(self.mutant_path) if self.mutant_path else p
         backup = target.read_text(errors="replace")
         try:
             for m in mutants:
@@ -284,8 +283,6 @@ class MutationTester:
                 report.results.append(res)
         finally:
             target.write_text(backup)  # always restore the target
-            if _tmp is not None:
-                _tmp.unlink(missing_ok=True)  # temp copy is disposable
 
         scored = report.killed + report.survived
         report.score = report.killed / scored if scored else 0.0

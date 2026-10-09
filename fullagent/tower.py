@@ -207,8 +207,11 @@ class Tower:
                                 on_tool_update=lambda e: None,
                                 on_status=lambda s: None,
                                 approve=lambda tool, args: False)
-                except Exception:      # the river shows the sealed error
-                    pass
+                except Exception:
+                    # the river shows the sealed error when the turn got
+                    # far enough to seal one — but a failure BEFORE that
+                    # would vanish completely, so it is logged server-side
+                    _log.exception("tower: background turn failed")
 
         threading.Thread(target=_run, name="tower:turn",
                          daemon=True).start()
@@ -282,7 +285,10 @@ class Tower:
                     return
                 try:
                     n = int(self.headers.get("Content-Length", 0))
-                    payload = json.loads(self.rfile.read(n) or b"{}")
+                    # a negative length would make rfile.read() block
+                    # until EOF and hang this handler thread
+                    payload = json.loads(self.rfile.read(max(0, n))
+                                         or b"{}")
                 except ValueError:
                     self._json({"error": "bad json"}, 400)
                     return

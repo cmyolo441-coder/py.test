@@ -185,6 +185,12 @@ class DualProcess:
                                      "complexity": len(
                                          _COMPLEXITY.findall(
                                              question))}})
+        # the routing ledger is dual.route for BOTH systems — without this
+        # the system-2 leg was invisible to anything counting route events
+        self.log.append("dual.route",
+                        {"system": 2, "cached": False,
+                         "confidence": round(conf, 3),
+                         "escalated": True})
         slow = self.slow_fn(question)
         self._cache_put(key, (slow, time.time(), True))
         return RouteDecision2(2, slow, max(conf, 0.8),

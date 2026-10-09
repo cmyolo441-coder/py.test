@@ -207,6 +207,15 @@ class Council:
             self._seal_verdict(council_id, verdict)
             return verdict
 
+        # an empty judge reply is not a draw — it is a missing verdict.
+        # _parse_synthesis("") would silently map to ("draw", 0.0, "")
+        # and seal ok=True; record it as a failure instead.
+        if not raw.strip():
+            verdict.ok = False
+            verdict.error = "empty synthesis"
+            self._seal_verdict(council_id, verdict)
+            return verdict
+
         side, conf, reason = _parse_synthesis(raw)
         verdict.winner = {"A": "thesis", "B": "antithesis"}.get(side, "draw")
         verdict.confidence = conf

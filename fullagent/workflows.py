@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -142,6 +143,13 @@ class WorkflowEngine:
         self.dir = Path(workflows_dir)
         self.executor = executor
         self.judge = judge
+        # Threads running step executors that outlived their timeout.
+        # Python cannot kill a thread, so a hung executor's thread is
+        # abandoned — but it is tracked here (with unique names) and the
+        # run's teardown reaps finished ones and seals workflow.stray
+        # for survivors, so the leak is audited, never silent.
+        self._step_threads: set[threading.Thread] = set()
+        self._step_lock = threading.Lock()
 
     # -- persistence -----------------------------------------------------------
 
@@ -211,47 +219,67 @@ class WorkflowEngine:
         state = "RUNNING"
         t0 = time.monotonic()
 
-        for phase_num, steps in ordered:
-            if state != "RUNNING":
-                break
-            # steps within a phase run one at a time, in the order the
-            # executor is bound to (the Crew's serial queue); a blocked
-            # or failing step stops the remaining steps right there
-            for n, step in steps:
-                rep = self._run_step(
-                    {"task": step.task, "role": step.role,
-                     "model": step.model, "_n": n}, timeout)
-                r = StepResult(step=n, task=step.task, role=step.role,
-                               status=rep.get("status", "error"),
-                               summary=str(rep.get("summary", "")),
-                               elapsed_ms=int(rep.get("elapsed_ms", 0)))
-                if r.status == "done" and step.expect is not None \
-                        and self.judge is not None:
-                    # BUG FIX: a judge crash used to kill the whole run
-                    # with an unsealed traceback. The predicate is the
-                    # thing being verified — its failure to even run is
-                    # a BLOCK, not a run-killer.
-                    try:
-                        verdict = self.judge.check(step.expect)
-                    except Exception as e:  # noqa: BLE001
-                        r.status = "blocked"
-                        r.check = f"judge crashed: {type(e).__name__}: {e}"
-                        r.summary = (r.summary + "\nEXPECT ERROR: "
-                                     + r.check).strip()
-                    else:
-                        r.check = verdict.detail
-                        if not verdict.passed:
-                            r.status = "blocked"
-                            r.summary = (r.summary + f"\nEXPECT FAILED: "
-                                         f"{verdict.detail}").strip()
-                self.log.append("workflow.step",
-                                {"name": wf.name, "phase": phase_num,
-                                 **r.to_dict()},
-                                actor="system")
-                results.append(r)
-                if r.status in ("blocked", "error"):
-                    state = "BLOCKED"
+        try:
+            for phase_num, steps in ordered:
+                if state != "RUNNING":
                     break
+                # steps within a phase run one at a time, in the order the
+                # executor is bound to (the Crew's serial queue); a blocked
+                # or failing step stops the remaining steps right there
+                for n, step in steps:
+                    rep = self._run_step(
+                        {"task": step.task, "role": step.role,
+                         "model": step.model, "_n": n}, timeout)
+                    r = StepResult(step=n, task=step.task, role=step.role,
+                                   status=rep.get("status", "error"),
+                                   summary=str(rep.get("summary", "")),
+                                   elapsed_ms=int(rep.get("elapsed_ms", 0)))
+                    if r.status == "done" and step.expect is not None:
+                        if self.judge is None:
+                            # BUG FIX: with no judge bound, the expect
+                            # predicate used to be silently skipped — the
+                            # step passed without ever being verified. The
+                            # hard rule is "never silently skipped", so a
+                            # step whose check cannot run BLOCKS the run
+                            # loudly instead of passing on faith.
+                            r.status = "blocked"
+                            r.check = ("no judge bound — expect predicate "
+                                       "could not be verified")
+                            r.summary = (r.summary + "\nEXPECT ERROR: "
+                                         + r.check).strip()
+                        else:
+                            # BUG FIX: a judge crash used to kill the whole run
+                            # with an unsealed traceback. The predicate is the
+                            # thing being verified — its failure to even run is
+                            # a BLOCK, not a run-killer.
+                            try:
+                                verdict = self.judge.check(step.expect)
+                            except Exception as e:  # noqa: BLE001
+                                r.status = "blocked"
+                                r.check = (f"judge crashed: "
+                                           f"{type(e).__name__}: {e}")
+                                r.summary = (r.summary + "\nEXPECT ERROR: "
+                                             + r.check).strip()
+                            else:
+                                r.check = verdict.detail
+                                if not verdict.passed:
+                                    r.status = "blocked"
+                                    r.summary = (r.summary
+                                                 + f"\nEXPECT FAILED: "
+                                                 f"{verdict.detail}").strip()
+                    self.log.append("workflow.step",
+                                    {"name": wf.name, "phase": phase_num,
+                                     **r.to_dict()},
+                                    actor="system")
+                    results.append(r)
+                    if r.status in ("blocked", "error"):
+                        state = "BLOCKED"
+                        break
+        finally:
+            # reap step-executor threads: finished ones are untracked, and
+            # any thread that outlived its timeout is sealed as
+            # workflow.stray instead of leaking silently.
+            self._reap_step_threads(wf.name)
 
         if state == "RUNNING":
             state = "DONE"
@@ -271,7 +299,6 @@ class WorkflowEngine:
         """Run ONE step through the bound executor — a blocked step never
         lets its phase's later steps execute; a hung executor is cut off
         at the step's timeout budget instead of stalling the workflow."""
-        import threading
         started = time.monotonic()
         out: dict = {}
 
@@ -286,9 +313,19 @@ class WorkflowEngine:
             out.update(rep)
 
         th = threading.Thread(target=runner, daemon=True,
-                              name="workflow:step")
+                              name=f"workflow:step:{item.get('_n', '?')}")
+        with self._step_lock:
+            self._step_threads.add(th)
         th.start()
         th.join(max(0.0, float(timeout)))
+        if not th.is_alive():
+            # finished inside its budget — untrack it. A thread that is
+            # still alive here outlived its timeout: it stays tracked so
+            # the run's teardown seals it as workflow.stray instead of
+            # leaking it silently (Python cannot kill the thread, so an
+            # audited abandon is the honest outcome).
+            with self._step_lock:
+                self._step_threads.discard(th)
         if not out and th.is_alive():
             rep = {"status": "error",
                    "summary": f"step timed out after {timeout:g}s"}
@@ -306,6 +343,25 @@ class WorkflowEngine:
                               + " [no status reported by executor]").strip()
         rep.setdefault("summary", "")
         return rep
+
+    def _reap_step_threads(self, wf_name: str) -> None:
+        """Run teardown for step-executor threads. Finished threads are
+        untracked; any thread still alive after its timeout is sealed as
+        workflow.stray — a hung executor's thread cannot be killed, but
+        the event log says exactly which step's thread survived instead
+        of leaking it silently."""
+        with self._step_lock:
+            threads = list(self._step_threads)
+            self._step_threads.clear()
+        for t in threads:
+            t.join(timeout=0)  # reap only — never block the teardown
+            if t.is_alive():
+                self.log.append("workflow.stray",
+                                {"name": wf_name, "thread": t.name,
+                                 "note": "step executor outlived its "
+                                         "timeout and is still running; "
+                                         "thread abandoned"},
+                                actor="system")
 
     # -- rendering -----------------------------------------------------------------
 
@@ -446,6 +502,44 @@ if __name__ == "__main__":
 
             # delete
             assert engine.delete("boom") and not engine.delete("boom")
+
+            # expect with no judge bound BLOCKS loudly instead of passing
+            # the step on faith (the hard rule: never silently skipped)
+            engine_nojudge = WorkflowEngine(log, root / "workflows",
+                                            executor=executor, judge=None)
+            wf4 = Workflow.from_dict({
+                "name": "nojudge",
+                "steps": [{"task": "do work", "role": "coder",
+                           "expect": {"type": "file_exists",
+                                      "path": str(ok_files)}}]})
+            engine_nojudge.save(wf4)
+            report = engine_nojudge.run("nojudge")
+            assert report["state"] == "BLOCKED", report
+            assert report["steps"][0]["status"] == "blocked"
+            assert "no judge bound" in report["steps"][0]["check"]
+
+            # a hung executor is cut off at the timeout and its thread is
+            # sealed as workflow.stray, never leaked silently
+            import threading as _th
+
+            def hanging(item):
+                _evt.wait(30)
+                return {"status": "done", "summary": "too late"}
+
+            _evt = _th.Event()
+            engine_hang = WorkflowEngine(log, root / "workflows",
+                                         executor=hanging, judge=judge)
+            wf5 = Workflow.from_dict({"name": "hang",
+                                      "steps": [{"task": "stall"}]})
+            engine_hang.save(wf5)
+            report = engine_hang.run("hang", timeout=0.2)
+            assert report["state"] == "BLOCKED", report
+            assert "timed out" in report["steps"][0]["summary"], report
+            stray = [e for e in log.events()
+                     if e.type == "workflow.stray"]
+            assert stray and stray[0].data["thread"].startswith(
+                "workflow:step:"), stray
+            _evt.set()
 
             print("WORKFLOWS SELF-TEST PASS")
 

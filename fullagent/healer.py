@@ -93,7 +93,15 @@ TAXONOMY: list[tuple[re.Pattern, str, str, tuple[str, ...]]] = [
      "assertion_failed",
      "the behaviour under test is wrong — inspect the assertion",
      ("assertionerror",)),
-    (re.compile(r"command not found|not recognized", re.I),
+    # BUG FIX (false positive): the old "not recognized" alternative
+    # matched ANY "not recognized" text — e.g. "SSL certificate not
+    # recognized" or "file format not recognized" — and mislabelled it
+    # missing_binary, shadowing the real cause (this entry sits ahead of
+    # tls_error in the table). Only the shell's missing-command phrasing
+    # ("'x' is not recognized as an internal or external command")
+    # means a missing binary.
+    (re.compile(r"command not found|not recognized as an? internal or "
+                r"external command", re.I),
      "missing_binary",
      "install the tool or fix PATH",
      ("command not found", "not recognized")),
@@ -250,6 +258,13 @@ class Healer:
         if report.healed:
             return (f"{d.root_cause}: auto-healed via "
                     f"'{d.suggestion}'")
+        if report.fix_applied and not report.retried:
+            # BUG FIX (false lesson): the old code fell through to "fix
+            # attempted but check still fails" even when the check was
+            # NEVER re-run (no recheck callback) — the ledger then
+            # claimed a failure that never happened.
+            return (f"{d.root_cause}: fix applied but the check was never "
+                    f"re-run — unverified")
         if report.fix_applied:
             return (f"{d.root_cause}: fix attempted but check still fails "
                     f"— needs a different approach")
@@ -349,6 +364,23 @@ if __name__ == "__main__":
         # unknown cause is never 'fixed' even with a fixer present
         rep4 = h.heal("a totally novel failure mode xyz")
         assert not rep4.fix_applied and not rep4.healed
+
+        # "not recognized" outside the shell's missing-command phrasing is
+        # NOT a missing binary (old pattern mislabelled e.g. TLS errors)
+        d = classify("'foo' is not recognized as an internal or "
+                     "external command")
+        assert d.root_cause == "missing_binary", d
+        d = classify("SSLError: certificate not recognized by peer")
+        assert d.root_cause == "tls_error", d
+        d = classify("file format not recognized")
+        assert d.root_cause == "unknown", d
+
+        # a fix applied with no recheck callback is "unverified" — the
+        # lesson must not claim the check still fails when it never ran
+        h4 = Healer(log, fixer=lambda d, c: "applied blind")
+        rep5 = h4.heal("ModuleNotFoundError: No module named 'yaml'")
+        assert rep5.fix_applied and not rep5.retried and not rep5.healed
+        assert "never re-run" in rep5.lesson, rep5.lesson
 
         # stats + ledger
         s = h.stats()

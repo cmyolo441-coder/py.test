@@ -67,7 +67,11 @@ class Oracle:
             cost_by_clause["__unattributed__"] = round(unattributed_usd, 6)
         cal = self.calibrate()
         return {
-            "events": len(self.log),
+            # default-branch count: every other field in this report
+            # (tool_calls, cost_usd, ...) folds the default branch, so
+            # len(self.log) — which spans ALL branches — made the event
+            # count disagree with its own report
+            "events": len(self.log.events()),
             "tool_calls": st.tool_calls,
             "tool_errors": st.tool_errors,
             "wasted_steps": wasted,

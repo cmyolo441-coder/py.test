@@ -28,19 +28,54 @@ PANELS = ("cost", "goal", "agents", "router", "speculator", "memory",
           "health", "engineering", "stream")
 
 
+def _safe_float(v, default: float = 0.0) -> float:
+    """float() that never raises — malformed event fields must not kill
+    the render path."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(v, default: int = 0) -> int:
+    """int() that never raises — same contract as _safe_float."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _copy_snapshot(s: dict) -> dict:
+    """Defensive copy of a snapshot for callers. The top-level dict copy
+    is not enough: the crew_agents row list/dicts are mutable, and the
+    old shallow copy let a caller corrupt the cached entry (rows edited
+    in place would persist across renders until the log head moved)."""
+    out = dict(s)
+    agents = out.get("crew_agents")
+    if isinstance(agents, list):
+        out["crew_agents"] = [dict(a) for a in agents]
+    return out
+
+
 def _fold_crew_agents(log) -> list[dict]:
     """Fold crew.* events into per-agent display rows.
 
     Pure fold over the event log (no state kept): spawn order is stable,
     running agents show step/elapsed, completed ones collapse to one line.
-    Defensive — handles crew.done without a prior crew.spawn.
+    Defensive — handles crew.done without a prior crew.spawn, non-dict
+    event payloads, and explicit null ids (no "None" ghost agents).
+    Mirrors the crew.py lifecycle: crew.message (follow-up send)
+    resurrects a settled agent back to running, crew.resumed restores
+    its terminal state, and crew.closed retires only the named agent
+    (unlike crew.force_stop, which stops the whole roster).
     """
     agents: dict[str, dict] = {}
     order: list[str] = []
     for ev in log.events():
-        t, d = ev.type, ev.data or {}
+        t = ev.type
+        d = ev.data if isinstance(ev.data, dict) else {}
         if t == "crew.spawn":
-            aid = str(d.get("id", ""))
+            aid = str(d.get("id") or "")
             if aid and aid not in agents:
                 agents[aid] = {
                     "id": aid,
@@ -52,11 +87,12 @@ def _fold_crew_agents(log) -> list[dict]:
                     "spawn_ts": getattr(ev, "ts", 0.0) or 0.0,
                     "elapsed_ms": 0,
                     "error": "",
+                    "had_error": False,
                     "files": 0,
                 }
                 order.append(aid)
         elif t == "crew.progress":
-            aid = str(d.get("id", ""))
+            aid = str(d.get("id") or "")
             st = agents.get(aid)
             if st is not None and st["status"] == "running":
                 try:
@@ -64,7 +100,7 @@ def _fold_crew_agents(log) -> list[dict]:
                 except (TypeError, ValueError):
                     pass
         elif t == "crew.done":
-            aid = str(d.get("id", ""))
+            aid = str(d.get("id") or "")
             st = agents.get(aid)
             if st is None and aid:
                 st = {"id": aid,
@@ -73,20 +109,60 @@ def _fold_crew_agents(log) -> list[dict]:
                       "task": str(d.get("task") or ""),
                       "status": "running", "step": 0,
                       "spawn_ts": 0.0, "elapsed_ms": 0,
-                      "error": "", "files": 0}
+                      "error": "", "had_error": False, "files": 0}
                 agents[aid] = st
                 order.append(aid)
             if st is not None and st["status"] == "running":
                 err = str(d.get("error") or "")
-                st["status"] = "error" if err else "done"
+                state = str(d.get("state") or "")
+                # crew.py seals state="blocked" for agents that finished
+                # without a verdict — not an error, but not "done" either
+                if err:
+                    st["status"] = "error"
+                elif state == "blocked":
+                    st["status"] = "blocked"
+                else:
+                    st["status"] = "done"
                 st["error"] = err[:80]
+                st["had_error"] = bool(err)
                 try:
                     st["elapsed_ms"] = int(d.get("elapsed_ms") or 0)
                 except (TypeError, ValueError):
                     pass
                 files = d.get("files_touched") or []
                 st["files"] = len(files) if isinstance(files, list) else 0
-        elif t in ("crew.force_stop", "crew.closed"):
+        elif t == "crew.message":
+            # crew.send() to a settled agent resubmits it — the agent is
+            # running again with a cleared error. Without this the row
+            # would stay frozen on its old terminal state forever.
+            aid = str(d.get("id") or "")
+            st = agents.get(aid)
+            if st is not None and st["status"] != "running":
+                st["status"] = "running"
+                st["step"] = 0
+                st["error"] = ""
+                st["had_error"] = False
+                st["spawn_ts"] = getattr(ev, "ts", 0.0) or 0.0
+        elif t == "crew.resumed":
+            # crew.resume() restores done/error from the agent's error
+            # field — mirror it via had_error so the row leaves
+            # "stopped" instead of sticking there forever
+            aid = str(d.get("id") or "")
+            st = agents.get(aid)
+            if st is not None and st["status"] != "running":
+                st["status"] = "error" if st.get("had_error") else "done"
+        elif t == "crew.closed":
+            # crew.closed carries ONE agent id (unlike crew.force_stop,
+            # which is roster-wide). Retiring one agent must not flip
+            # every other running agent to stopped. Only a running agent
+            # is affected — closing an already-finished one keeps its
+            # terminal state.
+            aid = str(d.get("id") or "")
+            st = agents.get(aid)
+            if st is not None and st["status"] == "running":
+                st["status"] = "stopped"
+                st["error"] = "closed"
+        elif t == "crew.force_stop":
             for aid in order:
                 st = agents[aid]
                 if st["status"] == "running":
@@ -112,6 +188,9 @@ def _fold_crew_agents(log) -> list[dict]:
                    + (f" \u00b7 {st['files']} files" if st["files"] else ""))
         elif st["status"] == "error":
             row = f"\u2717 {st['name']} \u00b7 {st['error'][:60]}"
+        elif st["status"] == "blocked":
+            row = (f"\u25d0 {st['name']} \u00b7 blocked"
+                   + (f" \u00b7 {st['error'][:60]}" if st["error"] else ""))
         else:
             row = f"\u25a0 {st['name']} \u00b7 {st['error'][:60]}"
         out.append({"id": aid, "status": st["status"], "row": row})
@@ -137,12 +216,14 @@ class Dashboard:
         if self._snap_cache is not None and self._snap_head == head:
             # Log unchanged since the last snapshot — the fold cache and
             # every count below would recompute identically. Return a
-            # shallow copy so callers can't corrupt the cached entry.
-            return dict(self._snap_cache)
+            # defensive copy so callers can't corrupt the cached entry
+            # (the top-level copy alone would still share the mutable
+            # crew_agents rows).
+            return _copy_snapshot(self._snap_cache)
         s = self._snapshot_uncached()
         self._snap_cache = s
         self._snap_head = head
-        return dict(s)
+        return _copy_snapshot(s)
 
     def _snapshot_uncached(self) -> dict:
         st = fold(self.log)
@@ -156,7 +237,7 @@ class Dashboard:
 
         # routing + speculation dividends
         routed = len(st.router_decisions)
-        routed_cost = sum(float(d.get("est_cost", 0.0))
+        routed_cost = sum(_safe_float(d.get("est_cost"))
                           for d in st.router_decisions)
         prefetched = sum(1 for e in st.spec_events
                          if e.get("type") == "spec.prefetch")
@@ -180,15 +261,18 @@ class Dashboard:
         graph_entities = 0
         for e in st.graph_events:
             graph_entities = max(graph_entities,
-                                 int(e.get("entities", 0)))
+                                 _safe_int(e.get("entities", 0)))
         cov_runs = [e for e in st.coverage_events
                     if e.get("type") == "coverage.result"]
-        cov_last = cov_runs[-1].get("percent", 0.0) if cov_runs else None
+        cov_last = (_safe_float(cov_runs[-1].get("percent", 0.0))
+                    if cov_runs else None)
         fuzz_crashes = sum(1 for e in st.fuzz_events
                            if e.get("type") == "fuzz.crash")
         mut_reports = [e for e in st.mutation_events
                        if e.get("type") == "mutation.result"]
-        mut_last = mut_reports[-1].get("score") if mut_reports else None
+        _mut_score = mut_reports[-1].get("score") if mut_reports else None
+        mut_last = (_safe_float(_mut_score)
+                    if _mut_score is not None else None)
 
         # parallel agents detail: per-agent rows from crew.* events.
         # Fold is O(crew events) and runs once per log-head change thanks
@@ -337,7 +421,13 @@ class Dashboard:
 
 
 def _summarise(type_: str, data: dict) -> str:
-    """One-line human summary of an event for the ticker."""
+    """One-line human summary of an event for the ticker.
+
+    Defensive: a single malformed event (non-dict payload, garbage
+    numerics) must not take down the TUI's polling ticker.
+    """
+    if not isinstance(data, dict):
+        return ""
     if type_ == "user.message":
         return str(data.get("text", ""))[:60]
     if type_ == "assistant.message":
@@ -347,7 +437,7 @@ def _summarise(type_: str, data: dict) -> str:
     if type_ == "tool.result":
         return f"{data.get('name', '?')} -> {data.get('status', '?')}"
     if type_ == "cost.incurred":
-        return f"${float(data.get('usd', 0)):.4f}"
+        return f"${_safe_float(data.get('usd', 0)):.4f}"
     if type_ == "router.decision":
         return f"-> {data.get('model', '?')}"
     if type_ == "spec.hit":
@@ -356,15 +446,16 @@ def _summarise(type_: str, data: dict) -> str:
         return f"{'PASS' if data.get('passed') else 'FAIL'} " \
                f"{data.get('kind', '?')}"
     if type_ == "goal.distance":
-        return f"distance {float(data.get('distance', 1)):.2f}"
+        return f"distance {_safe_float(data.get('distance', 1)):.2f}"
     if type_ in ("heal.lesson", "skill.registered", "council.verdict"):
         return type_
     if type_ == "coverage.result":
-        return f"coverage {data.get('percent', 0):.0f}% {data.get('path', '')}"
+        return (f"coverage {_safe_float(data.get('percent', 0)):.0f}% "
+                f"{data.get('path', '')}")
     if type_ == "fuzz.crash":
-        return f"crash {data.get('error', '')[:40]}"
+        return f"crash {str(data.get('error', ''))[:40]}"
     if type_ == "mutation.result":
-        return f"mutation score {data.get('score', 0):.0%}"
+        return f"mutation score {_safe_float(data.get('score', 0)):.0%}"
     if type_ == "analysis.taint":
         return f"taint {len(data.get('findings') or [])} finding(s)"
     return ""

@@ -599,6 +599,11 @@ class OverlayList:
         self.move(delta * self.PAGE)
 
     def select(self) -> None:
+        if not self.items:
+            # empty list — never call on_select with a bogus index
+            # (MODELS[-1] would silently pick the wrong model)
+            self.close()
+            return
         idx = self.index
         self.close()
         if self.on_select:
@@ -698,40 +703,54 @@ class ParallelAgentsPanel:
         # flips (forces a render even if throttle would skip it — status
         # changes must never feel laggy).
         self._structural: bool = False
+        # render-thread <-> tick-thread race guard: poll_log() (spinner
+        # tick) mutates _agents/_order/_dirty/_row_cache while the render
+        # thread reads them in _fragments(). Without this, list(self._dirty)
+        # in _reformat_dirty could raise "Set changed size during
+        # iteration" mid-render and kill the frame.
+        self._lock = threading.RLock()
+        # last rendered fragments + width: served when throttled so the
+        # panel never collapses to a blank frame between renders.
+        self._last_fragments: list | None = None
+        self._last_width: int = 0
 
     # -- event ingestion (O(1) per event) ------------------------------------
 
     def ingest(self, ev_type: str, data: dict, seq: int = -1) -> bool:
         """Feed one crew event. Returns True if the display changed."""
-        if seq >= 0:
-            self._last_seq = max(self._last_seq, seq)
-        if ev_type == "crew.spawn":
-            return self._on_spawn(data)
-        if ev_type == "crew.progress":
-            return self._on_progress(data)
-        if ev_type == "crew.done":
-            return self._on_done(data)
-        if ev_type == "crew.force_stop":
-            return self._on_force_stop(data)
-        if ev_type == "crew.closed":
-            return self._on_closed(data)
-        return False
+        with self._lock:
+            if seq >= 0:
+                self._last_seq = max(self._last_seq, seq)
+            if ev_type == "crew.spawn":
+                return self._on_spawn(data)
+            if ev_type == "crew.progress":
+                return self._on_progress(data)
+            if ev_type == "crew.done":
+                return self._on_done(data)
+            if ev_type == "crew.resumed":
+                return self._on_resumed(data)
+            if ev_type == "crew.force_stop":
+                return self._on_force_stop(data)
+            if ev_type == "crew.closed":
+                return self._on_closed(data)
+            return False
 
     def poll_log(self, log) -> bool:
         """Ingest all crew events since the last poll. O(new events)."""
-        changed = False
-        # Reverse-walk from the head and stop at the cursor: only new
-        # events are visited.
-        pending: list = []
-        for ev in reversed(log.events()):
-            if ev.seq <= self._last_seq:
-                break
-            if ev.type.startswith("crew."):
-                pending.append(ev)
-        for ev in reversed(pending):
-            if self.ingest(ev.type, ev.data or {}, ev.seq):
-                changed = True
-        return changed
+        with self._lock:
+            changed = False
+            # Reverse-walk from the head and stop at the cursor: only new
+            # events are visited.
+            pending: list = []
+            for ev in reversed(log.events()):
+                if ev.seq <= self._last_seq:
+                    break
+                if ev.type.startswith("crew."):
+                    pending.append(ev)
+            for ev in reversed(pending):
+                if self.ingest(ev.type, ev.data or {}, ev.seq):
+                    changed = True
+            return changed
 
     def _on_spawn(self, data: dict) -> bool:
         aid = str(data.get("id", ""))
@@ -759,18 +778,32 @@ class ParallelAgentsPanel:
     def _on_progress(self, data: dict) -> bool:
         aid = str(data.get("id", ""))
         st = self._agents.get(aid)
-        if st is None or st["status"] != self.RUNNING:
+        if st is None:
+            # progress for an agent we never saw spawn (e.g. a resumed
+            # agent — resume() seals crew.resumed, not crew.spawn — or the
+            # panel attached mid-run). Synthesize a minimal entry so the
+            # activity is visible instead of silently dropped.
+            self._on_spawn({"id": aid,
+                            "nickname": data.get("nickname"),
+                            "role": data.get("role"),
+                            "task": data.get("task")})
+            st = self._agents.get(aid)
+            if st is None:
+                return False
+        if st["status"] != self.RUNNING:
             return False
         step = data.get("step", st["step"])
         try:
             step = int(step)
         except (TypeError, ValueError):
             step = st["step"]
-        tools = data.get("tools") or []
-        if step == st["step"] and list(tools) == st["tools"]:
+        # coerce defensively — a non-string tool name would blow up
+        # ", ".join at render time and kill the whole frame
+        tools = [str(t) for t in (data.get("tools") or [])]
+        if step == st["step"] and tools == st["tools"]:
             return False  # no visible change — skip reformat entirely
         st["step"] = step
-        st["tools"] = list(tools)[:6]
+        st["tools"] = tools[:6]
         self._dirty.add(aid)
         return True
 
@@ -806,8 +839,42 @@ class ParallelAgentsPanel:
     def _on_force_stop(self, data: dict) -> bool:
         return self._mark_stopped("stopped by user")
 
+    def _on_resumed(self, data: dict) -> bool:
+        """A retired agent brought back to life (crew.resumed) — flip its
+        row back to running instead of leaving the stale terminal state
+        on screen forever."""
+        aid = str(data.get("id", ""))
+        st = self._agents.get(aid)
+        if st is None:
+            return self._on_spawn({"id": aid,
+                                   "nickname": data.get("nickname"),
+                                   "role": data.get("role"),
+                                   "task": data.get("task")})
+        if st["status"] == self.RUNNING:
+            return False
+        st["status"] = self.RUNNING
+        st["error"] = ""
+        st["step"] = 0
+        st["tools"] = []
+        st["spawn_ts"] = time.time()
+        st["elapsed_ms"] = 0
+        self._dirty.add(aid)
+        self._structural = True
+        return True
+
     def _on_closed(self, data: dict) -> bool:
-        return self._mark_stopped("crew closed")
+        # crew.closed carries ONE agent id (unlike crew.force_stop which
+        # is roster-wide). Only that agent is retired — never flip every
+        # other running agent to stopped.
+        aid = str(data.get("id") or "")
+        st = self._agents.get(aid)
+        if st is not None and st["status"] == self.RUNNING:
+            st["status"] = self.STOPPED
+            st["error"] = "crew closed"
+            self._dirty.add(aid)
+            self._structural = True
+            return True
+        return False
 
     def _mark_stopped(self, reason: str) -> bool:
         changed = False
@@ -828,15 +895,18 @@ class ParallelAgentsPanel:
     def active_count(self) -> int:
         """Number of currently-running agents. O(n) but n is tiny (crew
         capacity is bounded); cheap enough to not need caching."""
-        return sum(1 for aid in self._order
-                   if self._agents[aid]["status"] == self.RUNNING)
+        with self._lock:
+            return sum(1 for aid in self._order
+                       if self._agents[aid]["status"] == self.RUNNING)
 
     @property
     def total_count(self) -> int:
-        return len(self._order)
+        with self._lock:
+            return len(self._order)
 
     def has_activity(self) -> bool:
-        return bool(self._order)
+        with self._lock:
+            return bool(self._order)
 
     # -- rendering ---------------------------------------------------------------
 
@@ -846,34 +916,45 @@ class ParallelAgentsPanel:
 
     def maybe_render(self, width: int, force: bool = False) -> list | None:
         """Return prompt_toolkit fragments for the panel, or None if
-        throttled (no render needed right now).
+        there is nothing to show.
 
         Throttle rule: structural changes (spawn/done) always render
-        immediately; pure progress updates are capped at 10/sec.
+        immediately; pure progress updates are capped at 10/sec. When
+        throttled, the last rendered frame is served from cache — the old
+        code returned None here, which collapsed the panel window to zero
+        height on every other render frame (a visible blink while agents
+        were running).
         """
-        if not self._order:
-            return None
-        now = time.time()
-        if not force and not self._structural:
-            if now - self._last_emit < self.RENDER_INTERVAL:
+        with self._lock:
+            if not self._order:
                 return None
-        self._last_emit = now
-        self._structural = False
-        return self._fragments(width)
+            now = time.time()
+            if (not force and not self._structural
+                    and self._last_fragments is not None
+                    and width == self._last_width
+                    and now - self._last_emit < self.RENDER_INTERVAL):
+                return self._last_fragments
+            self._last_emit = now
+            self._structural = False
+            frags = self._fragments(width)
+            self._last_fragments = frags
+            self._last_width = width
+            return frags
 
     def render_text(self, width: int = 80) -> list[str]:
         """Plain-text rows (for dashboard / non-prompt_toolkit use)."""
-        self._reformat_dirty(width)
-        out: list[str] = []
-        spin = SPINNER_FRAMES[self._spin_i % len(SPINNER_FRAMES)]
-        for aid in self._order:
-            st = self._agents[aid]
-            row = self._row_cache.get(aid, "")
-            if st["status"] == self.RUNNING:
-                out.append(f"{spin} {row}")
-            else:
-                out.append(row)
-        return out
+        with self._lock:
+            self._reformat_dirty(width)
+            out: list[str] = []
+            spin = SPINNER_FRAMES[self._spin_i % len(SPINNER_FRAMES)]
+            for aid in self._order:
+                st = self._agents[aid]
+                row = self._row_cache.get(aid, "")
+                if st["status"] == self.RUNNING:
+                    out.append(f"{spin} {row}")
+                else:
+                    out.append(row)
+            return out
 
     def _fragments(self, width: int) -> list:
         """prompt_toolkit fragments. Only dirty rows are reformatted."""
@@ -968,6 +1049,10 @@ class UI:
         self._spinner_i = 0
         self._spinner_gen = 0
         self._spinner_on = False
+        # crew-watcher: after a turn ends, the spinner tick keeps running
+        # while subagents are still alive so the parallel-agents panel
+        # animates to completion instead of freezing
+        self._crew_watch = False
         self._turn_start_ts = 0.0
         self._cancel_flag = threading.Event()
         self._last_flush = 0.0
@@ -1002,12 +1087,17 @@ class UI:
 
     def _model(self) -> Model:
         m = model_by_id(self.cfg.model_id)
-        assert m is not None
+        if m is None:
+            # stale config (model id removed upstream) — fall back instead
+            # of asserting: an AssertionError here would propagate out of
+            # the per-frame border render and take the whole session down
+            m = model_by_id(config.DEFAULT_MODEL_ID) or MODELS[0]
         return m
 
     def _effort(self) -> Effort:
         e = effort_by_key(self.cfg.effort)
-        assert e is not None
+        if e is None:
+            e = effort_by_key(config.DEFAULT_EFFORT) or EFFORTS[0]
         return e
 
     def _width(self) -> int:
@@ -1085,10 +1175,16 @@ class UI:
         # folds the whole log
         now = time.time()
         if self._goal_cache is None or now - self._goal_cache_ts > 1.0:
-            self._goal_cache = self.agent.goal.status()
+            try:
+                self._goal_cache = self.agent.goal.status()
+            except Exception:
+                # a corrupt goal event (or a fold failure) must never break
+                # the render loop — keep the previous reading, or hide the
+                # segment when there isn't one yet
+                pass
             self._goal_cache_ts = now
         goal = self._goal_cache
-        if goal.active:
+        if goal is not None and goal.active:
             pct = max(0, min(100, (1 - goal.distance) * 100))
             filled = int(round(pct / 20))
             bar = "▰" * filled + "▱" * (5 - filled)
@@ -1491,8 +1587,7 @@ class UI:
         @kb.add("c-c", filter=focused & ~ov & idle)
         def _ctrl_c(event):
             if self._busy:
-                self._cancel_flag.set()
-                self.agent._cancel_flag.set()  # sync with agent for crew force stop
+                self._request_cancel()
                 self._set_status("cancelling…")
             elif self.buffer.text:
                 self.buffer.reset()
@@ -1506,8 +1601,7 @@ class UI:
         @kb.add(Keys.Escape, filter=focused & ~ov &
                 Condition(lambda: self._busy))
         def _esc_cancel(event):
-            self._cancel_flag.set()
-            self.agent._cancel_flag.set()  # sync with agent for crew force stop
+            self._request_cancel()
             self._set_status("cancelling…")
             self._set_flash("⊘ cancelling — force stopping…", C["yellow"])
 
@@ -1543,6 +1637,24 @@ class UI:
             self.buffer.open_in_editor(validate_and_handle=True)
 
         return kb
+
+    def _request_cancel(self) -> None:
+        """Idempotent cancel: stop this UI's turn flag, the agent's own
+        cancel flag, and force-stop any running subagents. Every step is
+        guarded — the original Esc/Ctrl+C crash was an AttributeError on
+        agent._cancel_flag, and this path must never raise back into the
+        key handler."""
+        self._cancel_flag.set()
+        flag = getattr(self.agent, "_cancel_flag", None)
+        if flag is not None:
+            try:
+                flag.set()
+            except Exception:
+                pass
+        try:
+            self.agent.crew.force_stop()
+        except Exception:
+            pass
 
     def _bg(self, fn) -> None:
         """Run fn on a daemon thread with exceptions surfaced to the UI —
@@ -3104,6 +3216,16 @@ class UI:
     def _run_turn_thread(self, text: str) -> None:
         self._busy = True
         try:
+            # Clear the agent's cancel flag on the turn thread, right before
+            # run_turn: run_turn clears it again internally, but a cancel
+            # landing in the window between thread start and that internal
+            # clear would otherwise be silently wiped.
+            flag = getattr(self.agent, "_cancel_flag", None)
+            if flag is not None:
+                try:
+                    flag.clear()
+                except Exception:
+                    pass
             self._run_turn(text)
         finally:
             self._stop_spinner()
@@ -3498,9 +3620,17 @@ class UI:
         self._spinner_gen = getattr(self, "_spinner_gen", 0) + 1
         gen = self._spinner_gen
         self._spinner_on = True
+        self._crew_watch = False
 
         def tick():
-            while self._spinner_on and gen == self._spinner_gen:
+            # The tick doubles as the crew panel's heartbeat: it polls crew
+            # events and invalidates the layout. After the turn ends it
+            # keeps running while subagents are still alive, so the panel
+            # animates to completion instead of freezing on stale
+            # "running" rows. A new turn bumps the generation and the old
+            # tick exits on its next wake (<=90ms) — no leak.
+            while (self._spinner_on or self._crew_watch) \
+                    and gen == self._spinner_gen:
                 self._spinner_i = (self._spinner_i + 1) % len(SPINNER_FRAMES)
                 # keep the parallel-agents panel live: poll crew events on
                 # the tick (O(new events); panel throttles renders to 10/s)
@@ -3508,14 +3638,25 @@ class UI:
                     self.poll_crew()
                 except Exception:
                     pass
+                try:
+                    self._crew_watch = self.crew_panel.active_count > 0
+                except Exception:
+                    self._crew_watch = False
                 self._invalidate()
                 time.sleep(0.09)
 
         threading.Thread(target=tick, daemon=True).start()
 
     def _stop_spinner(self) -> None:
-        self._spinner_gen = getattr(self, "_spinner_gen", 0) + 1
         self._spinner_on = False
+        # NOTE: the generation is deliberately NOT bumped here — the tick
+        # must survive the turn end while crew agents are still running
+        # (see _start_spinner). A new turn's _start_spinner bumps the
+        # generation and retires the old tick.
+        try:
+            self._crew_watch = self.crew_panel.active_count > 0
+        except Exception:
+            self._crew_watch = False
 
     # -- approval (in-app) ------------------------------------------------------------------------
 

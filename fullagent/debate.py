@@ -125,18 +125,37 @@ class DebateTournament:
 
     # -- the tournament ------------------------------------------------------------
 
+    def _ask(self, model_id: str, prompt: str) -> str:
+        """One speaker call, hardened. A failing speaker (exception or
+        None/non-str reply) degrades to an empty answer, which _fuse
+        already drops before clustering — a dead model must never kill
+        the tournament with an AttributeError on None.strip() or a
+        TypeError on None[:200] in the round log."""
+        try:
+            out = self.speaker(model_id, prompt)
+        except Exception as e:
+            _log.warning("debate speaker %s failed: %s: %s",
+                         model_id, type(e).__name__, e)
+            return ""
+        return out if isinstance(out, str) else str(out or "")
+
     def run(self, question: str, rounds: int = 3) -> DebateResult:
         """Full 3-round tournament (rounds<3 degrades gracefully: 2 =
         no revision, 1 = plain parallel sampling)."""
         question = str(question or "").strip()
         result = DebateResult(question=question, rounds=0)
+        # reset the winner credit FIRST: a previous tournament's cluster
+        # must not survive into confirm()/refute() for this one — an
+        # empty/degenerate run has no outcome, so confirm() then falls
+        # back to crediting exactly the model the caller names
+        self._champion_cluster = set()
         if not question or not self.models:
             return result
         positions = [Position(model_id=m) for m in self.models]
 
         # round 1 — blind proposals
         for p in positions:
-            p.answer = self.speaker(p.model_id, (
+            p.answer = self._ask(p.model_id, (
                 "Answer this question directly and concisely. Stand "
                 "alone: you will defend it in a tournament.\n\n"
                 f"QUESTION: {question}"))
@@ -152,7 +171,7 @@ class DebateTournament:
                 f"[{p.model_id}] says: {p.answer[:600]}"
                 for p in positions)
             for p in positions:
-                p.critique = self.speaker(p.model_id, (
+                p.critique = self._ask(p.model_id, (
                     f"QUESTION: {question}\n\nThe tournament's "
                     f"proposals:\n{others}\n\nYou are [{p.model_id}]. "
                     f"Attack the weakest claims above — including your "
@@ -170,7 +189,7 @@ class DebateTournament:
                 f"[{p.model_id}] critiques: {p.critique[:400]}"
                 for p in positions)
             for p in positions:
-                p.revised = self.speaker(p.model_id, (
+                p.revised = self._ask(p.model_id, (
                     f"QUESTION: {question}\n\nYour original answer: "
                     f"{p.answer[:600]}\n\nThe tournament's critiques:\n"
                     f"{all_critiques}\n\nRevise YOUR answer. Keep what "
@@ -262,9 +281,12 @@ class DebateTournament:
         verdict = vecs[best][1]
         dissent: list[str] = []
         if len(clusters) > 1:
-            other = clusters[1]
+            # best answer outside the champion cluster — scan ALL
+            # non-champion clusters, not just the runner-up: with 3+
+            # clusters the strongest dissent can sit in cluster 3.
+            others = [i for c in clusters[1:] for i in c]
             top_other = max(
-                other, key=lambda i: self.calibration(
+                others, key=lambda i: self.calibration(
                     vecs[i][0].model_id))
             dissent = [f"[{vecs[top_other][0].model_id}] dissents: "
                        + vecs[top_other][1][:300]]

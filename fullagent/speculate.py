@@ -137,6 +137,12 @@ class Speculator:
         self.turn = 0
         self.hits = 0
         self.misses = 0
+        # BUG FIX (race): two threads racing speculate() both saw the
+        # same prediction as "not in cache" and prefetched it twice —
+        # duplicate work and duplicate spec.prefetch audit events. Keys
+        # are reserved here between selection and completion so each
+        # prediction is prefetched at most once per round.
+        self._inflight: set[str] = set()
 
     # -- speculation round ---------------------------------------------------
 
@@ -145,12 +151,22 @@ class Speculator:
         with self._lock:
             self.turn += 1
             self._expire_locked()
+            turn = self.turn
         preds = predict(user_text, recent_tools)
         with self._lock:
+            # the whitelist is the safety gate: a prediction for a
+            # non-read-only tool can never reach the runner, so a
+            # speculative write is structurally impossible.
             fresh = [p for p in preds
                      if p.tool in SPECULATIVE_TOOLS
-                     and p.key() not in self._cache]
+                     and p.key() not in self._cache
+                     and p.key() not in self._inflight]
+            for p in fresh:
+                self._inflight.add(p.key())
         if not fresh or self.runner is None:
+            with self._lock:
+                for p in fresh:
+                    self._inflight.discard(p.key())
             return 0
 
         def _run(p: Prediction) -> tuple[Prediction, str]:
@@ -160,19 +176,29 @@ class Speculator:
                 return p, f"ERROR: {type(e).__name__}: {e}"
 
         done = 0
-        with ThreadPoolExecutor(max_workers=min(4, len(fresh))) as ex:
-            for p, result in ex.map(_run, fresh):
-                if result.startswith("ERROR:"):
-                    continue
-                with self._lock:
-                    self._cache[p.key()] = CacheEntry(
-                        p.tool, p.args, result, self.turn)
-                self.log.append("spec.prefetch",
-                                {"tool": p.tool, "args": p.args,
-                                 "score": p.score, "why": p.why,
-                                 "chars": len(result)},
-                                actor="speculator")
-                done += 1
+        try:
+            with ThreadPoolExecutor(max_workers=min(4, len(fresh))) as ex:
+                for p, result in ex.map(_run, fresh):
+                    with self._lock:
+                        self._inflight.discard(p.key())
+                    if result.startswith("ERROR:"):
+                        continue
+                    with self._lock:
+                        self._cache[p.key()] = CacheEntry(
+                            p.tool, p.args, result, turn)
+                    self.log.append("spec.prefetch",
+                                    {"tool": p.tool, "args": p.args,
+                                     "score": p.score, "why": p.why,
+                                     "chars": len(result)},
+                                    actor="speculator")
+                    done += 1
+        finally:
+            # never leave a reservation behind: an early exit (pool
+            # failure, BaseException) used to strand keys in _inflight
+            # and silently suppress those predictions forever after.
+            with self._lock:
+                for p in fresh:
+                    self._inflight.discard(p.key())
         return done
 
     # -- serving ---------------------------------------------------------------
@@ -292,5 +318,50 @@ if __name__ == "__main__":
 
         text = spec.format_status()
         assert "SPECULATOR" in text and "hit-rate" in text
+
+        # SAFETY: even a hostile prediction list can never route a
+        # non-read-only tool to the runner — the whitelist is the gate
+        evil_calls: list[tuple[str, dict]] = []
+
+        def evil_runner(name: str, args: dict) -> str:
+            evil_calls.append((name, args))
+            return "OK"
+
+        spec_evil = Speculator(log, evil_runner)
+        _real_predict = predict
+        try:
+            globals()["predict"] = lambda *a: [
+                Prediction("write_file",
+                           {"path": "x.txt", "content": "pwned"},
+                           1.0, "evil"),
+                Prediction("read_file", {"path": "ok.txt"}, 0.9, "ok")]
+            n = spec_evil.speculate("anything", [])
+        finally:
+            globals()["predict"] = _real_predict
+        assert n == 1, n
+        assert [c[0] for c in evil_calls] == ["read_file"], evil_calls
+
+        # a key already reserved in-flight is not prefetched again (the
+        # duplicate-prefetch race guard), and reservations are always
+        # released afterwards
+        dup_calls: list[tuple[str, dict]] = []
+
+        def dup_runner(name: str, args: dict) -> str:
+            dup_calls.append((name, dict(args)))
+            return "OK"
+
+        spec_dup = Speculator(log, dup_runner)
+        rkey = Prediction("read_file", {"path": "src/main.py"}).key()
+        spec_dup._inflight.add(rkey)
+        spec_dup.speculate("please look at src/main.py and fix it", [])
+        assert all(c[0] != "read_file" for c in dup_calls), dup_calls
+        # the round released everything IT reserved; only the foreign
+        # key I injected by hand remains
+        assert spec_dup._inflight == {rkey}, spec_dup._inflight
+        spec_dup._inflight.discard(rkey)
+        # every tool the runner ever saw is read-only
+        for c in dup_calls:
+            assert c[0] in ("read_file", "list_dir", "file_info",
+                            "search_files", "glob_files"), c
 
     print("SPECULATOR SELF-TEST PASS")
