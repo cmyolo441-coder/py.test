@@ -187,6 +187,12 @@ def build_diff(tool_name: str, args: Dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 def _print_diff(diff: str, tool_name: str, ui: Any) -> None:
+    # Truncate massive diffs — showing 400+ lines floods the TUI and
+    # makes users hit Esc in frustration. Show max 30 lines.
+    lines = diff.split("\n")
+    if len(lines) > 30:
+        shown = "\n".join(lines[:30])
+        diff = f"{shown}\n... ({len(lines) - 30} more lines, {len(lines)} total)"
     header = f"Diff preview — {tool_name}:"
     body = header + "\n" + diff
     try:
@@ -290,6 +296,12 @@ def register(agent: Any) -> None:
 
     def _bound(tool_name: str, args: Dict[str, Any],
                ui: Any = None) -> bool:
+        # Diff preview is OFF by default — it flooded the TUI with massive
+        # diffs and its input() blocked Esc cancellation. Enable explicitly
+        # via FULLAGENT_DIFF_PREVIEW=1 if you want it.
+        import os
+        if os.environ.get("FULLAGENT_DIFF_PREVIEW", "") != "1":
+            return True
         if _permission_mode(agent) == "bypassPermissions":
             return True
         return preview_and_confirm(tool_name, args, ui)

@@ -1692,6 +1692,22 @@ class UI:
             self.agent.crew.force_stop()
         except Exception:
             pass
+        # Watchdog: if the turn thread is stuck (e.g. blocked in input()
+        # or a hung subprocess), force-clear the busy state after 10s so
+        # the UI never shows "cancelling…" forever.
+        import threading as _th
+        def _watchdog():
+            import time as _t
+            _t.sleep(10)
+            if self._busy and self._cancel_flag.is_set():
+                self._busy = False
+                try:
+                    self._set_status("")
+                    self._set_flash("⚠ turn force-stopped (was stuck)",
+                                    C["yellow"])
+                except Exception:
+                    pass
+        _th.Thread(target=_watchdog, daemon=True).start()
 
     def _bg(self, fn) -> None:
         """Run fn on a daemon thread with exceptions surfaced to the UI —
