@@ -176,6 +176,38 @@ def _headless(argv: list[str]) -> int:
     return 2
 
 
+def _headless_print(prompt: str, ns) -> int:
+    """Run one headless turn and print the result (text or JSON)."""
+    from . import config
+    from .agent import Agent
+    from .config import Config
+
+    config.ensure_dirs()
+    cfg = Config.load()
+    agent = Agent(cfg)
+
+    def _noop(*a, **k):
+        pass
+
+    turn = agent.run_turn(
+        prompt,
+        on_token=_noop, on_reasoning=_noop,
+        on_tool_call=_noop, on_tool_update=_noop,
+        on_status=_noop, approve=lambda tool, args: True,
+    )
+    if getattr(ns, "output_format", "text") == "json":
+        from . import jsonout
+        jsonout.emit_json(jsonout.turn_to_json(
+            turn, getattr(agent, "session_id", None),
+            extra={"agent": agent}))
+    else:
+        print(turn.assistant_text or "(no response)")
+        if turn.error:
+            print(f"error: {turn.error}", file=sys.stderr)
+            return 1
+    return 0
+
+
 def main() -> int:
     _force_utf8()
 
@@ -192,7 +224,15 @@ def main() -> int:
                     help="resume a saved session (latest if no id)")
     _p.add_argument("--continue", dest="continue_", action="store_true",
                     help="resume the most recent session")
+    _p.add_argument("--print", dest="print_", metavar="PROMPT",
+                    default=None,
+                    help="run one headless turn with PROMPT and print result")
+    _p.add_argument("--output-format", choices=["text", "json"],
+                    default="text",
+                    help="headless turn output format (text|json)")
     _ns, argv = _p.parse_known_args(argv)
+    if _ns.print_:
+        return _headless_print(_ns.print_, _ns)
     if argv:
         return _headless(argv)
 

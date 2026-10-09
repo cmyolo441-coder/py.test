@@ -361,6 +361,12 @@ class Agent:
             "todos", "multiedit", "bgsh", "planmode", "codeinit",
             "review", "notebook", "permissions", "outstyle",
             "webfetch", "checkpoints", "hooks",
+            # Round 2 advanced features
+            "mcp", "skills", "agenttypes", "doctor", "statuscmd",
+            "permrules", "configcmd", "images", "export", "vimmode",
+            "thinking", "undocmd", "diffpreview", "costtrack",
+            "jsonout", "ctxmeter", "prreview", "smartctx",
+            "termsetup", "plugins",
         ):
             try:
                 mod = __import__(f"fullagent.{mod_name}",
@@ -1056,6 +1062,13 @@ class Agent:
                                           "tokens_out": tout,
                                           "model": self.model.id},
                         correlation_id=focus)
+        # costtrack module: per-turn spend for /cost
+        _tracker = getattr(self, "cost_tracker", None)
+        if _tracker is not None:
+            try:
+                _tracker.add_turn(self.model.id, tin, tout)
+            except Exception:
+                pass
 
     def _detect_goal_clauses(self, text: str) -> None:
         """The model may CLAIM 'PROVEN: <id>' — but the clause is only
@@ -1464,6 +1477,23 @@ class Agent:
                         actor="sovereign", provenance="model",
                         causation_id=causation_id,
                         correlation_id=clause_id)
+
+        # diffpreview: show unified diff + confirm before applying changes
+        if ev.name in ("write_file", "edit_file", "apply_patch",
+                       "MultiEdit", "multiedit"):
+            _preview = getattr(self, "diff_preview", None)
+            if callable(_preview):
+                _ui = getattr(self, "ui", None)
+                try:
+                    _proceed = _preview(ev.name, ev.args, _ui)
+                except Exception:
+                    _proceed = True
+                if not _proceed:
+                    ev.status = "denied"
+                    ev.result = ("ERROR: user declined the diff preview. "
+                                 "Ask the user how to proceed or choose "
+                                 "another approach.")
+                    return
 
         on_status(f"running:{ev.name}")
         # v3: if the Speculator already prefetched this exact read-only
@@ -1876,6 +1906,10 @@ class Agent:
                 "researcher": "researcher",
                 "reviewer": "reviewer",
             }
+            # Custom markdown-defined subagent types (agenttypes module)
+            _custom = getattr(self, "custom_agent_types", None) or {}
+            for _name in _custom:
+                role_map.setdefault(_name.lower(), _name)
             role = role_map.get(subagent_type.lower(), "researcher")
             try:
                 handle = crew.spawn(task=prompt, role=role,

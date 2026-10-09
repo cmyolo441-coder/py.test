@@ -286,7 +286,8 @@ SLASH_COMMANDS = [
     ("/focus", "deep-work mode — /focus <1-20> auto-continues until done"),
     ("/render", "toggle rendered-markdown replies — /render [on|off]"),
     ("/workflow", "saved pipelines — /workflow [list|run <name>|delete <name>]"),
-    ("/export", "enterprise audit report — /export [md|html]"),
+    ("/export", "export conversation — /export [markdown|html] [path]"),
+    ("/export-report", "enterprise audit report — /export-report [md|html]"),
     ("/forecast", "projection from measured velocity + usage"),
     ("/health", "provider health — model errors + failovers"),
     ("/notify", "event notifications — /notify <url|file:path|off>"),
@@ -1083,6 +1084,13 @@ class UI:
 
         self._build()
 
+        # vimmode: apply persisted vi/emacs editing preference
+        try:
+            from .vimmode import apply_vim_mode
+            apply_vim_mode(self)
+        except Exception:
+            pass
+
     # -- small helpers ---------------------------------------------------------
 
     def _model(self) -> Model:
@@ -1204,11 +1212,16 @@ class UI:
             except Exception:
                 self._ctx_cache = 0
             self._ctx_cache_ts = now
-        ctx_color = (C["green"] if self._ctx_cache < 60
-                     else C["yellow"] if self._ctx_cache < 85
-                     else C["red"])
-        segs.append((f" ◉ ctx {self._ctx_cache}% ",
-                     f"bold {ctx_color}"))
+        # ctxmeter: visual context bar (falls back to text % on any error)
+        try:
+            from . import ctxmeter
+            segs.extend(ctxmeter.context_bar(self))
+        except Exception:
+            ctx_color = (C["green"] if self._ctx_cache < 60
+                         else C["yellow"] if self._ctx_cache < 85
+                         else C["red"])
+            segs.append((f" ◉ ctx {self._ctx_cache}% ",
+                         f"bold {ctx_color}"))
         # parallel agents indicator — O(1) count from the crew panel; the
         # full panel renders below the top bar while crew is active
         try:
@@ -1787,6 +1800,43 @@ class UI:
         elif cmd == "/agents":
             from . import agentscmd
             self.print_info(agentscmd.handle(self, arg), C["fg"])
+        # ---- Round 2 advanced features ----
+        elif cmd == "/mcp":
+            from .mcp import handle_mcp
+            handle_mcp(self, arg)
+        elif cmd == "/skills":
+            from .skills import handle_skills
+            handle_skills(self, arg)
+        elif cmd == "/doctor":
+            from .doctor import handle_doctor
+            handle_doctor(self, arg)
+        elif cmd == "/status":
+            from .statuscmd import handle_status
+            handle_status(self, arg)
+        elif cmd == "/config":
+            from .configcmd import handle_config
+            handle_config(self, arg)
+        elif cmd == "/vim":
+            from .vimmode import handle_vim
+            handle_vim(self, arg)
+        elif cmd == "/thinking":
+            from .thinking import handle_thinking
+            handle_thinking(self, arg)
+        elif cmd == "/undo":
+            from .undocmd import handle_undo
+            handle_undo(self, arg)
+        elif cmd == "/cost":
+            from .costtrack import handle_cost
+            handle_cost(self, arg)
+        elif cmd == "/pr-review":
+            from .prreview import handle_pr_review
+            handle_pr_review(self, arg)
+        elif cmd == "/terminal-setup":
+            from .termsetup import handle_terminal_setup
+            handle_terminal_setup(self, arg)
+        elif cmd == "/plugin":
+            from .plugins import handle_plugin
+            handle_plugin(self, arg)
         elif cmd == "/compact":
             from .compact import do_compact
             stats = do_compact(self.agent)
@@ -1812,7 +1862,12 @@ class UI:
                 perms = PermissionManager()
                 self.agent.permissions = perms
             sub = arg.strip()
-            if sub:
+            # permrules: /permissions rules [allow|ask|deny|remove] <tool>
+            if sub.lower().startswith("rules"):
+                from .permrules import handle_permissions_rules
+                rest = sub[len("rules"):].strip()
+                self.print_info(handle_permissions_rules(self, rest), C["fg"])
+            elif sub:
                 try:
                     perms.set_mode(sub)
                     self.print_info(f"✓ {perms.describe()}", C["green"])
@@ -1873,6 +1928,12 @@ class UI:
         elif cmd == "/reasoning":
             self.cfg.show_reasoning = not self.cfg.show_reasoning
             self.cfg.save()
+            # keep in sync with /thinking (thinking module flag)
+            try:
+                if hasattr(self.agent, "set_thinking_visible"):
+                    self.agent.set_thinking_visible(self.cfg.show_reasoning)
+            except Exception:
+                pass
             state = "ON" if self.cfg.show_reasoning else "OFF"
             self.print_info(f"✓ reasoning display: {state}", C["pink"])
         elif cmd == "/usage":
@@ -1888,6 +1949,9 @@ class UI:
         elif cmd == "/workflow":
             self._cmd_workflow(arg)
         elif cmd == "/export":
+            from .export import handle_export
+            handle_export(self, arg)
+        elif cmd == "/export-report":
             self._cmd_export(arg)
         elif cmd == "/forecast":
             self.print_info(self.agent.get_forecast(), C["cyan"])
@@ -1996,8 +2060,6 @@ class UI:
             self._cmd_mission(arg)
         elif cmd == "/heal":
             self.print_info(self.agent.healer.format_status(), C["yellow"])
-        elif cmd == "/skills":
-            self.print_info(self.agent.skill_forge.format_status(), C["pink"])
         elif cmd == "/council":
             self._cmd_council(arg)
         elif cmd == "/analyze":
@@ -3649,6 +3711,19 @@ class UI:
             for r in route.reasons:
                 self.print_info(f"  ↳ {r}", C["dim"])
 
+        # smartctx: expand @file mentions / bare file paths into an
+        # attachments block before the turn starts
+        try:
+            _expand = getattr(self.agent, "expand_input", None)
+            if callable(_expand):
+                text, _attachments = _expand(text, cwd=os.getcwd())
+                if _attachments:
+                    text = text + _attachments
+        except Exception:
+            pass
+        # images: @image <path> tokens are left for the ImageRead tool —
+        # the model sees the path and reads it via the tool
+
         turn = None
         try:
             turn = self.agent.run_turn(
@@ -3676,8 +3751,26 @@ class UI:
                 self.console.print()
                 self.console.print(Markdown(turn.assistant_text),
                                    soft_wrap=True)
-            if turn.reasoning and self.cfg.show_reasoning:
-                self.print_reasoning(turn.reasoning)
+            # thinking module: collapsible reasoning display; falls back
+            # to the legacy show_reasoning flag
+            _think_visible = self.cfg.show_reasoning
+            try:
+                _think_visible = bool(getattr(
+                    self.agent, "thinking_visible", _think_visible))
+            except Exception:
+                pass
+            if turn.reasoning and _think_visible:
+                try:
+                    _fmt = getattr(self.agent, "format_thinking", None)
+                    _exp = bool(getattr(self.agent, "thinking_expanded",
+                                        False))
+                    if callable(_fmt):
+                        self.print_info(_fmt(turn.reasoning,
+                                            collapsed=not _exp), C["dim"])
+                    else:
+                        self.print_reasoning(turn.reasoning)
+                except Exception:
+                    self.print_reasoning(turn.reasoning)
             if turn.error:
                 if turn.error == "cancelled":
                     self.print_info("⊘ cancelled", C["yellow"])
