@@ -871,5 +871,87 @@ def _selftest() -> int:
     return 1 if failures else 0
 
 
+def _selftest_thread_efficiency() -> int:
+    """Prove the supervisor thread is cheap when idle and still restarts
+    crashed processes at the production 5s tick: (1) interval sane,
+    (2) idle wake rate <= 1/s, (3) crash -> restart fires within the
+    production tick budget."""
+    import tempfile
+
+    global _BACKOFF_BASE
+    failures: list[str] = []
+
+    def check(name: str, cond: bool) -> None:
+        print(("PASS" if cond else "FAIL") + f" — {name}")
+        if not cond:
+            failures.append(name)
+
+    tmp = Path(tempfile.mkdtemp(prefix="supervise_eff_"))
+    old_db = os.environ.get("FULLAGENT_SUPERVISE_DB")
+    old_backoff = _BACKOFF_BASE
+    os.environ["FULLAGENT_SUPERVISE_DB"] = str(tmp / "sup.db")
+    tid = ""
+    try:
+        # 1. production interval is a sane 5s -> 0.2 wakes/s when idle
+        check(f"production poll interval sane ({_POLL_INTERVAL}s)",
+              _POLL_INTERVAL == 5.0 and _POLL_INTERVAL >= 1.0)
+
+        ensure_started()
+        check("supervisor thread alive", _SUP._thread is not None
+              and _SUP._thread.is_alive())
+
+        # 2. idle wake budget: count real ticks over 2.2s
+        ticks: list[float] = []
+        orig = _SUP._poll_once
+
+        def counting() -> None:
+            ticks.append(time.monotonic())
+            orig()
+
+        _SUP._poll_once = counting  # type: ignore[method-assign]
+        time.sleep(2.2)
+        _SUP._poll_once = orig  # type: ignore[method-assign]
+        check("idle wake rate <= 1/s "
+              f"({len(ticks)} ticks in 2.2s)", len(ticks) <= 2)
+
+        # 3. function still triggers at production timing: a crashing
+        #    process is detected and restarted within the tick budget.
+        _BACKOFF_BASE = 1.0  # keep the test fast; poll stays at 5s
+        tid = add("exit 3", restart_policy="on-failure", max_restarts=1)
+        deadline = time.time() + 20
+        ok = False
+        while time.time() < deadline:
+            if len(_SUP._restart_times.get(tid, [])) >= 1:
+                ok = True
+                break
+            time.sleep(0.3)
+        check("crash -> restart fires at 5s production tick", ok)
+    finally:
+        _BACKOFF_BASE = old_backoff
+        if tid:
+            try:
+                stop_supervised(tid)
+            except Exception:  # noqa: BLE001 — best-effort cleanup
+                pass
+            try:
+                _db_delete(tid)
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            _SUP.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        if old_db is None:
+            os.environ.pop("FULLAGENT_SUPERVISE_DB", None)
+        else:
+            os.environ["FULLAGENT_SUPERVISE_DB"] = old_db
+
+    print("PASS - supervise thread efficiency"
+          if not failures else f"{len(failures)} EFFICIENCY FAILURES")
+    return 1 if failures else 0
+
+
 if __name__ == "__main__":
-    raise SystemExit(_selftest())
+    eff_rc = _selftest_thread_efficiency()
+    rc = _selftest()
+    raise SystemExit(eff_rc or rc)

@@ -742,5 +742,69 @@ def _selftest() -> int:
     return 1 if failures else 0
 
 
+def _selftest_thread_efficiency() -> int:
+    """Prove the job threads are event-driven, not polling: (1) no
+    persistent poll loop exists — pump threads block on pipe reads and the
+    watcher blocks on proc.wait(), (2) per-job threads die when the job
+    ends, (3) the recovery daemon is one-shot, (4) a job still runs to
+    completion with real output."""
+    import tempfile
+
+    failures: list[str] = []
+
+    def check(name: str, cond: bool) -> None:
+        print(("PASS" if cond else "FAIL") + f" — {name}")
+        if not cond:
+            failures.append(name)
+
+    tmp = Path(tempfile.mkdtemp(prefix="jobs_eff_"))
+    old = _STORE_DIR_OVERRIDE
+    set_store_dir(tmp)
+    try:
+        jid = start_job("echo efficiency-probe-ok")
+        deadline = time.time() + 15
+        while status(jid)["status"] not in ("done", "failed") \
+                and time.time() < deadline:
+            time.sleep(0.1)
+        st = status(jid)
+        check("job runs to completion", st["status"] == "done")
+        check("real output streamed", "efficiency-probe-ok" in logs(jid))
+
+        # per-job threads must be gone once the work is done: they block
+        # on the pipes / proc.wait() and exit — nothing polls.
+        deadline = time.time() + 10
+        lingering = True
+        while time.time() < deadline:
+            names = [t.name for t in threading.enumerate()]
+            if not any(n.startswith(f"jobs-pump-{jid}")
+                       or n.startswith(f"jobs-watch-{jid}") for n in names):
+                lingering = False
+                break
+            time.sleep(0.1)
+        check("per-job threads exit when work ends (no polling)",
+              not lingering)
+
+        # recovery daemon is one-shot: after register() it must not linger
+        class _FakeAgent:
+            def __init__(self):
+                self.tools = {}
+
+        register(_FakeAgent())
+        time.sleep(0.5)
+        rec = [t for t in threading.enumerate()
+               if t.name == "jobs-recovery-daemon" and t.is_alive()]
+        check("recovery daemon is one-shot (no persistent poll)", not rec)
+        print("PASS - jobs threads are event-driven "
+              "(blocking reads/wait, one-shot recovery)")
+    finally:
+        set_store_dir(old)
+
+    print("PASS - jobs thread efficiency"
+          if not failures else f"{len(failures)} EFFICIENCY FAILURES")
+    return 1 if failures else 0
+
+
 if __name__ == "__main__":
-    raise SystemExit(_selftest())
+    eff_rc = _selftest_thread_efficiency()
+    rc = _selftest()
+    raise SystemExit(eff_rc or rc)

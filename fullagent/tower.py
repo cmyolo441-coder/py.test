@@ -23,8 +23,6 @@ from __future__ import annotations
 
 import json
 import threading
-import webbrowser
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .kernel import EventLog, fold
 from .theater import Theater, _summary
@@ -220,6 +218,7 @@ class Tower:
     # -- HTTP plumbing ----------------------------------------------------------------
 
     def _handler(self) -> type:
+        from http.server import BaseHTTPRequestHandler  # deferred: slow cold
         tower = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -309,6 +308,7 @@ class Tower:
         """Start the server on a daemon thread; returns the URL."""
         if self.server is not None:
             return self.url
+        from http.server import ThreadingHTTPServer  # deferred: slow cold
         self.server = ThreadingHTTPServer((self.host, int(port)),
                                           self._handler())
         self.url = f"http://{self.host}:{self.server.server_port}"
@@ -317,6 +317,7 @@ class Tower:
         self.thread.start()
         if open_browser:
             try:
+                import webbrowser  # deferred: slow cold
                 webbrowser.open(self.url)
             except Exception:
                 pass

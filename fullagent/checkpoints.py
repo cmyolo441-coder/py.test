@@ -58,6 +58,12 @@ MAX_TRACKED_BYTES = 2 * 1024 * 1024  # 2 MB total
 AUTO_LABEL_PREFIX = "auto: "
 MAX_AUTO_CHECKPOINTS = 10
 
+# MEMORY BOUND (worker 19/20): manual checkpoints are full deep-copies of
+# the message history — cap them so /checkpoint spam in a long session
+# cannot grow RAM without limit. Oldest manual goes first; auto ring is
+# enforced separately and is untouched by this cap.
+MAX_MANUAL_CHECKPOINTS = 20
+
 RISK_SAFE = "safe"
 
 
@@ -83,6 +89,9 @@ class CheckpointManager:
         self._before_bytes = 0
         # Ordered ids of auto checkpoints (oldest first) for the ring.
         self._auto_ids: list[str] = []
+        # Ordered ids of manual checkpoints (oldest first) — bounded by
+        # MAX_MANUAL_CHECKPOINTS so snapshots can't grow RAM unboundedly.
+        self._manual_ids: list[str] = []
 
     # ------------------------------------------------------------------ files
 
@@ -134,9 +143,15 @@ class CheckpointManager:
         self._meta[cid] = meta
         if auto:
             self._auto_ids.append(cid)
-        self._persist_meta(meta)
-        if auto:
+            self._persist_meta(meta)
             self._enforce_auto_ring()
+        else:
+            self._manual_ids.append(cid)
+            self._persist_meta(meta)
+            # bound memory: each manual snapshot is a full deepcopy of
+            # the message history — evict the oldest manual first
+            while len(self._manual_ids) > MAX_MANUAL_CHECKPOINTS:
+                self.discard(self._manual_ids.pop(0))
         return cid
 
     def _persist_meta(self, meta: dict) -> None:
@@ -171,6 +186,8 @@ class CheckpointManager:
         self._meta.pop(checkpoint_id, None)
         if checkpoint_id in self._auto_ids:
             self._auto_ids.remove(checkpoint_id)
+        if checkpoint_id in self._manual_ids:
+            self._manual_ids.remove(checkpoint_id)
         try:
             (self.dir / f"{checkpoint_id}.json").unlink(missing_ok=True)
         except OSError:
@@ -392,6 +409,24 @@ if __name__ == "__main__":
 
     # Selftest dir should not leak into real ~/.fullagent (check we're using home).
     check("dir under ~/.fullagent", ".fullagent" in str(mgr.dir))
+
+    # MEMORY BOUND (worker 19/20): manual checkpoints are full deep-copies
+    # of the message history — creating far more than the cap must evict
+    # the oldest manual first, never the newest
+    big_msgs = [{"role": "user", "content": "x" * 2000}] * 50
+    fake.messages = big_msgs
+    newest = None
+    for i in range(MAX_MANUAL_CHECKPOINTS + 5):
+        newest = mgr.create(fake, f"spam {i}")
+    check("manual snapshots capped",
+          sum(1 for m in mgr._meta.values() if not m["auto"])
+          <= MAX_MANUAL_CHECKPOINTS)
+    check("manual ring keeps exactly the cap",
+          len(mgr._manual_ids) == MAX_MANUAL_CHECKPOINTS)
+    check("newest manual still restorable",
+          mgr.restore(fake, newest)["checkpoint_id"] == newest)
+    check("auto ring untouched by manual cap",
+          len(mgr._auto_ids) <= MAX_AUTO_CHECKPOINTS)
 
     # Cleanup.
     import shutil

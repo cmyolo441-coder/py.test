@@ -7,7 +7,21 @@ from unittest.mock import patch
 from rich.console import Console
 
 from fullagent.agent import ToolEvent, Turn
-from fullagent.tui import UI
+from fullagent.tui import UI, _StreamThrottle
+
+
+def _ticking_clock(start=100.0, step=0.2):
+    """Fake clock advancing 0.2s per call: every token passes the 10fps
+    stream throttle, so per-token visibility assertions keep their
+    original meaning."""
+    t = [start]
+
+    def now():
+        v = t[0]
+        t[0] += step
+        return v
+
+    return now
 
 
 class StreamingTests(unittest.TestCase):
@@ -42,7 +56,7 @@ class StreamingTests(unittest.TestCase):
             frames.append("".join(text for _, text in ui._bottom_fragments()))
             return Turn(text, assistant_text="first second ")
         ui.agent.run_turn = run
-        with patch("fullagent.tui.time.time", return_value=100):
+        with patch("fullagent.tui.time.time", side_effect=_ticking_clock()):
             ui._run_turn_thread("hello")
         self.assertIn("first", frames[0])
         self.assertNotIn("second", frames[0])
@@ -59,7 +73,7 @@ class StreamingTests(unittest.TestCase):
             snapshots.append(ui._status_text)
             return Turn(text, assistant_text="first line\nlast")
         ui.agent.run_turn = run
-        with patch("fullagent.tui.time.time", return_value=100):
+        with patch("fullagent.tui.time.time", side_effect=_ticking_clock()):
             ui._run_turn_thread("hello")
         self.assertIn("first line\n", snapshots[0])
         self.assertIn("last", snapshots[1])
@@ -75,7 +89,7 @@ class StreamingTests(unittest.TestCase):
             snapshots.extend([ui._status_text, ui.output.getvalue()])
             return Turn(text, assistant_text="first last")
         ui.agent.run_turn = run
-        with patch("fullagent.tui.time.time", return_value=100):
+        with patch("fullagent.tui.time.time", side_effect=_ticking_clock()):
             ui._run_turn_thread("hello")
         self.assertIn("last", snapshots[0])
         self.assertNotIn("first last", snapshots[1])
@@ -121,6 +135,60 @@ class StreamingTests(unittest.TestCase):
         with patch("fullagent.tui.threading.Thread") as worker:
             ui._dispatch("next request")
             worker.return_value.start.assert_called_once()
+
+    def test_1000_token_burst_throttles_renders_without_losing_text(self):
+        """1000 rapid tokens must not cause ~1000 renders. With a frozen
+        clock the 10fps throttle emits ~1 status frame, absorbs the rest,
+        the final flush surfaces the complete tail, and every token's text
+        still reaches the printed output (complete lines print immediately,
+        never throttled)."""
+        ui = self.make_ui()
+        ui._approve_request = None
+        ui._spinner_i = 0
+        statuses = []
+        real_set_status = UI._set_status
+
+        def spy(text):
+            statuses.append(text)
+            real_set_status(ui, text)
+
+        ui._set_status = spy
+        renders = {"n": 0}
+        ui._invalidate = lambda: renders.__setitem__("n", renders["n"] + 1)
+        N = 1000
+        words = [f"tok{i}" for i in range(N)]
+
+        def run(text, on_token, *args, **kwargs):
+            # every 7th token completes a line (must print immediately);
+            # the rest accumulate as partial tail shown in the preview
+            for i, w in enumerate(words):
+                on_token(w + ("\n" if i % 7 == 6 else " "))
+            return Turn(text, assistant_text=" ".join(words))
+
+        ui.agent.run_turn = run
+        with patch("fullagent.tui.time.time", return_value=100.0):
+            ui._run_turn_thread("hello")
+        out = ui.output.getvalue()
+        # no text lost: every token appears in the printed output
+        for w in words:
+            self.assertIn(w, out)
+        th = ui._stream_throttle
+        self.assertIsInstance(th, _StreamThrottle)
+        # renders collapsed to turn-lifecycle only (thinking…, first frame,
+        # final flush, teardown "", + 2 unconditional invalidates) —
+        # versus ~1 invalidation per token before throttling
+        self.assertLessEqual(renders["n"], 6,
+                             f"expected <=6 renders for {N} rapid tokens, "
+                             f"got {renders['n']}")
+        self.assertEqual(th.frames, 2,
+                         "only 2 stream frames should emit: first + final flush")
+        self.assertGreaterEqual(th.suppressed, N - 2,
+                                "throttle must absorb nearly the whole burst")
+        # the final flush surfaced the complete tail as a status frame
+        self.assertTrue(any(words[-1] in s for s in statuses),
+                        "final flush must surface the complete tail")
+        print(f"\n  [throttle] {N} tokens -> {renders['n']} renders "
+              f"({th.suppressed} absorbed, {th.frames} frames emitted)")
 
     def test_cancel_before_worker_start_is_preserved(self):
         ui = self.make_ui()

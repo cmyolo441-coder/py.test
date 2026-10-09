@@ -49,6 +49,7 @@ from .tools import RISK_CONFIRM, Tool
 _log = logging.getLogger(__name__)
 
 POLL_INTERVAL_S = 2.0
+_MIN_POLL_INTERVAL_S = 0.5  # hard floor: the poll loop can never spin faster
 DEBOUNCE_S = 5.0
 DEFAULT_CONFIG_PATH = Path("~/.fullagent/watches.json").expanduser()
 
@@ -79,12 +80,17 @@ class WatchManager:
     def __init__(self, config_path: Path | None = None,
                  poll_interval: float = POLL_INTERVAL_S) -> None:
         self.config_path = config_path or _config_path()
+        if poll_interval < _MIN_POLL_INTERVAL_S:
+            _log.warning("watch: poll_interval %.3fs below floor %.1fs — clamped",
+                         poll_interval, _MIN_POLL_INTERVAL_S)
+            poll_interval = _MIN_POLL_INTERVAL_S
         self.poll_interval = poll_interval
         self.watches: dict[str, Watch] = {}
         # (watch_id, abs_file_path) -> (mtime_ns, size)
         self._state: dict[tuple[str, str], tuple[int, int]] = {}
         self._lock = threading.RLock()
         self._stop = threading.Event()
+        self._wake = threading.Event()  # poke: instant wake when work arrives
         self._thread: threading.Thread | None = None
         self._load()
 
@@ -149,6 +155,7 @@ class WatchManager:
                                       added_at=time.time())
             self._save()
         _log.info("watch: added %s -> %s (%s)", wid, p, pattern or "*")
+        self.poke()  # pick the new watch up on the next instant tick
         return wid
 
     def remove(self, watch_id: str) -> bool:
@@ -182,17 +189,25 @@ class WatchManager:
 
     def stop(self) -> None:
         self._stop.set()
+        self._wake.set()  # release the sleeper instantly
         t, self._thread = self._thread, None
         if t and t.is_alive():
             t.join(timeout=self.poll_interval + 2)
 
+    def poke(self) -> None:
+        """Wake the poll loop immediately so newly added work is picked up."""
+        self._wake.set()
+
     def _loop(self) -> None:
+        # Sleeps on _wake: at most one wake per poll_interval when idle,
+        # instantly when poke()d (new watch) or when stop() is requested.
         while not self._stop.is_set():
             try:
                 self.poll_once()
             except Exception:  # noqa: BLE001 — the loop must never die
                 _log.exception("watch: unexpected error in poll loop")
-            self._stop.wait(self.poll_interval)
+            self._wake.clear()
+            self._wake.wait(self.poll_interval)
 
     def poll_once(self) -> int:
         """Run one poll cycle. Returns the number of actions fired."""
@@ -521,5 +536,77 @@ def _selftest() -> None:
     print("PASS")
 
 
+def _selftest_thread_efficiency() -> None:
+    """Prove the poll thread is cheap when idle and fast when work arrives:
+    (1) effective interval is sane and floored, (2) idle wake rate <= 1/s,
+    (3) poke() wakes the loop instantly and a real change is still
+    detected, (4) stop() returns promptly."""
+    import tempfile
+
+    def check(name: str, cond: bool, detail: str = "") -> None:
+        print(("PASS" if cond else "FAIL"), "-", name,
+              (f"({detail})" if detail and not cond else ""))
+        if not cond:
+            raise SystemExit(f"efficiency self-test failed: {name} {detail}")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+
+        # 1. interval floor: even a 10ms request is clamped, never a spin loop
+        tiny = WatchManager(config_path=tmp / "a.json", poll_interval=0.01)
+        check("poll_interval clamped to floor",
+              tiny.poll_interval >= _MIN_POLL_INTERVAL_S,
+              f"got {tiny.poll_interval}")
+        check("default interval sane (2.0s)", POLL_INTERVAL_S == 2.0,
+              f"got {POLL_INTERVAL_S}")
+
+        # 2. idle wake budget: count real loop ticks over 2.2s at 2s interval
+        mgr = WatchManager(config_path=tmp / "b.json", poll_interval=2.0)
+        ticks: list[float] = []
+        orig = mgr.poll_once
+
+        def counting() -> int:
+            ticks.append(time.monotonic())
+            return orig()
+
+        mgr.poll_once = counting  # type: ignore[method-assign]
+        mgr.start()
+        try:
+            time.sleep(2.2)
+        finally:
+            t0 = time.monotonic()
+            mgr.stop()
+            stop_dt = time.monotonic() - t0
+        check("idle wake rate <= 1/s", 1 <= len(ticks) <= 3,
+              f"{len(ticks)} ticks in 2.2s")
+        check("stop() returns promptly (< poll interval)", stop_dt < 2.0,
+              f"{stop_dt:.2f}s")
+
+        # 3. instant wake: 60s interval would never fire in-test, but a
+        #    poke + real file change must be detected within seconds.
+        watched = tmp / "w"
+        watched.mkdir()
+        marker = tmp / "hit.log"
+        mgr2 = WatchManager(config_path=tmp / "c.json", poll_interval=60.0)
+        mgr2.start()
+        try:
+            action = f"echo fired >> {marker}"
+            mgr2.add(str(watched), "*.txt", action)
+            target = watched / "poke.txt"
+            target.write_text("x\n", encoding="utf-8")
+            mgr2.poke()
+            t0 = time.monotonic()
+            deadline = t0 + 10
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.1)
+            check("poke: change detected despite 60s interval",
+                  marker.exists(), f"waited {time.monotonic() - t0:.1f}s")
+        finally:
+            mgr2.stop()
+
+    print("PASS - watch thread efficiency")
+
+
 if __name__ == "__main__":
     _selftest()
+    _selftest_thread_efficiency()

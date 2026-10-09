@@ -554,6 +554,60 @@ class _LiveWrite:
 
 
 # ---------------------------------------------------------------------------
+# Stream render throttle — cap per-token UI updates at ~10fps
+# ---------------------------------------------------------------------------
+
+
+class _StreamThrottle:
+    """Rate-limit per-token UI updates to at most one frame per `interval`.
+
+    Token ingestion is NEVER blocked: every update() buffers the latest
+    preview text instantly. maybe_flush() returns the buffered frame only
+    when >= interval seconds have passed since the previous frame, so a
+    fast stream (thousands of tokens/sec) triggers at most 10 screen
+    invalidations/sec instead of one full-screen re-render per token.
+    flush() forces the pending frame out — call it when the stream ends so
+    the final render always reflects the complete output.
+
+    `frames` / `suppressed` counters make the before/after measurable.
+    """
+
+    def __init__(self, interval: float = 0.1):
+        self.interval = interval
+        self._last_emit = 0.0
+        self._pending: str | None = None
+        self.frames = 0       # frames actually emitted
+        self.suppressed = 0   # updates absorbed without emitting a frame
+
+    def update(self, text: str) -> None:
+        """Buffer the latest text. Never blocks, never drops text."""
+        self._pending = text
+
+    def due(self) -> bool:
+        """True when at least `interval` seconds passed since last frame."""
+        return (time.time() - self._last_emit) >= self.interval
+
+    def maybe_flush(self) -> str | None:
+        """Return the buffered frame if one is due, else None."""
+        if self._pending is None:
+            return None
+        if not self.due():
+            self.suppressed += 1
+            return None
+        return self.flush()
+
+    def flush(self) -> str | None:
+        """Force the buffered frame out (stream end / final render)."""
+        if self._pending is None:
+            return None
+        text = self._pending
+        self._pending = None
+        self._last_emit = time.time()
+        self.frames += 1
+        return text
+
+
+# ---------------------------------------------------------------------------
 # Overlay list (model / effort / help / history pickers)
 # ---------------------------------------------------------------------------
 
@@ -3603,9 +3657,30 @@ class UI:
         self._start_spinner()
         # Only retain the unfinished line; emit complete lines immediately.
         # Throttle terminal redraws in Application, never token ingestion.
-        stream_tail = {"t": "", "blank": False}
+        # SPEED: pieces used to be concatenated with `tail = tail + piece`
+        # on EVERY token — O(n^2) copying for a long single line (minified
+        # JSON, base64 blobs) that visibly slowed the stream loop as the
+        # line grew. Parts accumulate in a list; we only join when a
+        # newline arrives (to split off complete lines) and keep a bounded
+        # live preview, so per-token cost stays O(len(piece)).
+        stream_tail = {"parts": [], "blank": False, "pv": ""}
         render_md = bool(self.cfg.extra.get("render_markdown", False))
         md_preview = ""
+
+        # SPEED: the status preview used to invalidate the whole
+        # prompt_toolkit app on EVERY token — a full-screen re-render per
+        # token chunk. Tokens are still ingested instantly (complete lines
+        # print immediately below); only the status/invalidate is throttled
+        # to ~10fps. flush() at the end guarantees the final frame is
+        # never skipped.
+        _throttle = _StreamThrottle(0.1)
+        self._stream_throttle = _throttle  # diagnostics / tests
+
+        def _stream_status(text: str) -> None:
+            _throttle.update(text)
+            frame = _throttle.maybe_flush()
+            if frame is not None:
+                self._set_status(frame)
 
         def on_token(piece: str):
             nonlocal md_preview
@@ -3614,14 +3689,21 @@ class UI:
                 maxw = max(1, self._width() - 26)
                 md_preview = (md_preview + piece)[-maxw:]
                 preview = md_preview.strip("\n")
-                self._set_status(preview if preview else "writing…")
+                _stream_status(preview if preview else "writing…")
                 return
             # patch_stdout can only interleave output safely when every
             # write ends in a newline, so emit complete lines here and keep
             # the partial line as a live preview inside the box border.
-            tail = stream_tail["t"] + piece
-            if "\n" in tail:
-                before, _, rem = tail.rpartition("\n")
+            parts = stream_tail["parts"]
+            parts.append(piece)
+            maxw = max(1, self._width() - 26)
+            if "\n" in piece:
+                # the unfinished tail never contains "\n" (it is the text
+                # after the last newline seen), so a newline can only have
+                # arrived inside this piece — join once, split, done.
+                full = "".join(parts)
+                parts.clear()
+                before, _, rem = full.rpartition("\n")
                 # collapse blank-line runs (the model loves "\n\n\n" between
                 # tool calls) — keep at most one blank in a row
                 out: list[str] = []
@@ -3635,16 +3717,19 @@ class UI:
                     out.append(ln)
                 if out:
                     self.console.print(Text("\n".join(out)), soft_wrap=True)
-                tail = rem
-            stream_tail["t"] = tail
-            maxw = max(1, self._width() - 26)
-            preview = tail.strip("\n")
-            if len(preview) > maxw:
-                preview = preview[-maxw:]
-            self._set_status(preview if preview else "writing…")
+                if rem:
+                    parts.append(rem)
+                pv = rem[-maxw:] if rem else ""
+            else:
+                pv = stream_tail["pv"] + piece
+                if len(pv) > maxw:
+                    pv = pv[-maxw:]
+            stream_tail["pv"] = pv
+            preview = pv.strip("\n")
+            _stream_status(preview if preview else "writing…")
 
         def on_reasoning(piece: str):
-            self._set_status("reasoning…")
+            _stream_status("reasoning…")
 
         # live shell streaming state — one tool runs at a time, so a plain
         # dict is enough: on_tool_call arms it, on_tool_output streams the
@@ -3815,8 +3900,9 @@ class UI:
                 live_f["held"].extend(new_lines)
 
         def on_tool_call(ev: ToolEvent):
-            rem = stream_tail["t"].strip("\n")
-            stream_tail["t"] = ""
+            rem = "".join(stream_tail["parts"]).strip("\n")
+            stream_tail["parts"].clear()
+            stream_tail["pv"] = ""
             stream_tail["blank"] = False
             if rem:
                 self.console.print(Text(rem), soft_wrap=True)
@@ -3928,8 +4014,13 @@ class UI:
         except Exception as e:  # noqa: BLE001 — never kill the UI thread
             self.print_error(f"{type(e).__name__}: {e}")
         finally:
-            rem = stream_tail["t"].strip("\n")
-            stream_tail["t"] = ""
+            rem = "".join(stream_tail["parts"]).strip("\n")
+            stream_tail["parts"].clear()
+            # Final flush: apply any preview frame the throttle absorbed so
+            # the last render reflects the complete stream before teardown.
+            frame = _throttle.flush()
+            if frame is not None:
+                self._set_status(frame)
             if rem:
                 self.console.print(Text(rem), soft_wrap=True)
             else:
@@ -4798,3 +4889,113 @@ class UI:
         t.append(f"   prompt tokens: {total_in}", style=C["dim"])
         t.append(f"   completion tokens: {total_out}", style=C["dim"])
         self.console.print(t)
+
+
+# ---------------------------------------------------------------------------
+# Module self-test: stream render throttling
+# ---------------------------------------------------------------------------
+
+def _tui_selftest() -> None:
+    """Prove the 10fps stream throttle: 1000 rapid tokens must collapse to
+    a handful of renders while every token's text still reaches the output
+    (complete lines print immediately, the final tail is flushed at turn
+    end). Headless-safe: the UI is stubbed, no TTY or app loop needed."""
+    import io
+    import threading
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from rich.console import Console
+
+    from .agent import Turn
+
+    # -- 1. throttle unit behavior --------------------------------------
+    import fullagent.tui as tui_mod
+
+    th = _StreamThrottle(0.1)
+    with patch.object(tui_mod.time, "time", return_value=1000.0):
+        for i in range(1000):
+            th.update(f"tok{i}")
+            frame = th.maybe_flush()
+            if i == 0:
+                assert frame == "tok0", f"first update must flush, got {frame!r}"
+            else:
+                assert frame is None, "burst updates must be absorbed"
+        assert th.frames == 1, th.frames
+        assert th.suppressed == 999, th.suppressed
+        # no text dropped: the buffered frame is always the LATEST text
+        final = th.flush()
+        assert final == "tok999", f"flush must return latest text, got {final!r}"
+        assert th.frames == 2, th.frames
+        assert th.flush() is None, "empty flush must return None"
+    print("PASS  throttle: 1000 rapid updates -> 1 frame + final flush "
+          "(999 absorbed), latest text never dropped")
+
+    # -- 2. full _run_turn stream path -----------------------------------
+    ui = UI.__new__(UI)
+    ui.cfg = SimpleNamespace(extra={"render_markdown": False},
+                             show_reasoning=False)
+    ui._busy = False
+    ui._cancel_flag = threading.Event()
+    ui._focus_remaining = 0
+    ui._status_text = ""
+    ui._width = lambda: 80
+    ui._start_spinner = lambda: None
+    ui._stop_spinner = lambda: None
+    ui._emit_user = lambda text: None
+    ui._set_flash = lambda *args: None
+    ui._print_turn_stats = lambda turn: None
+    ui.output = io.StringIO()
+    ui.console = Console(file=ui.output, width=80, color_system=None)
+    ui.agent = SimpleNamespace(save_session=lambda: None)
+    ui._approve_request = None
+    ui._spinner_i = 0
+    renders = {"n": 0}
+    ui._invalidate = lambda: renders.__setitem__("n", renders["n"] + 1)
+
+    N = 1000
+    words = [f"w{i}" for i in range(N)]
+
+    def fake_run(text, on_token, *args, **kwargs):
+        for i, w in enumerate(words):
+            on_token(w + ("\n" if i % 7 == 6 else " "))
+        return Turn(text, assistant_text=" ".join(words))
+
+    ui.agent.run_turn = fake_run
+    with patch.object(tui_mod.time, "time", return_value=1000.0):
+        ui._run_turn_thread("hello")
+
+    out = ui.output.getvalue()
+    missing = [w for w in words if w not in out]
+    assert not missing, f"text lost: {missing[:5]}…"
+    th2 = ui._stream_throttle
+    assert isinstance(th2, _StreamThrottle)
+    assert th2.suppressed >= N - 2, th2.suppressed
+    # turn-lifecycle renders only: thinking…, first frame, final flush,
+    # teardown "" + 2 unconditional invalidates — NOT ~1000
+    assert renders["n"] <= 6, f"{renders['n']} renders for {N} tokens"
+    print(f"PASS  stream path: {N} tokens -> {renders['n']} renders "
+          f"({th2.suppressed} absorbed, {th2.frames} frames), "
+          f"all {N} tokens present in output")
+
+    # -- 3. wall-clock timing: frames really are ~100ms apart -------------
+    th3 = _StreamThrottle(0.1)
+    stamps = []
+    t0 = tui_mod.time.time()
+    for i in range(400):
+        th3.update(f"x{i}")
+        if th3.maybe_flush() is not None:
+            stamps.append(tui_mod.time.time() - t0)
+        tui_mod.time.sleep(0.001)  # stretch the burst past the 0.1s window
+    th3.flush()
+    assert len(stamps) >= 2, f"expected multiple frames, got {len(stamps)}"
+    gaps = [b - a for a, b in zip(stamps, stamps[1:])]
+    assert all(g >= 0.095 for g in gaps), f"frames too close: {gaps[:5]}"
+    print(f"PASS  frame spacing: {th3.frames} frames, "
+          f"min gap {min(gaps):.3f}s (>= 0.1s throttle)")
+
+    print("ALL TUI SELF-TESTS PASS")
+
+
+if __name__ == "__main__":
+    _tui_selftest()

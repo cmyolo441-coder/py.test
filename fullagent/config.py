@@ -52,6 +52,13 @@ EVENT_LOG_FILE = APP_DIR / "eventlog.jsonl"
 
 DEFAULT_TIMEOUT = 300.0
 MAX_TOOL_ITERATIONS = 200
+# PERF: hard cap on executed tool calls per turn — 200 iterations of LLM
+# round-trips at ~2.5s each was the 500s+ hang. 25 calls is plenty for a
+# single turn; the model can say "continue".
+MAX_TOOL_CALLS_PER_TURN = 25
+# PERF: stop early when the same tool call returns an identical result
+# this many times in a row (no-progress loop).
+NO_PROGRESS_STALL_LIMIT = 3
 MAX_TOOL_OUTPUT_CHARS = 24_000
 # One output ceiling for every effort level: 200k tokens.
 MAX_TOKENS = 200_000
@@ -211,6 +218,8 @@ class Config:
     # which system prompt to send: "main" (compact) or "master" (130k+)
     prompt: str = "main"
     extra: dict = field(default_factory=dict)
+    # PERF: sliding window for model-visible history. 0 = disabled (legacy).
+    prune_window: int = 40
 
     @classmethod
     def load(cls) -> "Config":
@@ -220,7 +229,7 @@ class Config:
             if not isinstance(data, dict):
                 data = {}
             for k in ("model_id", "effort", "auto_approve", "show_reasoning",
-                      "theme", "prompt"):
+                      "theme", "prompt", "prune_window"):
                 if k not in data:
                     continue
                 if k in ("auto_approve", "show_reasoning"):
@@ -229,6 +238,12 @@ class Config:
                     # would silently disable the approval prompt
                     if isinstance(data[k], bool):
                         setattr(cfg, k, data[k])
+                elif k == "prune_window":
+                    # drift-safe int validation; 0 disables pruning
+                    try:
+                        cfg.prune_window = max(0, int(data[k]))
+                    except (TypeError, ValueError):
+                        pass
                 else:
                     setattr(cfg, k, data[k])
             cfg.extra = {k: v for k, v in data.items()

@@ -6,7 +6,7 @@ from pathlib import Path
 PKG = Path(__file__).resolve().parent
 mods = sorted(p.stem for p in (PKG / "fullagent").glob("*.py"))
 skip = {"__init__", "__main__",
-        "agent", "client", "config", "tui"}  # no self-test block
+        "agent", "config"}  # no self-test block
 
 failed = []
 for m in mods:

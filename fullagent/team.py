@@ -25,6 +25,7 @@ import time
 from dataclasses import dataclass, field
 
 from .client import APIError, chat_blocking, shrink_tool_outputs
+from .cancelguard import sleep_cancellable
 from ._foundation import get_logger
 
 _log = get_logger("team")
@@ -179,7 +180,8 @@ def parse_worker_final(text: str) -> tuple[str, str]:
 
 
 def chat_with_retry(provider, model, effort, messages: list[dict],
-                    schemas: list[dict] | None, timeout: float):
+                    schemas: list[dict] | None, timeout: float,
+                    should_cancel=None):
     """chat_blocking with rate-limit retry + exponential backoff.
 
     Shared by the persistent Crew and every blocking subsystem evaluator.
@@ -193,7 +195,11 @@ def chat_with_retry(provider, model, effort, messages: list[dict],
 
     Raises the last APIError when retries are exhausted; any
     non-rate-limit APIError (auth, bad request, …) is re-raised at once
-    without sleeping — retrying those can never succeed."""
+    without sleeping — retrying those can never succeed.
+
+    CANCEL: should_cancel (a zero-arg callable) makes the rate-limit
+    backoff — which totals ~254s over 8 retries — interruptible: Esc
+    raises TurnCancelled within ~0.25s instead of sleeping through."""
     last_err: Exception | None = None
     for attempt in range(RATE_LIMIT_RETRIES):
         try:
@@ -201,7 +207,8 @@ def chat_with_retry(provider, model, effort, messages: list[dict],
                                  messages, schemas,
                                  on_overflow=lambda: shrink_tool_outputs(
                                      messages),
-                                 timeout=timeout)
+                                 timeout=timeout,
+                                 should_cancel=should_cancel)
         except APIError as e:
             msg = str(e).lower()
             rate_limited = (e.status == 429 or "rate limit" in msg
@@ -213,7 +220,10 @@ def chat_with_retry(provider, model, effort, messages: list[dict],
                 break  # last attempt — no point sleeping after the verdict
             wait = RATE_LIMIT_BASE_WAIT * (2 ** attempt) \
                 + random.uniform(0, 1.5)
-            time.sleep(wait)
+            # CANCEL: the old bare sleep() held a rate-limited worker for
+            # up to ~254s total with Esc doing nothing (the reported 203s
+            # hang). The cancellable sleep raises TurnCancelled promptly.
+            sleep_cancellable(wait, should_cancel)
     raise last_err  # type: ignore[misc]
 
 

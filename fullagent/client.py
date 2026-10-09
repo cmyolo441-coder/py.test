@@ -2,20 +2,39 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import queue
 import random
 import re
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterator
 
-import requests
+# `requests` (~1.4s cold: pulls urllib3/chardet/email) is only needed when an
+# actual provider HTTP call is made — never at CLI startup / import time.
+# A transparent proxy stands in at module level so every existing
+# `requests.*` reference below keeps working unchanged; the real import
+# fires on first attribute access and then replaces the proxy in globals.
+class _LazyRequests:
+    def __getattr__(self, name: str):
+        import requests as _real
+        globals()["requests"] = _real
+        return getattr(_real, name)
+
+
+requests = _LazyRequests()  # type: ignore[assignment]
 
 from . import config
 from ._foundation import get_logger, NetworkError
 from .config import Effort, Model, Provider
+# TurnCancelled lives in .cancelguard (a leaf module with no import
+# cycles); imported here so `from .client import TurnCancelled` keeps
+# working for every existing consumer.
+from .cancelguard import (TurnCancelled, run_cancellable,
+                          sleep_cancellable)
 
 _log = get_logger("client")
 
@@ -24,11 +43,24 @@ MAX_RETRIES = 3
 # Fail fast on TCP/TLS connect; the (long) read budget stays untouched for
 # slow streams. A dead provider hangs 10s here, not the full 300s timeout.
 CONNECT_TIMEOUT = 10.0
+# Stall watchdog for SSE streams: if no event AND no keepalive comment
+# arrives for this long, the stream is dead â abort it instead of waiting
+# out the full read budget. requests' read timeout is per socket read, so
+# a server dribbling one byte just under the read budget could otherwise
+# hold the call open forever; this closes that hole.
+STREAM_STALL_TIMEOUT = 60.0
 
 class APIError(Exception):
     def __init__(self, message: str, status: int | None = None):
         super().__init__(message)
         self.status = status
+
+
+class APITimeoutError(APIError):
+    """A model call exceeded its time budget (connect, read, stall, or the
+    total per-call deadline). Subclasses APIError so every existing
+    `except APIError` handler keeps working unchanged â the timeout just
+    arrives with a clearer type and message instead of hanging forever."""
 
 
 # -- fast HTTP ---------------------------------------------------------------
@@ -57,10 +89,38 @@ def _http() -> requests.Session:
     return _SESSION
 
 
+def shared_session() -> requests.Session:
+    """Public accessor for the one pooled, keep-alive Session used by every
+    model call. Ad-hoc HTTP (web tools, sink posts) should use this instead
+    of one-shot ``requests.get/post(...)`` calls — a one-shot call pays a
+    fresh TCP+TLS handshake every time, while this session reuses its pooled
+    connection (HTTP keep-alive). Thread-safe: requests sessions multiplex
+    a thread-safe urllib3 pool, and construction is double-checked-locked."""
+    return _http()
+
+
 def _timeouts(timeout: float) -> tuple[float, float]:
     """Split (connect, read) timeouts. Connect fails fast; the read budget
     stays long because a healthy stream can legitimately take minutes."""
     return (min(CONNECT_TIMEOUT, timeout), timeout)
+
+
+def _sleep_capped(delay: float, deadline: float) -> None:
+    """Sleep for a retry backoff, but never past the call's deadline â
+    the budget belongs to the request, not to the wait between attempts."""
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        time.sleep(min(delay, remaining))
+
+
+def _sleep_capped_cancellable(delay: float, deadline: float,
+                              should_cancel: Callable[[], bool] | None) -> None:
+    """Retry backoff that honours Esc/Ctrl+C AND never sleeps past the
+    call's total deadline — the budget belongs to the request, not to the
+    wait between attempts."""
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        sleep_cancellable(min(delay, remaining), should_cancel)
 
 
 def _backoff(attempt: int) -> float:
@@ -112,15 +172,28 @@ def prewarm_connection(provider) -> None:
     threading.Thread(target=_warm, daemon=True, name="prewarm").start()
 
 
-class TurnCancelled(Exception):
-    """Raised inside the stream loop when the user cancels (Ctrl+C)."""
+# NOTE: TurnCancelled was defined here; it now lives in .cancelguard
+# (imported above) — a single class object, so `except TurnCancelled`
+# catches it no matter which module raised it.
 
 
 @dataclass
 class ToolCallDelta:
     id: str = ""
-    name: str = ""
-    arguments: str = ""
+    # Stream-hot path: tool arguments can be megabytes (e.g. a whole file
+    # in write_file args) arriving in thousands of chunks. Appending to a
+    # list and joining once is O(n); `+=` on a str is O(n^2) and made the
+    # stream loop visibly slower as the arguments grew.
+    name_parts: list = field(default_factory=list)
+    arguments_parts: list = field(default_factory=list)
+
+    @property
+    def name(self) -> str:
+        return "".join(self.name_parts)
+
+    @property
+    def arguments(self) -> str:
+        return "".join(self.arguments_parts)
 
 
 @dataclass
@@ -238,6 +311,169 @@ def build_payload(model: Model, effort: Effort, messages: list[dict],
     return payload
 
 
+# -- fast token-count cache -------------------------------------------------
+# estimate_tokens() re-serialized the whole payload with json.dumps on EVERY
+# call (~40 ms per MB of history). That is fine once per request, but it is
+# called repeatedly on identical content: _input_tokens() runs it twice per
+# send, ctxmeter + statuscmd + the TUI border re-read the same message list,
+# and the agent compaction loops call it in tight while loops.
+#
+# Two tiers:
+#   Tier 1 (identity): the same Python object, verified unmutated via a
+#   cheap O(#messages) structural fingerprint, returns its cached count
+#   with ZERO serialization and ZERO hashing (~microseconds). The
+#   fingerprint is re-computed on every lookup and compared to the stored
+#   one, so even id() reuse after GC is safe: a different object either
+#   mismatches (recount) or matches (same serialized length -> same
+#   count). Any real edit the agent performs (append/pop/in-place
+#   truncate) changes the fingerprint and recounts.
+#   Tier 2 (digest): blake2b(serialized) -> count for everything else —
+#   fresh but identical objects, non-message shapes. The correctness net.
+# Both tiers are keyed on the calibration epoch: when the backend teaches
+# us a new chars/token ratio, stale counts are never served.
+#
+# Approximation note: tier 1 treats two messages as identical when their
+# fingerprint matches (lengths + head/tail of every string field). A
+# pathological in-place edit that keeps every field length AND head/tail
+# while changing JSON-escapable characters mid-string could shift the true
+# serialized length by a few chars (< 1 token); the 8K+ context margins
+# dwarf that, and any length-changing edit recounts exactly.
+_TOKEN_CACHE_MAX = 1024          # tier-2 digest entries
+_ID_CACHE_MAX = 128             # tier-1 identity entries
+_token_cache: "OrderedDict[tuple, int]" = OrderedDict()
+_id_cache: "OrderedDict[int, tuple]" = OrderedDict()
+_token_cache_lock = threading.Lock()
+
+
+def _str_sig(s: Any) -> tuple | None:
+    """O(1) signature of a string field: (length, head, tail)."""
+    if s is None:
+        return (0, "", "")
+    if not isinstance(s, str):
+        return None
+    return (len(s), s[:16], s[-16:])
+
+
+def _message_fingerprint(obj: Any) -> tuple | None:
+    """Cheap structural fingerprint for a list of message dicts.
+
+    O(#messages), O(1) per field — no serialization, no content hashing.
+    Covers every string field of every message (plus tool-call payloads),
+    so any edit that could change the serialized length is detected.
+    Returns None for anything that is not a plain list of dicts (those
+    use the digest tier only).
+    """
+    if not isinstance(obj, list):
+        return None
+    fp: list = [len(obj)]
+    for m in obj:
+        if not isinstance(m, dict):
+            return None
+        item: list = []
+        for k, v in m.items():
+            if k == "tool_calls" and isinstance(v, list):
+                tc: list = []
+                for t in v:
+                    if not isinstance(t, dict):
+                        return None
+                    parts: list = []
+                    for tk, tv in t.items():
+                        if tk == "function" and isinstance(tv, dict):
+                            fsig = tuple((fk, _str_sig(fv))
+                                         for fk, fv in tv.items())
+                            if any(s is None for _, s in fsig):
+                                return None
+                            parts.append((tk, fsig))
+                        else:
+                            s = _str_sig(tv)
+                            if s is None:
+                                return None
+                            parts.append((tk, s))
+                    tc.append(tuple(parts))
+                item.append((k, tuple(tc)))
+            else:
+                s = _str_sig(v)
+                if s is None:
+                    return None
+                item.append((k, s))
+        fp.append(tuple(item))
+    return tuple(fp)
+
+
+def _token_cache_key(payload: str, model_id: str) -> tuple[str, str, int]:
+    digest = hashlib.blake2b(payload.encode("utf-8"),
+                             digest_size=16).hexdigest()
+    return (digest, _cal_key(model_id), _calibration_epoch)
+
+
+def _count_payload(payload: str, model_id: str = "") -> int:
+    """Token count for an already-serialized payload, via the content cache.
+
+    Cache hit: O(1) dict lookup. Miss: one cheap blake2b + the same
+    ``len / ratio`` math ``estimate_tokens`` always used, so displayed
+    counts are unchanged.
+    """
+    key = _token_cache_key(payload, model_id)
+    with _token_cache_lock:
+        hit = _token_cache.get(key)
+        if hit is not None:
+            _token_cache.move_to_end(key)
+            return hit
+    count = max(1, int(len(payload) / _chars_per_token(model_id)))
+    with _token_cache_lock:
+        _token_cache[key] = count
+        _token_cache.move_to_end(key)
+        while len(_token_cache) > _TOKEN_CACHE_MAX:
+            _token_cache.popitem(last=False)  # evict oldest
+    return count
+
+
+def _count_uncached(obj: Any, model_id: str,
+                    fingerprint: tuple | None) -> int:
+    """Serialize, count via the digest tier, and populate tier 1."""
+    try:
+        payload = json.dumps(obj, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        payload = str(obj)
+        fingerprint = None  # not the object we fingerprinted; stay safe
+    count = _count_payload(payload, model_id)
+    if fingerprint is not None:
+        # NOTE: plain lists do not support weakref; id() keying is safe
+        # here because the fingerprint is re-validated on every lookup
+        # (see the tier-1 comment above).
+        with _token_cache_lock:
+            _id_cache[id(obj)] = (fingerprint, _calibration_epoch, count)
+            _id_cache.move_to_end(id(obj))
+            while len(_id_cache) > _ID_CACHE_MAX:
+                _id_cache.popitem(last=False)
+    return count
+
+
+def estimate_tokens_fast(text: str, model_id: str = "") -> int:
+    """Hot-path token estimate for plain text (chars/ratio, cached).
+
+    Strings are immutable and the count depends only on ``len(text)`` for
+    a given calibration, so the key ``(id, len, model bucket, epoch)``
+    is exact with no hashing at all: repeated counts of the same string
+    are ~microseconds. Non-string input falls back to
+    :func:`estimate_tokens`.
+    """
+    if not isinstance(text, str):
+        return estimate_tokens(text, model_id)
+    key = (id(text), len(text), _cal_key(model_id), _calibration_epoch)
+    with _token_cache_lock:
+        hit = _token_cache.get(key)
+        if hit is not None:
+            _token_cache.move_to_end(key)
+            return hit
+    count = max(1, int(len(text) / _chars_per_token(model_id)))
+    with _token_cache_lock:
+        _token_cache[key] = count
+        _token_cache.move_to_end(key)
+        while len(_token_cache) > _TOKEN_CACHE_MAX:
+            _token_cache.popitem(last=False)
+    return count
+
 def estimate_tokens(obj: Any, model_id: str = "") -> int:
     """Deterministic token estimate for any JSON-serialisable object.
 
@@ -250,12 +486,23 @@ def estimate_tokens(obj: Any, model_id: str = "") -> int:
 
     Calibration is PER MODEL (tokenizers differ between models) and is
     persisted to disk, so the very first request of a fresh process on a
-    big project already uses the learned ratio."""
-    try:
-        payload = json.dumps(obj, ensure_ascii=False, default=str)
-    except (TypeError, ValueError):
-        payload = str(obj)
-    return max(1, int(len(payload) / _chars_per_token(model_id)))
+    big project already uses the learned ratio.
+
+    Speed: the count for an unchanged object is served from the identity
+    cache (~microseconds, no serialization); mutated or new content pays
+    one serialization and is then cached by content digest."""
+    # Tier 1: same object, verified unmutated -> free.
+    fingerprint = _message_fingerprint(obj)
+    if fingerprint is not None:
+        with _token_cache_lock:
+            entry = _id_cache.get(id(obj))
+            if entry is not None:
+                fp, epoch, count = entry
+                if epoch == _calibration_epoch and fp == fingerprint:
+                    _id_cache.move_to_end(id(obj))
+                    return count
+    # Tier 2 (inside _count_uncached): serialize once, digest-cache.
+    return _count_uncached(obj, model_id, fingerprint)
 
 
 # -- learned tokenizer calibration ------------------------------------------
@@ -280,6 +527,16 @@ _ratio_samples: dict[str, list[float]] = {}   # model id -> measured ratios
 _learned_windows: dict[str, int] = {}         # model id -> real window
 _calibration_loaded = False
 _CALIBRATION_FILE = config.APP_DIR / "calibration.json"
+
+# Bumped every time the learned chars/token ratios change. The token-count
+# cache below keys on this epoch so a freshly learned ratio instantly
+# invalidates stale counts (displayed numbers keep tracking reality).
+_calibration_epoch = 0
+
+
+def _bump_calibration_epoch() -> None:
+    global _calibration_epoch
+    _calibration_epoch += 1
 
 
 def _cal_key(model_id: str) -> str:
@@ -309,6 +566,10 @@ def _load_calibration() -> None:
     for key, win in windows.items():
         if isinstance(win, int) and win > 0:
             _learned_windows[key] = win
+    if _ratio_samples:
+        # Disk state changed the learned ratios -> cached counts computed
+        # under the old ratios must go.
+        _bump_calibration_epoch()
 
 
 def _save_calibration() -> None:
@@ -354,6 +615,7 @@ def learn_token_ratio(sent_chars: int, actual_tokens: int,
     samples.append(ratio)
     if len(samples) > _RATIO_SAMPLES_MAX:
         del samples[: len(samples) - _RATIO_SAMPLES_MAX]
+    _bump_calibration_epoch()  # new ground truth -> drop cached counts
     _save_calibration()
 
 
@@ -451,6 +713,12 @@ def _clamp_max_tokens(provider_key: str, value: int) -> int:
     return min(value, cap)
 
 
+# Yielded by _iter_sse_events for SSE comment lines (": ping" keepalives).
+# Not a real event â dict-checking consumers skip it, but the stall
+# watchdog treats it as proof the stream is alive.
+_KEEPALIVE = object()
+
+
 def _iter_sse_events(resp: requests.Response) -> Iterator[dict]:
     """Yield parsed JSON data objects from an SSE stream.
 
@@ -491,6 +759,7 @@ def _iter_sse_events(resp: requests.Response) -> Iterator[dict]:
                 yield ev
             continue
         if line.startswith(":"):  # comment / keepalive
+            yield _KEEPALIVE  # type: ignore[misc] â sentinel, skipped by consumers
             continue
         if line.startswith("data:"):
             data_lines.append(line[len("data:"):].strip())
@@ -500,9 +769,72 @@ def _iter_sse_events(resp: requests.Response) -> Iterator[dict]:
         yield ev
 
 
+def _response_socket(resp: requests.Response):
+    """Best-effort lookup of the live socket behind a streaming response.
+
+    Walks the private layers (requests -> urllib3 -> http.client ->
+    BufferedReader -> SocketIO -> socket), verifying each hop, because
+    the exact wrapping varies by requests/urllib3 version and by whether
+    the producer is currently inside recv(). Returns None when the
+    socket cannot be found (caller falls back to a plain close)."""
+    try:
+        import socket as _socket
+    except ImportError:  # pragma: no cover — stdlib always present
+        return None
+    try:
+        raw = getattr(resp, "raw", None)
+        # Path 1 (observed): urllib3.HTTPResponse._fp (http.client.HTTPResponse)
+        #   -> .fp (BufferedReader) -> .raw (SocketIO) -> ._sock
+        fp = getattr(getattr(raw, "_fp", None), "fp", None)
+        inner = getattr(fp, "raw", None)
+        sock = getattr(inner, "_sock", None)
+        if isinstance(sock, _socket.socket):
+            return sock
+        # Path 2: SocketIO directly under http.client.HTTPResponse
+        sock = getattr(fp, "_sock", None)
+        if isinstance(sock, _socket.socket):
+            return sock
+        # Path 3: urllib3 connection object
+        conn = getattr(raw, "_connection", None)
+        sock = getattr(conn, "sock", None)
+        if isinstance(sock, _socket.socket):
+            return sock
+    except Exception:  # noqa: BLE001 — lookup is best-effort
+        pass
+    return None
+
+
+def _abort_response(resp: requests.Response) -> None:
+    """Unblock a response whose socket is stuck in recv() in another
+    thread, then close it. Best-effort: never raises.
+
+    WHY shutdown() first: the SSE producer thread blocks in socket recv()
+    while holding the socket file's read lock. A plain resp.close() from
+    this thread then blocks on that lock until the producer's read times
+    out — so a stall watchdog (or Esc) that just calls close() would hang
+    for the full read budget instead of failing fast. shutdown() makes
+    the blocked recv() return immediately, the producer releases the
+    lock, and close() proceeds."""
+    try:
+        sock = _response_socket(resp)
+        if sock is not None:
+            try:
+                import socket as _socket
+                sock.shutdown(_socket.SHUT_RDWR)
+            except OSError:
+                pass  # already closed/reset by the peer — fine
+    except Exception:  # noqa: BLE001 — abort is best-effort
+        pass
+    try:
+        resp.close()
+    except Exception:  # noqa: BLE001 — abort is best-effort
+        pass
+
+
 def _iter_sse_events_cancellable(
         resp: requests.Response,
-        should_cancel: Callable[[], bool] | None) -> Iterator[dict]:
+        should_cancel: Callable[[], bool] | None,
+        stall_timeout: float = STREAM_STALL_TIMEOUT) -> Iterator[dict]:
     """Yield SSE events, honouring should_cancel even while the provider
     stalls. A stalled stream blocks inside iter_lines until the (long)
     read timeout — without this, Esc/Ctrl+C does nothing for up to
@@ -510,7 +842,14 @@ def _iter_sse_events_cancellable(
     thread keeps consuming; this thread polls with a short timeout and
     checks cancellation between polls. Producer exceptions (e.g.
     ChunkedEncodingError on a mid-stream disconnect) are re-raised here
-    with their original type so the retry layer still sees them."""
+    with their original type so the retry layer still sees them.
+
+    STALL WATCHDOG: requests' read timeout is per socket read, so a
+    provider dribbling one byte just under the read budget could hold the
+    stream open forever. If no event and no keepalive arrives for
+    `stall_timeout` seconds, the response is closed (unblocking the
+    producer's socket read) and an APITimeoutError is raised — the call
+    fails fast instead of hanging."""
     q: queue.Queue = queue.Queue()
     _END = object()
 
@@ -526,20 +865,38 @@ def _iter_sse_events_cancellable(
     thread = threading.Thread(target=_produce, daemon=True,
                               name="sse-producer")
     thread.start()
+    last_data = time.monotonic()
     while True:
         try:
             item = q.get(timeout=0.25)
         except queue.Empty:
             if should_cancel is not None and should_cancel():
-                # _chat_stream_once's finally closes resp, which unblocks
-                # the producer's socket read; the daemon thread then exits
-                # on its own.
+                # Abort the response: unblocks the producer's socket
+                # read (a plain close here or in the finally would block
+                # on the socket read lock until the read times out).
+                # The finally in _chat_stream_once then closes an
+                # already-dead socket.
+                _abort_response(resp)
                 raise TurnCancelled()
+            if time.monotonic() - last_data > stall_timeout:
+                # Abort (not just close): the producer thread is blocked
+                # in socket recv() holding the read lock — a plain
+                # resp.close() would block on that lock until the read
+                # times out. _abort_response shuts the socket down first
+                # so the recv returns immediately and close() proceeds.
+                _abort_response(resp)
+                raise APITimeoutError(
+                    f"stream stalled: no data for {stall_timeout:g}s — "
+                    f"the provider stopped sending; /retry to resend")
             continue
         if item is _END:
             return
         if isinstance(item, Exception):
             raise item
+        # Any event or keepalive comment proves the stream is alive.
+        last_data = time.monotonic()
+        if item is _KEEPALIVE:
+            continue
         yield item
 
 
@@ -857,10 +1214,16 @@ def _chat_stream_with_retries(
     A retry restarts the WHOLE request — once any token has already been
     streamed to the UI a restart would replay (duplicate) the completion on
     top of the partial output, so mid-output failures surface immediately
-    instead of being retried."""
+    instead of being retried.
+
+    TOTAL per-call budget: every attempt shares one deadline
+    (start + `timeout`). A dead provider used to cost MAX_RETRIES x
+    timeout — over 900s of silence before the user saw an error; now the
+    whole call, retries included, can never exceed `timeout`."""
     last_error: Exception | None = None
     attempt = 0
     emitted = {"out": False}
+    deadline = time.monotonic() + timeout
 
     def _tok(piece: str) -> None:
         emitted["out"] = True
@@ -880,10 +1243,17 @@ def _chat_stream_with_retries(
             on_tool_args(name, chunk)
 
     while attempt < MAX_RETRIES:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            # The whole per-call budget is spent — fail fast instead of
+            # starting another attempt with a fresh full timeout.
+            raise APITimeoutError(
+                f"request timed out after {timeout:g}s") from last_error
         try:
             return _chat_stream_once(url, headers, payload,
                                      _tok, _reason, on_tool_start,
-                                     _targs, should_cancel, timeout)
+                                     _targs, should_cancel,
+                                     min(timeout, remaining))
         except TurnCancelled:
             raise
         except APIError as e:
@@ -891,21 +1261,28 @@ def _chat_stream_with_retries(
             if e.status in RETRY_STATUSES and attempt < MAX_RETRIES - 1:
                 # fast first retry, then escalate — rate limits resolve
                 # quickly on free tiers; never stall the UI for seconds
-                time.sleep(_backoff(attempt))
+                # CANCEL: backoff sleeps honour Esc — the old bare sleep() ignored
+                # the cancel flag for the whole backoff window
+                _sleep_capped_cancellable(_backoff(attempt), deadline,
+                                          should_cancel)
                 attempt += 1
                 continue
             raise
         except requests.exceptions.Timeout as e:
             last_error = e
             if attempt < MAX_RETRIES - 1 and not emitted["out"]:
-                time.sleep(_backoff(attempt))
+                # CANCEL: backoff sleeps honour Esc — the old bare sleep() ignored
+                # the cancel flag for the whole backoff window
+                _sleep_capped_cancellable(_backoff(attempt), deadline,
+                                          should_cancel)
                 attempt += 1
                 continue
             if emitted["out"]:
-                raise APIError(
+                raise APITimeoutError(
                     f"stream stalled: no data for {timeout:g}s after output "
                     f"began — /retry to resend") from e
-            raise APIError(f"request timed out after {timeout:g}s") from e
+            raise APITimeoutError(
+                f"request timed out after {timeout:g}s") from e
         except (requests.exceptions.ConnectionError,
                 requests.exceptions.ChunkedEncodingError) as e:
             # ChunkedEncodingError is the typical MID-STREAM disconnect
@@ -913,7 +1290,10 @@ def _chat_stream_with_retries(
             # it here it bypasses the retry budget entirely
             last_error = e
             if attempt < MAX_RETRIES - 1 and not emitted["out"]:
-                time.sleep(_backoff(attempt))
+                # CANCEL: backoff sleeps honour Esc — the old bare sleep() ignored
+                # the cancel flag for the whole backoff window
+                _sleep_capped_cancellable(_backoff(attempt), deadline,
+                                          should_cancel)
                 attempt += 1
                 continue
             raise APIError(f"connection failed: {e}") from e
@@ -957,15 +1337,32 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
                       should_cancel: Callable[[], bool] | None,
                       timeout: float) -> StreamResult:
     result = StreamResult()
+    # Stream-hot path: content/reasoning/tool-args arrive in thousands of
+    # small chunks. `result.content += piece` per chunk is O(n^2) string
+    # copying that visibly slows the loop on long outputs; append to lists
+    # and join once at the end (O(n)). Callbacks still fire per chunk, so
+    # display latency is unchanged.
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
     tc_acc: dict[int, ToolCallDelta] = {}
     announced_tools: set[int] = set()
 
-    resp = _http().post(url, headers=headers, json=payload,
-                        stream=True, timeout=_timeouts(timeout))
-    if resp.status_code != 200:
-        body = resp.text
-        resp.close()  # release the pooled connection on the error path too
-        raise APIError(_extract_error_message(body), status=resp.status_code)
+    # CANCEL: the initial POST used to block with no cancel checks —
+    # requests' timeout does NOT cover DNS resolution, and a stalled
+    # connect/TLS handshake ignored Esc entirely. Run it on a worker and
+    # poll, so Esc interrupts within ~0.25s even mid-connect.
+    def _send() -> "requests.Response":
+        r = _http().post(url, headers=headers, json=payload,
+                         stream=True, timeout=_timeouts(timeout))
+        if r.status_code != 200:
+            # error bodies are small, but a hostile server could still
+            # stall .text until the read timeout — keep it guarded too
+            body = r.text
+            r.close()  # release the pooled connection on the error path
+            raise APIError(_extract_error_message(body),
+                           status=r.status_code)
+        return r
+    resp = run_cancellable(_send, should_cancel, name="model request")
 
     try:
         ctype = (resp.headers.get("Content-Type") or "").lower()
@@ -973,8 +1370,11 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
             # Some providers return a non-streamed JSON body even when
             # stream=true was requested — parse it like blocking mode
             # instead of silently dropping the whole completion.
+            # CANCEL: .json() reads the whole body — a stalled server
+            # could hold this until the (long) read timeout; guard it.
             try:
-                data = resp.json()
+                data = run_cancellable(resp.json, should_cancel,
+                                       name="model response")
             except ValueError as e:
                 raise APIError(
                     f"provider returned invalid JSON "
@@ -985,9 +1385,12 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
             # as a raw AttributeError instead of a clean APIError.
             model_id = data.get("model") if isinstance(data, dict) else None
             return _result_from_json(data, str(model_id or ""))
-        events = (_iter_sse_events_cancellable(resp, should_cancel)
-                  if should_cancel is not None
-                  else _iter_sse_events(resp))
+        # Every stream goes through the cancellable iterator: it honours
+        # Esc/Ctrl+C mid-stall AND aborts the stream when no data arrives
+        # for STREAM_STALL_TIMEOUT (the plain iterator has no watchdog —
+        # a dribbling provider could hold the call open forever).
+        events = _iter_sse_events_cancellable(resp, should_cancel,
+                                              STREAM_STALL_TIMEOUT)
         for event in events:
             if should_cancel is not None and should_cancel():
                 raise TurnCancelled()
@@ -1012,13 +1415,13 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
 
             piece = delta.get("content")
             if piece:
-                result.content += piece
+                content_parts.append(piece)
                 if on_token:
                     on_token(piece)
 
             reasoning = delta.get("reasoning_content") or delta.get("reasoning")
             if reasoning:
-                result.reasoning += reasoning
+                reasoning_parts.append(reasoning)
                 if on_reasoning:
                     on_reasoning(reasoning)
 
@@ -1029,16 +1432,19 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
                     acc.id = tc["id"]
                 fn = tc.get("function") or {}
                 if fn.get("name"):
-                    acc.name += fn["name"]
+                    acc.name_parts.append(fn["name"])
                     if idx not in announced_tools and on_tool_start:
                         announced_tools.add(idx)
                         on_tool_start(acc.name)
                 if fn.get("arguments"):
-                    acc.arguments += fn["arguments"]
+                    acc.arguments_parts.append(fn["arguments"])
                     if on_tool_args:
                         on_tool_args(acc.name, fn["arguments"])
     finally:
         resp.close()
+
+    result.content = "".join(content_parts)
+    result.reasoning = "".join(reasoning_parts)
 
     for idx in sorted(tc_acc):
         acc = tc_acc[idx]
@@ -1082,30 +1488,52 @@ def _result_from_json(data: dict, model_id: str) -> StreamResult:
 
 
 def _post_blocking(url: str, headers: dict, payload: dict,
-                   timeout: float) -> dict:
+                   timeout: float,
+                   should_cancel: Callable[[], bool] | None = None) -> dict:
     """POST with the same retry policy as the streaming path (rate limits,
     timeouts, connection errors). Blocking calls have no partial output,
     so every attempt is replay-safe — unlike the stream path there is no
     emitted-output guard here.
 
+    CANCEL: the old version blocked with zero cancel checks — a hung
+    provider held the turn for the full timeout (300s) per attempt with
+    Esc doing nothing. The POST, the body reads and the backoff sleeps
+    are all cancel-guarded now; Esc raises TurnCancelled within ~0.25s.
+
     The response is ALWAYS closed (try/finally): leaking it would pin a
-    pooled connection and eventually starve the session pool."""
+    pooled connection and eventually starve the session pool.
+
+    TOTAL per-call budget: every attempt shares one deadline
+    (start + `timeout`), so a hung endpoint fails after ~`timeout`
+    seconds total — never MAX_RETRIES x timeout."""
     last_error: Exception | None = None
+    deadline = time.monotonic() + timeout
     for attempt in range(MAX_RETRIES):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise APITimeoutError(
+                f"request timed out after {timeout:g}s") from last_error
         try:
-            resp = _http().post(url, headers=headers, json=payload,
-                                timeout=_timeouts(timeout))
+            resp = run_cancellable(
+                lambda: _http().post(url, headers=headers, json=payload,
+                                     timeout=_timeouts(min(timeout, remaining))),
+                should_cancel, name="model request")
+        except TurnCancelled:
+            raise
         except requests.exceptions.Timeout as e:
             last_error = e
             if attempt < MAX_RETRIES - 1:
-                time.sleep(_backoff(attempt))
+                _sleep_capped_cancellable(_backoff(attempt), deadline,
+                                          should_cancel)
                 continue
-            raise APIError(f"request timed out after {timeout:g}s") from e
+            raise APITimeoutError(
+                f"request timed out after {timeout:g}s") from e
         except (requests.exceptions.ConnectionError,
                 requests.exceptions.ChunkedEncodingError) as e:
             last_error = e
             if attempt < MAX_RETRIES - 1:
-                time.sleep(_backoff(attempt))
+                _sleep_capped_cancellable(_backoff(attempt), deadline,
+                                          should_cancel)
                 continue
             raise APIError(f"connection failed: {e}") from e
         except requests.exceptions.RequestException as e:
@@ -1116,10 +1544,15 @@ def _post_blocking(url: str, headers: dict, payload: dict,
             raise APIError(f"request failed: {e}") from e
         try:
             if resp.status_code != 200:
-                raise APIError(_extract_error_message(resp.text),
+                body = run_cancellable(lambda: resp.text, should_cancel,
+                                       name="error body")
+                raise APIError(_extract_error_message(body),
                                status=resp.status_code)
             try:
-                data = resp.json()
+                data = run_cancellable(resp.json, should_cancel,
+                                       name="model response")
+            except TurnCancelled:
+                raise
             except ValueError as e:
                 raise APIError(
                     f"provider returned invalid JSON "
@@ -1131,9 +1564,12 @@ def _post_blocking(url: str, headers: dict, payload: dict,
                     f"({type(data).__name__}): {str(data)[:200]}",
                     status=resp.status_code)
             return data
+        except TurnCancelled:
+            raise
         except APIError as e:
             if e.status in RETRY_STATUSES and attempt < MAX_RETRIES - 1:
-                time.sleep(_backoff(attempt))
+                _sleep_capped_cancellable(_backoff(attempt), deadline,
+                                          should_cancel)
                 continue
             raise
         finally:
@@ -1144,7 +1580,9 @@ def _post_blocking(url: str, headers: dict, payload: dict,
 def chat_blocking(provider: Provider, model: Model, effort: Effort,
                   messages: list[dict], tools: list[dict] | None,
                   on_overflow: Callable[[], bool] | None = None,
-                  timeout: float = config.DEFAULT_TIMEOUT) -> StreamResult:
+                  timeout: float = config.DEFAULT_TIMEOUT,
+                  should_cancel: Callable[[], bool] | None = None
+                  ) -> StreamResult:
     """Non-streaming fallback (used when a provider rejects stream=true).
 
     Carries the same three-layer context-overflow recovery as chat_stream:
@@ -1170,7 +1608,8 @@ def chat_blocking(provider: Provider, model: Model, effort: Effort,
                 continue
             raise
         try:
-            data = _post_blocking(url, headers, payload, timeout)
+            data = _post_blocking(url, headers, payload, timeout,
+                                  should_cancel=should_cancel)
         except APIError as err:
             if _is_reasoning_content_error(err):
                 if _sanitize_messages(messages):
@@ -1195,3 +1634,479 @@ def chat_blocking(provider: Provider, model: Model, effort: Effort,
     raise APIError(
         f"conversation is too large for {model.label} even after "
         f"re-clamping — start a new session (/new) or rewind (/rewind)")
+
+
+# ---------------------------------------------------------------------------
+# Self-test: prove connection reuse (run: python -m fullagent.client)
+# Spins up a local HTTPS server with a self-signed cert, counts accepted
+# TCP connections server-side (1 accept = 1 TLS handshake), then compares:
+#   BEFORE: 3 one-shot requests.get() calls  -> 3 handshakes
+#   AFTER:  3 pooled shared_session() calls   -> 1 handshake
+# Also stress-tests thread-safe singleton construction from 8 threads.
+# ---------------------------------------------------------------------------
+def _self_test_lazy_imports() -> None:
+    """Prove the import-time fix: `requests` (~1.4s cold) must NOT be in
+    sys.modules after importing this module, yet must resolve on first
+    real use through the _LazyRequests proxy.
+    Hermetic: runs in a FRESH interpreter via subprocess, so it passes no
+    matter how many HTTP-touching self-tests ran before it in this process
+    (e.g. the connection-reuse test above imports requests for real)."""
+    import subprocess as _sp
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    repo_root = str(_Path(__file__).resolve().parent.parent)
+    code = (
+        "import sys, fullagent.client as c; "
+        "assert 'requests' not in sys.modules, 'requests leaked at import'; "
+        "assert 'urllib3' not in sys.modules, 'urllib3 leaked at import'; "
+        "s = c.shared_session(); "
+        "assert 'requests' in sys.modules, 'lazy import did not fire'; "
+        "rq = sys.modules['requests']; "
+        "assert isinstance(s, rq.Session), type(s); "
+        "assert s is c.shared_session() is c.shared_session(), 'singleton broken'; "
+        "print('lazy-import: requests absent at import, resolves on first use')"
+    )
+    r = _sp.run([_sys.executable, "-c", code], capture_output=True,
+                text=True, cwd=repo_root, timeout=120)
+    out = (r.stdout + r.stderr).strip()
+    if out:
+        print(out)
+    assert r.returncode == 0, f"lazy-import self-test failed:\n{out}"
+
+
+if __name__ == "__main__":  # dead block (a later __main__ wins); kept as reference
+    import ssl
+    import subprocess
+    import tempfile
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from socketserver import ThreadingMixIn
+
+    try:
+        import urllib3 as _u3
+        _u3.disable_warnings(_u3.exceptions.InsecureRequestWarning)
+    except Exception:
+        pass
+
+    class _H(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"  # keep-alive across requests
+
+        def do_GET(self):
+            body = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            self.server.served += 1
+
+        def log_message(self, *a):
+            pass
+
+    class _CountingServer(ThreadingMixIn, HTTPServer):
+        # Threaded: keep-alive connections stay open in handler threads, so
+        # the serve loop keeps polling and shutdown() never deadlocks.
+        daemon_threads = True
+
+        def __init__(self, *a, ctx=None, **k):
+            self._ctx = ctx
+            self.accepted = 0
+            self.served = 0
+            self._alock = threading.Lock()
+            super().__init__(*a, **k)
+
+        def get_request(self):
+            conn, addr = self.socket.accept()
+            conn = self._ctx.wrap_socket(conn, server_side=True)
+            with self._alock:
+                self.accepted += 1
+            return conn, addr
+
+    def _mk_server():
+        d = tempfile.mkdtemp()
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048",
+             "-keyout", f"{d}/key.pem", "-out", f"{d}/cert.pem",
+             "-days", "1", "-nodes", "-subj", "/CN=127.0.0.1"],
+            capture_output=True, check=True)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(f"{d}/cert.pem", f"{d}/key.pem")
+        srv = _CountingServer(("127.0.0.1", 0), _H, ctx=ctx)
+        return srv
+
+    def _handshake_count_for(make_calls):
+        srv = _mk_server()
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            url = f"https://127.0.0.1:{srv.server_port}/"
+            start = time.monotonic()
+            make_calls(url)
+            elapsed = time.monotonic() - start
+            time.sleep(0.2)
+            return srv.accepted, srv.served, elapsed
+        finally:
+            srv.shutdown()
+
+    def _one_shot_calls(url):
+        for _ in range(3):
+            r = requests.get(url, verify=False, timeout=(5, 10))
+            r.text
+
+    def _pooled_calls(url):
+        s = shared_session()
+        for _ in range(3):
+            r = s.get(url, verify=False, timeout=(5, 10))
+            r.text
+
+    print("== connection-reuse self-test ==")
+    acc1, served1, t1 = _handshake_count_for(_one_shot_calls)
+    print(f"BEFORE (one-shot requests.get x3): {acc1} TLS handshakes, "
+          f"{served1} requests served, {t1:.2f}s")
+    acc2, served2, t2 = _handshake_count_for(_pooled_calls)
+    print(f"AFTER  (pooled shared_session x3): {acc2} TLS handshake(s), "
+          f"{served2} requests served, {t2:.2f}s")
+    assert served1 == 3 and served2 == 3, "server must see all 3 requests"
+    assert acc1 == 3, f"one-shot calls should open 3 connections, got {acc1}"
+    assert acc2 == 1, f"pooled calls should reuse 1 connection, got {acc2}"
+    print(f"handshakes: 3 -> 1 ({acc1 - acc2} saved); "
+          f"time {t1:.2f}s -> {t2:.2f}s")
+
+    # thread-safety: 8 threads racing to build the singleton must all get
+    # the same session, and concurrent requests must all succeed.
+    _SESSION = None
+    seen, errors = [], []
+    srv = _mk_server()
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"https://127.0.0.1:{srv.server_port}/"
+
+    def _worker():
+        try:
+            s = shared_session()
+            seen.append(id(s))
+            r = s.get(url, verify=False, timeout=(5, 10))
+            assert r.status_code == 200 and r.text == "ok"
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=_worker) for _ in range(8)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=60)
+    srv.shutdown()
+
+    assert not errors, f"thread errors: {errors}"
+    assert len(seen) == 8 and len(set(seen)) == 1, \
+        f"all threads must share one session, got {len(set(seen))} distinct"
+    print("thread-safety: 8 threads -> 1 shared session, 8/8 requests OK")
+    print("PASS: connection reuse verified (3 handshakes -> 1)")
+
+
+if __name__ == "__main__":
+    # -- token-count speed self-test -------------------------------------
+    # Proves: (1) repeated counts of the SAME object are ~free (identity
+    # tier: no serialization, no hashing) vs the old pay-every-call path;
+    # (2) counts are unchanged by the cache (same math as before);
+    # (3) mutations (append/pop/in-place truncate, tool-call edits)
+    # recount correctly; (4) calibration updates invalidate the cache;
+    # (5) the approximation stays within a sane bound of a chars/4-style
+    # real-tokenizer guess.
+    import tempfile as _tempfile
+    import time as _t
+    from pathlib import Path as _Path
+
+    _self_test_lazy_imports()  # import-time perf: requests must stay lazy
+
+    # Hermetic calibration: the test learns ratios, so point the
+    # calibration file at a temp dir — never touch the user's real one,
+    # and stay deterministic across reruns.
+    _CALIBRATION_FILE = (_Path(_tempfile.mkdtemp(prefix="toktest_"))
+                         / "calibration.json")
+    _calibration_loaded = False
+    _ratio_samples.clear()
+    _learned_windows.clear()
+    _token_cache.clear()
+    _id_cache.clear()
+
+    fails: list[str] = []
+
+    def check(name: str, cond: bool) -> None:
+        print(("PASS" if cond else "FAIL"), "-", name)
+        if not cond:
+            fails.append(name)
+
+    MID = "selftest-model-xyz"
+
+    def _old_path(obj, model_id=MID):  # the pre-fix hot path: no cache
+        p = json.dumps(obj, ensure_ascii=False, default=str)
+        return max(1, int(len(p) / _BASELINE_CHARS_PER_TOKEN))
+
+    # -- fixtures: ~100KB prompt and ~1MB history (the SAME objects are
+    #    reused across calls, exactly like agent.messages) ----------------
+    line = "def foo(bar):\n    return bar + 1  # some python code\n"
+    prompt100k = [{"role": "user", "content": line * 1800}]
+    hist1m = [{"role": "user", "content": line * 1800} for _ in range(10)]
+    size100k = len(json.dumps(prompt100k, ensure_ascii=False))
+    size1m = len(json.dumps(hist1m, ensure_ascii=False))
+    print(f"fixtures: prompt={size100k // 1024}KB history={size1m // 1024}KB")
+
+    def _bench(fn, iters=20):
+        t0 = _t.perf_counter()
+        for _ in range(iters):
+            fn()
+        return (_t.perf_counter() - t0) / iters * 1000.0
+
+    # -- 1. identical results with/without cache -------------------------
+    check("count == old path (100KB)",
+          estimate_tokens(prompt100k, MID) == _old_path(prompt100k))
+    check("count == old path (1MB)",
+          estimate_tokens(hist1m, MID) == _old_path(hist1m))
+
+    # -- 2. speed: old path vs identity-tier repeated counts ---------------
+    t_old_100k = _bench(lambda: _old_path(prompt100k))
+    estimate_tokens(prompt100k, MID)          # warm: miss populates tier 1
+    t_hit_100k = _bench(lambda: estimate_tokens(prompt100k, MID), 500)
+    print(f"100KB: old path {t_old_100k:.2f} ms/call, "
+          f"identity hit {t_hit_100k * 1000:.1f} us/call")
+    check("100KB repeated count >= 50x faster",
+          t_hit_100k * 50 < t_old_100k)
+
+    t_old_1m = _bench(lambda: _old_path(hist1m))
+    estimate_tokens(hist1m, MID)             # warm
+    t_hit_1m = _bench(lambda: estimate_tokens(hist1m, MID), 500)
+    print(f"1MB:   old path {t_old_1m:.2f} ms/call, "
+          f"identity hit {t_hit_1m * 1000:.1f} us/call")
+    check("1MB repeated count >= 50x faster", t_hit_1m * 50 < t_old_1m)
+    check("1MB hit under 1ms", t_hit_1m < 1.0)
+
+    big_text = line * 1800
+    estimate_tokens_fast(big_text, MID)     # warm
+    t_fast = _bench(lambda: estimate_tokens_fast(big_text, MID), 500)
+    print(f"fast text path hit: {t_fast * 1000:.1f} us/call")
+    check("fast path hit under 50us", t_fast < 0.05)
+
+    # -- 3. mutations recount correctly ------------------------------------
+    msgs = [{"role": "user", "content": "hello world"},
+            {"role": "assistant", "content": "hi there"}]
+    n0 = estimate_tokens(msgs, MID)
+    msgs.append({"role": "user", "content": "another question here"})
+    n1 = estimate_tokens(msgs, MID)
+    check("append changes count", n1 > n0)
+    msgs.pop()
+    n2 = estimate_tokens(msgs, MID)
+    check("pop restores original count", n2 == n0)
+    msgs[0]["content"] = "hello world, this is a much longer message now"
+    n3 = estimate_tokens(msgs, MID)
+    check("in-place content edit changes count", n3 > n0)
+    check("in-place edit count is exact", n3 == _old_path(msgs))
+    msgs2 = [{"role": "assistant", "content": "",
+              "tool_calls": [{"id": "1", "type": "function",
+                              "function": {"name": "read",
+                                           "arguments": '{"p": "x"}'}}]}]
+    a = estimate_tokens(msgs2, MID)
+    msgs2[0]["tool_calls"][0]["function"]["arguments"] = '{"p": "x' * 500
+    b = estimate_tokens(msgs2, MID)
+    check("tool-call arg growth changes count", b > a)
+    check("tool-call count exact", b == _old_path(msgs2))
+
+    # -- 4. calibration learn invalidates the cache -------------------------
+    before = estimate_tokens(prompt100k, MID)
+    learn_token_ratio(sent_chars=size100k, actual_tokens=10_000,
+                      model_id=MID)  # ratio 10 -> cheaper than baseline 3.2
+    after = estimate_tokens(prompt100k, MID)
+    check("learned ratio changes the count (epoch bump)", after < before)
+    check("learned count still sane", after > 0)
+
+    # -- 5. approximation within sane bounds ---------------------------------
+    guess = size100k / 4.0
+    check("within 4x of chars/4 guess",
+          guess / 4.0 <= after <= guess * 4.0)
+    check("never more tokens than chars", after <= size100k)
+    check("never fewer than chars/16", after >= size100k / 16.0)
+
+    # -- 6. caches stay bounded ----------------------------------------------
+    for i in range(_TOKEN_CACHE_MAX + 200):
+        estimate_tokens_fast(f"unique-content-{i}", MID)
+    check("digest cache evicts oldest (bounded)",
+          len(_token_cache) <= _TOKEN_CACHE_MAX)
+    for i in range(_ID_CACHE_MAX + 20):
+        estimate_tokens([{"role": "user", "content": f"m{i}"}], MID)
+    check("identity cache bounded", len(_id_cache) <= _ID_CACHE_MAX)
+
+    # -- 7. degenerate inputs never crash --------------------------------------
+    for weird in ("", [], {}, None, 0):
+        try:
+            n = estimate_tokens(weird, MID)
+            check(f"weird {weird!r} -> >=1", n >= 1)
+        except Exception as e:  # noqa: BLE001
+            check(f"weird {weird!r} no crash ({e})", False)
+
+    print()
+    if fails:
+        print(f"{len(fails)} FAILURES")
+        raise SystemExit(1)
+    print("ALL TOKEN-COUNT SELF-TESTS PASS")
+
+
+if __name__ == "__main__":
+    # -- timeout fail-fast self-test ---------------------------------------
+    # Proves a hung model endpoint fails fast with a clear APITimeoutError
+    # instead of hanging forever. Spins local TCP servers:
+    #   1. black hole (accepts the connection, never responds) ->
+    #      chat_blocking raises APITimeoutError in ~timeout seconds, not
+    #      MAX_RETRIES x DEFAULT_TIMEOUT (900s+) of silence;
+    #   2. stalled SSE (headers sent, then silence) -> the stall watchdog
+    #      aborts the stream (exercised with a 2s watchdog);
+    #   3. healthy SSE (keepalive comment + event + [DONE]) -> still
+    #      completes (regression guard for the watchdog path).
+    # Run:  python3 -m fullagent.client
+    _self_test_lazy_imports()  # import-time perf: requests must stay lazy
+
+    import socket as _socket
+
+    _OLD_WORST = MAX_RETRIES * config.DEFAULT_TIMEOUT  # 900s+ of silence
+
+    def _st_serve(_handler):
+        srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        srv.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(8)
+        port = srv.getsockname()[1]
+
+        def _read_headers(conn):
+            conn.settimeout(10)
+            data = b""
+            try:
+                while b"\r\n\r\n" not in data:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    data += chunk
+            except OSError:
+                pass
+
+        def _loop():
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return
+                _read_headers(conn)
+                threading.Thread(target=_handler, args=(conn,),
+                                 daemon=True).start()
+
+        threading.Thread(target=_loop, daemon=True).start()
+        return srv, port
+
+    def _st_black_hole(conn):
+        try:
+            time.sleep(3600)  # accept, then never respond — not even headers
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    def _st_stalled_sse(conn):
+        try:
+            conn.sendall(b"HTTP/1.1 200 OK\r\n"
+                         b"Content-Type: text/event-stream\r\n"
+                         b"Cache-Control: no-cache\r\n"
+                         b"Connection: keep-alive\r\n\r\n")
+            time.sleep(3600)  # headers, then silence forever
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    def _st_healthy_sse(conn):
+        try:
+            conn.sendall(b"HTTP/1.1 200 OK\r\n"
+                         b"Content-Type: text/event-stream\r\n"
+                         b"Connection: close\r\n\r\n"
+                         b": ping\n\n"
+                         b'data: {"model":"t","choices":[{"delta":{"content":"hi"},'
+                         b'"finish_reason":"stop"}]}\n\n'
+                         b"data: [DONE]\n\n")
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    def _st_mk(base_url):
+        return (Provider(key="t", name="t", base_url=base_url,
+                         api_key="dummy", color="red"),
+                Model(id="t", provider="t", label="t"),
+                Effort(key="t", label="T", color="red", max_tokens=None,
+                       temperature=0.0, reasoning_effort=None,
+                       description="t"))
+
+    _st_failures: list[str] = []
+    _st_msgs = [{"role": "user", "content": "hi"}]
+
+    def _st_check(name, fn, expect_timeout, limit):
+        t0 = time.monotonic()
+        try:
+            out = fn()
+        except APITimeoutError as e:
+            dt = time.monotonic() - t0
+            ok = expect_timeout and dt < limit
+            print(f"[{'PASS' if ok else 'FAIL'}] {name}: "
+                  f"APITimeoutError after {dt:.1f}s — {e}")
+            if not ok:
+                _st_failures.append(name)
+            return
+        except Exception as e:  # noqa: BLE001 — any other error is a failure
+            dt = time.monotonic() - t0
+            print(f"[FAIL] {name}: unexpected {type(e).__name__} "
+                  f"after {dt:.1f}s — {e}")
+            _st_failures.append(name)
+            return
+        dt = time.monotonic() - t0
+        if expect_timeout or getattr(out, "content", "") != "hi":
+            print(f"[FAIL] {name}: unexpectedly succeeded "
+                  f"({getattr(out, 'content', out)!r}) after {dt:.1f}s")
+            _st_failures.append(name)
+        else:
+            print(f"[PASS] {name}: healthy stream -> {out.content!r} "
+                  f"in {dt:.1f}s")
+
+    print("== timeout fail-fast self-test ==")
+    print(f"BEFORE: hung endpoint cost up to {MAX_RETRIES} x "
+          f"{config.DEFAULT_TIMEOUT:g}s = {_OLD_WORST:g}s+ of silence")
+    print(f"AFTER:  connect <={CONNECT_TIMEOUT:g}s, stalled SSE "
+          f"<={STREAM_STALL_TIMEOUT:g}s, total per call <={config.DEFAULT_TIMEOUT:g}s")
+    print()
+
+    _srv1, _p1 = _st_serve(_st_black_hole)
+    _pr, _mo, _ef = _st_mk(f"http://127.0.0.1:{_p1}")
+    _st_check("black-hole blocking (timeout=6)",
+              lambda: chat_blocking(_pr, _mo, _ef, _st_msgs, None, timeout=6),
+              True, 60)
+    _srv1.close()
+
+    _saved_stall = STREAM_STALL_TIMEOUT
+    globals()["STREAM_STALL_TIMEOUT"] = 2.0
+    _srv2, _p2 = _st_serve(_st_stalled_sse)
+    _pr, _mo, _ef = _st_mk(f"http://127.0.0.1:{_p2}")
+    try:
+        _st_check("stalled SSE stream (watchdog=2s)",
+                  lambda: chat_stream(_pr, _mo, _ef, _st_msgs, None,
+                                      timeout=30),
+                  True, 20)
+    finally:
+        globals()["STREAM_STALL_TIMEOUT"] = _saved_stall
+        _srv2.close()
+
+    _srv3, _p3 = _st_serve(_st_healthy_sse)
+    _pr, _mo, _ef = _st_mk(f"http://127.0.0.1:{_p3}")
+    _st_check("healthy SSE stream",
+              lambda: chat_stream(_pr, _mo, _ef, _st_msgs, None, timeout=30),
+              False, 30)
+    _srv3.close()
+
+    print()
+    if _st_failures:
+        print(f"SELF-TEST FAILED: {', '.join(_st_failures)}")
+        raise SystemExit(1)
+    print("ALL TIMEOUT SELF-TESTS PASS")

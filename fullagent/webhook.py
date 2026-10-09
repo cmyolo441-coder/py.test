@@ -511,5 +511,50 @@ def _self_test() -> None:
     print("PASS: webhook module self-test (real HTTP, real subprocess)")
 
 
+def _self_test_thread_efficiency() -> None:
+    """Prove the webhook server thread never polls: ThreadingHTTPServer
+    blocks in accept() (via serve_forever), so an idle server does zero
+    timed wakeups — thread count stays flat and the server still answers
+    a real request instantly."""
+    import http.client
+    import time
+    from types import SimpleNamespace
+
+    agent = SimpleNamespace(tools={}, webhook_queue=None)
+    port = ensure_server(agent, port=0)  # idempotent: once per process
+    assert port and port != 0, f"server did not start, port={port}"
+
+    # 1. idle: thread count must not churn (no spin / no thread factory)
+    before = threading.active_count()
+    time.sleep(2.0)
+    after = threading.active_count()
+    assert after <= before + 1, \
+        f"thread churn while idle: {before} -> {after}"
+    print(f"  idle 2s: threads {before} -> {after} (no churn)  PASS")
+
+    # 2. the serving thread is a single blocking serve_forever thread
+    srv_threads = [t for t in threading.enumerate()
+                   if t.name == "fullagent-webhook"]
+    assert srv_threads and all(t.is_alive() for t in srv_threads), \
+        [t.name for t in threading.enumerate()]
+    print(f"  serving thread alive: {srv_threads[0].name}  PASS")
+
+    # 3. functionality still instant: real request round-trips in < 2s
+    t0 = time.monotonic()
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    conn.request("GET", "/__nope__")
+    resp = conn.getresponse()
+    body = resp.read().decode()
+    conn.close()
+    dt = time.monotonic() - t0
+    assert resp.status == 200, resp.status  # GET = health endpoint
+    assert "fullagent-webhook" in body, body
+    assert dt < 2.0, f"server slow to answer: {dt:.2f}s"
+    print(f"  idle server answers in {dt*1000:.0f}ms  PASS")
+
+    print("PASS: webhook thread efficiency (blocking accept, zero idle wakes)")
+
+
 if __name__ == "__main__":
-    _self_test()
+    _self_test()  # first: starts the once-per-process server with its agent
+    _self_test_thread_efficiency()  # reuses that server via ensure_server

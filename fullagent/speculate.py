@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import re
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from .kernel import EventLog, fold
@@ -147,7 +146,19 @@ class Speculator:
     # -- speculation round ---------------------------------------------------
 
     def speculate(self, user_text: str, recent_tools: list[dict]) -> int:
-        """Predict + prefetch in a background pool. Returns # prefetched."""
+        """Predict + prefetch on daemon threads. Returns # launched.
+
+        CANCEL/PERF: this used to block the turn thread on a
+        ThreadPoolExecutor until EVERY prefetch finished — one slow
+        prefetch (search_files over a huge tree, a 30s web-adjacent
+        read) stalled the whole turn with no way to interrupt it, and
+        Esc during this window did nothing. Prefetches are best-effort,
+        so they now run fire-and-forget on daemon threads: speculate()
+        returns immediately, results land in the cache (and the audit
+        log) as they complete, and serve() hits whatever is ready when
+        the model actually asks. A prefetch still running at serve time
+        is simply a cache miss — the caller runs the tool for real.
+        """
         with self._lock:
             self.turn += 1
             self._expire_locked()
@@ -168,38 +179,42 @@ class Speculator:
                 for p in fresh:
                     self._inflight.discard(p.key())
             return 0
+        for p in fresh:
+            t = threading.Thread(target=self._prefetch_one,
+                                 args=(p, turn),
+                                 daemon=True,
+                                 name=f"speculate:{p.tool}")
+            t.start()
+        return len(fresh)
 
-        def _run(p: Prediction) -> tuple[Prediction, str]:
-            try:
-                return p, self.runner(p.tool, dict(p.args))
-            except Exception as e:  # speculation must never surface errors
-                return p, f"ERROR: {type(e).__name__}: {e}"
-
-        done = 0
+    def _prefetch_one(self, p: Prediction, turn: int) -> None:
+        """Run one prefetch on a daemon thread; cache + audit on success.
+        Never raises — speculation must never surface errors."""
         try:
-            with ThreadPoolExecutor(max_workers=min(4, len(fresh))) as ex:
-                for p, result in ex.map(_run, fresh):
-                    with self._lock:
-                        self._inflight.discard(p.key())
-                    if result.startswith("ERROR:"):
-                        continue
-                    with self._lock:
-                        self._cache[p.key()] = CacheEntry(
-                            p.tool, p.args, result, turn)
-                    self.log.append("spec.prefetch",
-                                    {"tool": p.tool, "args": p.args,
-                                     "score": p.score, "why": p.why,
-                                     "chars": len(result)},
-                                    actor="speculator")
-                    done += 1
-        finally:
-            # never leave a reservation behind: an early exit (pool
-            # failure, BaseException) used to strand keys in _inflight
-            # and silently suppress those predictions forever after.
+            try:
+                result = self.runner(p.tool, dict(p.args))
+            except Exception as e:  # noqa: BLE001
+                result = f"ERROR: {type(e).__name__}: {e}"
             with self._lock:
-                for p in fresh:
-                    self._inflight.discard(p.key())
-        return done
+                self._inflight.discard(p.key())
+                if not result.startswith("ERROR:"):
+                    self._cache[p.key()] = CacheEntry(
+                        p.tool, p.args, result, turn)
+                    cached = True
+                else:
+                    cached = False
+            if cached:
+                self.log.append("spec.prefetch",
+                                {"tool": p.tool, "args": p.args,
+                                 "score": p.score, "why": p.why,
+                                 "chars": len(result)},
+                                actor="speculator")
+        finally:
+            # never leave a reservation behind: a BaseException in the
+            # audit path used to strand keys in _inflight and silently
+            # suppress those predictions forever after.
+            with self._lock:
+                self._inflight.discard(p.key())
 
     # -- serving ---------------------------------------------------------------
 
@@ -272,7 +287,19 @@ class Speculator:
 
 if __name__ == "__main__":
     import tempfile
+    import time as _time
     from pathlib import Path
+
+    def _drain(spec, timeout=10.0, ignore=()):
+        """Wait until all in-flight prefetches finish (async speculate)."""
+        deadline = _time.monotonic() + timeout
+        while _time.monotonic() < deadline:
+            with spec._lock:
+                pending = set(spec._inflight) - set(ignore)
+            if not pending:
+                return
+            _time.sleep(0.05)
+        raise AssertionError(f"prefetches did not drain: {pending}")
 
     with tempfile.TemporaryDirectory() as td:
         log = EventLog(Path(td) / "spec.jsonl")
@@ -292,9 +319,14 @@ if __name__ == "__main__":
         assert any(p.tool == "read_file" and p.args["path"] == "src/main.py"
                    for p in preds), preds
 
-        # speculation round prefetches the predicted read
+        # speculation round launches the predicted reads WITHOUT blocking
+        # (fire-and-forget: a slow prefetch must never stall the turn)
+        t0 = _time.monotonic()
         n = spec.speculate("please look at src/main.py and fix it", [])
+        dt = _time.monotonic() - t0
         assert n >= 1, n
+        assert dt < 2.0, f"speculate() blocked {dt:.2f}s"
+        _drain(spec)
         assert any(c[0] == "read_file" for c in calls), calls
 
         # the model then asks for exactly that file -> cache HIT
@@ -309,6 +341,7 @@ if __name__ == "__main__":
 
         # erroring prefetches are dropped, never cached
         spec.speculate("read missing/file.txt", [])
+        _drain(spec)
         assert spec.serve("read_file", {"path": "missing/file.txt"}) is None
 
         # stats + ledger
@@ -339,6 +372,7 @@ if __name__ == "__main__":
         finally:
             globals()["predict"] = _real_predict
         assert n == 1, n
+        _drain(spec_evil)
         assert [c[0] for c in evil_calls] == ["read_file"], evil_calls
 
         # a key already reserved in-flight is not prefetched again (the
@@ -354,6 +388,7 @@ if __name__ == "__main__":
         rkey = Prediction("read_file", {"path": "src/main.py"}).key()
         spec_dup._inflight.add(rkey)
         spec_dup.speculate("please look at src/main.py and fix it", [])
+        _drain(spec_dup, ignore=(rkey,))
         assert all(c[0] != "read_file" for c in dup_calls), dup_calls
         # the round released everything IT reserved; only the foreign
         # key I injected by hand remains

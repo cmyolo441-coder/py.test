@@ -20,6 +20,7 @@ from typing import Any, Callable
 
 from . import config
 from ._foundation import get_logger, ToolError, validate_path, content_hash
+from .cancelguard import TurnCancelled, run_cancellable
 
 _log = get_logger("tools")
 
@@ -1011,9 +1012,13 @@ def apply_patch(patch: str) -> str:
 # Web
 # ---------------------------------------------------------------------------
 
-def web_fetch(url: str) -> str:
-    """Fetch a URL and return its text content."""
-    import requests
+def web_fetch(url: str,
+              should_cancel: "Callable[[], bool] | None" = None) -> str:
+    """Fetch a URL and return its text content.
+
+    CANCEL: the old version blocked up to 30s in requests.get() with no
+    way to interrupt it. The fetch now runs guarded — Esc raises
+    TurnCancelled within ~0.25s."""
     import urllib.parse
     if not isinstance(url, str) or not url.strip():
         return "ERROR: url must be a non-empty string"
@@ -1026,9 +1031,21 @@ def web_fetch(url: str) -> str:
         # reached through exotic schemes
         return f"ERROR: only http(s) URLs are allowed, got {scheme or 'no'} scheme"
     try:
-        resp = requests.get(url, timeout=30, headers={
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) FullAgent/1.0"})
-        resp.raise_for_status()
+        # Pooled keep-alive session: repeated fetches to the same host
+        # skip the TCP+TLS handshake instead of paying it every call.
+        from .client import shared_session
+
+        def _get():
+            r = shared_session().get(url, timeout=30, headers={
+                "User-Agent":
+                    "Mozilla/5.0 (X11; Linux x86_64) FullAgent/1.0"})
+            r.raise_for_status()
+            return r
+        resp = run_cancellable(_get, should_cancel, name="web fetch")
+    except TurnCancelled:
+        # Never swallow a cancel into an ERROR string — _execute_tool
+        # re-raises it so the turn actually stops.
+        raise
     except Exception as e:
         return f"ERROR: {e}"
     ctype = resp.headers.get("content-type", "")
@@ -1044,8 +1061,8 @@ def web_fetch(url: str) -> str:
 
 def _ddg_search(query: str) -> list[tuple[str, str, str]]:
     """DuckDuckGo HTML search -> [(title, url, snippet)]."""
-    import requests
-    resp = requests.post(
+    from .client import shared_session  # pooled keep-alive: no fresh handshake
+    resp = shared_session().post(
         "https://html.duckduckgo.com/html/",
         data={"q": query}, timeout=30,
         headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) FullAgent/1.0"})
@@ -1070,8 +1087,8 @@ def _ddg_search(query: str) -> list[tuple[str, str, str]]:
 
 def _bing_search(query: str) -> list[tuple[str, str, str]]:
     """Bing HTML search fallback -> [(title, url, snippet)]."""
-    import requests
-    resp = requests.get(
+    from .client import shared_session  # pooled keep-alive: no fresh handshake
+    resp = shared_session().get(
         "https://www.bing.com/search",
         params={"q": query, "count": "10"}, timeout=30,
         headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) "
@@ -1089,20 +1106,36 @@ def _bing_search(query: str) -> list[tuple[str, str, str]]:
     return out
 
 
-def web_search(query: str) -> str:
+def web_search(query: str,
+               should_cancel: "Callable[[], bool] | None" = None) -> str:
     """Real-time web search. Tries DuckDuckGo, then Bing; returns the top
     results with titles, URLs and snippets, stamped with the retrieval
-    time so the data's freshness is explicit."""
+    time so the data's freshness is explicit.
+
+    CANCEL: each engine used to block up to 30s with no interrupt — the
+    whole loop is cancel-guarded now; Esc raises TurnCancelled."""
     from datetime import datetime
     errors = []
     results: list[tuple[str, str, str]] = []
-    for engine, fn in (("DuckDuckGo", _ddg_search), ("Bing", _bing_search)):
-        try:
-            results = fn(query)
-            if results:
-                break
-        except Exception as e:
-            errors.append(f"{engine}: {e}")
+
+    def _engines():
+        out: list[tuple[str, str, str]] = []
+        errs: list[str] = []
+        for engine, fn in (("DuckDuckGo", _ddg_search),
+                           ("Bing", _bing_search)):
+            try:
+                out = fn(query)
+                if out:
+                    break
+            except Exception as e:
+                errs.append(f"{engine}: {e}")
+        return out, errs
+
+    try:
+        results, errors = run_cancellable(_engines, should_cancel,
+                                          name="web search")
+    except TurnCancelled:
+        raise
     if not results:
         return ("ERROR: all search engines failed — "
                 + ("; ".join(errors) if errors else "no results"))

@@ -21,7 +21,6 @@ Wired here (all enforced mechanically, rung 1 — never as prompt advice):
 from __future__ import annotations
 
 import hashlib
-import inspect
 import json
 import os
 import re
@@ -32,68 +31,170 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from . import config
-from . import systemprompt
 from ._foundation import get_logger
-from .autopilot import AutoPilot, RouteDecision
-from .cassette import Cassette
-from .client import (APIError, TurnCancelled, assistant_message,
-                     chat_blocking, chat_stream, estimate_tokens,
-                     is_context_overflow)
-from .config import Config, Effort, Model, Provider, PROVIDERS, model_by_id
-from .attention import AttentionEconomy
-from .bandit import BanditRouter
-from .brain import Brain
-from .causal import CausalEngine
 
 _log = get_logger("agent")
-from .ci import CIPilot
-from .compiler import IntentCompiler, default_drafter
-from .cortex import Budget, BudgetGovernor, LoopDetector
-from .council import Council
-from .debate import DebateTournament
-from .dual import DualProcess
-from .evolution import EvolutionEngine, default_benchmark
-from .fabric import KnowledgeFabric
-from .formal import ModelChecker
-from .homeo import Homeostasis
-from .market import TaskMarket
-from .mcts import TreeSearch
-from .merge import TimelineMerger
-from .mesh import MeshNode
-from .meta import RoleForge, default_drafter as role_drafter
-from .goal import TERMINAL_STATES
-from .report import export_html, export_markdown, forecast, format_forecast
-from .workflows import WorkflowEngine, WorkflowError
-from .cov import CoverageEngine
-from .daemon import Daemon
-from .dashboard import Dashboard
-from .forge import Forge
-from .fuzz import Fuzzer
-from .goal import GoalContract
-from .healer import Healer
-from .judge import Judge
-from .kernel import EventLog, fold
-from .kgraph import KnowledgeGraph
-from .mastermind import Mastermind
-from .memory import Hippocampus
-from .mutate import MutationTester
-from .nexus import Nexus
-from .oracle import Oracle
-from .router import Router
-from .semantic import SemanticMemory
-from .skills import SkillForge
-from .snapshots import SnapshotStore
-from .speculate import Speculator, SPECULATIVE_TOOLS
-from .race import RacingUniverses
-from .synth import ProgramSynthesizer, SynthSpec, default_generator
-from .taint import StaticAnalyzer
-from .team import MAX_SUMMARY_CHARS, WorkerReport, parse_worker_final
-from .theater import Theater
-from .tools import RISK_CONFIRM, Tool, build_registry, parse_tool_arguments
-from .tower import Tower
-from .tuner import ParzenTuner
-from .world import WorldModel
+
+# ---------------------------------------------------------------------------
+# Lazy submodule imports (Worker 8/20 — startup time).
+#
+# Importing this module used to pull ~55 subsystem modules in eagerly
+# (~2.5s of interpreter work on a cold start). The names below now resolve
+# lazily via PEP 562: the first attribute access imports the owning
+# submodule and caches the result in module globals, so every existing
+# reference (`Judge`, `config.MODELS`, `build_registry()`, ...) keeps
+# working unchanged — the cost is paid on first use, not at import.
+# ---------------------------------------------------------------------------
+import importlib as _importlib
+
+_LAZY_IMPORTS: dict[str, str] = {
+    # attribute -> owning submodule (relative to this package)
+    "config": ".config",
+    "systemprompt": ".systemprompt",
+    "AutoPilot": ".autopilot",
+    "RouteDecision": ".autopilot",
+    "Cassette": ".cassette",
+    "APIError": ".client",
+    "TurnCancelled": ".client",
+    "assistant_message": ".client",
+    "chat_blocking": ".client",
+    "chat_stream": ".client",
+    "estimate_tokens": ".client",
+    "is_context_overflow": ".client",
+    "Config": ".config",
+    "Effort": ".config",
+    "Model": ".config",
+    "Provider": ".config",
+    "PROVIDERS": ".config",
+    "model_by_id": ".config",
+    "AttentionEconomy": ".attention",
+    "BanditRouter": ".bandit",
+    "Brain": ".brain",
+    "CausalEngine": ".causal",
+    "CIPilot": ".ci",
+    "IntentCompiler": ".compiler",
+    "default_drafter": ".compiler",
+    "Budget": ".cortex",
+    "BudgetGovernor": ".cortex",
+    "LoopDetector": ".cortex",
+    "Council": ".council",
+    "DebateTournament": ".debate",
+    "DualProcess": ".dual",
+    "EvolutionEngine": ".evolution",
+    "default_benchmark": ".evolution",
+    "KnowledgeFabric": ".fabric",
+    "ModelChecker": ".formal",
+    "Homeostasis": ".homeo",
+    "TaskMarket": ".market",
+    "TreeSearch": ".mcts",
+    "TimelineMerger": ".merge",
+    "MeshNode": ".mesh",
+    "RoleForge": ".meta",
+    # aliased import: from .meta import default_drafter as role_drafter
+    "role_drafter": (".meta", "default_drafter"),
+    "TERMINAL_STATES": ".goal",
+    "GoalContract": ".goal",
+    "export_html": ".report",
+    "export_markdown": ".report",
+    "forecast": ".report",
+    "format_forecast": ".report",
+    "WorkflowEngine": ".workflows",
+    "WorkflowError": ".workflows",
+    "CoverageEngine": ".cov",
+    "Daemon": ".daemon",
+    "Dashboard": ".dashboard",
+    "Forge": ".forge",
+    "Fuzzer": ".fuzz",
+    "Healer": ".healer",
+    "Judge": ".judge",
+    "EventLog": ".kernel",
+    "fold": ".kernel",
+    "KnowledgeGraph": ".kgraph",
+    "Mastermind": ".mastermind",
+    "Hippocampus": ".memory",
+    "MutationTester": ".mutate",
+    "Nexus": ".nexus",
+    "Oracle": ".oracle",
+    "Router": ".router",
+    "SemanticMemory": ".semantic",
+    "SkillForge": ".skills",
+    "SnapshotStore": ".snapshots",
+    "Speculator": ".speculate",
+    "SPECULATIVE_TOOLS": ".speculate",
+    "RacingUniverses": ".race",
+    "ProgramSynthesizer": ".synth",
+    "SynthSpec": ".synth",
+    "default_generator": ".synth",
+    "StaticAnalyzer": ".taint",
+    "MAX_SUMMARY_CHARS": ".team",
+    "WorkerReport": ".team",
+    "parse_worker_final": ".team",
+    "Theater": ".theater",
+    "RISK_CONFIRM": ".tools",
+    "Tool": ".tools",
+    "build_registry": ".tools",
+    "parse_tool_arguments": ".tools",
+    "dispatch_block": ".parallel_tools",
+    "Tower": ".tower",
+    "ParzenTuner": ".tuner",
+    "WorldModel": ".world",
+    "Crew": ".crew",
+}
+
+
+def __getattr__(name: str):
+    """PEP 562: import the owning submodule on first attribute access."""
+    rel = _LAZY_IMPORTS.get(name)
+    if rel is None:
+        raise AttributeError(
+            f"module {__name__!r} has no attribute {name!r}")
+    value = _import_lazy_value(name, rel)
+    globals()[name] = value  # cache: later lookups skip __getattr__
+    return value
+
+
+def _import_lazy_value(name: str, rel) -> object:
+    """Resolve one _LAZY_IMPORTS entry to its value."""
+    if isinstance(rel, tuple):
+        # aliased import: ("module", "real_attr")
+        rel, real = rel
+        return getattr(_importlib.import_module(rel, __package__), real)
+    module = _importlib.import_module(rel, __package__)
+    # `from . import config` binds the submodule itself, not an attr of it
+    return module if rel == "." + name else getattr(module, name)
+
+
+def _resolve_lazy(*names: str) -> None:
+    """Import the named lazy attributes into module globals, now.
+
+    A bare global reference inside a method body (LOAD_GLOBAL) never
+    consults the PEP 562 __getattr__ above, so methods that run before
+    the bulk import below resolve exactly the names they need.
+    Idempotent and cheap after the first call.
+    """
+    g = globals()
+    for name in names:
+        if name in g:
+            continue
+        g[name] = _import_lazy_value(name, _LAZY_IMPORTS[name])
+
+
+_submodules_loaded = False
+
+
+def _ensure_submodules() -> None:
+    """Bulk-import every lazily-declared submodule into module globals.
+
+    Runs once, on first real use (first turn, first subsystem access,
+    first schema build). Afterwards every method body sees the exact
+    same globals the old eager imports provided.
+    """
+    global _submodules_loaded
+    if _submodules_loaded:
+        return
+    _resolve_lazy(*_LAZY_IMPORTS)
+    _submodules_loaded = True
+
 
 # The system prompt lives in systemprompt.py — the single source of truth.
 # This module only ever reads it from there.
@@ -151,12 +252,54 @@ def _signature(name: str, args: dict) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
+def prune_messages(messages: list, window: int = 40,
+                   tool_keep: int = 2) -> list:
+    """PERF: sliding-window prune for the model-visible history.
+
+    Keeps: (1) system prompt, (2) first user message (task framing),
+    (3) the last `window` messages. Old tool outputs are truncated to
+    summaries first (newest `tool_keep` stay verbatim). Never mutates
+    the input. window=0 disables (returns everything).
+    """
+    if not messages or window <= 0 or len(messages) <= window + 2:
+        return list(messages)
+    out = []
+    idx = 0
+    if messages[0].get("role") == "system":
+        out.append(messages[0])
+        idx = 1
+    rest = messages[idx:]
+    first_user = next((m for m in rest if m.get("role") == "user"), None)
+    tail = [dict(m) if m.get("role") == "tool" else m
+            for m in rest[-window:]]
+    # truncate old tool outputs, keep newest tool_keep verbatim
+    tool_idx = [i for i, m in enumerate(tail) if m.get("role") == "tool"]
+    for i in tool_idx[:max(0, len(tool_idx) - tool_keep)]:
+        content = tail[i].get("content", "")
+        if isinstance(content, str) and len(content) > 500:
+            tail[i]["content"] = (
+                content[:500] +
+                f"\n…[truncated {len(content) - 500} chars — "
+                f"re-read from disk if needed]")
+    if first_user is not None and first_user not in out \
+            and all(m is not first_user for m in tail):
+        out.append(first_user)
+    out.extend(tail)
+    return out
+
+
 
 NOTIFY_EVENTS = ("goal.closed", "focus.stop", "workflow.done",
                  "crew.done", "provider.failover")
 
 # provider errors that justify an automatic model failover
 _FAILOVER_STATUSES = {408, 429, 500, 502, 503, 504}
+
+# MEMORY BOUNDS (worker 19/20): every unbounded runtime structure gets a
+# cap. These are live UI/detection state only — the event log is the
+# durable record, so trimming here loses nothing the session needs.
+_FOCUS_HISTORY_MAX = 64    # stall detection reads only the last 4 ticks
+_FILE_HASH_PATHS_MAX = 256  # distinct paths tracked for oscillation
 
 
 class Notifier:
@@ -196,8 +339,10 @@ class Notifier:
                 with open(self.sink[5:], "a", encoding="utf-8") as f:
                     f.write(json.dumps(record, default=str) + "\n")
             else:
-                import requests
-                requests.post(self.sink, json=record, timeout=5)
+                # Pooled keep-alive session: sink posts to the same host
+                # skip the TLS handshake on every event.
+                from .client import shared_session
+                shared_session().post(self.sink, json=record, timeout=5)
             self.sent += 1
             return True
         except Exception as e:  # noqa: BLE001
@@ -213,7 +358,127 @@ class Notifier:
 
 
 class Agent:
+    # cache for _handler_takes_cancel (handler -> bool)
+    _cancel_kwarg_cache: dict = {}
+    # Lazily-built subsystems (Worker 8/20 — startup time).
+    #
+    # Constructing an Agent used to instantiate ~45 subsystems eagerly
+    # (~1.5s, plus the module imports above). Each factory below builds
+    # exactly what the old __init__ line built; Agent.__getattr__
+    # materialises and caches it in the instance dict on first access, so
+    # `agent.judge`, `agent.forge`, ... behave exactly as before — the
+    # cost is paid on first use, not at construction. Factories may only
+    # touch attributes that exist right after __init__ (cfg, log, tools,
+    # mastermind, messages, session_id) or other lazy subsystems.
+    _SUBSYSTEM_FACTORIES: dict[str, Callable[["Agent"], Any]] = {
+        "crew": lambda self: Crew(
+            self.log, self.provider, self.model, self.cfg.effort,
+            mastermind=self.mastermind),
+        "store": lambda self: SnapshotStore(config.APP_DIR / "store"),
+        "memory": lambda self: Hippocampus(self.log),
+        "judge": lambda self: Judge(self.log),
+        "goal": lambda self: GoalContract(self.log, judge=self.judge),
+        "brain": lambda self: Brain(self.log, config.APP_DIR / "brain.json"),
+        "compiler": lambda self: IntentCompiler(
+            self.log,
+            default_drafter(self.provider, self.model, self.effort),
+            executor=self._compile_wave),
+        "evolution": lambda self: EvolutionEngine(
+            self.log, self._evolution_mutator, self._evolution_evaluator),
+        "merger": lambda self: TimelineMerger(self.log),
+        "theater": lambda self: Theater(self.log),
+        "debate": lambda self: DebateTournament(
+            self.log, self._debate_speaker,
+            [m.id for m in config.MODELS if m.supports_tools][:4]),
+        "market": lambda self: TaskMarket(self.log,
+                                          executor=self._market_exec),
+        "tower": lambda self: Tower(self),
+        "formal": lambda self: ModelChecker(self.log),
+        "mcts": lambda self: TreeSearch(self.log, self._mcts_evaluator),
+        "causal": lambda self: CausalEngine(self.log),
+        "bandit": lambda self: BanditRouter(
+            self.log, [m.id for m in config.MODELS[:8]]),
+        "mesh": lambda self: MeshNode(self.log, self.session_id,
+                                      executor=self._mesh_exec),
+        "roleforge": lambda self: RoleForge(
+            self.log,
+            role_drafter(self.provider, self.model, self.effort),
+            self._role_audition),
+        "synth": lambda self: ProgramSynthesizer(
+            self.log,
+            default_generator(self.provider, self.model, self.effort),
+            registry=self.tools),
+        "ci": lambda self: CIPilot(self.log, Path.cwd(),
+                                   runner=self._ci_runner),
+        "tuner": lambda self: ParzenTuner(self.log, {
+            "effort": [e.key for e in config.EFFORTS],
+            "worker_steps": ["low", "medium", "high"],
+        }),
+        "dual": lambda self: DualProcess(self.log, self._dual_fast,
+                                         self._dual_slow, brain=self.brain),
+        "world": lambda self: WorldModel(self.log, root=Path.cwd()),
+        "racer": lambda self: RacingUniverses(self.log, self._race_runner,
+                                              self._race_verify),
+        "homeo": lambda self: Homeostasis(self.log, repairs={
+            "tool_error_rate": self._repair_reseed_prompts,
+            "loop_alerts": self._repair_consolidate,
+            "tool_latency_ms": self._repair_warm_caches,
+        }),
+        "attention": lambda self: AttentionEconomy(self.log),
+        "fabric": lambda self: KnowledgeFabric(self.log),
+        "autopilot": lambda self: AutoPilot(self.log),
+        "nexus": lambda self: Nexus(),
+        "forge": lambda self: Forge(self.log),
+        "oracle": lambda self: Oracle(self.log,
+                                      memory_dir=config.APP_DIR / "memory"),
+        "budget_gov": lambda self: BudgetGovernor(self.log, Budget()),
+        "loop_det": lambda self: LoopDetector(self.log),
+        "router": lambda self: Router(self.log),
+        "semantic": lambda self: SemanticMemory(self.log),
+        "speculator": lambda self: Speculator(self.log,
+                                              runner=self._spec_runner),
+        "dashboard": lambda self: Dashboard(self.log),
+        "daemon": lambda self: Daemon(self.log, executor=self._daemon_step),
+        "healer": lambda self: Healer(self.log),
+        "skill_forge": lambda self: SkillForge(
+            self.log, skills_dir=config.APP_DIR / "skills"),
+        "council": lambda self: Council(self.log,
+                                        speaker=self._council_speaker),
+        "kgraph": lambda self: KnowledgeGraph(self.log),
+        "static": lambda self: StaticAnalyzer(self.log),
+        "coverage": lambda self: CoverageEngine(self.log),
+        "fuzzer": lambda self: Fuzzer(self.log),
+        "workflows": lambda self: WorkflowEngine(
+            self.log, config.APP_DIR / "workflows",
+            executor=self._workflow_step, judge=self.judge),
+    }
+
+    def __getattr__(self, name: str) -> Any:
+        """Build a lazy subsystem on first access (Worker 8/20).
+
+        Only called when normal attribute lookup fails. The factory runs
+        once; the result is cached in the instance dict, so explicit
+        assignment (tests, monkeypatching) keeps working and never hits
+        this path.
+        """
+        # NOTE: class-attribute lookup only — touching self.<attr> here
+        # would recurse.
+        factory = type(self)._SUBSYSTEM_FACTORIES.get(name)
+        if factory is None:
+            raise AttributeError(
+                f"{type(self).__name__!r} object has no attribute {name!r}")
+        # Bulk-import the submodule globals first: factory bodies (and
+        # every other method) reference them as bare globals, which never
+        # consult the module __getattr__.
+        _ensure_submodules()
+        value = factory(self)
+        self.__dict__[name] = value
+        return value
+
     def __init__(self, cfg: Config):
+        # Only the names __init__ itself needs; everything else stays
+        # unimported until first use (Worker 8/20 — startup time).
+        _resolve_lazy("build_registry", "config", "EventLog", "Mastermind")
         self.cfg = cfg
         self.tools = build_registry()
         self.session_id = uuid.uuid4().hex[:8]
@@ -223,6 +488,11 @@ class Agent:
         # stop promptly. Cleared at the start of every turn.
         import threading
         self._cancel_flag = threading.Event()
+        # Worker 11/20 — parallel tool execution: serializes the two
+        # non-thread-safe touches inside _execute_tool (_error_counts
+        # read-modify-write, LoopDetector._last_sig). Uncontended on the
+        # sequential path.
+        self._tool_exec_lock = threading.Lock()
 
         # Temporal kernel + the nine subsystems
         config.ensure_dirs()
@@ -231,93 +501,19 @@ class Agent:
         # Built before messages so the very first system prompt is sealed
         # and dispatched through the gate, not assembled by hand.
         self.mastermind = Mastermind(self.log)
-        # Crew: parallel subagents (Claude Code-style Task tool). The LLM
-        # can spawn subagents via the Task tool; they run concurrently
-        # and stream progress to the TUI panel via crew.* events.
-        from .crew import Crew
-        self.crew = Crew(self.log, self.provider, self.model,
-                         self.cfg.effort, mastermind=self.mastermind)
         self.messages: list[dict] = []
         self._reseat_system_prompt()
-        self.store = SnapshotStore(config.APP_DIR / "store")
-        self.memory = Hippocampus(self.log)
-        self.judge = Judge(self.log)
-        self.goal = GoalContract(self.log, judge=self.judge)
-        # v5 advanced subsystems — same kernel, same discipline
-        self.brain = Brain(self.log, config.APP_DIR / "brain.json")
-        self.compiler = IntentCompiler(
-            self.log, default_drafter(self.provider, self.model,
-                                      self.effort),
-            executor=self._compile_wave)
-        self.evolution = EvolutionEngine(
-            self.log, self._evolution_mutator, self._evolution_evaluator)
-        self.merger = TimelineMerger(self.log)
-        self.theater = Theater(self.log)
-        self.debate = DebateTournament(
-            self.log, self._debate_speaker,
-            [m.id for m in config.MODELS if m.supports_tools][:4])
-        self.market = TaskMarket(self.log, executor=self._market_exec)
-        self.tower = Tower(self)
-        # v6 frontier subsystems — same kernel, same discipline
-        self.formal = ModelChecker(self.log)
-        self.mcts = TreeSearch(self.log, self._mcts_evaluator)
-        self.causal = CausalEngine(self.log)
-        self.bandit = BanditRouter(
-            self.log, [m.id for m in config.MODELS[:8]])
-        self.mesh = MeshNode(self.log, self.session_id,
-                             executor=self._mesh_exec)
-        self.roleforge = RoleForge(
-            self.log,
-            role_drafter(self.provider, self.model, self.effort),
-            self._role_audition)
-        self.synth = ProgramSynthesizer(
-            self.log, default_generator(self.provider, self.model,
-                                        self.effort),
-            registry=self.tools)
-        self.ci = CIPilot(self.log, Path.cwd(),
-                          runner=self._ci_runner)
-        self.tuner = ParzenTuner(self.log, {
-            "effort": [e.key for e in config.EFFORTS],
-            "worker_steps": ["low", "medium", "high"],
-        })
-        self.dual = DualProcess(self.log, self._dual_fast,
-                                self._dual_slow, brain=self.brain)
-        self.world = WorldModel(self.log, root=Path.cwd())
-        self.racer = RacingUniverses(self.log, self._race_runner,
-                                     self._race_verify)
-        self.homeo = Homeostasis(self.log, repairs={
-            "tool_error_rate": self._repair_reseed_prompts,
-            "loop_alerts": self._repair_consolidate,
-            "tool_latency_ms": self._repair_warm_caches,
-        })
-        self.attention = AttentionEconomy(self.log)
-        self.fabric = KnowledgeFabric(self.log)
-        self.autopilot = AutoPilot(self.log)
-        self.nexus = Nexus()
-        self.forge = Forge(self.log)
-        self.oracle = Oracle(self.log, memory_dir=config.APP_DIR / "memory")
-        self.budget_gov = BudgetGovernor(self.log, Budget())
-        self.loop_det = LoopDetector(self.log)
 
-        # v3 advanced subsystems — all event-sourced on the same kernel
-        self.router = Router(self.log)                 # cost brain
-        self.semantic = SemanticMemory(self.log)       # meaning-based recall
-        self.speculator = Speculator(self.log,
-                                     runner=self._spec_runner)
-        self.dashboard = Dashboard(self.log)           # live observability
-        self.daemon = Daemon(self.log,
-                             executor=self._daemon_step)
-        self.healer = Healer(self.log)                 # root-cause capture
-        self.skill_forge = SkillForge(self.log,
-                                      skills_dir=config.APP_DIR / "skills")
-        self.council = Council(self.log, speaker=self._council_speaker)
-
-        # v4 professional subsystems — same kernel, same discipline
-        self.kgraph = KnowledgeGraph(self.log)         # knowledge graph
-        self.static = StaticAnalyzer(self.log)         # taint/complexity
-        self.coverage = CoverageEngine(self.log)       # real line coverage
-        self.fuzzer = Fuzzer(self.log)                 # property fuzzing
-        self.mutator: MutationTester | None = None     # needs a suite cmd
+        # Worker 8/20 — startup time: the rest of the old __init__ (~45
+        # subsystem constructors, the code/v4/advanced tool registrations,
+        # ~50 feature-module imports, cassette setup, session.start, env
+        # probing, connection pre-warm — about 4s on a warm log) now runs
+        # once, on first use, via _ensure_session(). All features still
+        # work when invoked.
+        self._session_started = False
+        # cassette is assigned for real in _ensure_session(); None keeps
+        # the attribute present (and falsy) until then.
+        self.cassette = None
 
         self.autonomy = 3
         # live status pipe for the current turn (set in run_turn) — lets
@@ -325,11 +521,6 @@ class Agent:
         self._turn_status: Callable[[str], None] | None = None
         # Focus Mode (deep work): distance history drives stall detection
         self._focus_history: list[float] = []
-        # enterprise extras
-        self.workflows = WorkflowEngine(self.log,
-                                        config.APP_DIR / "workflows",
-                                        executor=self._workflow_step,
-                                        judge=self.judge)
         self.notifier = Notifier(self.log)
         self._notify_seq = self.log.head()
         self.health = {"model_errors": {}, "failovers": 0}
@@ -342,14 +533,49 @@ class Agent:
         # changes (was re-serialized before every model call)
         self._schemas_cache: list[dict] | None = None
         self._schemas_tool_count = -1
+        # PERF (tool bloat): the per-turn tool filter is keyed on the
+        # active keyword groups; _turn_user_text carries the current
+        # turn's message so _tool_schemas() can filter without a
+        # signature change.
+        self._schemas_filter_key = ""
+        self._turn_user_text = ""
         # SPEED: compaction gate — the full token re-estimate only runs
         # after ~15% conversation growth, not before every model call
         self._compact_check_chars = 0
+
+    def _ensure_session(self) -> None:
+        """Run the deferred (expensive) half of __init__ exactly once.
+
+        Worker 8/20 — startup time. Called at the top of run_turn() and
+        _tool_schemas(), so every model-invoking path is covered. Cheap
+        after the first call.
+        """
+        if self._session_started:
+            return
+        self._session_started = True
+        _ensure_submodules()
         self._register_code_tools()
         self._register_v4_tools()
         self._register_advanced_tools()
         self._register_persisted_skills()
         self._register_feature_modules()
+        # cassette: record/replay model calls (FULLAGENT_CASSETTE=path,
+        # FULLAGENT_CASSETTE_MODE=record|replay|off)
+        cassette_path = os.environ.get("FULLAGENT_CASSETTE")
+        cassette_mode = os.environ.get("FULLAGENT_CASSETTE_MODE", "off")
+        self.cassette = (Cassette(Path(cassette_path), cassette_mode)
+                         if cassette_path else None)
+
+        self.log.append("session.start", {"session_id": self.session_id,
+                                          "model": self.cfg.model_id,
+                                          "effort": self.cfg.effort},
+                        actor="system")
+        self.forge.probe()  # PERCEIVE: stamp the environment
+        # SPEED: pre-warm the TCP+TLS connection to the provider in the
+        # background — the first model call hits a warm socket, not a cold
+        # handshake (saves 200-800ms on the first turn)
+        from .client import prewarm_connection
+        prewarm_connection(self.provider)
 
     def _register_feature_modules(self) -> None:
         """Register the Claude Code-parity feature modules.
@@ -400,39 +626,27 @@ class Agent:
                                     actor="system")
                 except Exception:
                     pass
-
-        # cassette: record/replay model calls (FULLAGENT_CASSETTE=path,
-        # FULLAGENT_CASSETTE_MODE=record|replay|off)
-        cassette_path = os.environ.get("FULLAGENT_CASSETTE")
-        cassette_mode = os.environ.get("FULLAGENT_CASSETTE_MODE", "off")
-        self.cassette = (Cassette(Path(cassette_path), cassette_mode)
-                         if cassette_path else None)
-
-        self.log.append("session.start", {"session_id": self.session_id,
-                                          "model": self.cfg.model_id,
-                                          "effort": self.cfg.effort},
-                        actor="system")
-        self.forge.probe()  # PERCEIVE: stamp the environment
-        # SPEED: pre-warm the TCP+TLS connection to the provider in the
-        # background — the first model call hits a warm socket, not a cold
-        # handshake (saves 200-800ms on the first turn)
-        from .client import prewarm_connection
-        prewarm_connection(self.provider)
+        # NOTE (Worker 8/20): cassette setup, session.start, forge.probe()
+        # and connection pre-warming used to live here; they moved to
+        # _ensure_session(), which runs them once on first use.
 
     # -- model / effort ----------------------------------------------------
 
     @property
     def model(self) -> Model:
+        _resolve_lazy("model_by_id")
         m = model_by_id(self.cfg.model_id)
         assert m is not None
         return m
 
     @property
     def provider(self) -> Provider:
+        _resolve_lazy("PROVIDERS")
         return PROVIDERS[self.model.provider]
 
     @property
     def effort(self) -> Effort:
+        _resolve_lazy("config")
         e = config.effort_by_key(self.cfg.effort)
         assert e is not None
         return e
@@ -442,6 +656,7 @@ class Agent:
         vault (hash-sealed copy of systemprompt.py). Falls back to the
         module source if the vault somehow lacks the name, so the model is
         never promptless."""
+        _resolve_lazy("systemprompt")
         name = self.cfg.prompt
         sealed = self.mastermind.vault.get(name)
         return sealed if sealed is not None else systemprompt.get(name)
@@ -458,12 +673,14 @@ class Agent:
 
     def state(self):
         """Live projection of the event log (cost, goal, dead-ends, …)."""
+        _resolve_lazy("fold")
         return fold(self.log)
 
     # -- conversation ------------------------------------------------------
 
     def reset(self) -> None:
         self.messages = []
+        self._turn_user_text = ""
         self._reseat_system_prompt()
         self.turns = []
         self.session_id = uuid.uuid4().hex[:8]
@@ -546,19 +763,55 @@ class Agent:
         return sections
 
     def _tool_schemas(self) -> list[dict] | None:
+        # Worker 8/20: the full tool registry (code/v4/advanced/feature
+        # tools) is registered on first use — schemas need it complete.
+        self._ensure_session()
         if not self.model.supports_tools:
             return None
-        # SPEED: the schema list is rebuilt only when the registry changes
-        # (new tools/skills) — it used to be re-serialized before EVERY
-        # model call inside a turn.
+        # PERF (tool bloat): schemas are filtered per turn (core tools
+        # always + keyword-matched advanced tools + recently used) and
+        # compressed (trimmed descriptions, no example blobs). The full
+        # registry stays intact — the executor still resolves every
+        # tool by name from self.tools.
+        try:
+            from . import toolfilter as _tf
+            compress = _tf.compression_enabled()
+            do_filter = _tf.filter_enabled()
+        except Exception:
+            compress, do_filter = False, False
         n = len(self.tools)
+        # Filter only when we know the current turn's user text; any
+        # other path (autopilot, subagents outside a turn) gets the
+        # full set — fail-open, never silently tool-less.
+        user_text = getattr(self, "_turn_user_text", "") or ""
+        filt_key = (_tf.filter_signature(user_text)
+                    if do_filter and user_text else "all")
         if (self._schemas_cache is not None
-                and self._schemas_tool_count == n):
+                and self._schemas_tool_count == n
+                and self._schemas_filter_key == filt_key):
             return self._schemas_cache
-        schemas = [t.openai_schema() for t in self.tools.values()]
+        if do_filter and user_text:
+            names = _tf.select_tools(
+                self.tools, user_text, recent=self._recent_tool_names())
+            tools = [self.tools[tname] for tname in names]
+        else:
+            tools = list(self.tools.values())
+        if compress:
+            schemas = [_tf.compressed_schema(t) for t in tools]
+        else:
+            schemas = [t.openai_schema() for t in tools]
         self._schemas_cache = schemas
         self._schemas_tool_count = n
+        self._schemas_filter_key = filt_key
         return schemas
+
+    def _recent_tool_names(self) -> tuple[str, ...]:
+        """Tool names used in the last 2 turns (filter continuity)."""
+        try:
+            return tuple(
+                t.name for tn in self.turns[-2:] for t in tn.tools)
+        except Exception:
+            return ()
 
     def _seal_pending_tool_calls(self, note: str) -> None:
         """Pairing repair: every assistant tool_call must be followed by a
@@ -593,6 +846,9 @@ class Agent:
                   on_tool_args: Callable[[str, str], None] | None = None,
                   ) -> Turn:
         """Run one user turn through the full agent loop."""
+        # Worker 8/20: deferred session start — registers the full tool
+        # set, feature modules, cassette, session.start, env probe.
+        self._ensure_session()
         # Feature: per-turn model override (/model <name> --once)
         try:
             from .modelpick import get_effective_model, clear_turn_model
@@ -603,6 +859,9 @@ class Agent:
         turn = Turn(user_text=user_text, model_id=_eff_model.id,
                     effort=self.cfg.effort)
         started = time.time()
+        # PERF (tool bloat): remember this turn's message so
+        # _tool_schemas() can send only the relevant tools.
+        self._turn_user_text = user_text
         self._turn_start_seq = self.log.head()
         self._failed_over = False
         # Fresh turn: clear any stale cancellation from a previous turn
@@ -688,6 +947,12 @@ class Agent:
                                   actor="human", provenance="user")
 
         iterations = 0
+        # PERF: hard cap on tool calls per turn + no-progress detection.
+        # 200 LLM round-trips at ~2.5s each was the 500s+ hang.
+        tool_calls_this_turn = 0
+        _last_tool_sig = None
+        _stall_count = 0
+        turn_stopped = False
         self._turn_status = on_status
         try:
             while iterations < config.MAX_TOOL_ITERATIONS:
@@ -729,6 +994,14 @@ class Agent:
                         result.content, result.tool_calls, result.reasoning))
                     if result.content:
                         turn.assistant_text += result.content
+                    # Worker 11/20 — parallel tool execution: parse the whole
+                    # block first (model-emitted order preserved), then
+                    # dispatch it in order — maximal runs of independent
+                    # read-only calls run concurrently in a capped pool,
+                    # everything else stays sequential. _finish_one replays
+                    # all per-call bookkeeping in order, so the transcript
+                    # is identical to the old sequential loop.
+                    pending: list[tuple[dict, ToolEvent]] = []
                     for tc in result.tool_calls:
                         fn = tc["function"]
                         name = fn.get("name", "")
@@ -736,9 +1009,14 @@ class Agent:
                         ev = ToolEvent(name=name, args=args)
                         turn.tools.append(ev)
                         on_tool_call(ev)
-                        self._execute_tool(ev, approve, on_status,
-                                           causation_id=user_ev.id,
-                                           on_tool_output=on_tool_output)
+                        pending.append((tc, ev))
+
+                    def _finish_one(tc, ev) -> None:
+                        """Per-call bookkeeping in model-emitted order."""
+                        nonlocal tool_calls_this_turn, _last_tool_sig
+                        nonlocal _stall_count, turn_stopped
+                        fn = tc["function"]
+                        name = fn.get("name", "")
                         on_tool_update(ev)
                         self.log.append(
                             "tool.result",
@@ -758,6 +1036,42 @@ class Agent:
                         # the turn immediately, not after the next model call
                         if should_cancel is not None and should_cancel():
                             raise TurnCancelled()
+                        # PERF: tool-call cap + no-progress detection
+                        tool_calls_this_turn += 1
+                        if tool_calls_this_turn >= config.MAX_TOOL_CALLS_PER_TURN:
+                            turn_stopped = True
+                            turn.error = (
+                                "Turn stopped after 25 tool calls — ask me "
+                                "to continue.")
+                        else:
+                            try:
+                                _sig = (name,
+                                        hashlib.sha256(ev.result.encode(
+                                            "utf-8", "replace")).hexdigest())
+                            except Exception:
+                                _sig = None
+                            if _sig is not None and _sig == _last_tool_sig:
+                                _stall_count += 1
+                                if _stall_count >= config.NO_PROGRESS_STALL_LIMIT:
+                                    turn_stopped = True
+                                    turn.error = (
+                                        "No progress detected — the same tool "
+                                        "call returned an identical result 3 "
+                                        "times in a row. Stopped to avoid "
+                                        "looping; rephrase or ask me to "
+                                        "continue.")
+                            else:
+                                _stall_count = 0
+                            _last_tool_sig = _sig
+
+                    dispatch_block(
+                        self._execute_tool, _finish_one, pending,
+                        approve=approve, on_status=on_status,
+                        causation_id=user_ev.id,
+                        on_tool_output=on_tool_output,
+                        hooks_enabled=getattr(self, "hooks_enabled", False))
+                    if turn_stopped:
+                        break
                     continue
 
                 # plain assistant reply — done
@@ -1119,13 +1433,27 @@ class Agent:
                 self.goal.prove_clause(clause.id, True, "human_approval",
                                        detail="model claim, advisory clause")
 
+    def _prune_for_model(self) -> list:
+        """PERF: model-visible message view — sliding window prune.
+
+        self.messages stays canonical (event log, checkpoints keep
+        everything); only the API payload shrinks.
+        """
+        try:
+            window = int(getattr(self.cfg, "prune_window", 40) or 0)
+        except (TypeError, ValueError):
+            window = 40
+        return prune_messages(self.messages, window=window)
+
     def _complete(self, on_token, on_reasoning, on_status, should_cancel=None,
                   on_tool_args=None):
         schemas = self._tool_schemas()
+        # PERF: send the pruned view, not the full history
+        model_msgs = self._prune_for_model()
         # cassette replay: zero API cost, fully deterministic (§20.2)
         if self.cassette is not None and self.cassette.mode == "replay":
             from .client import StreamResult
-            stored = self.cassette.replay(self.model.id, self.messages,
+            stored = self.cassette.replay(self.model.id, model_msgs,
                                           schemas, self.effort.key)
             if stored is None:
                 raise APIError("cassette replay miss — request not in the "
@@ -1141,7 +1469,7 @@ class Agent:
                                 model=self.model.id)
         def _attempt():
             return chat_stream(self.provider, self.model, self.effort,
-                               self.messages, schemas,
+                               model_msgs, schemas,
                                on_token=on_token,
                                on_reasoning=on_reasoning,
                                on_tool_start=lambda n: on_status(f"tool:{n}"),
@@ -1162,7 +1490,7 @@ class Agent:
                 on_status("compacting context")
                 self._emergency_compact()
                 result = chat_stream(self.provider, self.model, self.effort,
-                                     self.messages, schemas,
+                                     model_msgs, schemas,
                                      on_token=on_token,
                                      on_reasoning=on_reasoning,
                                      on_tool_start=lambda n: on_status(f"tool:{n}"),
@@ -1180,7 +1508,7 @@ class Agent:
             elif e.status == 400 and "stream" in msg:
                 on_status("retrying (non-stream)")
                 result = chat_blocking(self.provider, self.model,
-                                       self.effort, self.messages, schemas,
+                                       self.effort, model_msgs, schemas,
                                        on_overflow=self._overflow_shrink)
             else:
                 # enterprise failover: provider outage -> switch model once
@@ -1202,7 +1530,7 @@ class Agent:
                     f"⚠ provider failover → {label.label if label else fallback}")
                 result = _attempt()
         if self.cassette is not None and self.cassette.mode == "record":
-            self.cassette.record(self.model.id, self.messages, schemas,
+            self.cassette.record(self.model.id, model_msgs, schemas,
                                  {"content": result.content,
                                   "reasoning": result.reasoning,
                                   "tool_calls": result.tool_calls,
@@ -1247,6 +1575,7 @@ class Agent:
           * no goal and the agent produced a final answer with no tool
             work twice in a row (it believes itself done)
         """
+        _resolve_lazy("TERMINAL_STATES")
         goal = self.goal.status()
 
         def _stop(reason: str) -> None:
@@ -1266,6 +1595,8 @@ class Agent:
                 return None
             distance = goal.distance
             self._focus_history.append(distance)
+            # bound memory: stall detection only ever reads the last 4
+            del self._focus_history[:-_FOCUS_HISTORY_MAX]
             recent = self._focus_history[-4:]
             if len(recent) >= 4 and all(
                     recent[i] >= recent[i - 1] - 1e-9
@@ -1289,6 +1620,8 @@ class Agent:
         # no active goal — stop when the agent is clearly done
         worked = bool(last_turn.tools)
         self._focus_history.append(1.0 if worked else 0.0)
+        # bound memory: done-detection only ever reads the last 2
+        del self._focus_history[:-_FOCUS_HISTORY_MAX]
         tail = self._focus_history[-2:]
         if len(tail) == 2 and tail == [0.0, 0.0]:
             _stop("agent answered without further tool work — done")
@@ -1313,6 +1646,7 @@ class Agent:
             pass
 
     def _attribute(self, tool_name: str) -> tuple[str | None, str | None]:
+        _resolve_lazy("TERMINAL_STATES")
         """§38.1 total attribution. Returns (clause_id, orphan_reason).
 
         With an active goal, every action binds to the focus clause (the
@@ -1371,6 +1705,36 @@ class Agent:
         return paths
 
     @staticmethod
+    def _handler_takes_cancel(handler) -> bool:
+        """True if the tool handler declares a `should_cancel` keyword
+        (so _execute_tool may pass the live Esc/Ctrl+C flag). Cached
+        per handler — inspect.signature on every tool call was
+        measurable in tight tool loops."""
+        cache = Agent._cancel_kwarg_cache
+        try:
+            return cache[handler]
+        except KeyError:
+            pass
+        except TypeError:  # unhashable handler — introspect directly
+            return Agent._has_cancel_kwarg(handler)
+        takes = Agent._has_cancel_kwarg(handler)
+        try:
+            cache[handler] = takes
+        except TypeError:
+            pass
+        return takes
+
+    @staticmethod
+    def _has_cancel_kwarg(handler) -> bool:
+        # inspect is imported lazily (Worker 8/20): it costs ~150ms and is
+        # only needed when a tool call is dispatched.
+        import inspect
+        try:
+            return "should_cancel" in inspect.signature(handler).parameters
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
     def _check_tool_args(tool: Tool, args: dict,
                          extra: dict) -> str | None:
         """Pre-validate keyword binding so a *binding* TypeError is
@@ -1380,6 +1744,7 @@ class Agent:
         after two occurrences the dead-end ledger recorded a bogus
         'bad arguments' reason and blocked that call shape for the
         whole session.)"""
+        import inspect  # lazy: ~150ms, only needed on tool dispatch
         try:
             sig = inspect.signature(tool.handler)
         except (TypeError, ValueError):
@@ -1528,8 +1893,13 @@ class Agent:
             if on_tool_output is not None and ev.name in ("run_command",
                                                           "live_shell"):
                 extra["on_output"] = on_tool_output
-            # Esc/Ctrl+C: let shell tools kill their subprocess promptly
-            if ev.name in ("run_command", "live_shell"):
+            # Esc/Ctrl+C: any handler that declares a `should_cancel`
+            # kwarg gets the live cancel flag — shell tools kill their
+            # subprocess, web_fetch/web_search abort their HTTP calls,
+            # etc. Signature-based (not name-based) so new cancellable
+            # tools are wired automatically; handlers without the kwarg
+            # are untouched (backwards compatible).
+            if self._handler_takes_cancel(tool.handler):
                 extra["should_cancel"] = self._cancel_flag.is_set
             bind_error = self._check_tool_args(tool, ev.args, extra)
             if bind_error is not None:
@@ -1540,6 +1910,11 @@ class Agent:
                 try:
                     ev.result = tool.handler(**ev.args, **extra)
                     ev.status = "done"
+                except TurnCancelled:
+                    # CANCEL: a handler interrupted by Esc must abort the
+                    # turn, not be swallowed into an "ERROR: ..." tool
+                    # result that the turn then keeps going past.
+                    raise
                 except Exception as e:  # noqa: BLE001 — tool errors go back to the LLM
                     ev.result = f"ERROR: {type(e).__name__}: {e}"
                     ev.status = "error"
@@ -1576,6 +1951,14 @@ class Agent:
                 # bound the per-path history — only recent flips matter
                 # for oscillation detection
                 del hist[:-20]
+                # bound the number of tracked paths — a long session can
+                # touch thousands of files; evict the oldest paths
+                # (dicts preserve insertion order)
+                while len(self._file_hashes) > _FILE_HASH_PATHS_MAX:
+                    oldest = next(iter(self._file_hashes))
+                    if oldest == p:
+                        break  # never evict the path just touched
+                    del self._file_hashes[oldest]
                 if self.loop_det.oscillation(p, hist):
                     self.log.append("loop.alert",
                                     {"kind": "oscillation", "path": p,
@@ -1583,27 +1966,33 @@ class Agent:
                                                "versions to the human"},
                                     actor="kernel")
 
-        # repeated identical failure -> deterministic dead-end (§14.3)
-        if ev.status == "error":
-            sig = _signature(ev.name, ev.args)
-            self._error_counts[sig] = self._error_counts.get(sig, 0) + 1
-            if self._error_counts[sig] == 2:
-                self.memory.record_dead_end(
-                    signature=sig,
-                    reason=f"{ev.name} failed twice: {ev.result[:200]}",
-                    scope="session", confidence="contextual")
-            # v3: healer captures + classifies the root cause and seals a
-            # lesson, so the same failure is recognised instantly next time.
-            # (No fixer attached here — the agent reads the diagnosis and
-            # decides the fix; the healer never mutates on its own.)
-            try:
-                self.healer.heal(ev.result,
-                                 context=f"{ev.name} {ev.args}")
-            except Exception:
-                pass
+        # Worker 11/20 — parallel tool execution: the two blocks below
+        # touch agent-wide mutable state that is not thread-safe
+        # (_error_counts read-modify-write, LoopDetector._last_sig), so
+        # they run under _tool_exec_lock when calls fan out across
+        # worker threads. Uncontended on the sequential path.
+        with self._tool_exec_lock:
+            # repeated identical failure -> deterministic dead-end (§14.3)
+            if ev.status == "error":
+                sig = _signature(ev.name, ev.args)
+                self._error_counts[sig] = self._error_counts.get(sig, 0) + 1
+                if self._error_counts[sig] == 2:
+                    self.memory.record_dead_end(
+                        signature=sig,
+                        reason=f"{ev.name} failed twice: {ev.result[:200]}",
+                        scope="session", confidence="contextual")
+                # v3: healer captures + classifies the root cause and seals a
+                # lesson, so the same failure is recognised instantly next time.
+                # (No fixer attached here — the agent reads the diagnosis and
+                # decides the fix; the healer never mutates on its own.)
+                try:
+                    self.healer.heal(ev.result,
+                                     context=f"{ev.name} {ev.args}")
+                except Exception:
+                    pass
 
-        # §13.4 exact-repeat detection over recent tool calls
-        self.loop_det.detect()
+            # §13.4 exact-repeat detection over recent tool calls
+            self.loop_det.detect()
 
         # Feature: PostToolUse hooks (failures only log, never block)
         if getattr(self, "hooks_enabled", False):
@@ -1620,6 +2009,7 @@ class Agent:
         return {"status": "error", "summary": "Crew feature has been removed"}
 
     def export_report(self, fmt: str = "md") -> Path:
+        _resolve_lazy("export_html", "export_markdown")
         """Write the enterprise audit report (md or html) to the cwd."""
         title = f"FullAgent session {self.session_id}"
         if fmt == "html":
@@ -1634,6 +2024,7 @@ class Agent:
         return path
 
     def get_forecast(self) -> str:
+        _resolve_lazy("forecast", "format_forecast")
         return format_forecast(forecast(self.log))
 
     # -- enterprise: provider health + failover ------------------------------------
@@ -1778,6 +2169,7 @@ class Agent:
         return catalog
 
     def resume_session(self, branch: str) -> int:
+        _resolve_lazy("fold")
         """Checkout a branch and rebuild the conversation from the fold.
         The full history (tool calls, verdicts) stays in the log; the
         model-visible context is rebuilt from user/assistant messages."""
@@ -1819,6 +2211,7 @@ class Agent:
         return best
 
     def rewind_to(self, seq: int) -> tuple[int, int]:
+        _resolve_lazy("fold")
         """REWIND (§9.1): filesystem AND agent state return to step N.
 
         Materialises the nearest snapshot at/below seq, then rewinds the
@@ -2776,6 +3169,7 @@ class Agent:
     # -- shared subagent context ------------------------------------------------
 
     def scout_context(self, max_chars: int = 4000) -> str:
+        _resolve_lazy("fold")
         """Shared read-only context handed to every subagent (each gets
         a fresh minimal context — its task plus a little shared state).
         Subagents get little else, so anything they must reason about has
@@ -2811,6 +3205,7 @@ class Agent:
     # -- persistence -------------------------------------------------------
 
     def save_session(self) -> Path | None:
+        _resolve_lazy("config")
         try:
             config.ensure_dirs()
             path = config.SESSIONS_DIR / f"{self.session_id}.json"
@@ -2830,3 +3225,72 @@ class Agent:
             return path
         except (OSError, ValueError, TypeError, RuntimeError):
             return None
+
+
+# ---------------------------------------------------------------------------
+# Self-test (worker 19/20): bounded-memory proof for the agent's runtime
+# data structures. Run with FULLAGENT_HOME pointed at a scratch dir:
+#   FULLAGENT_HOME=$(mktemp -d) python3 -m fullagent.agent
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import tempfile
+    from types import SimpleNamespace
+
+    from .config import Config
+    from .kernel import EventLog as _EventLog
+
+    failures: list[str] = []
+
+    def check(name: str, cond: bool) -> None:
+        print(("PASS " if cond else "FAIL ") + name)
+        if not cond:
+            failures.append(name)
+
+    agent = Agent(Config())
+    # isolate: swap the real event log for a temp-dir one (subsystems keep
+    # their own refs, but every agent-level append below goes here)
+    agent.log.close()
+    _td = tempfile.mkdtemp(prefix="agent_mem_selftest_")
+    agent.log = _EventLog(Path(_td) / "events.jsonl",
+                          session=agent.session_id)
+
+    # 1. focus history: 200 ticks through the REAL focus_continue path —
+    # stall detection only reads the last 4, so the list must stay capped
+    fake_turn = SimpleNamespace(error="", tools=[SimpleNamespace()])
+    for _ in range(200):
+        agent.focus_continue(fake_turn, 10)
+    check(f"focus_history bounded at {_FOCUS_HISTORY_MAX} "
+          f"(got {len(agent._focus_history)})",
+          len(agent._focus_history) <= _FOCUS_HISTORY_MAX)
+    check("focus history keeps the newest ticks",
+          agent._focus_history[-1] == 1.0)
+
+    # 2. file-hash oscillation map: touch 300+ distinct files through the
+    # REAL _execute_tool path (write_file) — the per-path lists were
+    # already capped at 20; the path COUNT must now stay capped too
+    n_paths = _FILE_HASH_PATHS_MAX + 60
+    for i in range(n_paths):
+        p = Path(_td) / f"f{i}.txt"
+        ev = ToolEvent(name="write_file",
+                       args={"path": str(p), "content": f"v{i}"})
+        agent._execute_tool(ev, approve=lambda t, a: True,
+                            on_status=lambda s: None)
+        assert ev.status == "done", (ev.name, ev.status, ev.result[:100])
+    check(f"file_hash paths bounded at {_FILE_HASH_PATHS_MAX} "
+          f"(got {len(agent._file_hashes)})",
+          len(agent._file_hashes) <= _FILE_HASH_PATHS_MAX)
+    check("newest path still tracked",
+          str(Path(_td) / f"f{n_paths - 1}.txt") in agent._file_hashes)
+    check("per-path hash lists still capped at 20",
+          all(len(h) <= 20 for h in agent._file_hashes.values()))
+
+    # 3. EventLog window (kernel): the log must not hold every event in RAM
+    check("event log windowed in RAM",
+          len(agent.log._events) <= 2000 + 64)
+
+    agent.log.close()
+    print()
+    if failures:
+        print(f"{len(failures)} FAILED: {failures}")
+        raise SystemExit(1)
+    print("AGENT MEMORY SELF-TEST PASS")

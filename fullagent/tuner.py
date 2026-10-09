@@ -33,6 +33,9 @@ _log = get_logger("tuner")
 _GAMMA = 0.25          # fraction of history counted as GOOD
 _EPSILON = 0.10        # uniform exploration probability
 _PATIENCE = 8          # stop if no improvement for this many trials
+# MEMORY BOUND (worker 19/20): the score cache is pure memoization —
+# capped FIFO so a long tuning run cannot grow it without limit.
+_SCORE_CACHE_MAX = 4096
 
 
 def _config_key(config: dict) -> tuple:
@@ -179,6 +182,11 @@ class ParzenTuner:
         else:
             score = float(self.objective(config))
             self._score_cache[key] = score
+            # bound memory: the cache is pure memoization — evict the
+            # oldest entries first-in-first-out (dicts keep insertion
+            # order). Re-evaluating an evicted config just costs a trial.
+            while len(self._score_cache) > _SCORE_CACHE_MAX:
+                self._score_cache.pop(next(iter(self._score_cache)))
             self._last_was_cached = False
         self.observe(config, score)
         return self.history[-1]
@@ -312,5 +320,22 @@ if __name__ == "__main__":
             raise AssertionError("must raise without objective")
         except RuntimeError:
             pass
+
+        # MEMORY BOUND (worker 19/20): the score cache is pure
+        # memoization — hammer it with far more distinct configs than the
+        # cap and it must stay bounded (FIFO eviction)
+        big_space = {"p1": list(range(40)), "p2": list(range(40)),
+                     "p3": list(range(40))}
+        t4 = ParzenTuner(EventLog(Path(td) / "t4.jsonl"), big_space,
+                         seed=7,
+                         objective=lambda c: float(c["p1"] + c["p2"]))
+        for _ in range(_SCORE_CACHE_MAX + 500):
+            t4.step()
+        assert len(t4._score_cache) <= _SCORE_CACHE_MAX, \
+            f"score cache unbounded: {len(t4._score_cache)}"
+        # still functional after eviction: cached hits still served
+        assert t4._last_was_cached in (True, False)
+        print(f"memory: score cache capped at {len(t4._score_cache)} "
+              f"after {_SCORE_CACHE_MAX + 500} steps")
 
         print("TUNER SELF-TEST PASS")

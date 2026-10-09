@@ -172,6 +172,19 @@ class Crew:
         self.mastermind = mastermind
         self.max_agents = max(1, int(max_agents))
         self._chat = chat or chat_with_retry
+        # CANCEL: Esc sets each agent's stop_event (via force_stop), but
+        # the worker loop only checked it BETWEEN steps — a worker stuck
+        # inside a blocking model call ignored it for up to `timeout`
+        # seconds (and chat_with_retry's rate-limit backoff could add
+        # ~254s). Detect once whether the chat callable honours a
+        # should_cancel kwarg; _run_loop passes the stop flag through.
+        import inspect as _inspect
+        try:
+            self._chat_takes_cancel = (
+                "should_cancel" in
+                _inspect.signature(self._chat).parameters)
+        except (TypeError, ValueError):
+            self._chat_takes_cancel = False
         self._agents: dict[str, CrewAgent] = {}
         self._order: list[str] = []
         self._lock = threading.RLock()  # protects roster + _futures.
@@ -686,8 +699,19 @@ class Crew:
             for step in range(max_steps):
                 if agent.stop_event.is_set():
                     break
-                result = self._chat(provider, model, self.effort,
-                                    agent.messages, schemas, 120.0)
+                # CANCEL: thread the stop flag into the blocking model
+                # call so Esc interrupts a hung provider in ~0.25s instead
+                # of waiting out the full timeout (or the rate-limit
+                # backoff). Custom chat callables without the kwarg keep
+                # the old call shape — the stop check above still applies.
+                if self._chat_takes_cancel:
+                    result = self._chat(provider, model, self.effort,
+                                        agent.messages, schemas, 120.0,
+                                        should_cancel=(
+                                            agent.stop_event.is_set))
+                else:
+                    result = self._chat(provider, model, self.effort,
+                                        agent.messages, schemas, 120.0)
                 if result.usage:
                     agent.tokens_in += int(
                         result.usage.get("prompt_tokens", 0) or 0)

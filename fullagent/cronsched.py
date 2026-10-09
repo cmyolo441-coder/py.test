@@ -208,6 +208,7 @@ class CronScheduler:
             self._conn.executescript(_SCHEMA)
             self._conn.commit()
         self._stop = threading.Event()
+        self._wake = threading.Event()  # poke: instant wake when work arrives
         self._thread: Optional[threading.Thread] = None
         # Survive restarts: recompute next_run from now so stale values
         # (e.g. the machine was down) never fire a flood of backfill runs.
@@ -232,7 +233,9 @@ class CronScheduler:
                 " next_run, created_at) VALUES (?, ?, 1, NULL, ?, ?)",
                 (expr, command.strip(), nxt, now))
             self._conn.commit()
-            return cur.lastrowid, nxt
+            cron_id = cur.lastrowid
+        self.poke()  # wake the loop so the new cron is checked right away
+        return cron_id, nxt
 
     def list(self) -> list[dict]:
         with self._lock:
@@ -247,7 +250,10 @@ class CronScheduler:
             cur = self._conn.execute("DELETE FROM crons WHERE id = ?",
                                      (cron_id,))
             self._conn.commit()
-            return cur.rowcount > 0
+            removed = cur.rowcount > 0
+        if removed:
+            self.poke()
+        return removed
 
     def set_enabled(self, cron_id: int, enabled: bool) -> bool:
         with self._lock:
@@ -255,7 +261,10 @@ class CronScheduler:
                 "UPDATE crons SET enabled = ? WHERE id = ?",
                 (1 if enabled else 0, cron_id))
             self._conn.commit()
-            return cur.rowcount > 0
+            changed = cur.rowcount > 0
+        if changed:
+            self.poke()
+        return changed
 
     def runs(self, cron_id: int, limit: int = 5) -> list[dict]:
         limit = max(1, min(50, int(limit)))
@@ -328,27 +337,45 @@ class CronScheduler:
             self._conn.commit()
 
     def run_due(self, now: Optional[float] = None) -> int:
-        """Run every due cron once. Returns number of crons executed."""
+        """Run every due cron once. Returns number of crons executed.
+
+        The whole sweep holds the lock: a concurrent run_due() (background
+        thread racing a manual call) blocks instead of double-firing the
+        same cron slot.
+        """
         now = time.time() if now is None else now
         with self._lock:
             cur = self._conn.execute(
                 "SELECT * FROM crons WHERE enabled = 1 AND next_run <= ?",
                 (now,))
             due = [dict(r) for r in cur.fetchall()]
-        for cron in due:
-            try:
-                self._run_cron(cron)
-            except Exception:  # noqa: BLE001 — one cron must not kill others
-                traceback.print_exc()
+            for cron in due:
+                try:
+                    self._run_cron(cron)
+                except Exception:  # noqa: BLE001 — one cron must not kill others
+                    traceback.print_exc()
         return len(due)
 
     # -- background thread ---------------------------------------------------
     def _loop(self) -> None:
-        while not self._stop.wait(POLL_SECONDS):
+        # Sleeps on _wake: at most one wake per POLL_SECONDS when idle,
+        # instantly when poke()d (add/enable/remove) or stop() is requested.
+        # The wait comes FIRST (then clear): a fresh thread never races the
+        # caller with an immediate tick, and a stale poke can't trigger
+        # work before the first wait.
+        while not self._stop.is_set():
+            self._wake.clear()
+            self._wake.wait(POLL_SECONDS)
+            if self._stop.is_set():
+                break
             try:
                 self.run_due()
             except Exception:  # noqa: BLE001 — scheduler must never die
                 traceback.print_exc()
+
+    def poke(self) -> None:
+        """Wake the scheduler loop immediately (e.g. after add/enable)."""
+        self._wake.set()
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -360,6 +387,7 @@ class CronScheduler:
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
+        self._wake.set()  # release the sleeper instantly
         if self._thread:
             self._thread.join(timeout=timeout)
             self._thread = None
@@ -508,6 +536,63 @@ def register(agent: Any) -> None:
 # Self-test: proves REAL behavior (real SQLite, real subprocess).
 # ---------------------------------------------------------------------------
 
+
+def _selftest_thread_efficiency() -> None:
+    """Prove the scheduler thread is cheap when idle and fast when work
+    arrives: (1) POLL_SECONDS is a sane 30s, (2) the loop sleeps on _wake
+    with a 30s timeout and wakes instantly on poke, (3) a due cron fires
+    within seconds of poke() instead of waiting out the 30s tick."""
+    import tempfile
+
+    tmp = Path(tempfile.mkdtemp(prefix="cron_eff_"))
+    sched = CronScheduler(tmp / "cron.db")
+    try:
+        # 1. sane interval: 30s -> 0.033 wakes/s when idle
+        assert POLL_SECONDS == 30, POLL_SECONDS
+        print(f"PASS - scheduler interval sane: {POLL_SECONDS}s "
+              f"({1 / POLL_SECONDS:.3f} wakes/s idle)")
+
+        # 2+3. the loop sleeps on _wake: a due cron must fire promptly
+        # after poke(), not after 30s.
+        fired: list[float] = []
+        orig = sched.run_due
+
+        def counting(now=None):
+            fired.append(time.monotonic())
+            return orig(now)
+
+        sched.run_due = counting  # type: ignore[method-assign]
+        sched.start()
+        try:
+            cid, _ = sched.add("* * * * *", "echo poke-fired-ok")
+            with sched._lock:
+                sched._conn.execute(
+                    "UPDATE crons SET next_run = ? WHERE id = ?",
+                    (time.time() - 1, cid))
+                sched._conn.commit()
+            sched.poke()  # explicit: the loop must wake NOW, not in 30s
+            t0 = time.monotonic()
+            deadline = t0 + 10
+            while not sched.runs(cid) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            dt = time.monotonic() - t0
+            assert sched.runs(cid), "due cron never fired after poke()"
+            assert dt < 10, f"cron took {dt:.1f}s despite poke()"
+            print(f"PASS - poke wakes scheduler: due cron fired in "
+                  f"{dt:.2f}s (not 30s)")
+            assert fired, "scheduler loop never ticked"
+            print(f"PASS - scheduler loop ticked {len(fired)}x "
+                  f"(instant on poke, 30s when idle)")
+        finally:
+            t0 = time.monotonic()
+            sched.stop()
+            assert time.monotonic() - t0 < 5.0, "stop() hung"
+            print("PASS - scheduler stop() returns promptly")
+    finally:
+        sched.close()
+
+    print("PASS - cronsched thread efficiency")
+
 if __name__ == "__main__":
     import tempfile
 
@@ -625,3 +710,5 @@ if __name__ == "__main__":
     sched.stop()
     print("PASS cronsched self-test: real sqlite + real subprocess + "
           "restart survival verified")
+
+    _selftest_thread_efficiency()

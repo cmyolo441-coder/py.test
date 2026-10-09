@@ -24,7 +24,6 @@ healthy system seals a quiet all-clear and touches nothing.
 
 from __future__ import annotations
 
-import statistics
 import time
 from dataclasses import dataclass, field
 from typing import Callable
@@ -128,6 +127,7 @@ class Homeostasis:
 
         durations = [float(e.data.get("duration", 0) or 0)
                      for e in tool_results]
+        import statistics  # ~170ms cold (fractions/decimal); defer to use
         mean_ms = (statistics.fmean(durations) * 1000
                    if durations else 0.0)
 

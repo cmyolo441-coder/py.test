@@ -13,7 +13,6 @@ zero model calls):
 
 from __future__ import annotations
 
-import html
 import re
 import time
 from datetime import datetime
@@ -175,6 +174,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 def export_html(log: EventLog, title: str = "FullAgent session report"
                 ) -> str:
     """Render the markdown report as self-contained HTML (dracula-ish)."""
+    import html  # deferred: ~60ms cold via html.entities
     md = export_markdown(log, title)
     body: list[str] = []
     in_table = False
