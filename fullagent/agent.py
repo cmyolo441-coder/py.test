@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ._foundation import get_logger
+from .loopdetect import LoopDetector as _RetryLoopDetector, normalize_error
 
 _log = get_logger("agent")
 
@@ -357,6 +358,40 @@ class Notifier:
                + ", ".join(NOTIFY_EVENTS)
 
 
+# Worker 14/20 — per-tool timeouts. The 512s-turn incident showed any
+# single hung tool (a subprocess that never exits, a deadlocked HTTP
+# call) can block a turn indefinitely. Every handler now runs in a
+# worker thread and the wait is bounded: default 120s, per-tool
+# overrides below. On timeout the process group(s) the tool spawned
+# are killed (killpg) and the tool reports a clear error — the turn
+# never hangs silently.
+TOOL_TIMEOUT_DEFAULT = 120.0
+TOOL_TIMEOUTS: dict[str, float] = {
+    # shell tools legitimately run long builds/test suites; their own
+    # internal timeouts can be raised by the caller, so cap higher here
+    "run_command": 600.0,
+    "live_shell": 600.0,
+    # network tools have their own shorter fail-fast paths; keep them
+    # tighter than the default so a wedged connection can't stall a turn
+    "web_fetch": 45.0,
+    "web_search": 60.0,
+}
+
+
+def _fmt_timeout(limit: float) -> str:
+    return str(int(limit)) if float(limit).is_integer() else str(limit)
+
+
+class ToolTimeout(Exception):
+    """A tool call exceeded its per-tool timeout."""
+
+    def __init__(self, name: str, limit: float):
+        self.name = name
+        self.limit = limit
+        super().__init__(f"Tool {name} timed out after "
+                         f"{_fmt_timeout(limit)}s and was killed.")
+
+
 class Agent:
     # cache for _handler_takes_cancel (handler -> bool)
     _cancel_kwarg_cache: dict = {}
@@ -584,8 +619,14 @@ class Agent:
         broken optional module can never kill agent startup.
         """
         for mod_name in (
-            "todos", "multiedit", "bgsh", "planmode", "codeinit",
+            "todos", "multiedit",
+            # Deep reliability round (512s-incident fixes): read-guard must
+            # wrap MultiEdit, so it registers right after "multiedit".
+            "readguard",
+            "bgsh", "planmode", "codeinit",
             "review", "notebook", "permissions", "outstyle",
+            # Worker 8/20: mtime+size file change detection (512s incident)
+            "filestat",
             "webfetch", "checkpoints", "hooks",
             # Round 2 advanced features
             "mcp", "skills", "agenttypes", "doctor", "statuscmd",
@@ -613,6 +654,10 @@ class Agent:
             "notify",
             # Incoming HTTP webhooks (127.0.0.1 only, daemon thread)
             "webhook",
+            # Deep reliability round (512s-incident fixes)
+            "fuzzymatch",   # no-op register; used by the edit fallback chain
+            "editbackup",   # auto-snapshot before risky edits + EditRollback
+            "retrycmd",     # /retry conversation repair
         ):
             try:
                 mod = __import__(f"fullagent.{mod_name}",
@@ -779,13 +824,21 @@ class Agent:
             do_filter = _tf.filter_enabled()
         except Exception:
             compress, do_filter = False, False
+            _tf = None
         n = len(self.tools)
         # Filter only when we know the current turn's user text; any
         # other path (autopilot, subagents outside a turn) gets the
         # full set — fail-open, never silently tool-less.
         user_text = getattr(self, "_turn_user_text", "") or ""
-        filt_key = (_tf.filter_signature(user_text)
-                    if do_filter and user_text else "all")
+        # Cache key covers both the filter selection AND the progressive-
+        # disclosure rank order (worker 12/20): rank is a pure function of
+        # the hint, so a different hint must not reuse a stale ordering.
+        if _tf is not None and user_text:
+            filt_key = ((_tf.filter_signature(user_text)
+                         if do_filter else "all")
+                        + "|r=" + _tf.rank_signature(user_text))
+        else:
+            filt_key = "all"
         if (self._schemas_cache is not None
                 and self._schemas_tool_count == n
                 and self._schemas_filter_key == filt_key):
@@ -796,6 +849,16 @@ class Agent:
             tools = [self.tools[tname] for tname in names]
         else:
             tools = list(self.tools.values())
+        # Worker 12/20: progressive disclosure — order the schemas by
+        # task relevance so the model sees the most relevant tools
+        # first (full registry order is arbitrary; schema order biases
+        # tool choice). Stable: unknown tools keep relative order.
+        if _tf is not None:
+            try:
+                ranked = _tf.rank_tools(user_text, [t.name for t in tools])
+                tools = [self.tools[tname] for tname in ranked]
+            except Exception:
+                pass
         if compress:
             schemas = [_tf.compressed_schema(t) for t in tools]
         else:
@@ -863,6 +926,12 @@ class Agent:
         # _tool_schemas() can send only the relevant tools.
         self._turn_user_text = user_text
         self._turn_start_seq = self.log.head()
+        # tooldedup hook — fresh dedup cache each turn (dedup is turn-scoped).
+        try:
+            from .tooldedup import reset as _dedup_reset
+            _dedup_reset(self)
+        except Exception:  # noqa: BLE001
+            pass
         self._failed_over = False
         # Fresh turn: clear any stale cancellation from a previous turn
         self._cancel_flag.clear()
@@ -953,6 +1022,7 @@ class Agent:
         _last_tool_sig = None
         _stall_count = 0
         turn_stopped = False
+        _retry_loop_det = _RetryLoopDetector()  # loopdetect: per-turn detector
         self._turn_status = on_status
         try:
             while iterations < config.MAX_TOOL_ITERATIONS:
@@ -1030,6 +1100,23 @@ class Agent:
                             "tool_call_id": tc["id"],
                             "content": ev.result,
                         })
+                        # loopdetect hook: the same (tool, args, error) triple
+                        # failing repeatedly means the model is stuck retrying
+                        if ev.status == "error":
+                            _loop_msg = _retry_loop_det.note(
+                                name, ev.args, normalize_error(ev.result))
+                            if _loop_msg:
+                                turn_stopped = True
+                                turn.error = _loop_msg
+                        # retryhint hook — inject recovery alternatives on
+                        # repeated same-tool failures (see retryhint.py)
+                        from .retryhint import note_failure, note_success
+                        if ev.status == "error":
+                            _rh_hint = note_failure(name, ev.result)
+                            if _rh_hint:
+                                self.messages.append({"role": "system", "content": _rh_hint})
+                        else:
+                            note_success(name)
                         # §38.3 goal kernel tick after every action
                         self._goal_tick()
                         # CANCEL CHECK between tool calls — Esc stops
@@ -1475,7 +1562,8 @@ class Agent:
                                on_tool_start=lambda n: on_status(f"tool:{n}"),
                                on_tool_args=on_tool_args,
                                should_cancel=should_cancel,
-                               on_overflow=self._overflow_shrink)
+                               on_overflow=self._overflow_shrink,
+                               on_status=on_status)
 
         try:
             result = _attempt()
@@ -1496,7 +1584,8 @@ class Agent:
                                      on_tool_start=lambda n: on_status(f"tool:{n}"),
                                      on_tool_args=on_tool_args,
                                      should_cancel=should_cancel,
-                                     on_overflow=self._overflow_shrink)
+                                     on_overflow=self._overflow_shrink,
+                                     on_status=on_status)
             elif e.status == 400 and "tool" in msg and schemas:
                 on_status("retrying (no tools)")
                 result = chat_stream(self.provider, self.model, self.effort,
@@ -1504,7 +1593,8 @@ class Agent:
                                      on_token=on_token,
                                      on_reasoning=on_reasoning,
                                      should_cancel=should_cancel,
-                                     on_overflow=self._overflow_shrink)
+                                     on_overflow=self._overflow_shrink,
+                                     on_status=on_status)
             elif e.status == 400 and "stream" in msg:
                 on_status("retrying (non-stream)")
                 result = chat_blocking(self.provider, self.model,
@@ -1755,6 +1845,68 @@ class Agent:
             return str(e)
         return None
 
+    def _run_tool_with_timeout(self, tool: Tool, args: dict,
+                                 extra: dict):
+        """Run ``tool.handler`` bounded by the per-tool timeout.
+
+        The handler runs in a daemon thread; the wait is limited to
+        ``TOOL_TIMEOUTS[tool.name]`` (default ``TOOL_TIMEOUT_DEFAULT``).
+        While it runs, ``subprocess.Popen`` is tracked so that on
+        timeout every child process tree the tool spawned is killed
+        via the shared ``_kill_process_tree`` helper (killpg). Raises
+        ``ToolTimeout`` on timeout; exceptions raised by the handler
+        itself (including ``TurnCancelled``) are re-raised unchanged.
+        """
+        import threading
+        import subprocess as _sp
+
+        limit = TOOL_TIMEOUTS.get(tool.name, TOOL_TIMEOUT_DEFAULT)
+        spawned: list = []
+        lock = threading.Lock()
+        orig_popen = _sp.Popen
+
+        def _tracking_popen(*a, **k):
+            # subprocess.run / check_output / call all go through
+            # subprocess.Popen, so every spawned child is captured.
+            p = orig_popen(*a, **k)
+            with lock:
+                spawned.append(p)
+            return p
+
+        outcome: dict = {}
+
+        def _target():
+            _sp.Popen = _tracking_popen
+            try:
+                outcome["result"] = tool.handler(**args, **extra)
+            except BaseException as e:  # noqa: BLE001 — re-raised below
+                outcome["error"] = e
+            finally:
+                _sp.Popen = orig_popen
+
+        worker = threading.Thread(target=_target, daemon=True,
+                                  name=f"tool-{tool.name}")
+        worker.start()
+        worker.join(limit)
+        # restore even if the thread is still running — it can only kill
+        # processes, so a still-running worker is harmless to the turn.
+        _sp.Popen = orig_popen
+        if worker.is_alive():
+            try:
+                from .tools import _kill_process_tree
+                for p in spawned:
+                    try:
+                        if p.poll() is None:
+                            _kill_process_tree(p)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            raise ToolTimeout(tool.name, limit)
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome.get("result")
+
     def _execute_tool(self, ev: ToolEvent,
                       approve: Callable[[Tool, dict], bool],
                       on_status: Callable[[str], None],
@@ -1880,6 +2032,16 @@ class Agent:
                                  "another approach.")
                     return
 
+        # tooldedup hook — the identical call already ran this turn: serve
+        # the cached result instead of re-executing (short-circuits the
+        # identical-retry loop from the 512s incident).
+        from .tooldedup import check as _dedup_check
+        _dedup_hit = _dedup_check(self, ev.name, ev.args)
+        if _dedup_hit is not None:
+            ev.result, ev.status = _dedup_hit
+            ev.duration = 0.0
+            return
+
         on_status(f"running:{ev.name}")
         # v3: if the Speculator already prefetched this exact read-only
         # call, serve it from the cache instead of re-running (a hit).
@@ -1908,8 +2070,12 @@ class Agent:
                 ev.status = "error"
             else:
                 try:
-                    ev.result = tool.handler(**ev.args, **extra)
+                    ev.result = self._run_tool_with_timeout(
+                        tool, ev.args, extra)
                     ev.status = "done"
+                except ToolTimeout as e:
+                    ev.result = f"ERROR: {e}"
+                    ev.status = "error"
                 except TurnCancelled:
                     # CANCEL: a handler interrupted by Esc must abort the
                     # turn, not be swallowed into an "ERROR: ..." tool
@@ -1927,6 +2093,15 @@ class Agent:
         # raising — count those as errors too, so the dead-end ledger works
         if ev.status == "done" and ev.result.startswith("ERROR:"):
             ev.status = "error"
+        # tooldedup hook — record the completed execution so identical calls
+        # later in this turn hit the cache. Only done/error: blocked/denied
+        # results are never cached (gates and user denials re-evaluate).
+        if ev.status in ("done", "error"):
+            try:
+                from .tooldedup import store as _dedup_store
+                _dedup_store(self, ev.name, ev.args, ev.result, ev.status)
+            except Exception:  # noqa: BLE001 — caching must never break a turn
+                pass
         ev.duration = time.time() - started
 
         # §37.4: after EVERY successful write, re-check the anti-clauses

@@ -35,6 +35,9 @@ from .config import Effort, Model, Provider
 # working for every existing consumer.
 from .cancelguard import (TurnCancelled, run_cancellable,
                           sleep_cancellable)
+# StallWatcher is a stdlib-only leaf module (no import cycles) — the
+# client is its only consumer.
+from .stallwatch import StallWatcher
 
 _log = get_logger("client")
 
@@ -1067,9 +1070,16 @@ def chat_stream(provider: Provider, model: Model, effort: Effort,
                 on_tool_args: Callable[[str, str], None] | None = None,
                 should_cancel: Callable[[], bool] | None = None,
                 on_overflow: Callable[[], bool] | None = None,
-                timeout: float = config.DEFAULT_TIMEOUT) -> StreamResult:
+                timeout: float = config.DEFAULT_TIMEOUT,
+                on_status: Callable[[str], None] | None = None) -> StreamResult:
     """Send a streaming chat completion request; calls callbacks as tokens
     arrive; returns the fully accumulated result.
+
+    on_status (optional): stream-time status notices that are NOT model
+    output — e.g. the stall warning when the stream is open but no tokens
+    arrive. It is passed through the retry layer unchanged, never marks
+    the turn as "output emitted", and defaults to None (warnings then
+    fall back to the on_reasoning path so direct callers still see them).
 
     Context-overflow recovery — three escalating layers, so a long session
     on a huge project never dies with a context-length error:
@@ -1133,7 +1143,8 @@ def chat_stream(provider: Provider, model: Model, effort: Effort,
         try:
             result = _chat_stream_with_retries(
                 url, headers, payload, on_token_w, on_reasoning_w,
-                on_tool_start, on_tool_args_w, should_cancel, timeout)
+                on_tool_start, on_tool_args_w, should_cancel, timeout,
+                on_status=on_status)
             _learn_from_usage(result.usage, sent_chars, model.id)
             return result
         except APIError as e:
@@ -1208,7 +1219,8 @@ def _chat_stream_with_retries(
         on_tool_start: Callable[[str], None] | None,
         on_tool_args: Callable[[str, str], None] | None,
         should_cancel: Callable[[], bool] | None,
-        timeout: float) -> StreamResult:
+        timeout: float,
+        on_status: Callable[[str], None] | None = None) -> StreamResult:
     """The plain retry loop (rate limits, timeouts, connection errors).
 
     A retry restarts the WHOLE request — once any token has already been
@@ -1253,7 +1265,8 @@ def _chat_stream_with_retries(
             return _chat_stream_once(url, headers, payload,
                                      _tok, _reason, on_tool_start,
                                      _targs, should_cancel,
-                                     min(timeout, remaining))
+                                     min(timeout, remaining),
+                                     on_status=on_status)
         except TurnCancelled:
             raise
         except APIError as e:
@@ -1335,7 +1348,9 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
                       on_tool_start: Callable[[str], None] | None,
                       on_tool_args: Callable[[str, str], None] | None,
                       should_cancel: Callable[[], bool] | None,
-                      timeout: float) -> StreamResult:
+                      timeout: float,
+                      on_status: Callable[[str], None] | None = None
+                      ) -> StreamResult:
     result = StreamResult()
     # Stream-hot path: content/reasoning/tool-args arrive in thousands of
     # small chunks. `result.content += piece` per chunk is O(n^2) string
@@ -1391,7 +1406,31 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
         # a dribbling provider could hold the call open forever).
         events = _iter_sse_events_cancellable(resp, should_cancel,
                                               STREAM_STALL_TIMEOUT)
+        # STALL WATCH: the hard watchdog above only fires when NO data at
+        # all arrives — a stream dribbling reasoning chunks (the 512s
+        # silent hang: UI stuck on "reasoning...", zero content tokens)
+        # never trips it. Warn the user instead of hanging silently.
+        # NB: only VISIBLE output (content tokens, tool-call activity)
+        # resets the timer — reasoning pieces alone still trigger the
+        # warning, which is exactly the incident being fixed.
+        stall = StallWatcher()
+
+        def _stall_check() -> None:
+            warning = stall.check()
+            if warning is None:
+                return
+            if on_status is not None:
+                on_status(warning)
+            elif on_reasoning is not None:
+                # fallback so direct client users (no on_status) still see
+                # it: on_reasoning is the existing dim-notice path. Via the
+                # retry wrapper this also marks emitted["out"] — intended:
+                # the user has seen activity, so a later failure must not
+                # retry-and-replay on top of it.
+                on_reasoning(warning)
+
         for event in events:
+            _stall_check()
             if should_cancel is not None and should_cancel():
                 raise TurnCancelled()
             if not isinstance(event, dict):
@@ -1416,12 +1455,16 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
             piece = delta.get("content")
             if piece:
                 content_parts.append(piece)
+                stall.token_received()  # visible token — reset stall timer
                 if on_token:
                     on_token(piece)
 
             reasoning = delta.get("reasoning_content") or delta.get("reasoning")
             if reasoning:
                 reasoning_parts.append(reasoning)
+                # NB: reasoning does NOT reset the stall timer — it is not
+                # a visible token, and a reasoning-only stream is exactly
+                # the silent-hang incident this fixes.
                 if on_reasoning:
                     on_reasoning(reasoning)
 
@@ -1433,11 +1476,13 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
                 fn = tc.get("function") or {}
                 if fn.get("name"):
                     acc.name_parts.append(fn["name"])
+                    stall.token_received()  # visible activity
                     if idx not in announced_tools and on_tool_start:
                         announced_tools.add(idx)
                         on_tool_start(acc.name)
                 if fn.get("arguments"):
                     acc.arguments_parts.append(fn["arguments"])
+                    stall.token_received()  # visible activity
                     if on_tool_args:
                         on_tool_args(acc.name, fn["arguments"])
     finally:

@@ -2037,6 +2037,9 @@ class UI:
         elif cmd == "/undo":
             from .undocmd import handle_undo
             handle_undo(self, arg)
+        elif cmd == "/retry":
+            from .retrycmd import handle_retry
+            handle_retry(self, arg)
         elif cmd == "/cost":
             from .costtrack import handle_cost
             handle_cost(self, arg)
@@ -3728,8 +3731,38 @@ class UI:
             preview = pv.strip("\n")
             _stream_status(preview if preview else "writing…")
 
+        # Live-reasoning stream state — one accumulator per turn; the TUI
+        # feeds client.py's on_reasoning chunks and shows a bounded tail
+        # preview in the status line (see ReasoningStream in thinking.py).
+        from .thinking import ReasoningStream
+        reasoning_stream = ReasoningStream()
+        _reasoning_throttle = _StreamThrottle(0.1)
+        self._reasoning_throttle = _reasoning_throttle  # diagnostics / tests
+        _reasoning_visible = self.cfg.show_reasoning
+        try:
+            _reasoning_visible = bool(getattr(
+                self.agent, "thinking_visible", _reasoning_visible))
+        except Exception:
+            pass
+
+        def _reasoning_status() -> None:
+            _reasoning_throttle.update(
+                reasoning_stream.preview() if _reasoning_visible
+                else "reasoning…")
+            frame = _reasoning_throttle.maybe_flush()
+            if frame is not None and frame:
+                self._set_status(frame)
+
         def on_reasoning(piece: str):
-            _stream_status("reasoning…")
+            # LIVE REASONING: stream the model's thoughts into the status
+            # line as they arrive (~10fps via a dedicated throttle), so a
+            # long thinking phase shows WHAT the model is doing instead of
+            # a dead "reasoning…" spinner. client.py already normalizes
+            # the provider fields (reasoning_content / reasoning) into this
+            # callback. When thinking display is off, keep the old static
+            # status so the user sees no reasoning text at all.
+            reasoning_stream.feed(piece)
+            _reasoning_status()
 
         # live shell streaming state — one tool runs at a time, so a plain
         # dict is enough: on_tool_call arms it, on_tool_output streams the

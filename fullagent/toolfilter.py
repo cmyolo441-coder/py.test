@@ -280,6 +280,172 @@ def selected_schemas(registry: dict, user_text: str,
 
 
 # ---------------------------------------------------------------------------
+# 3. Progressive tool disclosure (ranking)
+# ---------------------------------------------------------------------------
+# Worker 12/20 (RELIABILITY): filtering *removes* irrelevant tools, but the
+# model still saw ~40-60 tools in arbitrary registry order. Ranking *orders*
+# the survivors so the tools most relevant to the current hint appear first
+# in the model request. Schema order matters: models attend more to early
+# function definitions, and a relevant-first order reduces wrong-tool
+# confusion (the 512s loop had 117 tools in context during a simple edit).
+#
+# Data-driven: RANK_HINTS is a plain table of (keywords, ordered tools).
+# To cover a new tool, add its name to the right tuple; to cover a new
+# task family, add a new (keywords, tools) row. Nothing is hard-coded
+# anywhere else. rank_tools() is stable: tools with equal relevance keep
+# their input order, and an empty hint returns the input order unchanged.
+
+# keyword (word-boundary regex, lowercased) -> tool names, MOST relevant
+# first. A tool's relevance for a hint = its best (lowest) position across
+# all groups whose keywords match.
+RANK_HINTS: tuple[tuple[frozenset[str], tuple[str, ...]], ...] = (
+    (frozenset({"edit", "fix", "patch", "modify", "rewrite", "update",
+                "refactor", "rename variable"}),
+     ("MultiEdit", "edit_file", "apply_patch", "write_file", "read_file")),
+    (frozenset({"file", "files", "write", "create file", "new file",
+                "directory", "folder", "path"}),
+     ("write_file", "read_file", "edit_file", "MultiEdit", "apply_patch",
+      "list_dir", "file_info", "create_directory", "copy_path",
+      "move_path", "delete_path")),
+    (frozenset({"read", "show", "view", "open", "display", "print",
+                "cat "}),
+     ("read_file", "list_dir", "file_info", "ImageRead", "NotebookRead")),
+    (frozenset({"run", "test", "execute", "pytest", "check", "build",
+                "compile", "script"}),
+     ("run_command", "compile_and_run", "live_shell", "BashBG",
+      "BashOutput", "RetryRun", "RetryShell", "measure_coverage",
+      "fuzz_target")),
+    (frozenset({"git", "commit", "branch", "push", "pull", "merge",
+                "rebase", "checkout", "stash", "diff"}),
+     ("GitStatus", "GitDiff", "GitCommit", "GitBranch", "GitPush",
+      "GitLog")),
+    (frozenset({"search", "find", "grep", "locate", "where is",
+                "which file"}),
+     ("search_files", "glob_files", "code_symbols", "graph_query",
+      "graph_index", "knowledge_ask")),
+    (frozenset({"analy", "impact", "symbol", "coverage", "call graph",
+                "dependenc"}),
+     ("analyze_code", "code_symbols", "code_impact", "graph_impact",
+      "graph_query", "graph_index", "measure_coverage", "inspect_why",
+      "verify_plan", "predict_impact")),
+    (frozenset({"move", "copy", "delete", "remove file", "rename",
+                "mkdir"}),
+     ("move_path", "copy_path", "delete_path", "create_directory")),
+    (frozenset({"web", "fetch", "url", "http", "website", "download"}),
+     ("web_fetch", "web_search", "BrowserOpen", "BrowserSnapshot",
+      "BrowserClick", "BrowserClose")),
+    (frozenset({"browser", "playwright", "chromium", "headless",
+                "webpage", "click"}),
+     ("BrowserOpen", "BrowserSnapshot", "BrowserClick", "BrowserClose")),
+    (frozenset({"docker", "container"}),
+     ("docker_ps", "docker_logs", "docker_run", "docker_stop",
+      "docker_images")),
+    (frozenset({"database", "sql", "sqlite", "postgres", r"db\b"}),
+     ("DbQuery", "DbTables", "DbSchema")),
+    (frozenset({"email", "mail", "smtp"}),
+     ("EmailSend", "EmailConfig")),
+    (frozenset({"ssh", "remote"}),
+     ("SshRun", "SshTest")),
+    (frozenset({r"\btask\b", "subagent", "delegate", "agent team"}),
+     ("Task", "TaskList", "TaskOutput", "TaskStop")),
+    (frozenset({"todo", "plan", "planning", "roadmap"}),
+     ("TodoWrite", "TodoRead", "PlanWrite", "ReviewChanges",
+      "verify_plan")),
+    (frozenset({"review", "pull request", r"\bpr\b", "code review"}),
+     ("ReviewPR", "ReviewChanges")),
+    (frozenset({"cron", "schedul"}),
+     ("CronAdd", "CronList", "CronLog", "CronRemove")),
+    (frozenset({r"\bjob\b", "background", "daemon"}),
+     ("JobStart", "JobStatus", "JobLogs", "JobCancel")),
+    (frozenset({"log", "tail", "follow"}),
+     ("LogTail", "LogFollow", "LogList")),
+    (frozenset({"notif"}),
+     ("NotifySend", "NotifyTest")),
+    (frozenset({"voice", "audio", "transcrib", "speech"}),
+     ("VoiceTranscribe", "VoiceRecord")),
+    (frozenset({"sandbox"}),
+     ("SandboxedRun", "SandboxInfo")),
+    (frozenset({"backup", "restore"}),
+     ("BackupCreate", "BackupList", "BackupRestore")),
+    (frozenset({"supervis"}),
+     ("SuperviseAdd", "SuperviseList", "SuperviseLogs",
+      "SuperviseStop")),
+    (frozenset({"watch", "file watcher"}),
+     ("WatchAdd", "WatchList", "WatchRemove")),
+    (frozenset({"webhook"}),
+     ("WebhookAdd", "WebhookTest", "WebhookList", "WebhookRemove")),
+    (frozenset({"progress bar"}),
+     ("ProgressStart", "ProgressUpdate", "ProgressDone")),
+    (frozenset({"retry", "retr", "flaky"}),
+     ("RetryRun", "RetryShell")),
+    (frozenset({"notebook", "ipynb", "jupyter"}),
+     ("NotebookRead", "NotebookEdit", "NotebookInsert",
+      "NotebookDelete")),
+    (frozenset({r"\binit\b", "scaffold", "new project"}),
+     ("InitProject",)),
+    (frozenset({"image", "picture", "screenshot", "photo"}),
+     ("ImageRead",)),
+    (frozenset({"session"}),
+     ("SessionList", "SessionNew", "SessionSwitch")),
+    (frozenset({"brain", "memory", "recall", "remember"}),
+     ("brain_recall", "knowledge_ask", "inspect_why")),
+    (frozenset({"debate"}),
+     ("run_debate",)),
+    (frozenset({"market", "bids"}),
+     ("run_market",)),
+    (frozenset({"mcts", "monte carlo"}),
+     ("mcts_solve",)),
+    (frozenset({"race", "strategies"}),
+     ("race_strategies",)),
+    (frozenset({"synthesi", "new tool", "create a tool"}),
+     ("synthesize_tool",)),
+    (frozenset({"config", "settings", "preferences"}),
+     ("read_file", "edit_file", "list_dir")),
+)
+
+_RANK_RES: tuple[tuple[re.Pattern, tuple[str, ...]], ...] = tuple(
+    (re.compile(r"(?:%s)" % "|".join(sorted(kw))), tools)
+    for kw, tools in RANK_HINTS
+)
+
+_NO_RANK = 10 ** 9
+
+
+def rank_tools(task_hint: str,
+               names: list[str] | None = None) -> list[str]:
+    """Order tool names by relevance to ``task_hint`` (progressive
+    disclosure). Tools matching hint keywords sort first (best position
+    across matched groups); everything else keeps its input order
+    (stable). Empty hint -> input order unchanged.
+
+    ``names`` defaults to the full registry in registry order.
+    """
+    if names is None:
+        names = list(build_full_registry())
+    if not task_hint:
+        return list(names)
+    text = task_hint.lower()
+    best: dict[str, int] = {}
+    for rx, tools in _RANK_RES:
+        if rx.search(text):
+            for i, tname in enumerate(tools):
+                if i < best.get(tname, _NO_RANK):
+                    best[tname] = i
+    default_pos = {n: i for i, n in enumerate(names)}
+    return sorted(names,
+                  key=lambda n: (best.get(n, _NO_RANK),
+                                 default_pos.get(n, _NO_RANK)))
+
+
+def rank_signature(task_hint: str) -> str:
+    """Cache key fragment: which rank groups the hint activates."""
+    text = (task_hint or "").lower()
+    hits = [str(i) for i, (rx, _) in enumerate(_RANK_RES)
+            if rx.search(text)]
+    return ",".join(hits)
+
+
+# ---------------------------------------------------------------------------
 # Registry reconstruction (for offline measurement / self-test)
 # ---------------------------------------------------------------------------
 
@@ -432,6 +598,32 @@ if __name__ == "__main__":
 
     def _tok(chars):
         return chars // 4
+
+    # 6) progressive disclosure ranking
+    all_names = list(reg)
+    r_edit = rank_tools("edit the config file", all_names)
+    assert set(r_edit) == set(all_names), "rank dropped/added tools"
+    assert {"MultiEdit", "edit_file", "read_file"} <= set(r_edit[:5]), \
+        f"edit hint not ranked first: {r_edit[:6]}"
+    r_test = rank_tools("run the tests", all_names)
+    assert r_test[0] == "run_command", \
+        f"run hint: expected run_command first, got {r_test[0]}"
+    assert {"live_shell", "BashBG"} <= set(r_test[:8]), \
+        f"shell tools not near top: {r_test[:8]}"
+    r_git = rank_tools("commit and push my changes", all_names)
+    assert {"GitCommit", "GitPush", "GitStatus"} <= set(r_git[:6]), \
+        f"git tools not near top: {r_git[:6]}"
+    r_dock = rank_tools("check docker containers", all_names)
+    assert "docker_ps" in r_dock[:4], \
+        f"docker_ps not near top: {r_dock[:4]}"
+    # empty hint -> stable default order
+    assert rank_tools("", all_names) == all_names, \
+        "empty hint changed default order"
+    assert rank_tools(None, all_names) == all_names, \
+        "None hint changed default order"
+    # ranking never reorders ties against the default order
+    r_plain = rank_tools("something with no keywords xyzzy", all_names)
+    assert r_plain == all_names, "unmatched hint reordered tools"
 
     print(f"tools registered+callable : {n_total}")
     print(f"BEFORE  all schemas       : {before_chars:,} chars "

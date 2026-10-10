@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import config
+from . import filestat  # Worker 8/20: mtime+size change detection
 from ._foundation import get_logger, ToolError, validate_path, content_hash
 from .cancelguard import TurnCancelled, run_cancellable
 
@@ -160,6 +161,128 @@ def _line_numbered(text: str, start: int = 1) -> str:
     return "\n".join(out)
 
 
+# Bounds for the self-diagnosing edit-miss error below: large enough to be
+# useful to the caller, small enough not to blow up the context window.
+_MISS_EXPECTED_MAX_LINES = 20
+_MISS_EXCERPT_RADIUS = 5
+_MISS_MAX_CHARS = 4000
+
+
+def _rich_edit_miss_error(p: Path, text: str, old_string: str,
+                          label: str = "") -> str:
+    """Self-diagnosing 'old_string not found' error.
+
+    A bare "not found" leaves the caller guessing (the incident that
+    motivated this: a model retried blindly for 512s). This error hands
+    the caller everything needed to fix the edit in ONE retry: the file
+    path and line count, the expected text (truncated), a unified diff of
+    expected-vs-closest-actual, the actual file excerpt with line numbers,
+    and 1-3 concrete copy-ready suggestions.
+    """
+    file_lines = text.splitlines()
+    old_lines = old_string.splitlines()
+    total = len(file_lines)
+
+    head = (f"ERROR: {label}old_string not found in {p} "
+            f"({total} line(s) total; it must match exactly, "
+            "including indentation)")
+
+    parts = [head, "",
+             "EXPECTED (first "
+             f"{min(len(old_lines), _MISS_EXPECTED_MAX_LINES)} of "
+             f"{len(old_lines)} line(s)):"]
+    exp_shown = "\n".join(old_lines[:_MISS_EXPECTED_MAX_LINES])
+    if len(old_lines) > _MISS_EXPECTED_MAX_LINES:
+        exp_shown += (f"\n… [+{len(old_lines) - _MISS_EXPECTED_MAX_LINES} "
+                      "more line(s) of the expected text omitted]")
+    parts.append(exp_shown or "(empty)")
+
+    # --- cheap near-miss diagnostics ---
+    hints: list[str] = []
+    stripped = old_string.strip()
+    if stripped and stripped in text:
+        hints.append(
+            "near-miss: old_string appears once leading/trailing "
+            "whitespace is ignored — check for extra blank lines or "
+            "wrong indentation at the edges of your old_string")
+    if "\r\n" in text and stripped and \
+            old_string.replace("\n", "\r\n") in text:
+        hints.append(
+            "near-miss: the file uses CRLF line endings but your old_string "
+            "uses LF — match the file's actual line endings")
+    if stripped and stripped not in text \
+            and stripped.lower() in text.lower():
+        hints.append(
+            "near-miss: a case-insensitive match exists — check letter "
+            "casing in your old_string")
+
+    # --- closest-match search: anchor on the first non-blank line ---
+    anchor = next((ln for ln in old_lines if ln.strip()), "")
+    top: list[int] = []  # 0-based file line indexes, best first
+    if anchor and file_lines:
+        scored = sorted(
+            ((difflib.SequenceMatcher(None, anchor.strip(),
+                                      fl.strip()).ratio(), i)
+             for i, fl in enumerate(file_lines)),
+            key=lambda t: t[0], reverse=True)
+        top = [i for r, i in scored[:3] if r > 0.0]
+    if not top and file_lines:
+        top = [0]
+
+    if top:
+        # Align the anchor's position inside old_string with its best
+        # match in the file to get the closest region of equal length.
+        anchor_pos = old_lines.index(anchor) if anchor else 0
+        start = max(0, top[0] - anchor_pos)  # 0-based
+        region = file_lines[start:start + len(old_lines)]
+
+        parts += ["",
+                  f"CLOSEST MATCH in file (line {start + 1}"
+                  f"..{start + len(region)}), unified diff "
+                  "expected -> actual:"]
+        diff_lines = list(difflib.unified_diff(
+            old_lines[:_MISS_EXPECTED_MAX_LINES],
+            region[:_MISS_EXPECTED_MAX_LINES],
+            fromfile="expected", tofile="actual", lineterm="", n=3))
+        parts.append("\n".join(diff_lines) if diff_lines
+                     else "(region identical to expected — unreachable)")
+
+        # Whitespace-only near miss on the closest region.
+        norm = lambda lines: [re.sub(r"\s+", " ", ln).strip()
+                              for ln in lines]
+        if region and norm(old_lines) == norm(region)[:len(old_lines)]:
+            hints.append(
+                "near-miss: the closest region matches except for "
+                "whitespace (tabs vs spaces / trailing spaces) — copy the "
+                "exact indentation from the excerpt above")
+
+        ex_lo = max(1, start + 1 - _MISS_EXCERPT_RADIUS)
+        ex_hi = min(total, start + len(region) + _MISS_EXCERPT_RADIUS)
+        parts += ["",
+                  f"FILE EXCERPT around the closest match "
+                  f"(lines {ex_lo}..{ex_hi}):"]
+        parts.append(_line_numbered("\n".join(file_lines[ex_lo - 1:ex_hi]),
+                                    ex_lo))
+
+        parts += ["", "SUGGESTIONS (closest matching lines, copy from "
+                      "the excerpt above):"]
+        for j, i in enumerate(top[:3], 1):
+            line = file_lines[i]
+            one = line if len(line) <= 100 else line[:97] + "..."
+            parts.append(f"  {j}. line {i + 1}: {one!r}")
+    elif total == 0:
+        parts += ["", "(the file is empty — nothing to match against)"]
+
+    if hints:
+        parts += ["", "DIAGNOSIS:"]
+        parts += [f"  - {h}" for h in hints]
+
+    msg = "\n".join(parts)
+    if len(msg) > _MISS_MAX_CHARS:
+        msg = msg[:_MISS_MAX_CHARS] + "\n… [error truncated]"
+    return msg
+
+
 # ---------------------------------------------------------------------------
 # File tools
 # ---------------------------------------------------------------------------
@@ -183,15 +306,21 @@ def _atomic_write_text(p: Path, text: str) -> None:
     os.replace(tmp, p)
 
 
-def read_file(path: str, offset: int = 1, limit: int = 1000) -> str:
-    """Read a text file with line numbers."""
+def read_file(path: str, offset: int = 1, limit: int = 200) -> str:
+    """Read a text file with line numbers.
+
+    The DEFAULT is a bounded window (first 200 lines). When output is
+    truncated, a trailer states exactly how many lines remain and how to
+    page further — so the agent never dumps a whole multi-thousand-line
+    file into context on every read.
+    """
     p, err = _checked(path)
     if err:
         return err
     offset, err = _coerce_int(offset, "offset", 1, 1, 10_000_000)
     if err:
         return err
-    limit, err = _coerce_int(limit, "limit", 1000, 1, 5000)
+    limit, err = _coerce_int(limit, "limit", 200, 1, 5000)
     if err:
         return err
     try:
@@ -207,14 +336,38 @@ def read_file(path: str, offset: int = 1, limit: int = 1000) -> str:
         text = p.read_text(encoding="utf-8", errors="replace")
     except OSError as e:
         return f"ERROR: {e}"
+    # Worker 8/20: record mtime+size so a later edit_file can detect an
+    # external change between this read and the edit (the 512s incident).
+    filestat.note_read(None, str(p))
     lines = text.splitlines()
-    if offset > len(lines):
-        return (f"[{p} — {len(lines)} lines total; offset {offset} is past the "
+    total = len(lines)
+    if total == 0:
+        return f"[{p} — 0 lines (empty file)]"
+    if offset > total:
+        return (f"[{p} — {total} lines total; offset {offset} is past the "
                 f"end of file]")
     chunk = lines[offset - 1: offset - 1 + limit]
     end = offset + len(chunk) - 1
-    header = f"[{p} — {len(lines)} lines total, showing {offset}..{end}]"
-    return f"{header}\n{_line_numbered(chr(10).join(chunk), offset)}"
+    header = f"[{p} — {total} lines total, showing {offset}..{end}]"
+    body = _line_numbered(chr(10).join(chunk), offset)
+    remaining = total - end
+    if remaining > 0:
+        body += (f"\n… ({remaining} more lines, total {total} lines). "
+                 "Use offset/limit to read more.")
+    return f"{header}\n{body}"
+
+
+def read_region(path: str, start_line: int, end_line: int) -> str:
+    """Convenience wrapper: read lines start_line..end_line (1-based,
+    inclusive). Delegates to read_file — NOT registered as a separate
+    agent tool, so the tool count stays down."""
+    start, err = _coerce_int(start_line, "start_line", 1, 1, 10_000_000)
+    if err:
+        return err
+    end, err = _coerce_int(end_line, "end_line", start, 1, 10_000_000)
+    if err:
+        return err
+    return read_file(path, offset=start, limit=max(1, end - start + 1))
 
 
 def write_file(path: str, content: str) -> str:
@@ -247,6 +400,9 @@ def write_file(path: str, content: str) -> str:
         _atomic_write_text(p, content)
     except OSError as e:
         return f"ERROR: {e}"
+    # Worker 8/20: the agent knows this exact state — a following edit must
+    # not mistake our own write for an external change.
+    filestat.note_written(None, str(p))
     if not existed or old == "":
         # brand-new (or previously empty) file — a pure-addition report
         adds = len(content.splitlines())
@@ -255,10 +411,41 @@ def write_file(path: str, content: str) -> str:
     return f"Updated {p} with {adds} addition(s) and {removes} removal(s)"
 
 
+def _match_line_numbers(text: str, old_string: str) -> list[int]:
+    """1-based line numbers where old_string occurs in text (start of match)."""
+    nums: list[int] = []
+    start = 0
+    while True:
+        idx = text.find(old_string, start)
+        if idx == -1:
+            break
+        nums.append(text.count("\n", 0, idx) + 1)
+        start = idx + (len(old_string) or 1)
+    return nums
+
+
+def _preview_edit(path: Path, old: str, new: str,
+                  detail_lines: list[str]) -> str:
+    """Dry-run report for edit_file / MultiEdit: which lines WOULD match,
+    plus a unified before/after diff. The file is NOT modified."""
+    body = "\n".join(difflib.unified_diff(
+        old.splitlines(), new.splitlines(),
+        fromfile=f"a/{path}", tofile=f"b/{path}", lineterm=""))
+    if not body:
+        body = "(no changes — old and new content are identical)"
+    header = ("PREVIEW (dry-run, file NOT modified):\n"
+              + "\n".join(detail_lines) + "\n")
+    return header + body
+
+
 def edit_file(path: str, old_string: str, new_string: str,
-              replace_all: bool = False) -> str:
+              replace_all: bool = False,
+              preview_only: bool = False) -> str:
     """Replace an exact string in a file. old_string must match exactly once
-    (or set replace_all=true to replace every occurrence)."""
+    (or set replace_all=true to replace every occurrence). When
+    preview_only=true the file is left untouched and a unified
+    before/after diff of exactly what WOULD change is returned instead,
+    including the matched line numbers."""
     p, err = _checked(path)
     if err:
         return err
@@ -268,6 +455,12 @@ def edit_file(path: str, old_string: str, new_string: str,
         # str.count("") counts len+1 positions and str.replace("") would
         # interleave new_string between EVERY character — destroy the file
         return "ERROR: old_string must be a non-empty string"
+    # Worker 8/20 (512s incident): if the file changed since the agent last
+    # read it, say so plainly instead of failing with a cryptic
+    # "old_string not found".
+    warn = filestat.check_stale(None, str(p))
+    if warn:
+        return warn
     try:
         text = p.read_text(encoding="utf-8")
     except UnicodeDecodeError:
@@ -277,8 +470,7 @@ def edit_file(path: str, old_string: str, new_string: str,
         return f"ERROR: {e}"
     count = text.count(old_string)
     if count == 0:
-        return "ERROR: old_string not found in file (it must match exactly, " \
-               "including indentation)"
+        return _rich_edit_miss_error(p, text, old_string)
     if count > 1 and not replace_all:
         return f"ERROR: old_string matches {count} places; add more context " \
                "to make it unique or set replace_all=true"
@@ -286,10 +478,21 @@ def edit_file(path: str, old_string: str, new_string: str,
         new_text = text.replace(old_string, new_string)
     else:
         new_text = text.replace(old_string, new_string, 1)
+    if preview_only:
+        matches = _match_line_numbers(text, old_string)
+        if not replace_all:
+            matches = matches[:1]
+        n = count if replace_all else 1
+        return _preview_edit(
+            p, text, new_text,
+            [f"  {n} occurrence(s) WOULD be replaced at line(s) {matches}"])
     try:
         _atomic_write_text(p, new_text)
     except OSError as e:
         return f"ERROR: {e}"
+    # Worker 8/20: record post-edit stat so a chained edit doesn't warn
+    # about our own change.
+    filestat.note_written(None, str(p))
     adds, removes = _diff_summary(text, new_text)
     n = count if replace_all else 1
     return (f"Updated {p} — {n} occurrence(s) replaced, "
@@ -1165,11 +1368,13 @@ def build_registry() -> dict[str, Tool]:
         return _REGISTRY
     tools: list[Tool] = [
         Tool("read_file",
-             "Read a text file with line numbers. Use offset/limit for large files.",
+             "Read a text file with line numbers. Defaults to the first 200 lines; "
+             "a trailer shows remaining lines and how to page with "
+             "offset/limit.",
              {"type": "object", "properties": {
                  "path": _STR,
                  "offset": {"type": "integer", "description": "first line (1-based)"},
-                 "limit": {"type": "integer", "description": "max lines (default 1000)"}},
+                 "limit": {"type": "integer", "description": "max lines (default 200)"}},
               "required": ["path"]},
              read_file),
         Tool("write_file",
@@ -1180,10 +1385,18 @@ def build_registry() -> dict[str, Tool]:
              write_file, risk=RISK_CONFIRM),
         Tool("edit_file",
              "Replace an exact string in a file. old_string must match exactly "
-             "(including indentation) and uniquely, unless replace_all=true.",
+             "(including indentation) and uniquely, unless replace_all=true. "
+             "Set preview_only=true for a dry-run: returns a unified diff of "
+             "what WOULD change (with matched line numbers) without "
+             "modifying the file — use it to verify the match before "
+             "committing.",
              {"type": "object", "properties": {
                  "path": _STR, "old_string": _STR, "new_string": _STR,
-                 "replace_all": {"type": "boolean"}},
+                 "replace_all": {"type": "boolean"},
+                 "preview_only": {"type": "boolean",
+                                  "description": "Dry-run: show the diff of "
+                                  "what would change without modifying the "
+                                  "file."}},
               "required": ["path", "old_string", "new_string"]},
              edit_file, risk=RISK_CONFIRM),
         Tool("list_dir", "List a directory's contents (one level).",
@@ -1318,5 +1531,25 @@ if __name__ == "__main__":
         err = apply_patch(bad)
         assert err.startswith("ERROR: hunk context mismatch"), err
         assert fp.read_text() == "a\nB\nc\n", "failed patch mutated the file!"
+
+        # edit_file miss is self-diagnosing: path, line count, expected
+        # text, numbered excerpt, and a suggestion — one retry should
+        # suffice instead of a blind retry loop.
+        fp2 = Path(td) / "miss.py"
+        fp2.write_text(
+            "def foo():\n    x = 1\n    return x\n\n"
+            "def bar():\n    y = 2\n    return y\n", encoding="utf-8")
+        err = edit_file(str(fp2), "def foo():\n   x = 1\n", "zzz")
+        assert err.startswith("ERROR:"), err
+        assert str(fp2) in err, "error must name the file path"
+        assert "7 line(s) total" in err, "error must give the line count"
+        assert "EXPECTED" in err, "error must show the expected text"
+        assert "→" in err and "line 1" in err, \
+            "error must show a line-numbered excerpt"
+        assert "SUGGESTIONS" in err, "error must include suggestions"
+        assert "whitespace" in err.lower(), \
+            "error must diagnose the indentation near-miss"
+        assert fp2.read_text().startswith("def foo():"), \
+            "failed edit must not mutate the file"
 
     print("TOOLS SELF-TEST PASS")

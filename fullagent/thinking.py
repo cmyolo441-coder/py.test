@@ -18,6 +18,8 @@ Shapes handled by :func:`extract_thinking` (mirrors ``client.py``):
 Public API:
     - :func:`extract_thinking` -- pull reasoning text out of a message.
     - :func:`format_thinking` -- collapsed/expanded render-ready string.
+    - :class:`ReasoningStream` -- incremental reasoning accumulator for
+      live TUI streaming (feed per-chunk, bounded tail ``preview()``).
     - :func:`handle_thinking` -- the ``/thinking`` TUI command.
     - :func:`register` -- wire ``agent.thinking_visible`` + helpers.
 
@@ -188,6 +190,85 @@ def format_thinking(text: str, collapsed: bool = True) -> str:
 
 
 # ---------------------------------------------------------------------------
+# live reasoning streaming — incremental accumulator + bounded preview
+# ---------------------------------------------------------------------------
+
+
+class ReasoningStream:
+    """Incremental reasoning accumulator for live TUI streaming.
+
+    ``client.py`` fires the ``on_reasoning`` callback per reasoning chunk
+    (provider fields already normalized there: ``delta.reasoning_content``
+    or ``delta.reasoning`` — provider differences never reach this class).
+    The TUI feeds each chunk here and asks for a bounded ``preview()`` at
+    ~10fps (the caller throttles with ``tui._StreamThrottle``), so the user
+    watches the model's thought process evolve instead of a static
+    "reasoning…" spinner.
+
+    Chunks are kept in a list — O(1) append, joined once per read (the
+    same O(n) discipline as ``client._chat_stream_once``). The live
+    preview renders the single-line TAIL of the text: the latest thought
+    is what the user watches, and the cost stays O(tail) per frame no
+    matter how long the stream grows.
+    """
+
+    def __init__(self, tail_chars: int = 90):
+        self._parts: list[str] = []
+        self._chars = 0             # total reasoning chars fed
+        self.chunks = 0             # total reasoning chunks fed
+        self._tail_chars = max(1, tail_chars)
+
+    def feed(self, piece: Any) -> None:
+        """Accumulate one reasoning chunk. Never raises; ignores empties."""
+        try:
+            if not piece:
+                return
+            text = piece if isinstance(piece, str) else str(piece)
+            if not text:
+                return
+            self._parts.append(text)
+            self._chars += len(text)
+            self.chunks += 1
+        except Exception:
+            pass
+
+    @property
+    def text(self) -> str:
+        """The full accumulated reasoning text."""
+        return "".join(self._parts)
+
+    @property
+    def chars(self) -> int:
+        """Total reasoning characters fed so far."""
+        return self._chars
+
+    def preview(self, tail_chars: int | None = None) -> str:
+        """Bounded single-line preview of the reasoning so far.
+
+        Takes the tail of the accumulated text (the latest thought),
+        collapses newlines/whitespace runs to single spaces, and prefixes
+        "💭 " ("💭 …" when the tail was cut from a longer stream).
+        Returns "" when nothing (non-blank) has arrived yet. Never raises.
+        """
+        try:
+            limit = (self._tail_chars if tail_chars is None
+                     else max(1, tail_chars))
+            if self._chars == 0:
+                return ""
+            raw = "".join(self._parts)
+            if not raw.strip():
+                return ""
+            truncated = len(raw) > limit
+            tail = raw[-limit:] if truncated else raw
+            single = " ".join(tail.split())
+            if not single:
+                return ""
+            return ("💭 …" if truncated else "💭 ") + single
+        except Exception:
+            return ""
+
+
+# ---------------------------------------------------------------------------
 # /thinking command
 # ---------------------------------------------------------------------------
 
@@ -350,6 +431,67 @@ def _selftest() -> None:
 
     assert format_thinking("") == ""
     assert format_thinking("   ") == ""
+
+    # -- ReasoningStream: live incremental accumulation -------------------
+    # Simulate a stream of chunks exactly like client._chat_stream_once
+    # delivers them to the TUI's on_reasoning callback: the accumulator
+    # must grow incrementally, and the preview must always reflect the
+    # latest text.
+    rs = ReasoningStream(tail_chars=40)
+    assert rs.text == "" and rs.chars == 0 and rs.chunks == 0
+    assert rs.preview() == "", "no preview before any chunk"
+
+    streamed: list[str] = []
+    chunks = ["The user wants ", "a quick sort.\n", "Plan: partition ",
+              "around a pivot, then recurse on both halves."]
+    seen_tails: list[str] = []
+    for i, c in enumerate(chunks):
+        rs.feed(c)
+        streamed.append(c)
+        # full text grows incrementally — nothing dropped, nothing reordered
+        assert rs.text == "".join(streamed), f"chunk {i}"
+        assert rs.chunks == i + 1
+        assert rs.chars == sum(len(s) for s in streamed)
+        pv = rs.preview()
+        assert pv, f"preview must be non-empty after chunk {i}"
+        assert pv.startswith("💭 "), repr(pv)
+        assert "\n" not in pv, "preview must be single-line"
+        seen_tails.append(pv)
+
+    # the preview follows the stream: the last preview ends with the
+    # tail of the latest chunk
+    assert seen_tails[-1].endswith("recurse on both halves."), seen_tails[-1]
+    # incremental growth: later previews show later text
+    assert "pivot" in seen_tails[-1] or "recurse" in seen_tails[-1]
+
+    # long stream → bounded tail with ellipsis marker
+    rs2 = ReasoningStream(tail_chars=20)
+    for _ in range(50):
+        rs2.feed("lorem ipsum dolor sit amet ")
+    p2 = rs2.preview()
+    assert p2.startswith("💭 …"), repr(p2[:10])
+    assert len(p2) <= len("💭 …") + 20, len(p2)
+    assert "\n" not in p2
+
+    # explicit tail_chars override
+    p3 = rs2.preview(tail_chars=5)
+    assert p3.startswith("💭 …") and len(p3) <= len("💭 …") + 5, repr(p3)
+
+    # garbage never breaks the stream
+    rs3 = ReasoningStream()
+    rs3.feed("")
+    rs3.feed(None)
+    rs3.feed("   \n  ")
+    assert rs3.preview() == "", "blank-only stream has no preview"
+    rs3.feed("real thought")
+    assert "real thought" in rs3.preview()
+    rs3.feed(123)                       # non-str coerced, not crashing
+    assert "123" in rs3.text
+
+    # whitespace collapse: newlines/tabs become single spaces
+    rs4 = ReasoningStream(tail_chars=200)
+    rs4.feed("line one\n\nline\t\ttwo")
+    assert rs4.preview() == "💭 line one line two", repr(rs4.preview())
 
     # -- register + persistence round-trip --------------------------------
     class FakeAgent:

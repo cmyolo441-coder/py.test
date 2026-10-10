@@ -339,6 +339,9 @@ if __name__ == "__main__":
         if not cond:
             raise AssertionError(f"self-test FAILED: {name}")
 
+    # Enable preview for testing (it's OFF by default since the UX fix)
+    os.environ["FULLAGENT_DIFF_PREVIEW"] = "1"
+
     tmp = tempfile.mkdtemp(prefix="diffpreview_selftest_")
     os.chdir(tmp)
 
