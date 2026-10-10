@@ -1158,11 +1158,17 @@ class Agent:
                                 _sig = None
                             if _sig is not None and _sig == _last_tool_sig:
                                 _stall_count += 1
-                                if _stall_count >= config.NO_PROGRESS_STALL_LIMIT:
+                                # Only hard-stop on repeated ERRORS, not successful
+                                # results. A tool legitimately returning the same
+                                # success 3x (e.g. status checks) is not a loop.
+                                # But the same ERROR 3x means the model is stuck.
+                                _is_error = ev.result.strip().upper().startswith(
+                                    ("ERROR", "FAILED", "EXCEPTION"))
+                                if _stall_count >= config.NO_PROGRESS_STALL_LIMIT and _is_error:
                                     turn_stopped = True
                                     turn.error = (
                                         "No progress detected — the same tool "
-                                        "call returned an identical result 3 "
+                                        "call failed with an identical error 3 "
                                         "times in a row. Stopped to avoid "
                                         "looping; rephrase or ask me to "
                                         "continue.")

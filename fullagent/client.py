@@ -453,6 +453,13 @@ def _sanitize_messages(messages: list[dict]) -> bool:
     provider only requires the field to exist, not to be non-empty.
     """
     fixed = False
+    # Collect all tool_call_ids that have responses
+    tool_response_ids = set()
+    for m in messages:
+        if isinstance(m, dict) and m.get("role") == "tool":
+            _tid = m.get("tool_call_id")
+            if _tid:
+                tool_response_ids.add(str(_tid))
     for m in messages:
         if not isinstance(m, dict):
             continue
@@ -462,6 +469,11 @@ def _sanitize_messages(messages: list[dict]) -> bool:
                                   in (tcs if isinstance(tcs, (list, tuple))
                                       else [tcs]))
                       if c is not None]
+            # Drop orphaned tool_calls (no matching tool response).
+            # Orphaned calls cause provider invalid_request_error.
+            normed = [c for c in normed
+                      if str(c.get("id", "")) in tool_response_ids
+                      or not tool_response_ids]
             if len(normed) != (len(tcs) if isinstance(tcs, (list, tuple))
                                else 1):
                 fixed = True
