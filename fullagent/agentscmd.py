@@ -49,6 +49,28 @@ def _row(agent_obj) -> str:
     return f"  {who:<24} {state:<8} {role:<12} {task}"
 
 
+def agents_errors(agent) -> str:
+    """Show FULL error messages for failed subagents (not truncated)."""
+    agents = _crew(agent).list()
+    failed = [a for a in agents if getattr(a, "state", "") == "error"]
+    if not failed:
+        return "no failed subagents"
+    lines = [f"failed subagents ({len(failed)}):", ""]
+    for a in failed:
+        aid = getattr(a, "id", "?")
+        name = getattr(a, "nickname", "") or ""
+        error = getattr(a, "error", "") or "(no error message)"
+        tb = getattr(a, "traceback", "") or ""
+        lines.append(f"  {aid} ({name}):")
+        lines.append(f"    {error}")
+        if tb:
+            lines.append(f"    Traceback (last 2000 chars):")
+            for tline in tb[-2000:].split("\n"):
+                lines.append(f"      {tline}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def agents_list(agent) -> str:
     """List all subagents with id, state, role and task."""
     agents = _crew(agent).list()
@@ -113,6 +135,8 @@ def handle(ui, arg: str) -> str:
         return agents_stop_all(agent)
     if sub in ("list", "ls"):
         return agents_list(agent)
+    if sub == "errors":
+        return agents_errors(agent)
     return f"unknown subcommand: {sub}\n{USAGE}"
 
 

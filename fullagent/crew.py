@@ -87,6 +87,7 @@ class CrewAgent:
     state: str = "running"      # running | done | blocked | error | closed
     summary: str = ""
     error: str = ""
+    traceback: str = ""  # full traceback for debugging (see /agents errors)
     messages: list = field(default_factory=list)   # full conversation
     files_touched: list = field(default_factory=list)
     tool_calls: int = 0
@@ -248,12 +249,16 @@ class Crew:
             # sit unretrieved on the Future and the subagent would die
             # invisibly. Record it instead.
             try:
+                import traceback as _tb
+                _tb_str = "".join(_tb.format_exception(type(e), e, e.__traceback__))
                 with agent.mutex:
                     if gen != agent.generation:
                         # a newer iteration owns the state now
                         return
                     agent.state = "error"
                     agent.error = f"{type(e).__name__}: {e}"
+                    # Store full traceback for /agents errors debugging
+                    agent.traceback = _tb_str[-4000:]
                     agent.finished_at = time.time()
                 self.log.append("crew.done", agent.to_dict(),
                                 actor=f"crew:{agent.id}")
