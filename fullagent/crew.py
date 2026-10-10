@@ -727,7 +727,13 @@ class Crew:
                     getattr(result, "reasoning", "") or ""))
                 tool_names = []
                 for tc in result.tool_calls:
+                    # Defensive: skip malformed tool calls (provider may
+                    # return strings or partial objects)
+                    if not isinstance(tc, dict):
+                        continue
                     fn = tc.get("function") or {}
+                    if not isinstance(fn, dict):
+                        fn = {}
                     name = fn.get("name", "")
                     args = parse_tool_arguments(fn.get("arguments"))
                     agent.tool_calls += 1

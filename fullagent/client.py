@@ -1546,7 +1546,8 @@ def _result_from_json(data: dict, model_id: str) -> StreamResult:
             f"provider returned unexpected JSON shape "
             f"({type(data).__name__}): {str(data)[:200]}")
     result = StreamResult(model=data.get("model", model_id),
-                          usage=data.get("usage"))
+                          usage=(data.get("usage") if isinstance(
+                              data.get("usage"), dict) else None))
     choices = data.get("choices") or []
     if choices:
         msg = choices[0].get("message") or {}
@@ -1555,7 +1556,11 @@ def _result_from_json(data: dict, model_id: str) -> StreamResult:
                             or msg.get("reasoning") or "")
         result.finish_reason = choices[0].get("finish_reason")
         for tc in msg.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue  # skip malformed tool calls
             fn = tc.get("function") or {}
+            if not isinstance(fn, dict):
+                fn = {}
             result.tool_calls.append({
                 "id": tc.get("id", "call_0"),
                 "type": "function",
