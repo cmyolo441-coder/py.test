@@ -416,6 +416,13 @@ class Crew:
         self.log = log
         self.provider = provider
         self.model = model
+        # effort MUST be an Effort object, not a string key. A string here
+        # caused AttributeError: 'str' object has no attribute 'temperature'
+        # in every subagent. Fail fast with a clear message.
+        if isinstance(effort, str):
+            raise CrewError(
+                f"Crew effort must be an Effort object, not string "
+                f"'{effort}' — use config.effort_by_key() to convert")
         self.effort = effort
         # Spawn-path type guards (fail fast HERE, not as a bare
         # AttributeError inside spawn() or on a pool thread):

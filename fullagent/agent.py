@@ -412,7 +412,12 @@ class Agent:
     # mastermind, messages, session_id) or other lazy subsystems.
     _SUBSYSTEM_FACTORIES: dict[str, Callable[["Agent"], Any]] = {
         "crew": lambda self: Crew(
-            self.log, self.provider, self.model, self.cfg.effort,
+            self.log, self.provider, self.model,
+            # cfg.effort is a STRING key ("ultra high") — Crew needs the
+            # Effort object. Passing the raw string caused
+            # AttributeError: 'str' object has no attribute 'temperature'.
+            config.effort_by_key(self.cfg.effort) or config.effort_by_key(
+                config.DEFAULT_EFFORT),
             mastermind=self.mastermind),
         "store": lambda self: SnapshotStore(config.APP_DIR / "store"),
         "memory": lambda self: Hippocampus(self.log),
