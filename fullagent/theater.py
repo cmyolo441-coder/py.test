@@ -208,8 +208,13 @@ class Theater:
 
 
 def _summary(ev) -> str:
-    """One-line essence of an event for frames and whys."""
-    d = ev.data or {}
+    """One-line essence of an event for frames and whys.
+
+    Hardened: a poisoned event whose data is a bare string (not a
+    dict) would crash every d.get(...) below with AttributeError —
+    coerce to {} so one bad event never kills the timeline."""
+    raw = getattr(ev, "data", None)
+    d = raw if isinstance(raw, dict) else {}
     if ev.type in ("user.message", "assistant.message"):
         return str(d.get("text", ""))[:100]
     if ev.type == "tool.call":

@@ -38,6 +38,7 @@ from .cancelguard import (TurnCancelled, run_cancellable,
 # StallWatcher is a stdlib-only leaf module (no import cycles) — the
 # client is its only consumer.
 from .stallwatch import StallWatcher
+from . import typeguards as _typeguards  # central provider-boundary guards
 
 _log = get_logger("client")
 
@@ -208,6 +209,158 @@ class StreamResult:
     usage: dict | None = None
     model: str = ""
 
+    def __post_init__(self) -> None:
+        # Providers and cassette replays can hand us wrong-typed values
+        # (usage as a string, tool_calls as ["str"], content as an int,
+        # model as a dict). Coerce at construction so the declared types
+        # always hold — one bad field must never become an
+        # AttributeError/TypeError downstream (e.g. turn.usage.get(...)
+        # in tui.py, tc["function"] in agent.py). Never raises.
+        self.normalize()
+
+    def normalize(self) -> "StreamResult":
+        """Coerce every field to its declared type, in place.
+
+        Never raises. Tool-call entries go through the single
+        normalize_tool_call() canonicalizer so a malformed entry is
+        dropped or repaired, never left as a crash vector.
+        """
+        # STRICT str-or-empty (not ensure_str's str()-ification):
+        # non-string junk must become "", never "123"/"{'m': 1}".
+        self.content = _strict_str(self.content)
+        self.reasoning = _strict_str(self.reasoning)
+        self.model = _strict_str(self.model)
+        self.finish_reason = (None if self.finish_reason is None
+                              else _strict_str(self.finish_reason))
+        # usage: dict-or-None only. A non-empty string is truthy and
+        # would sail past `if usage` guards straight into usage.get().
+        self.usage = self.usage if isinstance(self.usage, dict) else None
+        normed: list[dict] = []
+        for tc in _typeguards.ensure_list(self.tool_calls):
+            canon = normalize_tool_call(tc)
+            if canon is not None:
+                normed.append(canon)
+        self.tool_calls = normed
+        return self
+
+
+_tc_fallback_seq = [0]
+
+
+def normalize_tool_call(tc: Any) -> dict | None:
+    """Canonicalize ANY value into a valid OpenAI-style tool_call dict.
+
+    The tool_calls pipeline (client.py parsing -> crew.py execution ->
+    agent.py history) has crashed repeatedly with
+    `AttributeError: 'str' object has no attribute 'get'` because
+    providers (and old history/cassettes) can hand us strings, None,
+    ints, partial dicts, or dicts whose ``function`` is a JSON string
+    instead of an object. Every creation site and every iteration site
+    must run values through this function and skip None results.
+
+    Returns ``{"id": str, "type": "function",
+    "function": {"name": str, "arguments": str}}`` or None when the
+    value is unrecoverable (not a dict at all, or no usable function).
+    ``arguments`` is always returned as a JSON string — a dict/list
+    value is json.dumps-ed so downstream ``fn["arguments"]`` handling
+    sees one canonical shape.
+    """
+    if not isinstance(tc, dict):
+        return None
+    raw_fn = tc.get("function")
+    if isinstance(raw_fn, str):
+        # Some providers serialise the whole function object as a JSON
+        # string: {"function": "{\\"name\\": \\"read\\", ...}"}. Parse it;
+        # if it is not JSON, treat the string itself as the tool name
+        # (e.g. {"function": "read"}) rather than dropping the call.
+        try:
+            parsed = json.loads(raw_fn)
+            raw_fn = parsed if isinstance(parsed, dict) else {
+                "name": raw_fn, "arguments": "{}"}
+        except (ValueError, TypeError):
+            raw_fn = {"name": raw_fn, "arguments": "{}"}
+    if not isinstance(raw_fn, dict):
+        return None
+    name = raw_fn.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+    args = raw_fn.get("arguments", "")
+    if isinstance(args, str):
+        arguments = args
+    else:
+        try:
+            arguments = json.dumps(args, ensure_ascii=False)
+        except (TypeError, ValueError):
+            arguments = str(args)
+    tc_id = tc.get("id")
+    if not isinstance(tc_id, str) or not tc_id:
+        _tc_fallback_seq[0] += 1
+        tc_id = f"call_auto_{_tc_fallback_seq[0]}"
+    return {"id": tc_id,
+            "type": "function",
+            "function": {"name": name, "arguments": arguments}}
+
+
+def _coerce_token_count(value: Any) -> int:
+    """Coerce one usage value to a non-negative int. Never raises.
+
+    Accepts ints (incl. bools), floats (truncated toward zero), and
+    numeric strings ("42", "3.7", " 12 "). Anything else — None,
+    garbage strings, inf/nan, containers — yields 0. Note: the central
+    typeguards.ensure_int deliberately does NOT coerce strings/floats,
+    so usage counting carries its own coercion here.
+    """
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, float):
+        try:
+            return max(0, int(value))
+        except (OverflowError, ValueError):
+            return 0
+    if isinstance(value, str):
+        s = value.strip()
+        if s:
+            try:
+                return max(0, int(s))
+            except (ValueError, OverflowError):
+                try:
+                    return max(0, int(float(s)))
+                except (ValueError, OverflowError):
+                    pass
+    return 0
+
+
+def safe_token_counts(usage: Any) -> tuple[int, int]:
+    """Safely extract (prompt_tokens, completion_tokens) from ANY usage shape.
+
+    Providers are inconsistent: usage may be a dict, None, a raw string,
+    a number, or a malformed dict (string/None values, unexpected keys).
+    This function never raises and always returns non-negative ints.
+    Also honours the Anthropic-style input_tokens/output_tokens aliases.
+    """
+    usage = _typeguards.ensure_dict(usage)
+    if not usage:
+        return (0, 0)
+    prompt = None
+    for key in ("prompt_tokens", "input_tokens"):
+        if key in usage:
+            prompt = usage[key]
+            break
+    completion = None
+    for key in ("completion_tokens", "output_tokens"):
+        if key in usage:
+            completion = usage[key]
+            break
+    return (_coerce_token_count(prompt), _coerce_token_count(completion))
+
+
+def usage_tokens(usage: Any) -> tuple[int, int]:
+    """Historical name for safe_token_counts (kept: tests and older
+    call sites import it)."""
+    return safe_token_counts(usage)
+
 
 def assistant_message(content: str | None, tool_calls: list[dict],
                       reasoning: str = "") -> dict:
@@ -233,17 +386,54 @@ def assistant_message(content: str | None, tool_calls: list[dict],
     # model that spent the budget on thinking is a legitimate reply, not the
     # same as "no content at all". Using truthiness here was turning real
     # "" / " " replies into None and corrupting conversation history.
-    msg["content"] = content if content is not None else None
-    if tool_calls:
-        msg["tool_calls"] = tool_calls
+    # HARDEN (malformed-provider audit): content / tool_calls / reasoning
+    # can arrive as dicts, lists, or bare strings from sloppy providers —
+    # storing them raw lets a downstream tc.get() / str op raise
+    # AttributeError: 'str' object has no attribute ... . Coerce every
+    # input; this function never raises.
+    if content is None:
+        msg["content"] = None
+    elif isinstance(content, str):
+        msg["content"] = content
+    elif isinstance(content, (dict, list)):
+        try:
+            msg["content"] = json.dumps(content, ensure_ascii=False)
+        except (TypeError, ValueError):
+            msg["content"] = str(content)
+    else:
+        msg["content"] = _typeguards.ensure_str(content)
+    # Only real dict tool calls survive: strings/scalars are dropped, a
+    # bare dict becomes a one-element list, [1, 2, "x"] yields [].
+    calls: list[dict] = []
+    _tcs = [tool_calls] if isinstance(tool_calls, dict) else tool_calls
+    if isinstance(_tcs, (list, tuple)):
+        for tc in _tcs:
+            # One canonical shape: full normalization, not just a dict
+            # check — {"function": "name-string"} would sail past
+            # isinstance() and crash fn.get("name") downstream with
+            # AttributeError: 'str' object has no attribute 'get'.
+            norm = normalize_tool_call(tc)
+            if norm is not None:
+                calls.append(norm)
+    if calls:
+        msg["tool_calls"] = calls
     # Always carry reasoning_content when reasoning exists OR when the
     # turn carried tool_calls (history validation requires it).  Set
     # both keys for maximum provider compatibility.
-    if reasoning:
-        msg["reasoning_content"] = reasoning
+    _rs = reasoning
+    if _rs is not None and not isinstance(_rs, str):
+        if isinstance(_rs, (dict, list)):
+            try:
+                _rs = json.dumps(_rs, ensure_ascii=False)
+            except (TypeError, ValueError):
+                _rs = str(_rs)
+        else:
+            _rs = _typeguards.ensure_str(_rs)
+    if _rs:
+        msg["reasoning_content"] = _rs
         # some providers also accept "reasoning"
-        msg["reasoning"] = reasoning
-    elif tool_calls:
+        msg["reasoning"] = _rs
+    elif calls:
         msg["reasoning_content"] = ""
     return msg
 
@@ -253,13 +443,32 @@ def _sanitize_messages(messages: list[dict]) -> bool:
 
     Mutates `messages` in place: any assistant message with tool_calls
     that lacks reasoning_content/reasoning gets an empty
-    reasoning_content. Returns True if anything was fixed.
+    reasoning_content. Every assistant tool_call is also run through
+    normalize_tool_call so malformed history entries (restored from
+    stale session JSON, old cassettes, provider quirks) can never reach
+    the wire — one bad entry would otherwise become a provider 400 or
+    an AttributeError downstream. Returns True if anything was fixed.
 
     Note: an existing empty string ("") counts as present — the
     provider only requires the field to exist, not to be non-empty.
     """
     fixed = False
     for m in messages:
+        if not isinstance(m, dict):
+            continue
+        tcs = m.get("tool_calls")
+        if tcs:
+            normed = [c for c in (normalize_tool_call(tc) for tc
+                                  in (tcs if isinstance(tcs, (list, tuple))
+                                      else [tcs]))
+                      if c is not None]
+            if len(normed) != (len(tcs) if isinstance(tcs, (list, tuple))
+                               else 1):
+                fixed = True
+            if normed:
+                m["tool_calls"] = normed
+            else:
+                m.pop("tool_calls", None)
         if m.get("role") == "assistant" and m.get("tool_calls"):
             has_rc = m.get("reasoning_content") is not None
             has_r = m.get("reasoning") is not None
@@ -745,9 +954,17 @@ def _iter_sse_events(resp: requests.Response) -> Iterator[dict]:
         if text == "[DONE]":
             return "done"
         try:
-            return json.loads(text)
+            parsed = json.loads(text)
         except ValueError:
             return None
+        # Provider boundary: a JSON array/string/number is a valid JSON
+        # value but not a valid SSE event object.  The declared
+        # Iterator[dict] contract promises dicts — yielding a non-dict
+        # would hand it to every consumer as if it were an event object.
+        # Drop it here instead of crashing downstream.
+        if not isinstance(parsed, dict):
+            return None
+        return parsed
 
     for raw in resp.iter_lines():
         line = raw.decode("utf-8", errors="replace")
@@ -919,6 +1136,72 @@ def _extract_error_message(body: str) -> str:
     return body[:500]
 
 
+def _error_obj_message(err: Any) -> str:
+    """Coerce an already-parsed ``error`` payload to a string. Never raises.
+
+    Providers send the error as a dict ({"message": ...}), a bare string,
+    or occasionally some other shape (a list, a number). Every
+    error-handling site funnels through here so APIError always carries
+    a str message — no shape can leak through and crash str formatting
+    or .lower() calls downstream."""
+    if isinstance(err, dict):
+        return str(err.get("message") or err)
+    if isinstance(err, str):
+        return err
+    return str(err)
+
+
+def _strict_str(value: Any) -> str:
+    """str-or-empty: keep real strings, map every other shape to "".
+
+    Stricter than _typeguards.ensure_str (which str()-ifies ints: 5 ->
+    "5"): a non-string content/reasoning/model/finish_reason is
+    provider junk, and surfacing it as "123" would corrupt display,
+    history and downstream string ops. Never raises."""
+    return value if isinstance(value, str) else ""
+
+
+def _coerce_text(value: Any) -> str:
+    """Coerce any content/reasoning shape to str. Never raises.
+
+    Plain strings pass through; Anthropic-style content blocks
+    ([{"type": "text", "text": "hi"}]) are joined on their text parts;
+    every other shape (None, int, dict, ...) becomes "". Providers
+    (kios/kilo/opencode gateways) have all been observed sending
+    non-string content."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        texts = []
+        for item in value:
+            if isinstance(item, str):
+                texts.append(item)
+            elif isinstance(item, dict):
+                t = item.get("text")
+                if isinstance(t, str):
+                    texts.append(t)
+        return "".join(texts)
+    return ""
+
+
+def _coerce_arguments(value: Any) -> str:
+    """Coerce any tool-call arguments shape to a JSON string. Never raises.
+
+    Downstream parse_tool_arguments() does json.loads on this, so a
+    dict/list value is json.dumps-ed (str() would produce a Python repr
+    with single quotes, which json.loads rejects)."""
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(value)
+    return str(value)
+
+
 # -- context-overflow detection + self-healing ------------------------------
 # Backends reject a request outright when input + max_tokens exceeds the
 # context window, and the error message carries the REAL token counts
@@ -995,13 +1278,15 @@ def _fit_max_tokens_from_actual(model: Model, info: dict,
 
 def _learn_from_usage(usage: dict | None, sent_chars: int,
                      model_id: str = "") -> None:
-    """Calibrate the chars/token estimator with the backend's real count."""
+    """Calibrate the chars/token estimator with the backend's real count.
+
+    Delegates to safe_token_counts: a non-dict usage (string/int from a
+    sloppy provider) used to raise AttributeError on usage.get() here,
+    which the old try/except did not catch.
+    """
     if not usage:
         return
-    try:
-        prompt_tokens = int(usage.get("prompt_tokens") or 0)
-    except (TypeError, ValueError):
-        return
+    prompt_tokens, _ = safe_token_counts(usage)
     if prompt_tokens > 0 and sent_chars > 0:
         learn_token_ratio(sent_chars, prompt_tokens, model_id)
 
@@ -1379,6 +1664,15 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
         return r
     resp = run_cancellable(_send, should_cancel, name="model request")
 
+    # The stop event is created BEFORE the try so the finally below can
+    # always stop the background stall-timer thread — an exception out
+    # of the event loop (SSE-embedded error event, Esc cancel, stall
+    # timeout, mid-stream disconnect) used to leak the daemon thread,
+    # which then kept firing on_status/on_reasoning callbacks on a dead
+    # stream every 5s.
+    import threading as _th
+    _stall_stop = _th.Event()
+
     try:
         ctype = (resp.headers.get("Content-Type") or "").lower()
         if "text/event-stream" not in ctype:
@@ -1417,8 +1711,8 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
         # The stall check MUST run on a background timer, not inside the
         # event loop — if the stream stalls (no events), the loop never
         # iterates and the check never fires. This was the 140s bug.
-        import threading as _th
-        _stall_stop = _th.Event()
+        # (_stall_stop is created before the try; the finally stops it on
+        # every exit path.)
 
         def _stall_check() -> None:
             warning = stall.check()
@@ -1446,25 +1740,39 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
             warning = stall.check()
             if warning is None:
                 return
+            # Same never-crash rule as the background _stall_check above:
+            # a raising user callback must not kill the stream loop.
             if on_status is not None:
-                on_status(warning)
+                try:
+                    on_status(warning)
+                except Exception:
+                    pass
             elif on_reasoning is not None:
                 # fallback so direct client users (no on_status) still see
                 # it: on_reasoning is the existing dim-notice path. Via the
                 # retry wrapper this also marks emitted["out"] — intended:
                 # the user has seen activity, so a later failure must not
                 # retry-and-replay on top of it.
-                on_reasoning(warning)
+                try:
+                    on_reasoning(warning)
+                except Exception:
+                    pass
 
         for event in events:
             _stall_check_inline()
             if should_cancel is not None and should_cancel():
                 _stall_stop.set()
                 raise TurnCancelled()
-            if not isinstance(event, dict):
-                continue
+            # Provider boundary (typeguards): the loop assumes a dict
+            # everywhere below — a malformed event (string, JSON array,
+            # keepalive sentinel) becomes {} and is skipped downstream
+            # instead of crashing on .get().
+            event = _typeguards.ensure_dict(event)
             if event.get("model"):
-                result.model = event["model"]
+                # HARDEN: model must stay a str — a non-str model
+                # (int/dict from a sloppy provider) would violate the
+                # StreamResult field type (no normalize() backstop here).
+                result.model = _typeguards.ensure_str(event["model"])
             if event.get("usage"):
                 # Some providers return usage as a string or malformed type.
                 # Only accept dicts to prevent AttributeError downstream.
@@ -1473,25 +1781,43 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
                     result.usage = _u
             if event.get("error"):
                 err = event["error"]
-                msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                # HARDEN: message may be missing or a non-str (dict/list
+                # from a sloppy provider) — APIError must get a real str.
+                _raw_msg = err.get("message") if isinstance(err, dict) else err
+                msg = (_raw_msg if isinstance(_raw_msg, str) and _raw_msg
+                       else str(err))
                 raise APIError(msg, status=_sse_error_status(err))
-            choices = event.get("choices") or []
+            # HARDEN: choices may be a string or other non-list shape —
+            # indexing a string yields a str whose .get() raises
+            # AttributeError (the reported subagent crash). Coerce every
+            # level; a malformed entry is skipped, never fatal.
+            choices = _typeguards.ensure_list(event.get("choices"))
             if not choices:
                 continue
-            choice = choices[0]
-            delta = choice.get("delta") or {}
+            choice = _typeguards.ensure_dict(choices[0])
+            if not choice:
+                continue
+            delta = _typeguards.ensure_dict(choice.get("delta"))
 
             if choice.get("finish_reason"):
-                result.finish_reason = choice["finish_reason"]
+                _fr = choice["finish_reason"]
+                result.finish_reason = (None if _fr is None
+                                        else _typeguards.ensure_str(_fr))
 
-            piece = delta.get("content")
+            # HARDEN: content may arrive as blocks (list/dict) where a
+            # str was assumed — a non-str would raise TypeError at
+            # "".join(content_parts) below.
+            piece = _typeguards.ensure_str(delta.get("content"))
             if piece:
                 content_parts.append(piece)
                 stall.token_received()  # visible token — reset stall timer
                 if on_token:
                     on_token(piece)
 
-            reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+            # HARDEN: same str-only rule as content — a non-str would
+            # raise TypeError at "".join(reasoning_parts) below.
+            reasoning = _typeguards.ensure_str(delta.get("reasoning_content")
+                                               or delta.get("reasoning"))
             if reasoning:
                 reasoning_parts.append(reasoning)
                 # NB: reasoning does NOT reset the stall timer — it is not
@@ -1500,24 +1826,70 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
                 if on_reasoning:
                     on_reasoning(reasoning)
 
-            for tc in delta.get("tool_calls") or []:
+            tool_calls_raw = delta.get("tool_calls")
+            # HARDEN: a string tool_calls would iterate char-by-char and
+            # crash on char.get(); only accept a list, and skip non-dict
+            # entries individually (never let one bad entry kill the turn).
+            if not isinstance(tool_calls_raw, list):
+                tool_calls_raw = []
+            for tc in tool_calls_raw:
+                if not isinstance(tc, dict):
+                    continue
                 idx = tc.get("index", 0)
+                # HARDEN: index may be a string/None; int() can raise —
+                # default to 0 so sorted(tc_acc) later can't TypeError on
+                # mixed-type keys.
+                try:
+                    idx = int(idx)
+                except (TypeError, ValueError, OverflowError):
+                    # OverflowError: int(float('inf')) from a sloppy
+                    # provider's {"index": 1e999}.
+                    idx = 0
                 acc = tc_acc.setdefault(idx, ToolCallDelta())
-                if tc.get("id"):
-                    acc.id = tc["id"]
-                fn = tc.get("function") or {}
+                _tc_id = tc.get("id")
+                # HARDEN: ToolCallDelta.id is declared str — only accept
+                # real non-empty strings.
+                if isinstance(_tc_id, str) and _tc_id:
+                    acc.id = _tc_id
+                fn = tc.get("function")
+                # HARDEN: function as a string would crash fn.get below.
+                if not isinstance(fn, dict):
+                    fn = {}
                 if fn.get("name"):
-                    acc.name_parts.append(fn["name"])
-                    stall.token_received()  # visible activity
-                    if idx not in announced_tools and on_tool_start:
-                        announced_tools.add(idx)
-                        on_tool_start(acc.name)
+                    # HARDEN: a tool name must be a str — a non-str name
+                    # (int/dict from a sloppy provider) is dropped instead
+                    # of polluting the accumulated name (it could never
+                    # dispatch to a real tool anyway).
+                    _name = fn["name"]
+                    if isinstance(_name, str) and _name:
+                        acc.name_parts.append(_name)
+                        stall.token_received()  # visible activity
+                        if idx not in announced_tools and on_tool_start:
+                            announced_tools.add(idx)
+                            on_tool_start(acc.name)
                 if fn.get("arguments"):
-                    acc.arguments_parts.append(fn["arguments"])
+                    _args = fn["arguments"]
+                    if isinstance(_args, str):
+                        pass
+                    elif isinstance(_args, (dict, list)):
+                        # json.dumps, not str(): downstream parses this
+                        # as JSON — a Python repr would be unparseable.
+                        try:
+                            _args = json.dumps(_args, ensure_ascii=False)
+                        except (TypeError, ValueError):
+                            _args = str(_args)
+                    else:
+                        _args = str(_args)
+                    acc.arguments_parts.append(_args)
                     stall.token_received()  # visible activity
                     if on_tool_args:
-                        on_tool_args(acc.name, fn["arguments"])
+                        on_tool_args(acc.name, _args)
     finally:
+        # Stop the stall timer on EVERY exit path (normal return, error
+        # event, cancel, stall timeout, disconnect) — without this an
+        # exception out of the loop leaked the daemon thread, which kept
+        # firing on_status/on_reasoning callbacks on a dead stream.
+        _stall_stop.set()
         resp.close()
 
     result.content = "".join(content_parts)
@@ -1525,13 +1897,18 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
 
     for idx in sorted(tc_acc):
         acc = tc_acc[idx]
+        # HARDEN: a nameless accumulated call can never dispatch to a
+        # real tool — drop it instead of emitting {"name": ""}, which
+        # only wastes a turn on a bogus "tool '' not available" call.
+        if not acc.name:
+            continue
         result.tool_calls.append({
             "id": acc.id or f"call_{idx}",
             "type": "function",
             "function": {"name": acc.name, "arguments": acc.arguments},
         })
 
-    _stall_stop.set()  # stop the background stall timer
+    # Post-loop: the stall timer is stopped by the finally above.
     return result
 
 
@@ -1541,32 +1918,67 @@ def _result_from_json(data: dict, model_id: str) -> StreamResult:
     # Providers occasionally return a JSON array/string instead of the
     # chat.completion object — without this guard `data.get` raises a raw
     # AttributeError that bypasses every error handler upstream.
+    # Provider boundary (typeguards): central entry guard; the explicit
+    # shape check keeps the APIError contract for non-dict payloads.
     if not isinstance(data, dict):
         raise APIError(
             f"provider returned unexpected JSON shape "
             f"({type(data).__name__}): {str(data)[:200]}")
-    result = StreamResult(model=data.get("model", model_id),
-                          usage=(data.get("usage") if isinstance(
-                              data.get("usage"), dict) else None))
-    choices = data.get("choices") or []
-    if choices:
-        msg = choices[0].get("message") or {}
-        result.content = msg.get("content") or ""
-        result.reasoning = (msg.get("reasoning_content")
-                            or msg.get("reasoning") or "")
-        result.finish_reason = choices[0].get("finish_reason")
-        for tc in msg.get("tool_calls") or []:
-            if not isinstance(tc, dict):
-                continue  # skip malformed tool calls
-            fn = tc.get("function") or {}
-            if not isinstance(fn, dict):
-                fn = {}
-            result.tool_calls.append({
-                "id": tc.get("id", "call_0"),
-                "type": "function",
-                "function": {"name": fn.get("name", ""),
-                             "arguments": fn.get("arguments", "")},
-            })
+    data = _typeguards.ensure_dict(data)
+    # HARDEN (provider shapes): some gateways (kilo/opencode-class) return
+    # HTTP 200 with an error ENVELOPE — {"error": {"message": ...,
+    # "code": 429}} or {"error": "bare string"} — instead of an error
+    # status. Without this check the error silently becomes an EMPTY
+    # StreamResult (content="", no tool calls) and the agent loops on
+    # ghost turns. Every error shape is normalized to a clean APIError
+    # with a string message, same contract as the streaming event path.
+    if data.get("error"):
+        err = data["error"]
+        raise APIError(_error_obj_message(err),
+                       status=_sse_error_status(err))
+    result = StreamResult(
+        model=(_strict_str(data.get("model"))
+               or _typeguards.ensure_str(model_id)),
+        usage=(data.get("usage") if isinstance(
+            data.get("usage"), dict) else None))
+    # HARDEN: choices may be a string ("gateway blew up"), a single dict,
+    # or a list containing non-dicts — indexing a string yields a str
+    # whose .get() raises AttributeError: 'str' object has no attribute
+    # 'get' (the reported subagent crash). Coerce every level; malformed
+    # entries are skipped, never fatal.
+    raw_choices = data.get("choices")
+    if isinstance(raw_choices, dict):
+        # some gateways send a single choice object instead of a list
+        raw_choices = [raw_choices]
+    choices = _typeguards.ensure_list(raw_choices)
+    choice = choices[0] if choices else None
+    choice = choice if isinstance(choice, dict) else {}
+    if choice:
+        # HARDEN: message may itself be a string ("just a string") —
+        # .get() on it would raise AttributeError the same way.
+        msg = choice.get("message")
+        msg = msg if isinstance(msg, dict) else {}
+        # HARDEN: content as Anthropic-style blocks ([{"type": "text",
+        # "text": "hi"}]) or a bare int must never reach the str-typed
+        # field (TypeError downstream) — blocks join on text parts.
+        result.content = _coerce_text(msg.get("content"))
+        result.reasoning = _coerce_text(msg.get("reasoning_content")
+                                       or msg.get("reasoning"))
+        # HARDEN: finish_reason as a non-str (int/dict from a sloppy
+        # provider) would violate the StreamResult field type — strict
+        # str-or-empty, matching StreamResult.normalize().
+        _fr = choice.get("finish_reason")
+        result.finish_reason = (None if _fr is None else _strict_str(_fr))
+        # Canonical tool-call normalization: strings/None/ints are
+        # dropped, function-as-JSON-string is parsed, dict arguments
+        # become JSON strings, missing ids get unique fallbacks, and
+        # nameless entries are dropped. One helper, one shape — a
+        # malformed entry must never reach the turn loop as a raw dict
+        # (AttributeError: 'str' object has no attribute ...).
+        for tc in _typeguards.ensure_list(msg.get("tool_calls")):
+            norm = normalize_tool_call(tc)
+            if norm is not None:
+                result.tool_calls.append(norm)
     return result
 
 

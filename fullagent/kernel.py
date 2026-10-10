@@ -643,8 +643,22 @@ class EventLog:
         The causal envelope (§7.1) makes every event attributable:
         causation_id = the event that directly caused this one,
         correlation_id = the goal clause this ultimately serves.
+
+        The payload is ALWAYS sealed as a dict: a non-dict (or a
+        non-JSON value nested inside) is coerced instead of rejected,
+        because every downstream consumer — the TUI panel, the
+        dashboard fold, report/evolution/theater reads, the notifier —
+        calls ``ev.data.get(...)`` and a single string payload would
+        crash them all with ``AttributeError: 'str' object has no
+        attribute 'get'``.
         """
-        data = data or {}
+        if data is None:
+            data = {}
+        elif not isinstance(data, dict):
+            # Never seal a non-dict payload: keep the information in
+            # _raw instead of letting a malformed emitter poison the
+            # log for every consumer.
+            data = {"_raw": data}
         with self._lock:
             br = branch or self.branch
             parent_id = self._heads.get(br)

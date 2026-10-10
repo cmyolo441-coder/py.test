@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import itertools
+import json
 import threading
 import time
 from typing import Callable
@@ -51,11 +52,17 @@ _log = get_logger("crew")
 from dataclasses import dataclass, field
 
 from . import systemprompt
-from .config import PROVIDERS, model_by_id
+from .config import PROVIDERS, model_by_id, DEFAULT_MODEL_ID
 from .kernel import EventLog, fold
 from .team import (ROLES, DEFAULT_ROLE, MAX_WORKER_STEPS,
                    _WRITE_LOCK, chat_with_retry, parse_worker_final)
 from .tools import Tool, build_registry, parse_tool_arguments
+# Type guards for every provider/data boundary (deep-reliability audit):
+# custom chat callables and provider results are untrusted — a usage
+# string, a tool_calls list containing strings, or a non-str content
+# must never crash the agent loop with AttributeError.
+from .typeguard import ensure_dict, ensure_int, ensure_list, ensure_str
+from . import typeguards as _typeguards  # central provider-boundary guards
 
 MAX_AGENTS = 10            # default pool size / roster ceiling
 MAX_SEND_STEPS = 40        # tool-loop budget per follow-up message
@@ -74,6 +81,150 @@ _ROLE_ICON = {"researcher": "🔎", "coder": "👨‍💻", "tester": "🧪",
               "debugger": "🐞", "optimizer": "⚡", "refactorer": "🧹",
               "documenter": "📝", "devops": "🛠️", "integrator": "🔗",
               "planner": "🗺️"}
+
+
+# -- defensive serialization helpers -----------------------------------------
+# CrewAgent.to_dict() runs inside exception handlers (crew.done logging).
+# If to_dict itself raises on a malformed field, it masks the real error
+# and breaks error reporting. Every helper below coerces and NEVER raises.
+
+
+def _safe_str(value, limit: int = 0) -> str:
+    """Best-effort str coercion with an optional length cap. Never raises."""
+    try:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            s = value
+        elif isinstance(value, (bytes, bytearray)):
+            s = value.decode("utf-8", "replace")
+        else:
+            s = str(value)
+    except Exception:
+        return ""
+    if limit and len(s) > limit:
+        s = s[:limit]
+    return s
+
+
+def _safe_int(value) -> int:
+    """Best-effort int coercion ("10" -> 10). Never raises."""
+    try:
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, str):
+            return int(float(value.strip()))
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _safe_files(value) -> list:
+    """Coerce files_touched to a list of short strings. Never raises."""
+    try:
+        if value is None:
+            return []
+        if isinstance(value, (str, bytes)):
+            items = [value]
+        else:
+            items = list(value)  # TypeError for non-iterables -> below
+    except TypeError:
+        items = [value]
+    except Exception:
+        return []
+    out = []
+    for item in items[:12]:
+        s = _safe_str(item, 200)
+        if s:
+            out.append(s)
+    return out
+
+
+def _safe_len(value) -> int:
+    """Best-effort len() for a container that may be junk. Never raises."""
+    try:
+        return max(0, int(len(value)))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+_tc_id_counter = itertools.count(1)
+
+
+def _normalize_tool_call(tc):
+    """Canonicalize ANY value into an OpenAI-style tool_call dict.
+
+    isinstance guards only — never raises. Returns
+    ``{"id": str, "type": "function",
+      "function": {"name": str, "arguments": str}}``
+    or None when the value is unrecoverable (not a dict at all, or no
+    usable function name). String / None / int entries and partial
+    dicts — the shapes that used to crash the loop as
+    ``AttributeError: 'str' object has no attribute 'get'`` — are
+    skipped by the caller via the None return.
+
+    (client.normalize_tool_call no longer exists in client.py; the
+    crew keeps this local copy so the _run_loop sanitize step keeps
+    working. Idempotent: feeding its own output back returns an
+    equal dict.)
+    """
+    if not isinstance(tc, dict):
+        return None
+    fn = tc.get("function")
+    if isinstance(fn, str):
+        # Some providers serialise the whole function object as a JSON
+        # string. Parse it; a non-JSON string is the tool name itself.
+        try:
+            parsed = json.loads(fn)
+            fn = parsed if isinstance(parsed, dict) else {
+                "name": fn, "arguments": "{}"}
+        except (ValueError, TypeError):
+            fn = {"name": fn, "arguments": "{}"}
+    if not isinstance(fn, dict):
+        return None
+    name = fn.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+    args = fn.get("arguments", "")
+    if isinstance(args, str):
+        arguments = args
+    elif isinstance(args, (dict, list)):
+        try:
+            arguments = json.dumps(args, ensure_ascii=False)
+        except (TypeError, ValueError):
+            arguments = str(args)
+    else:
+        arguments = "" if args is None else str(args)
+    tc_id = tc.get("id")
+    if not isinstance(tc_id, str) or not tc_id:
+        tc_id = f"call_auto_{next(_tc_id_counter)}"
+    return {"id": tc_id, "type": "function",
+            "function": {"name": name, "arguments": arguments}}
+
+
+def _usage_pair(usage) -> tuple:
+    """(prompt_tokens, completion_tokens) from ANY usage shape.
+
+    Providers are inconsistent: usage may be a dict, None, a raw
+    string, or a malformed dict. Never raises; returns (0, 0) for
+    anything unusable. (Replaces the client.usage_tokens /
+    safe_token_counts imports that no longer exist in client.py.)"""
+    try:
+        if isinstance(usage, dict):
+            return (max(0, int(usage.get("prompt_tokens") or 0)),
+                    max(0, int(usage.get("completion_tokens") or 0)))
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return (0, 0)
+
+
+def _safe_elapsed_ms(agent) -> int:
+    """elapsed_ms that survives malformed finished_at/spawned_at. Never raises."""
+    try:
+        end = agent.finished_at or time.time()
+        return max(0, int((float(end) - float(agent.spawned_at)) * 1000))
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 @dataclass
@@ -122,31 +273,127 @@ class CrewAgent:
     # Worse: the `pending_messages` list is shared, so a `pop(0)` from
     # the worker interleaves with a sovereign `append`, silently losing
     # follow-ups.
-    mutex: threading.RLock = field(default_factory=threading.RLock)
+    # repr=False / compare=False like stop_event above: a lock's repr is
+    # noise in logs and lock-identity must never decide agent equality.
+    mutex: threading.RLock = field(default_factory=threading.RLock,
+                                   repr=False, compare=False)
 
     @property
     def icon(self) -> str:
-        return _ROLE_ICON.get(self.role, "◆")
+        """Role icon for status lines. NEVER raises: role may be any
+        junk (non-string, or an unhashable type like a list — dict.get
+        would raise TypeError on those), so the lookup is guarded and
+        falls back to the generic ◆."""
+        try:
+            return _ROLE_ICON.get(self.role, "◆")
+        except TypeError:
+            # unhashable role (list/dict/set) — no icon, no crash
+            return "◆"
 
     @property
     def elapsed_ms(self) -> int:
-        end = self.finished_at or time.time()
-        return int((end - self.spawned_at) * 1000)
+        return _safe_elapsed_ms(self)
 
     def to_dict(self) -> dict:
-        return {"id": self.id, "nickname": self.nickname, "role": self.role,
-                "task": self.task, "state": self.state,
-                "model": self.model_id,
-                "summary": self.summary[:600], "error": self.error[:300],
-                "files_touched": self.files_touched[:12],
-                "tool_calls": self.tool_calls,
-                "tokens_in": self.tokens_in, "tokens_out": self.tokens_out,
-                "elapsed_ms": self.elapsed_ms}
+        """Serialize for crew.done logging. NEVER raises: this runs in
+        exception handlers, so every field is coerced defensively — a
+        crash here would mask the real error being reported.
+
+        Defensive: every value is coerced to its contract type. A
+        summary/error that is None or a non-string (an exception
+        object, a leftover from a botched assignment) would otherwise
+        poison the sealed crew.done event — ``self.summary[:600]``
+        raises TypeError on None, and a non-str error breaks every
+        consumer that calls ``data["error"]``-style string ops.
+        files_touched must be a list of strings. The traceback is
+        capped (it can be 100k+ chars of junk) and messages are
+        reduced to a count — the full history is too large for the
+        sealed event and may contain non-dict entries."""
+        try:
+            return {"id": _safe_str(self.id),
+                    "nickname": _safe_str(self.nickname),
+                    "role": _safe_str(self.role),
+                    "task": _safe_str(self.task, 2000),
+                    "state": _safe_str(self.state),
+                    "model": _safe_str(self.model_id),
+                    "summary": _safe_str(self.summary, 600),
+                    "error": _safe_str(self.error),
+                    "traceback": _safe_str(self.traceback, 4000),
+                    "files_touched": _safe_files(self.files_touched),
+                    "tool_calls": _safe_int(self.tool_calls),
+                    "tokens_in": _safe_int(self.tokens_in),
+                    "tokens_out": _safe_int(self.tokens_out),
+                    "message_count": _safe_len(self.messages),
+                    "elapsed_ms": _safe_elapsed_ms(self)}
+        except Exception:
+            # absolute last resort — a minimal dict rather than
+            # propagating and masking the caller's real exception
+            try:
+                return {"id": _safe_str(getattr(self, "id", "")),
+                        "nickname": "", "role": "", "task": "",
+                        "state": "error", "model": "",
+                        "summary": "", "error": "to_dict failed",
+                        "traceback": "", "files_touched": [],
+                        "tool_calls": 0, "tokens_in": 0, "tokens_out": 0,
+                        "message_count": 0, "elapsed_ms": 0}
+            except Exception:
+                return {"id": "", "state": "error"}
 
 
 class CrewError(RuntimeError):
     """Raised for invalid lifecycle operations (unknown id, spawn at
     capacity, send to a closed agent)."""
+
+
+def _validate_spawn_args(task, role, name, context, read_only,
+                         model_id) -> dict:
+    """Validate + normalise spawn()/spawn_parallel() arguments.
+
+    Raises CrewError with a clear message on wrong-typed input instead
+    of letting a bad value sail through and explode later as a
+    confusing AttributeError/TypeError on a pool thread. Rejected
+    examples: a dict task silently becoming the task text "{'a': 1}",
+    a list role crashing `role not in ROLES` with "unhashable type",
+    a dict name becoming the nickname "{'n': 1}".
+
+    None means "absent" for the optional fields (name/context/
+    model_id); read_only is coerced with bool(). Unknown *string*
+    roles still fall back to DEFAULT_ROLE — that is the documented
+    behaviour custom agent types rely on (see agenttypes.py); only
+    non-string roles are rejected.
+    """
+    if task is None:
+        raise CrewError("cannot spawn a subagent without a task")
+    if not isinstance(task, str):
+        raise CrewError(
+            f"spawn task must be a string, got {type(task).__name__}")
+    task = task.strip()
+    if not task:
+        raise CrewError("cannot spawn a subagent without a task")
+    if not isinstance(role, str):
+        raise CrewError(
+            f"spawn role must be a string, got {type(role).__name__}")
+    if role not in ROLES:
+        role = DEFAULT_ROLE
+    if name is None:
+        name = ""
+    if not isinstance(name, str):
+        raise CrewError(
+            f"spawn name must be a string, got {type(name).__name__}")
+    if context is None:
+        context = ""
+    if not isinstance(context, str):
+        raise CrewError(
+            f"spawn context must be a string, got {type(context).__name__}")
+    if model_id is None:
+        model_id = ""
+    if not isinstance(model_id, str):
+        raise CrewError(
+            f"spawn model_id must be a string, got "
+            f"{type(model_id).__name__}")
+    return {"task": task, "role": role, "name": name.strip(),
+            "context": context, "read_only": bool(read_only),
+            "model_id": model_id.strip()}
 
 
 class Crew:
@@ -170,22 +417,46 @@ class Crew:
         self.provider = provider
         self.model = model
         self.effort = effort
+        # Spawn-path type guards (fail fast HERE, not as a bare
+        # AttributeError inside spawn() or on a pool thread):
+        #   * mastermind must be None or expose gate.dispatch() — a str
+        #     or other junk here used to die as
+        #     AttributeError: 'str' object has no attribute 'gate'.
+        #   * log must accept .append() — spawn() seals crew.spawn
+        #     before the pool ever runs.
+        #   * the chat override must be callable — a non-callable used
+        #     to surface as TypeError deep inside the worker loop.
+        if mastermind is not None:
+            _gate = getattr(mastermind, "gate", None)
+            if _gate is None or not callable(
+                    getattr(_gate, "dispatch", None)):
+                raise CrewError(
+                    "Crew mastermind must be None or expose "
+                    "gate.dispatch(), got "
+                    f"{type(mastermind).__name__}")
+        if not callable(getattr(log, "append", None)):
+            raise CrewError(
+                "Crew log must expose append(), got "
+                f"{type(log).__name__}")
         self.mastermind = mastermind
         self.max_agents = max(1, int(max_agents))
         self._chat = chat or chat_with_retry
+        if not callable(self._chat):
+            raise CrewError(
+                "Crew chat must be callable, got "
+                f"{type(self._chat).__name__}")
         # CANCEL: Esc sets each agent's stop_event (via force_stop), but
         # the worker loop only checked it BETWEEN steps — a worker stuck
         # inside a blocking model call ignored it for up to `timeout`
         # seconds (and chat_with_retry's rate-limit backoff could add
-        # ~254s). Detect once whether the chat callable honours a
+        # ~254s). Detect whether the chat callable honours a
         # should_cancel kwarg; _run_loop passes the stop flag through.
-        import inspect as _inspect
-        try:
-            self._chat_takes_cancel = (
-                "should_cancel" in
-                _inspect.signature(self._chat).parameters)
-        except (TypeError, ValueError):
-            self._chat_takes_cancel = False
+        # Detection is callable-identity-cached (see
+        # _chat_accepts_cancel): re-computed whenever self._chat is
+        # swapped (tests monkeypatch it), and a **kwargs signature
+        # counts as accepting the kwarg — passing should_cancel to a
+        # callable that takes **kwargs is always safe.
+        self._chat_takes_cancel = self._chat_accepts_cancel()
         self._agents: dict[str, CrewAgent] = {}
         self._order: list[str] = []
         self._lock = threading.RLock()  # protects roster + _futures.
@@ -213,7 +484,84 @@ class Crew:
         self._futures: dict[str, concurrent.futures.Future] = {}
         self._shutdown = False
 
+    def _chat_accepts_cancel(self) -> bool:
+        """Whether self._chat can be called with should_cancel=....
+
+        Cached on the callable's identity, so swapping self._chat
+        (tests, hot-swapped providers) re-detects instead of reusing a
+        stale flag. A **kwargs parameter also counts: such callables
+        accept should_cancel without raising TypeError.
+        """
+        import inspect as _inspect
+        chat = self._chat
+        cached = getattr(self, "_chat_cancel_cache", None)
+        if cached is not None and cached[0] is chat:
+            return cached[1]
+        try:
+            params = _inspect.signature(chat).parameters.values()
+            ok = any(p.name == "should_cancel" or
+                     p.kind is _inspect.Parameter.VAR_KEYWORD
+                     for p in params)
+        except (TypeError, ValueError):
+            ok = False
+        self._chat_cancel_cache = (chat, ok)
+        self._chat_takes_cancel = ok
+        return ok
+
     # -- internal ---------------------------------------------------------------
+
+    # Expected keys per crew event type (contract the consumers —
+    # ParallelAgentsPanel, dashboard fold, evolution, report, theater,
+    # notifier — read via .get()). _emit() fills any that are missing
+    # with a sane default so a partially-built payload never makes a
+    # consumer crash on a missing key.
+    _EVENT_DEFAULTS: dict[str, dict] = {
+        "crew.spawn": {"id": "", "nickname": "", "role": "", "task": "",
+                       "read_only": False, "model": ""},
+        "crew.progress": {"id": "", "phase": "", "nickname": "", "role": "",
+                          "step": 0, "tools": []},
+        "crew.done": {"id": "", "nickname": "", "role": "", "task": "",
+                      "state": "", "model": "", "summary": "", "error": "",
+                      "traceback": "", "files_touched": [],
+                      "tool_calls": 0, "tokens_in": 0, "tokens_out": 0,
+                      "message_count": 0, "elapsed_ms": 0},
+        "crew.message": {"id": "", "chars": 0, "interrupt": False},
+        "crew.closed": {"id": "", "prev_state": ""},
+        "crew.resumed": {"id": ""},
+        "crew.force_stop": {"reason": "", "stopped": 0},
+    }
+
+    def _emit(self, type_: str, data: dict | None,
+              *, actor: str = "sovereign"):
+        """Seal one crew.* event after validating the payload.
+
+        Guarantees the event data is ALWAYS a dict carrying the keys
+        every consumer expects: a non-dict payload (a bug would seal a
+        bare string and crash every ``ev.data.get(...)`` reader with
+        ``AttributeError: 'str' object has no attribute 'get'``) is
+        wrapped as {"_raw": ...}, and missing contract keys are filled
+        from _EVENT_DEFAULTS. This is the only path crew.py uses to
+        seal crew.* events.
+        """
+        if not isinstance(data, dict):
+            data = {"_raw": data}
+        defaults = self._EVENT_DEFAULTS.get(type_)
+        if defaults:
+            for key, default in defaults.items():
+                data.setdefault(key, default)
+        # Value-shape hardening for the fields consumers iterate or
+        # join: a non-list "tools"/"files_touched" (or a non-string
+        # item inside) would blow up ", ".join / len() at render time.
+        tools = data.get("tools")
+        if tools is not None:
+            data["tools"] = ([str(t) for t in tools]
+                             if isinstance(tools, (list, tuple)) else [])
+        files = data.get("files_touched")
+        if files is not None:
+            data["files_touched"] = ([str(p) for p in files]
+                                     if isinstance(files, (list, tuple))
+                                     else [])
+        return self.log.append(type_, data, actor=actor)
 
     def _submit(self, agent: CrewAgent, read_only: bool,
                 max_steps: int, gen: int) -> bool:
@@ -222,6 +570,13 @@ class Crew:
         Returns False when the crew is shut down — the caller must then
         settle the agent itself; it must never be left "running" with no
         future behind it (wait() would hang to timeout on a ghost)."""
+        if not isinstance(agent, CrewAgent):
+            # Fail fast on the calling thread: a non-agent here would
+            # otherwise explode on a pool thread as
+            # AttributeError: 'str' object has no attribute 'id'.
+            raise CrewError(
+                "crew._submit requires a CrewAgent, got "
+                f"{type(agent).__name__}")
         with self._lock:
             if self._shutdown:
                 return False
@@ -233,6 +588,14 @@ class Crew:
                  max_steps: int, gen: int) -> None:
         """Pool entry point. Never raises: a crash here must not poison
         the pool or the other agents — it lands as an error report."""
+        if not isinstance(agent, CrewAgent):
+            # No agent to attach an error report to, and this entry
+            # point must never raise (it runs on a pool thread) — seal
+            # it in the log instead of dying as
+            # AttributeError: 'str' object has no attribute 'mutex'.
+            _log.error("crew._execute called with %s, not a CrewAgent — "
+                       "dropping the iteration", type(agent).__name__)
+            return
         try:
             with agent.mutex:
                 if gen != agent.generation:
@@ -256,11 +619,16 @@ class Crew:
                         # a newer iteration owns the state now
                         return
                     agent.state = "error"
-                    agent.error = f"{type(e).__name__}: {e}"
+                    # Exception class + message + failing-operation
+                    # context: a bare "AttributeError: ..." tells the
+                    # user WHAT but not WHERE in the crew pipeline.
+                    agent.error = (f"{type(e).__name__}: {e} "
+                                   "(unexpected failure outside the "
+                                   "subagent turn loop)")
                     # Store full traceback for /agents errors debugging
                     agent.traceback = _tb_str[-4000:]
                     agent.finished_at = time.time()
-                self.log.append("crew.done", agent.to_dict(),
+                self._emit("crew.done", agent.to_dict(),
                                 actor=f"crew:{agent.id}")
             except Exception:
                 pass
@@ -293,12 +661,15 @@ class Crew:
         ids fall back to the crew default with a sealed note.
 
         Raises CrewError when the crew is at capacity (max_agents
-        running) — fail fast, never silently queue."""
-        task = str(task or "").strip()
-        if not task:
-            raise CrewError("cannot spawn a subagent without a task")
-        if role not in ROLES:
-            role = DEFAULT_ROLE
+        running) — fail fast, never silently queue. Also raises
+        CrewError on wrong-typed arguments (non-string task/role/name/
+        context/model_id) instead of coercing them into garbage or
+        crashing later on a pool thread."""
+        args = _validate_spawn_args(task, role, name, context,
+                                    read_only, model_id)
+        task, role = args["task"], args["role"]
+        name, context = args["name"], args["context"]
+        read_only, model_id = args["read_only"], args["model_id"]
         # Build the opening conversation BEFORE touching the roster.
         # mastermind.dispatch() can raise — the old order left a
         # "running" agent registered that was never started, so wait()
@@ -306,13 +677,39 @@ class Crew:
         user = (f"Shared context:\n{context}\n\nYOUR TASK: {task}"
                 if context else f"YOUR TASK: {task}")
         opening: list[dict] = []
-        if self.mastermind is not None:
-            opening, _ = self.mastermind.gate.dispatch(
-                f"worker:{role}", opening)
-        else:
-            systemprompt.with_system(opening,
-                                     systemprompt.worker(role,
-                                                         self.max_agents))
+        try:
+            if self.mastermind is not None:
+                dispatched = self.mastermind.gate.dispatch(
+                    f"worker:{role}", opening)
+                # Contract: (messages, report). A custom/mocked gate
+                # returning None, a bare dict, or a non-list messages
+                # payload used to escape as a raw TypeError on unpack
+                # ("cannot unpack non-iterable NoneType") or as
+                # AttributeError on opening.append — both far from the
+                # real problem. Validate the shape and name it.
+                if (not isinstance(dispatched, (list, tuple))
+                        or len(dispatched) != 2):
+                    raise CrewError(
+                        "mastermind.gate.dispatch() must return "
+                        "(messages, report), got "
+                        f"{type(dispatched).__name__}")
+                opening = dispatched[0]
+                if (not isinstance(opening, list)
+                        or not all(isinstance(m, dict)
+                                   for m in opening)):
+                    raise CrewError(
+                        "mastermind.gate.dispatch() returned malformed "
+                        "messages — expected a list of dicts, got "
+                        f"{type(opening).__name__}")
+            else:
+                systemprompt.with_system(
+                    opening, systemprompt.worker(role, self.max_agents))
+        except CrewError:
+            raise
+        except Exception as e:  # noqa: BLE001 — name the failure
+            raise CrewError(
+                "could not build the subagent's opening messages: "
+                f"{type(e).__name__}: {e}") from e
         opening.append({"role": "user", "content": user})
         with self._lock:
             if self._shutdown:
@@ -323,25 +720,25 @@ class Crew:
                     f"running) — wait for one to finish or close one")
             self._counter += 1
             agent_id = f"crew-{self._counter}"
-            nickname = str(name or "").strip() or next(self._names)
+            nickname = name or next(self._names)
             while any(a.nickname == nickname
                       for a in self._agents.values()):
                 nickname = f"{nickname}-{self._counter}"
             agent = CrewAgent(id=agent_id, nickname=nickname, role=role,
-                              task=task, read_only=bool(read_only))
+                              task=task, read_only=read_only)
             agent.messages = opening
             agent.generation = 1  # first loop iteration
-            override = model_by_id(str(model_id or "")) if model_id else None
+            override = model_by_id(model_id) if model_id else None
             if override is not None:
                 agent.model_id = override.id
             self._agents[agent_id] = agent
             self._order.append(agent_id)
 
-        self.log.append("crew.spawn",
+        self._emit("crew.spawn",
                         {"id": agent.id, "nickname": agent.nickname,
                          "role": role, "task": task[:300],
                          "read_only": bool(read_only),
-                         "model": agent.model_id or self.model.id},
+                         "model": agent.model_id or self._default_model_id()},
                         actor="sovereign")
         if not self._submit(agent, read_only, MAX_WORKER_STEPS,
                             agent.generation):
@@ -351,7 +748,7 @@ class Crew:
                 agent.state = "error"
                 agent.error = "crew shut down before the subagent started"
                 agent.finished_at = time.time()
-            self.log.append("crew.done", agent.to_dict(),
+            self._emit("crew.done", agent.to_dict(),
                             actor="sovereign")
             raise CrewError("crew is shut down — cannot spawn a subagent")
         return agent
@@ -371,26 +768,50 @@ class Crew:
 
         Atomic capacity check: if the batch would exceed max_agents,
         NOTHING is spawned and CrewError is raised."""
-        items = list(tasks or [])
+        # Type-confusion guard: a bare string here used to be shredded
+        # into one-character "tasks" by list(tasks) — spawn_parallel("do
+        # x") silently launched 4 garbage subagents. A dict would have
+        # iterated its keys the same way. tasks must be a real sequence
+        # of items (None/empty is still a no-op empty batch).
+        if tasks is None:
+            return []
+        if isinstance(tasks, (str, bytes, bytearray)) or not isinstance(
+                tasks, (list, tuple)):
+            raise CrewError(
+                "spawn_parallel tasks must be a list of task strings or "
+                f"dicts, got {type(tasks).__name__} — nothing spawned")
+        items = list(tasks)
         if not items:
             return []
+        if not isinstance(role, str):
+            raise CrewError(
+                "spawn_parallel role must be a string, got "
+                f"{type(role).__name__} — nothing spawned")
         if role not in ROLES:
             role = DEFAULT_ROLE
         # Normalise + validate BEFORE touching the roster: a bad item must
         # fail the whole batch, never leave a partially-spawned one behind.
+        # Every item goes through the SAME validation spawn() applies, so
+        # a later item can never fail mid-batch after earlier ones spawned.
         prepared: list[dict] = []
-        for item in items:
+        for i, item in enumerate(items):
             if isinstance(item, str):
                 item = {"task": item}
             if not isinstance(item, dict):
                 raise CrewError(
                     "spawn_parallel items must be task strings or dicts, "
                     f"got {type(item).__name__} — nothing spawned")
-            if not str(item.get("task", "")).strip():
+            try:
+                prepared.append(_validate_spawn_args(
+                    item.get("task", ""),
+                    item.get("role", role),
+                    item.get("name", ""),
+                    item.get("context", context),
+                    item.get("read_only", read_only),
+                    item.get("model_id", model_id)))
+            except CrewError as e:
                 raise CrewError(
-                    "spawn_parallel item is missing its task — "
-                    "nothing spawned")
-            prepared.append(item)
+                    f"spawn_parallel item {i}: {e} — nothing spawned") from e
         # One lock hold across the capacity check AND every spawn: the
         # batch is atomic — either all items spawn or none does. A plain
         # check-then-loop would let a concurrent spawn() slip in between
@@ -404,13 +825,13 @@ class Crew:
                     f"capacity ({self.max_agents} running) — "
                     f"{self._live_count()} already running")
             return [self.spawn(
-                task=item.get("task", ""),
-                role=item.get("role", role),
-                name=item.get("name", ""),
-                context=item.get("context", context),
-                read_only=item.get("read_only", read_only),
-                model_id=item.get("model_id", model_id))
-                for item in prepared]
+                task=p["task"],
+                role=p["role"],
+                name=p["name"],
+                context=p["context"],
+                read_only=p["read_only"],
+                model_id=p["model_id"])
+                for p in prepared]
 
     def send(self, agent_id: str, message: str,
              interrupt: bool = False) -> CrewAgent:
@@ -436,7 +857,7 @@ class Crew:
             if agent.state == "closed":
                 raise CrewError(
                     f"agent {agent_id} is closed — resume it first")
-            self.log.append("crew.message",
+            self._emit("crew.message",
                             {"id": agent_id, "chars": len(message),
                              "interrupt": bool(interrupt)},
                             actor="sovereign")
@@ -456,6 +877,9 @@ class Crew:
                                        "content": f"FOLLOW-UP: {message}"})
                 agent.state = "running"
                 agent.error = ""
+                # a re-run starts clean — a stale traceback from the
+                # previous iteration would mislead /agents errors
+                agent.traceback = ""
                 agent.stop_event.clear()
                 agent.generation += 1
                 gen = agent.generation
@@ -556,7 +980,7 @@ class Crew:
             if fut is not None and not fut.done():
                 fut.cancel()  # no-op if already running; harmless
         if stopped:
-            self.log.append("crew.force_stop",
+            self._emit("crew.force_stop",
                             {"reason": "user_interrupt",
                              "stopped": stopped},
                             actor="sovereign")
@@ -578,7 +1002,7 @@ class Crew:
             fut = self._futures.get(agent_id)
         if fut is not None and not fut.done():
             fut.cancel()
-        self.log.append("crew.closed",
+        self._emit("crew.closed",
                         {"id": agent_id, "prev_state": prev},
                         actor="sovereign")
         return agent
@@ -592,7 +1016,7 @@ class Crew:
                 return agent
             agent.state = "done" if not agent.error else "error"
             agent.stop_event.clear()
-        self.log.append("crew.resumed", {"id": agent_id},
+        self._emit("crew.resumed", {"id": agent_id},
                         actor="sovereign")
         return agent
 
@@ -617,6 +1041,13 @@ class Crew:
         return [a for a in self.list() if a.state == "running"]
 
     def _require(self, agent_id: str) -> CrewAgent:
+        # Type guard: an unhashable id (list/dict) used to die inside
+        # dict.get as "TypeError: unhashable type" — far from the real
+        # problem (a bad caller). Name it as a CrewError instead.
+        if not isinstance(agent_id, str):
+            raise CrewError(
+                "subagent id must be a string, got "
+                f"{type(agent_id).__name__}")
         agent = self._agents.get(agent_id)
         if agent is None:
             with self._lock:
@@ -625,6 +1056,8 @@ class Crew:
         return agent
 
     def status(self) -> dict:
+        """Never raises: agent counters may be junk (str/None), so the
+        sums coerce defensively instead of blowing up the TUI poll."""
         agents = self.list()
         return {"total": len(agents),
                 "running": sum(1 for a in agents if a.state == "running"),
@@ -632,9 +1065,9 @@ class Crew:
                 "blocked": sum(1 for a in agents if a.state == "blocked"),
                 "error": sum(1 for a in agents if a.state == "error"),
                 "closed": sum(1 for a in agents if a.state == "closed"),
-                "tool_calls": sum(a.tool_calls for a in agents),
-                "tokens_in": sum(a.tokens_in for a in agents),
-                "tokens_out": sum(a.tokens_out for a in agents)}
+                "tool_calls": sum(_safe_int(a.tool_calls) for a in agents),
+                "tokens_in": sum(_safe_int(a.tokens_in) for a in agents),
+                "tokens_out": sum(_safe_int(a.tokens_out) for a in agents)}
 
     def format(self, agents: list[CrewAgent] | None = None) -> str:
         """Compact multi-line report — the shape handed back to the LLM."""
@@ -643,21 +1076,40 @@ class Crew:
             return "crew is empty — spawn a subagent first"
         lines = []
         for a in agents:
-            icon = {"done": "✓", "blocked": "◐", "error": "✗",
-                    "closed": "⊘", "running": "…"}.get(a.state, "?")
-            model_tag = (f" · {a.model_id}" if a.model_id
-                         and a.model_id != self.model.id else "")
-            head = (f"{a.icon} [{a.id}] {a.nickname} ({a.role}) {icon} "
-                    f"{a.state} · {a.tool_calls} tools{model_tag} · "
-                    f"{a.elapsed_ms}ms")
-            lines.append(head)
-            lines.append(f"  task: {a.task[:200]}")
-            if a.files_touched:
-                lines.append("  files: " + ", ".join(a.files_touched[:8]))
-            if a.error:
-                lines.append(f"  error: {a.error[:200]}")
-            if a.summary:
-                lines.append("  " + a.summary.replace("\n", "\n  ")[:1200])
+            try:
+                # every attribute read here is defensive: malformed
+                # agent fields (task/error/summary as non-strings,
+                # files_touched as non-strings, unhashable state) must
+                # never crash a status report
+                state = _safe_str(a.state)
+                icon = {"done": "✓", "blocked": "◐", "error": "✗",
+                        "closed": "⊘", "running": "…"}.get(state, "?")
+                model_tag = (f" · {_safe_str(a.model_id)}"
+                             if a.model_id
+                             and _safe_str(a.model_id) != self._default_model_id()
+                             else "")
+                head = (f"{a.icon} [{_safe_str(a.id)}] "
+                        f"{_safe_str(a.nickname)} ({_safe_str(a.role)}) "
+                        f"{icon} {state} · "
+                        f"{_safe_int(a.tool_calls)} tools{model_tag} · "
+                        f"{_safe_elapsed_ms(a)}ms")
+                lines.append(head)
+                lines.append(f"  task: {_safe_str(a.task, 200)}")
+                files = _safe_files(a.files_touched)
+                if files:
+                    lines.append("  files: " + ", ".join(files[:8]))
+                err = _safe_str(a.error)
+                if err:
+                    # full error text — a truncated mystery here costs the
+                    # sovereign more than the context it saves (see /agents
+                    # errors for the traceback companion)
+                    lines.append(f"  error: {err}")
+                summ = _safe_str(a.summary, 1200)
+                if summ:
+                    lines.append("  " + summ.replace("\n", "\n  "))
+            except Exception:
+                # a single poisoned agent must not kill the whole report
+                lines.append(f"  [unreadable agent]")
         return "\n".join(lines)
 
     def format_status(self) -> str:
@@ -666,11 +1118,205 @@ class Crew:
                  f"{s['running']} running · {s['done']} done · "
                  f"{s['error']} error · {s['closed']} closed"]
         for a in self.list():
-            lines.append(f"  {a.icon} [{a.id}] {a.nickname} ({a.role}) — "
-                         f"{a.state}: {a.task[:70]}")
+            try:
+                lines.append(f"  {a.icon} [{_safe_str(a.id)}] "
+                             f"{_safe_str(a.nickname)} "
+                             f"({_safe_str(a.role)}) — "
+                             f"{_safe_str(a.state)}: {_safe_str(a.task, 70)}")
+            except Exception:
+                lines.append("  [unreadable agent]")
         return "\n".join(lines)
 
     # -- the worker loop ----------------------------------------------------------
+    def _default_model_id(self) -> str:
+        """Display id of the crew default model. self.model may be a
+        bare model-id STRING rather than a Model object (Crew accepts
+        both) — never touch ``self.model.id`` directly or spawn() /
+        format() die with AttributeError: 'str' object has no attribute
+        'id'."""
+        if isinstance(self.model, str):
+            return self.model
+        return _safe_str(getattr(self.model, "id", "")) or "?"
+
+    def _resolve_model(self, agent: CrewAgent):
+        """Resolve the (model, provider) pair for one worker. Never
+        returns a junk pair: every bad input — a non-string model_id, an
+        unknown model id, a crew default that isn't a model-like object
+        (e.g. a bare model-id string), an unknown provider key — falls
+        back to the crew default (or the built-in default model as a last
+        resort) and logs a crew.warn so the misconfiguration is visible
+        instead of crashing the worker with AttributeError ('str' object
+        has no attribute 'provider' / 'supports_tools').
+
+        The ONE case that raises: the built-in default model itself is
+        unusable (a broken model registry — config.py's import asserts
+        make this unreachable in production). Then a CrewError is raised
+        and _run_loop settles the agent with a visible error instead of
+        letting the worker die with AttributeError on a pool thread.
+
+        Accepts duck-typed model/provider objects (the self-tests use
+        SimpleNamespace stubs) — only objects that lack the attributes
+        the loop needs are treated as broken."""
+        def _warn(reason: str, detail: str) -> None:
+            try:
+                self.log.append(
+                    "crew.warn",
+                    {"id": agent.id, "phase": "model-resolve",
+                     "reason": reason, "detail": _safe_str(detail)[:200]},
+                    actor=f"crew:{agent.id}")
+            except Exception:  # noqa: BLE001 — logging must never break
+                pass           # the worker
+
+        def _model_like(m) -> bool:
+            return (m is not None and hasattr(m, "provider")
+                    and hasattr(m, "supports_tools"))
+
+        # 1. per-agent override
+        model = None
+        mid = agent.model_id
+        if isinstance(mid, str) and mid:
+            model = model_by_id(mid)
+            if model is None:
+                _warn("unknown-model-id",
+                      f"model_id {mid!r} is not a known model — "
+                      "falling back to the crew default model")
+        elif mid:
+            _warn("bad-model-id",
+                  f"model_id {mid!r} is not a string — "
+                  "falling back to the crew default model")
+        # 2. crew default
+        if model is None:
+            model = self.model
+        if not _model_like(model):
+            # self.model isn't model-like either (e.g. Crew was built
+            # with a bare model-id string, or None). Try to resolve a
+            # string as an id; otherwise take the built-in default,
+            # which config.py guarantees exists (assert at import).
+            resolved = (model_by_id(model)
+                        if isinstance(model, str) else None)
+            if resolved is None:
+                _warn("bad-crew-model",
+                      f"crew default model {model!r} is not usable — "
+                      f"falling back to {DEFAULT_MODEL_ID!r}")
+            model = resolved or model_by_id(DEFAULT_MODEL_ID)
+            if not _model_like(model):
+                # Last resort — config.py asserts at import that
+                # DEFAULT_MODEL_ID resolves, so this is unreachable in
+                # production. Never return a junk pair: a None/broken
+                # model here would AttributeError in _run_loop. Raise a
+                # clean CrewError instead — _run_loop settles the agent
+                # with a visible error, and the crew keeps running.
+                _warn("no-model",
+                      f"built-in default model {DEFAULT_MODEL_ID!r} is "
+                      "not usable — the model registry is broken")
+                raise CrewError(
+                    f"cannot resolve a usable model for subagent "
+                    f"{agent.id}: built-in default {DEFAULT_MODEL_ID!r} "
+                    "is not usable — the model registry is broken")
+        # 3. provider follows the model that will actually serve the
+        # agent (tool schemas differ between models)
+        provider = None
+        pkey = getattr(model, "provider", None)
+        if isinstance(pkey, str):
+            try:
+                provider = PROVIDERS.get(pkey)
+            except Exception:  # noqa: BLE001 — unhashable key etc.
+                provider = None
+        if provider is None:
+            provider = self.provider
+        if not getattr(provider, "base_url", None):
+            _warn("bad-provider",
+                  f"no usable provider for model "
+                  f"{getattr(model, 'id', model)!r} "
+                  f"(provider key {pkey!r}) — using the first "
+                  "configured provider")
+            provider = next(iter(PROVIDERS.values()), None)
+        if not getattr(provider, "base_url", None):
+            # No usable provider at all — junk here would AttributeError
+            # inside the chat callable. Clean CrewError instead; _run_loop
+            # settles the agent with a visible error.
+            _warn("no-provider",
+                  f"no usable provider for model "
+                  f"{getattr(model, 'id', model)!r}")
+            raise CrewError(
+                f"cannot resolve a usable provider for subagent "
+                f"{agent.id}: model {getattr(model, 'id', model)!r} names "
+                f"provider key {pkey!r}, which is not configured")
+        return model, provider
+
+
+    def _checked_chat(self, provider, model, messages, schemas,
+                      timeout: float, should_cancel=None):
+        """Call self._chat and VALIDATE its reply before the worker loop
+        touches it.
+
+        WHY: _run_loop reads result.usage / result.tool_calls /
+        result.content unconditionally. When an injected or misbehaving
+        chat callable returned None, a plain string, or a dict, the loop
+        died with a cryptic AttributeError ('str' object has no
+        attribute 'usage') instead of naming the real problem. This
+        wrapper turns every shape violation into a CrewError that names
+        the offending type — the agent lands in 'error' with a message
+        that points at the chat callable, and the crew keeps running.
+
+        Contract enforced:
+          * not None, not a str/bytes, not a dict
+          * exposes .content, .tool_calls and .usage (duck-typed —
+            a real StreamResult or anything shaped like it; the crew's
+            own self-test stubs pass as long as they carry the attrs)
+          * .content is a str (or None)
+          * .tool_calls is a list/tuple — None is a shape violation,
+            not "no tool calls" (silently treating it as [] would end
+            the turn early on corrupted data)
+
+        Errors raised BY the chat callable itself (APIError, retry
+        exhaustion, TurnCancelled, ...) are NOT touched — they
+        propagate unchanged so retry/cancel semantics stay intact."""
+        # Detection runs per call (identity-cached): a swapped
+        # self._chat is re-detected instead of trusting a stale flag.
+        if self._chat_accepts_cancel():
+            result = self._chat(provider, model, self.effort,
+                                messages, schemas, timeout,
+                                should_cancel=should_cancel)
+        else:
+            result = self._chat(provider, model, self.effort,
+                                messages, schemas, timeout)
+        where = "provider returned unusable result — the crew's chat callable"
+        if result is None:
+            raise CrewError(
+                f"{where} returned None — expected a StreamResult (an "
+                "object with .content, .tool_calls and .usage). Check the "
+                "chat callable injected into Crew(..., chat=...).")
+        if isinstance(result, (str, bytes, bytearray)):
+            raise CrewError(
+                f"{where} returned a {type(result).__name__}, not a "
+                "StreamResult — expected an object with .content, "
+                ".tool_calls and .usage. Wrap the text in a StreamResult.")
+        if isinstance(result, dict):
+            raise CrewError(
+                f"{where} returned a dict, not a StreamResult — return "
+                "the StreamResult itself (e.g. StreamResult(**d)) "
+                "instead of a plain mapping.")
+        missing = [a for a in ("content", "tool_calls", "usage")
+                   if not hasattr(result, a)]
+        if missing:
+            raise CrewError(
+                f"{where} returned {type(result).__name__}, which is "
+                f"missing StreamResult attribute(s): {', '.join(missing)}.")
+        content = result.content
+        if content is not None and not isinstance(content, str):
+            raise CrewError(
+                f"{where} returned {type(result).__name__} whose "
+                f".content is {type(content).__name__} — expected str "
+                "(or None).")
+        tc = result.tool_calls
+        if not isinstance(tc, (list, tuple)):
+            raise CrewError(
+                f"{where} returned {type(result).__name__} with "
+                f".tool_calls of type {type(tc).__name__} — expected a "
+                "list of tool-call dicts (or an empty list). None is not "
+                "accepted: return [] when there are no tool calls.")
+        return result
 
     def _run_loop(self, agent: CrewAgent, read_only: bool,
                   max_steps: int, gen: int) -> None:
@@ -687,15 +1333,27 @@ class Crew:
                                   "create_directory", "run_command")}
         # per-agent model override resolves its own provider (schemas must
         # follow the model that will actually serve this agent, not the
-        # crew default — tool support differs between models)
-        model = (model_by_id(agent.model_id) if agent.model_id
-                 else None) or self.model
-        provider = PROVIDERS.get(model.provider, self.provider)
+        # crew default — tool support differs between models).
+        # _resolve_model falls every bad input back to the crew default
+        # with a crew.warn logged; it raises CrewError only when the
+        # model registry itself is broken (built-in default unusable or
+        # no usable provider at all). That case is settled here with a
+        # visible agent error — never an AttributeError on a pool thread.
+        try:
+            model, provider = self._resolve_model(agent)
+        except CrewError as e:
+            with agent.mutex:
+                agent.state = "error"
+                agent.error = str(e)
+                agent.finished_at = time.time()
+            self._emit("crew.done", agent.to_dict(),
+                       actor=f"crew:{agent.id}")
+            return
         schemas = ([t.openai_schema() for t in tools.values()]
-                   if model.supports_tools else None)
+                   if getattr(model, "supports_tools", True) else None)
         # lightweight progress event — the TUI renders one row per
         # agent from these without re-rendering the world
-        self.log.append("crew.progress",
+        self._emit("crew.progress",
                         {"id": agent.id, "phase": "started",
                          "nickname": agent.nickname, "role": agent.role},
                         actor=f"crew:{agent.id}")
@@ -704,43 +1362,72 @@ class Crew:
             for step in range(max_steps):
                 if agent.stop_event.is_set():
                     break
-                # CANCEL: thread the stop flag into the blocking model
-                # call so Esc interrupts a hung provider in ~0.25s instead
-                # of waiting out the full timeout (or the rate-limit
-                # backoff). Custom chat callables without the kwarg keep
-                # the old call shape — the stop check above still applies.
-                if self._chat_takes_cancel:
-                    result = self._chat(provider, model, self.effort,
-                                        agent.messages, schemas, 120.0,
-                                        should_cancel=(
-                                            agent.stop_event.is_set))
-                else:
-                    result = self._chat(provider, model, self.effort,
-                                        agent.messages, schemas, 120.0)
-                if result.usage:
-                    # Defensive: usage must be a dict (some providers return strings)
-                    _usage = result.usage if isinstance(result.usage, dict) else {}
-                    agent.tokens_in += int(
-                        _usage.get("prompt_tokens", 0) or 0)
-                    agent.tokens_out += int(
-                        _usage.get("completion_tokens", 0) or 0)
-                if not result.tool_calls:
+                # _checked_chat validates the reply AND threads the stop flag
+                # into the blocking model call, so Esc interrupts a hung
+                # provider in ~0.25s instead of waiting out the full
+                # timeout (or the rate-limit backoff). Custom chat
+                # callables without the kwarg keep the old call shape —
+                # the stop check above still applies.
+                result = self._checked_chat(provider, model, agent.messages,
+                                            schemas, 120.0,
+                                            should_cancel=(
+                                                agent.stop_event.is_set))
+                # Provider boundary (typeguards): coerce the reply's
+                # fields to their promised types once, right where the
+                # provider data enters the loop — a string where a
+                # list/dict was expected used to crash below with
+                # AttributeError ('str' object has no attribute ...).
+                _content = _typeguards.ensure_str(
+                    getattr(result, "content", ""))
+                # _checked_chat allows list OR tuple; ensure_list only
+                # keeps lists, so coerce tuples explicitly — otherwise a
+                # tuple of tool calls would be silently dropped and the
+                # turn would end early on valid data.
+                _raw_tool_calls = getattr(result, "tool_calls", None)
+                _tool_calls = (list(_raw_tool_calls)
+                               if isinstance(_raw_tool_calls, (list, tuple))
+                               else [])
+                # _usage_pair handles every provider shape (dict, string,
+                # None, malformed) without raising.
+                _tin, _tout = _usage_pair(result.usage)
+                agent.tokens_in += _tin
+                agent.tokens_out += _tout
+                if not _tool_calls:
                     break
                 from .client import assistant_message
+                # Sanitize ONCE per step, before history: raw tool-call
+                # entries (strings, None, partial dicts) must never reach
+                # the provider inside the message history — the loop below
+                # skips them, but history is sent back on the next step.
+                # reasoning is coerced too: _checked_chat doesn't validate
+                # its type and a non-str would corrupt the history.
+                safe_calls = [c for c in (_normalize_tool_call(tc)
+                                          for tc in _tool_calls)
+                              if c is not None]
+                if not safe_calls:
+                    # No USABLE tool calls this turn: every entry was
+                    # garbage that _normalize_tool_call filtered (strings,
+                    # None, partial dicts). The turn is over — end it on
+                    # this step's content. Without this break the loop
+                    # re-asks the provider with identical history up to
+                    # max_steps times (96x real latency/cost) for a reply
+                    # that can never produce a tool call.
+                    break
+                reasoning = getattr(result, "reasoning", "")
+                if not isinstance(reasoning, str):
+                    reasoning = ""
                 agent.messages.append(assistant_message(
-                    result.content, result.tool_calls,
-                    getattr(result, "reasoning", "") or ""))
+                    _content, safe_calls, reasoning))
                 tool_names = []
-                for tc in result.tool_calls:
-                    # Defensive: skip malformed tool calls (provider may
-                    # return strings or partial objects)
-                    if not isinstance(tc, dict):
+                for tc in safe_calls:
+                    # Already canonical — the guard stays as a no-op
+                    # (_normalize_tool_call is idempotent).
+                    tc = _normalize_tool_call(tc)
+                    if tc is None:
                         continue
-                    fn = tc.get("function") or {}
-                    if not isinstance(fn, dict):
-                        fn = {}
-                    name = fn.get("name", "")
-                    args = parse_tool_arguments(fn.get("arguments"))
+                    fn = tc["function"]
+                    name = fn["name"]
+                    args = parse_tool_arguments(fn["arguments"])
                     agent.tool_calls += 1
                     tool_names.append(name)
                     tool = tools.get(name)
@@ -761,6 +1448,13 @@ class Crew:
                                     out = tool.handler(**args)
                             else:
                                 out = tool.handler(**args)
+                            # Data boundary (typeguard): a misbehaving
+                            # handler may return non-text (None, dict) —
+                            # out.startswith below would raise
+                            # AttributeError. Coerce here, before any str
+                            # method is touched (default preserves the old
+                            # str(out) fallback for non-str returns).
+                            out = ensure_str(out, str(out))
                             if name in ("write_file", "edit_file") and \
                                     out.startswith("OK"):
                                 p = str(args.get("path", ""))
@@ -768,24 +1462,41 @@ class Crew:
                                     agent.files_touched.append(p)
                         except Exception as e:  # noqa: BLE001
                             out = f"ERROR: {type(e).__name__}: {e}"
+                    # out is coerced to str right after the handler call
+                    # above; guard the id too (a non-str tool_call_id
+                    # breaks history validation on the next provider
+                    # call).
                     agent.messages.append(
-                        {"role": "tool", "tool_call_id": tc.get("id", ""),
+                        {"role": "tool",
+                         "tool_call_id": ensure_str(tc.get("id")),
                          "content": out[:6000]})
                 if step % 2 == 0:
-                    self.log.append("crew.progress",
+                    self._emit("crew.progress",
                                     {"id": agent.id, "phase": "step",
                                      "step": step + 1,
                                      "tools": tool_names[:6]},
                                     actor=f"crew:{agent.id}")
-            final = (result.content if result is not None else "") or ""
+            # Data boundary (typeguard): final must be a str for the
+            # report/log path — _checked_chat enforces this, but never
+            # trust a field that crossed a provider boundary twice.
+            final = _content if result is not None else ""
         except BaseException as e:  # noqa: BLE001 — a failing agent never kills the crew
             # BaseException, not just Exception: anything escaping the loop
             # must land as a visible error report, never an unretrieved
             # Future exception with the subagent dying invisibly.
             final = None
             loop_error: BaseException | None = e
+            # Capture the traceback NOW (inside the except block, while
+            # __traceback__ is alive) so /agents errors can show it: the
+            # landing below only ever set agent.error, leaving
+            # agent.traceback empty for the most common error path —
+            # exactly when the user needs the traceback most.
+            import traceback as _tb
+            loop_tb = "".join(
+                _tb.format_exception(type(e), e, e.__traceback__))
         else:
             loop_error = None
+            loop_tb = ""
         # The whole landing sequence runs under the agent mutex: a
         # sovereign send()/close()/resume() in this exact window could
         # otherwise resurrect a closed agent, clobber "closed" back to
@@ -814,8 +1525,16 @@ class Crew:
             else:
                 if loop_error is not None:
                     agent.state = "error"
+                    # Exception class + message + failing-operation
+                    # context (the turn loop covers provider calls, tool
+                    # dispatch and worker-final parsing).
                     agent.error = (f"{type(loop_error).__name__}: "
-                                   f"{loop_error}")
+                                   f"{loop_error} (while executing the "
+                                   "subagent turn loop)")
+                    # Full traceback for /agents errors debugging (the
+                    # field was previously only set by the outer
+                    # _execute handler, so loop errors showed none).
+                    agent.traceback = loop_tb[-4000:]
                 else:
                     state, summary = parse_worker_final(final or "")
                     agent.summary = summary[:1800]
@@ -832,13 +1551,15 @@ class Crew:
                                            "content": f"FOLLOW-UP: {queued}"})
                     agent.state = "running"
                     agent.error = ""
+                    # stale traceback must not survive into the new run
+                    agent.traceback = ""
                     agent.finished_at = 0.0
                     agent.generation += 1
                     submit_gen = agent.generation
                     resubmit = True
                 else:
                     agent.pending_messages.clear()
-                    self.log.append("crew.done", agent.to_dict(),
+                    self._emit("crew.done", agent.to_dict(),
                                     actor=f"crew:{agent.id}")
         if resubmit:
             if not self._submit(agent, read_only, MAX_SEND_STEPS,
@@ -849,7 +1570,7 @@ class Crew:
                     agent.state = "error"
                     agent.error = "crew shut down with a follow-up pending"
                     agent.finished_at = time.time()
-                self.log.append("crew.done", agent.to_dict(),
+                self._emit("crew.done", agent.to_dict(),
                                 actor=f"crew:{agent.id}")
 
 

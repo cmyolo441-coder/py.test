@@ -135,9 +135,19 @@ class EvolutionEngine:
         # of the window — a role with declining performance looked
         # stable because its decline fell off the end of the slice.
         evolvable = _evolvable_roles()
-        events = [e.data for e in events
-                  if e.type == "crew.done"
-                  and str(e.data.get("role", "")).strip() in evolvable]
+        # Hardened: a poisoned/legacy crew.done event whose data is a
+        # bare string (not a dict) would crash e.data.get(...) with
+        # AttributeError — coerce to {} so the fold survives. Attribute
+        # access is defensive too: a duck-typed event missing .type
+        # must not kill fitness.
+        events = []
+        for e in self.log.events():
+            if getattr(e, "type", "") != "crew.done":
+                continue
+            ed = getattr(e, "data", None)
+            d = ed if isinstance(ed, dict) else {}
+            if str(d.get("role", "")).strip() in evolvable:
+                events.append(d)
         for d in events[-EVAL_WINDOW * len(evolvable):]:
             role = str(d.get("role", "")).strip()
             status = d.get("status") or d.get("state") or ""

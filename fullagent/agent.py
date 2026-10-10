@@ -333,6 +333,11 @@ class Notifier:
     def emit(self, event_type: str, payload: dict) -> bool:
         if not self.sink:
             return False
+        # Hardened: a malformed event payload that is not a dict (a
+        # bare string) would crash the ``**payload`` expansion below
+        # with TypeError — wrap it so a bad event never kills notify.
+        if not isinstance(payload, dict):
+            payload = {"_raw": payload}
         record = {"event": event_type, "ts": time.time(),
                   "app": "fullagent", **payload}
         try:
@@ -1072,10 +1077,19 @@ class Agent:
                     # all per-call bookkeeping in order, so the transcript
                     # is identical to the old sequential loop.
                     pending: list[tuple[dict, ToolEvent]] = []
-                    for tc in result.tool_calls:
+                    from .client import normalize_tool_call as _norm_tc
+                    for raw_tc in result.tool_calls:
+                        # One canonical shape everywhere: normalize every
+                        # entry and skip unrecoverable ones. A malformed
+                        # entry must never reach tc["function"] as
+                        # AttributeError: 'str' object has no attribute
+                        # 'get' (the reported subagent crash).
+                        tc = _norm_tc(raw_tc)
+                        if tc is None:
+                            continue
                         fn = tc["function"]
-                        name = fn.get("name", "")
-                        args = parse_tool_arguments(fn.get("arguments"))
+                        name = fn["name"]
+                        args = parse_tool_arguments(fn["arguments"])
                         ev = ToolEvent(name=name, args=args)
                         turn.tools.append(ev)
                         on_tool_call(ev)
@@ -1471,10 +1485,13 @@ class Agent:
             return
 
     def _emit_cost(self, usage: dict | None) -> None:
-        if not usage:
+        # Delegates to the canonical extractor: a non-dict usage (string
+        # from a sloppy provider) used to raise AttributeError on
+        # usage.get() here. Nothing is sealed for zero-token turns.
+        from .client import safe_token_counts
+        tin, tout = safe_token_counts(usage)
+        if not (tin or tout):
             return
-        tin = int(usage.get("prompt_tokens", 0) or 0)
-        tout = int(usage.get("completion_tokens", 0) or 0)
         # configured models are free-tier; ledger still tracks tokens so a
         # price table can be dropped in later without schema changes
         usd = 0.0

@@ -83,6 +83,7 @@ from .config import (
     model_by_id,
 )
 from .tools import Tool
+from .typeguards import ensure_dict, ensure_str  # central panel-ingest guards
 
 
 class SafeFileHistory(FileHistory):
@@ -207,6 +208,63 @@ def _truncate_w(s: str, maxw: int) -> str:
         out.append(ch)
         w += cw
     return "".join(out) + "…"
+
+
+def _trunc_err_mid(s: str, maxw: int) -> str:
+    """Middle-cut an error message to at most maxw COLUMNS.
+
+    The diagnostic payload of an exception (e.g. the attribute name in
+    ``AttributeError: 'str' object has no attribute 'X'``) sits at the
+    END of the message, so head-truncation hides exactly what the user
+    needs. Keep the head (exception class) and the tail (the diagnostic
+    detail), marking the cut with an ellipsis. Never splits wide chars.
+    """
+    s = s if isinstance(s, str) else str(s)
+    if maxw <= 1 or _disp_width(s) <= maxw:
+        return s
+    tail_budget = maxw // 2
+    head_budget = maxw - tail_budget - 1  # 1 column for the ellipsis
+
+    def _take(text, budget, rev=False):
+        out: list[str] = []
+        w = 0
+        seq = reversed(text) if rev else text
+        for ch in seq:
+            cw = (2 if unicodedata.east_asian_width(ch) in _WIDE_CATS
+                  else 1)
+            if w + cw > budget:
+                break
+            out.append(ch)
+            w += cw
+        return "".join(reversed(out)) if rev else "".join(out)
+
+    return (_take(s, head_budget) + "…" + _take(s, tail_budget, rev=True))
+
+
+def _fit_err_row(icon: str, name, err, width: int) -> str:
+    """One crew-panel error row, pre-fitted to the panel width.
+
+    The row is a single line: if we let the row overflow and rely on
+    the final width clamp, the clamp head-cuts the message and eats the
+    diagnostic tail (the attribute name in AttributeError) even when the
+    panel HAS the space for it. Middle-truncating to the exact budget
+    guarantees the tail is always on screen. The full text stays
+    available via ParallelAgentsPanel.error_detail() and the
+    /agents errors command.
+    """
+    prefix = f"{icon} {name} \u00b7 "
+    budget = max(10, width - 2) - _disp_width(prefix)
+    err_s = err if isinstance(err, str) else str(err)
+    if _disp_width(err_s) > max(1, budget):
+        # The one-line row cannot fit everything: drop the trailing
+        # operation-context clause (" (while …)" / " (unexpected …)")
+        # so the exception itself — class + message + the attribute
+        # name — is what stays on screen. The full text WITH context is
+        # still in ParallelAgentsPanel.error_detail() and /agents errors.
+        m = re.match(r"^(.*) \([a-z][^()]{0,120}\)$", err_s)
+        if m:
+            err_s = m.group(1)
+    return prefix + _trunc_err_mid(err_s, max(1, budget))
 
 # ---------------------------------------------------------------------------
 # Rich markdown rendering tweaks (used for non-streamed output)
@@ -756,6 +814,11 @@ class ParallelAgentsPanel:
         # event-log cursor: highest seq ingested, so poll_log() only
         # reads new events.
         self._last_seq: int = -1
+        # first-poll flag (distinct from _last_seq == -1): a first poll
+        # against an EMPTY log must not arm the history-skip for the
+        # next poll, or the first real crew events would be swallowed
+        # as "history".
+        self._initialized: bool = False
         # throttle bookkeeping
         self._last_emit: float = 0.0
         # spinner frame, advanced by the caller on each tick
@@ -777,9 +840,46 @@ class ParallelAgentsPanel:
 
     # -- event ingestion (O(1) per event) ------------------------------------
 
+    # -- defensive event helpers (the panel must NEVER crash the TUI) -------
+
+    @staticmethod
+    def _safe_type(ev) -> str:
+        """Best-effort event type; '' when missing/non-string."""
+        t = getattr(ev, "type", None)
+        return t if isinstance(t, str) else ""
+
+    @staticmethod
+    def _safe_seq(ev) -> int:
+        """Best-effort event seq; -1 when missing/non-int."""
+        s = getattr(ev, "seq", None)
+        if isinstance(s, bool) or not isinstance(s, int):
+            return -1
+        return s
+
+    @staticmethod
+    def _safe_data(ev) -> dict:
+        """Best-effort event payload; {} when missing/non-dict.
+
+        A malformed crew.* event can carry a STRING payload. Passing it
+        straight into ingest() makes _on_spawn()'s data.get() raise
+        AttributeError: 'str' object has no attribute 'get' — killing the
+        whole TUI frame. Coerce here, once, for every entry point."""
+        d = getattr(ev, "data", None)
+        return d if isinstance(d, dict) else {}
+
     def ingest(self, ev_type: str, data: dict, seq: int = -1) -> bool:
-        """Feed one crew event. Returns True if the display changed."""
+        """Feed one crew event. Returns True if the display changed.
+
+        Fully defensive: data may be a string/None (malformed event),
+        ev_type may be non-string, seq may be non-int. Nothing here may
+        raise."""
         with self._lock:
+            # Provider boundary (typeguards): central guards at the
+            # panel ingest — a malformed event can never raise here.
+            data = ensure_dict(data)
+            ev_type = ensure_str(ev_type)
+            if isinstance(seq, bool) or not isinstance(seq, int):
+                seq = -1
             if seq >= 0:
                 self._last_seq = max(self._last_seq, seq)
             if ev_type == "crew.spawn":
@@ -797,30 +897,49 @@ class ParallelAgentsPanel:
             return False
 
     def poll_log(self, log) -> bool:
-        """Ingest all crew events since the last poll. O(new events)."""
+        """Ingest all crew events since the last poll. O(new events).
+
+        Every event attribute is read defensively: event objects that
+        lack seq/type/data (or carry non-string types / non-dict
+        payloads) are skipped or coerced, never allowed to raise into
+        the TUI."""
         with self._lock:
             changed = False
             # Reverse-walk from the head and stop at the cursor: only new
             # events are visited.
             pending: list = []
-            events = list(log.events())
-            # FIRST POLL: skip all historical events (from previous sessions).
-            # Otherwise the panel shows stale failed agents from old sessions,
-            # confusing users into thinking current subagents are broken.
-            if self._last_seq == -1 and events:
-                self._last_seq = max(ev.seq for ev in events)
+            try:
+                events = list(log.events())
+            except Exception:
+                return False
+            # FIRST POLL: skip all historical events (from previous
+            # sessions). Otherwise the panel shows stale failed agents
+            # from old sessions, confusing users into thinking current
+            # subagents are broken. Uses _initialized (not
+            # _last_seq == -1): a first poll against an empty log must
+            # not swallow the first real events as "history" on the
+            # next poll.
+            if not self._initialized:
+                self._initialized = True
+                if events:
+                    seqs = [self._safe_seq(ev) for ev in events]
+                    self._last_seq = max(seqs) if seqs else -1
                 return False
             for ev in reversed(events):
-                if ev.seq <= self._last_seq:
+                if self._safe_seq(ev) <= self._last_seq:
                     break
-                if ev.type.startswith("crew."):
+                if self._safe_type(ev).startswith("crew."):
                     pending.append(ev)
             for ev in reversed(pending):
-                if self.ingest(ev.type, ev.data or {}, ev.seq):
+                if self.ingest(self._safe_type(ev),
+                               self._safe_data(ev),
+                               self._safe_seq(ev)):
                     changed = True
             return changed
 
     def _on_spawn(self, data: dict) -> bool:
+        if not isinstance(data, dict):
+            return False
         aid = str(data.get("id", ""))
         if not aid or aid in self._agents:
             return False
@@ -844,6 +963,8 @@ class ParallelAgentsPanel:
         return True
 
     def _on_progress(self, data: dict) -> bool:
+        if not isinstance(data, dict):
+            return False
         aid = str(data.get("id", ""))
         st = self._agents.get(aid)
         if st is None:
@@ -866,8 +987,19 @@ class ParallelAgentsPanel:
         except (TypeError, ValueError):
             step = st["step"]
         # coerce defensively — a non-string tool name would blow up
-        # ", ".join at render time and kill the whole frame
-        tools = [str(t) for t in (data.get("tools") or [])]
+        # ", ".join at render time and kill the whole frame. Also: a bare
+        # STRING payload would iterate char-by-char into garbage rows
+        # ("bash" -> "b, a, s, h"), and a non-iterable (int/None) would
+        # raise TypeError here.
+        raw_tools = data.get("tools")
+        if raw_tools is None:
+            raw_tools = []
+        elif isinstance(raw_tools, str):
+            raw_tools = [raw_tools]
+        try:
+            tools = [str(t) for t in raw_tools]
+        except TypeError:
+            tools = []
         if step == st["step"] and tools == st["tools"]:
             return False  # no visible change — skip reformat entirely
         st["step"] = step
@@ -876,6 +1008,8 @@ class ParallelAgentsPanel:
         return True
 
     def _on_done(self, data: dict) -> bool:
+        if not isinstance(data, dict):
+            return False
         aid = str(data.get("id", ""))
         st = self._agents.get(aid)
         if st is None:
@@ -893,7 +1027,14 @@ class ParallelAgentsPanel:
             return False
         err = str(data.get("error") or "")
         st["status"] = self.ERROR if err else self.DONE
-        st["error"] = err[:120]
+        # Store the FULL error text here — crew.py seals the complete
+        # message in the crew.done event. Head-truncating at ingest
+        # (e.g. err[:120]) would silently eat the diagnostic tail of
+        # long errors (the attribute name in AttributeError) before the
+        # row renderer ever sees it. Width-fitting with tail
+        # preservation happens in _fit_err_row; error_detail() and
+        # /agents errors expose the full text on demand.
+        st["error"] = err
         try:
             st["elapsed_ms"] = int(data.get("elapsed_ms") or 0)
         except (TypeError, ValueError):
@@ -905,9 +1046,13 @@ class ParallelAgentsPanel:
         return True
 
     def _on_force_stop(self, data: dict) -> bool:
+        if not isinstance(data, dict):
+            return False
         return self._mark_stopped("stopped by user")
 
     def _on_resumed(self, data: dict) -> bool:
+        if not isinstance(data, dict):
+            return False
         """A retired agent brought back to life (crew.resumed) — flip its
         row back to running instead of leaving the stale terminal state
         on screen forever."""
@@ -931,6 +1076,8 @@ class ParallelAgentsPanel:
         return True
 
     def _on_closed(self, data: dict) -> bool:
+        if not isinstance(data, dict):
+            return False
         # crew.closed carries ONE agent id (unlike crew.force_stop which
         # is roster-wide). Only that agent is retired — never flip every
         # other running agent to stopped.
@@ -959,13 +1106,24 @@ class ParallelAgentsPanel:
 
     # -- queries ---------------------------------------------------------------
 
+    @staticmethod
+    def _status_of(st) -> str:
+        """status of an agent state entry that may be corrupted (a
+        non-dict, or a dict missing keys). Never raises — a bad entry
+        reads as "" (not running), never kills the frame."""
+        if isinstance(st, dict):
+            s = st.get("status")
+            return s if isinstance(s, str) else ""
+        return ""
+
     @property
     def active_count(self) -> int:
         """Number of currently-running agents. O(n) but n is tiny (crew
         capacity is bounded); cheap enough to not need caching."""
         with self._lock:
             return sum(1 for aid in self._order
-                       if self._agents[aid]["status"] == self.RUNNING)
+                       if self._status_of(self._agents.get(aid))
+                       == self.RUNNING)
 
     @property
     def total_count(self) -> int:
@@ -1016,9 +1174,9 @@ class ParallelAgentsPanel:
             out: list[str] = []
             spin = SPINNER_FRAMES[self._spin_i % len(SPINNER_FRAMES)]
             for aid in self._order:
-                st = self._agents[aid]
+                st = self._agents.get(aid)
                 row = self._row_cache.get(aid, "")
-                if st["status"] == self.RUNNING:
+                if self._status_of(st) == self.RUNNING:
                     out.append(f"{spin} {row}")
                 else:
                     out.append(row)
@@ -1034,12 +1192,13 @@ class ParallelAgentsPanel:
                   f"{len(self._order)} total ")
         frags.append(("class:crew.header", _truncate_w(header, width) + "\n"))
         for aid in self._order:
-            st = self._agents[aid]
+            st = self._agents.get(aid)
             row = self._row_cache.get(aid, "")
-            if st["status"] == self.RUNNING:
+            status = self._status_of(st)
+            if status == self.RUNNING:
                 style = "class:crew.running"
                 text = f" {spin} {row}"
-            elif st["status"] == self.DONE:
+            elif status == self.DONE:
                 style = "class:crew.done"
                 text = f" {row}"
             else:
@@ -1060,34 +1219,58 @@ class ParallelAgentsPanel:
         self._dirty.clear()
 
     def _format_row(self, st: dict, width: int, now: float) -> str:
-        """Format one row (no spinner — composed at render time)."""
-        name = st["name"]
-        role = st["role"]
-        task = " ".join(st["task"].split())  # collapse whitespace
-        status = st["status"]
+        """Format one row (no spinner — composed at render time).
+
+        Defensive: a corrupted/partial agent state dict (missing keys
+        or wrong-typed values — e.g. a test or a bug surgically
+        removing keys) must render a degraded row, never KeyError /
+        TypeError into the TUI frame."""
+        if not isinstance(st, dict):
+            return "  (invalid agent state)"
+        name = str(st.get("name") or "?")
+        role = str(st.get("role") or "")
+        task = " ".join(str(st.get("task") or "").split())  # collapse ws
+        status = st.get("status") or ""
         if status == self.RUNNING:
-            elapsed = self._fmt_elapsed(now - st["spawn_ts"])
+            try:
+                elapsed = self._fmt_elapsed(
+                    now - float(st.get("spawn_ts") or now))
+            except (TypeError, ValueError):
+                elapsed = self._fmt_elapsed(0)
             parts = [name]
             if role:
                 parts.append(role)
             if task:
                 parts.append(task[:60])
             detail = " \u00b7 ".join(parts)
-            step_bit = f" \u00b7 step {st['step']}" if st["step"] else ""
-            tools = st["tools"]
-            tools_bit = f" \u00b7 {', '.join(tools[:3])}" if tools else ""
+            step = st.get("step") or 0
+            step_bit = f" \u00b7 step {step}" if step else ""
+            tools = st.get("tools") or []
+            if isinstance(tools, str):
+                tools = [tools]
+            elif not isinstance(tools, (list, tuple)):
+                tools = []
+            tools_bit = (f" \u00b7 {', '.join(str(t) for t in tools[:3])}"
+                         if tools else "")
             row = f"  {detail}{step_bit}{tools_bit} \u00b7 {elapsed}"
         elif status == self.DONE:
-            elapsed = self._fmt_elapsed(st["elapsed_ms"] / 1000.0) \
-                if st["elapsed_ms"] else "\u2014"
-            files_bit = f" \u00b7 {st['files']} files" if st["files"] else ""
+            try:
+                ms = int(st.get("elapsed_ms") or 0)
+            except (TypeError, ValueError):
+                ms = 0
+            elapsed = self._fmt_elapsed(ms / 1000.0) if ms else "\u2014"
+            try:
+                files = int(st.get("files") or 0)
+            except (TypeError, ValueError):
+                files = 0
+            files_bit = f" \u00b7 {files} files" if files else ""
             row = f"\u2713 {name} \u00b7 done in {elapsed}{files_bit}"
         elif status == self.ERROR:
-            err = st["error"] or "failed"
-            row = f"\u2717 {name} \u00b7 {err[:60]}"
-        else:  # STOPPED
-            err = st["error"] or "stopped"
-            row = f"\u25a0 {name} \u00b7 {err[:60]}"
+            row = _fit_err_row("\u2717", name,
+                               str(st.get("error") or "failed"), width)
+        else:  # STOPPED (and any unknown status degrades here)
+            row = _fit_err_row("\u25a0", name,
+                               str(st.get("error") or "stopped"), width)
         return _truncate_w(row, max(10, width - 2))
 
     @staticmethod
@@ -4171,8 +4354,10 @@ class UI:
     def _print_turn_stats(self, turn) -> None:
         parts = [f"{turn.duration:.1f}s"]
         if turn.usage:
-            tin = turn.usage.get("prompt_tokens", 0) or 0
-            tout = turn.usage.get("completion_tokens", 0) or 0
+            # HARDEN: usage values may be non-int (string/None from a
+            # sloppy provider) — raw .get() would TypeError on display.
+            from .client import safe_token_counts
+            tin, tout = safe_token_counts(turn.usage)
             if tin or tout:
                 parts.append(f"{tin}→{tout} tokens")
         t = Text("  ·  ".join(parts), style=C["dim"])
@@ -4942,11 +5127,15 @@ class UI:
         self.console.print(Text(text, style=color or C["cyan"]))
 
     def print_usage(self, turns) -> None:
+        from .client import safe_token_counts
         total_in = total_out = 0
         for t in turns:
             if t.usage:
-                total_in += t.usage.get("prompt_tokens", 0) or 0
-                total_out += t.usage.get("completion_tokens", 0) or 0
+                # HARDEN: see _print_turn_stats — coerce via the canonical
+                # normalizer so malformed usage dicts can't TypeError here.
+                tin, tout = safe_token_counts(t.usage)
+                total_in += tin
+                total_out += tout
         t = Text()
         t.append(f" turns: {len(turns)}", style=C["fg"])
         t.append(f"   prompt tokens: {total_in}", style=C["dim"])

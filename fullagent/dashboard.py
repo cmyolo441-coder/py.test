@@ -72,8 +72,12 @@ def _fold_crew_agents(log) -> list[dict]:
     agents: dict[str, dict] = {}
     order: list[str] = []
     for ev in log.events():
-        t = ev.type
-        d = ev.data if isinstance(ev.data, dict) else {}
+        # Hardened: an event object missing .type/.data (a legacy
+        # duck-typed entry, a mock, a corrupted row) must not kill the
+        # fold with AttributeError — coerce, never index directly.
+        t = getattr(ev, "type", "") or ""
+        raw = getattr(ev, "data", None)
+        d = raw if isinstance(raw, dict) else {}
         if t == "crew.spawn":
             aid = str(d.get("id") or "")
             if aid and aid not in agents:

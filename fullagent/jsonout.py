@@ -93,19 +93,11 @@ def _json_safe(value: Any) -> Any:
 
 
 def _usage(turn: Any) -> Dict[str, int]:
-    usage = getattr(turn, "usage", None) or {}
-    if not isinstance(usage, dict):
-        usage = {}
-    in_tok = usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0
-    out_tok = usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0
-    try:
-        in_tok = int(in_tok)
-    except (TypeError, ValueError):
-        in_tok = 0
-    try:
-        out_tok = int(out_tok)
-    except (TypeError, ValueError):
-        out_tok = 0
+    # Delegate to the canonical extractor: ad-hoc int() coercion here
+    # used to pass negative values straight through (and any future
+    # usage-shape weirdness would need fixing in two places).
+    from .client import safe_token_counts
+    in_tok, out_tok = safe_token_counts(getattr(turn, "usage", None))
     return {"input_tokens": in_tok, "output_tokens": out_tok}
 
 
