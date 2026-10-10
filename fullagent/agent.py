@@ -1333,6 +1333,17 @@ class Agent:
 
         self._turn_status = None
         turn.duration = time.time() - started
+        # Worker 5/20 (flight prewarm): drain any flight that was never
+        # consumed (single-call turns never reach a next iteration) so
+        # the external-edit early notice still fires. The prompt-prep
+        # half of the bundle is simply discarded — there is no next
+        # iteration to spend it on.
+        try:
+            _fp = getattr(self, "_flight_prewarmer", None)
+            if _fp is not None:
+                _fp.consume(self)
+        except Exception:
+            pass
         try:
             self._score_turn(turn)
         except Exception:
