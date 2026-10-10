@@ -803,7 +803,14 @@ class ParallelAgentsPanel:
             # Reverse-walk from the head and stop at the cursor: only new
             # events are visited.
             pending: list = []
-            for ev in reversed(log.events()):
+            events = list(log.events())
+            # FIRST POLL: skip all historical events (from previous sessions).
+            # Otherwise the panel shows stale failed agents from old sessions,
+            # confusing users into thinking current subagents are broken.
+            if self._last_seq == -1 and events:
+                self._last_seq = max(ev.seq for ev in events)
+                return False
+            for ev in reversed(events):
                 if ev.seq <= self._last_seq:
                     break
                 if ev.type.startswith("crew."):
