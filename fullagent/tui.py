@@ -2152,7 +2152,10 @@ class UI:
                     self.print_info(f"✓ model → {m.label} ({m.id})",
                                     C["green"])
             else:
-                self.print_info(format_model_list(list_models()), C["cyan"])
+                # Open the interactive selector (same as Ctrl+T) instead of
+                # just printing the list — users couldn't figure out how to
+                # actually SELECT a model.
+                self.open_model_selector()
         elif cmd == "/models":
             from .modelpick import list_models, format_model_list
             filt = arg.strip()
