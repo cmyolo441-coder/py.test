@@ -410,6 +410,7 @@ SLASH_COMMANDS = [
     ("/help", "commands and key bindings"),
     ("/clear", "clear the screen"),
     ("/new", "new session — /new [name] (old session snapshotted)"),
+    ("/reset", "reset history — clear messages + per-turn caches, keep session/goal/todos"),
     ("/switch", "switch session — /switch <id> (bare: list)"),
     ("/history", "browse previous turns"),
     ("/save", "save session to disk"),
@@ -614,55 +615,11 @@ class _LiveWrite:
 # ---------------------------------------------------------------------------
 # Stream render throttle — cap per-token UI updates at ~10fps
 # ---------------------------------------------------------------------------
-
-
-class _StreamThrottle:
-    """Rate-limit per-token UI updates to at most one frame per `interval`.
-
-    Token ingestion is NEVER blocked: every update() buffers the latest
-    preview text instantly. maybe_flush() returns the buffered frame only
-    when >= interval seconds have passed since the previous frame, so a
-    fast stream (thousands of tokens/sec) triggers at most 10 screen
-    invalidations/sec instead of one full-screen re-render per token.
-    flush() forces the pending frame out — call it when the stream ends so
-    the final render always reflects the complete output.
-
-    `frames` / `suppressed` counters make the before/after measurable.
-    """
-
-    def __init__(self, interval: float = 0.1):
-        self.interval = interval
-        self._last_emit = 0.0
-        self._pending: str | None = None
-        self.frames = 0       # frames actually emitted
-        self.suppressed = 0   # updates absorbed without emitting a frame
-
-    def update(self, text: str) -> None:
-        """Buffer the latest text. Never blocks, never drops text."""
-        self._pending = text
-
-    def due(self) -> bool:
-        """True when at least `interval` seconds passed since last frame."""
-        return (time.time() - self._last_emit) >= self.interval
-
-    def maybe_flush(self) -> str | None:
-        """Return the buffered frame if one is due, else None."""
-        if self._pending is None:
-            return None
-        if not self.due():
-            self.suppressed += 1
-            return None
-        return self.flush()
-
-    def flush(self) -> str | None:
-        """Force the buffered frame out (stream end / final render)."""
-        if self._pending is None:
-            return None
-        text = self._pending
-        self._pending = None
-        self._last_emit = time.time()
-        self.frames += 1
-        return text
+# The throttle is pure logic (no prompt_toolkit imports) and lives in
+# fullagent/streamthrottle.py so latency tests can drive the real class
+# without a terminal. Re-exported here under the historical private name
+# — fullagent.tui._StreamThrottle keeps working for existing imports.
+from .streamthrottle import StreamThrottle as _StreamThrottle  # noqa: F401
 
 
 # ---------------------------------------------------------------------------
@@ -2253,6 +2210,9 @@ class UI:
         elif cmd == "/retry":
             from .retrycmd import handle_retry
             handle_retry(self, arg)
+        elif cmd == "/reset":
+            from .resetcmd import handle_reset
+            handle_reset(self, arg)
         elif cmd == "/cost":
             from .costtrack import handle_cost
             handle_cost(self, arg)
@@ -4227,6 +4187,16 @@ class UI:
                 self._set_status(f"calling {s[5:]}…")
             elif s.startswith("running:"):
                 self._set_status(f"running {s[8:]}…")
+            elif s.startswith("progress:"):
+                # worker 9/20 — live per-call progress readout, e.g.
+                # "Call 12/25 · 45s elapsed · last: read_file aegisscan.py".
+                # _set_status dedupes, so at most one extra invalidation
+                # per tool call (nothing near the 10fps stream throttle),
+                # and it never touches the event log.
+                from .callprogress import format_status as _fmt_progress
+                text = _fmt_progress(s)
+                if text is not None:
+                    self._set_status(text)
             else:
                 self._set_status(s)
 
@@ -5164,22 +5134,24 @@ def _tui_selftest() -> None:
     # -- 1. throttle unit behavior --------------------------------------
     import fullagent.tui as tui_mod
 
-    th = _StreamThrottle(0.1)
-    with patch.object(tui_mod.time, "time", return_value=1000.0):
-        for i in range(1000):
-            th.update(f"tok{i}")
-            frame = th.maybe_flush()
-            if i == 0:
-                assert frame == "tok0", f"first update must flush, got {frame!r}"
-            else:
-                assert frame is None, "burst updates must be absorbed"
-        assert th.frames == 1, th.frames
-        assert th.suppressed == 999, th.suppressed
-        # no text dropped: the buffered frame is always the LATEST text
-        final = th.flush()
-        assert final == "tok999", f"flush must return latest text, got {final!r}"
-        assert th.frames == 2, th.frames
-        assert th.flush() is None, "empty flush must return None"
+    # the throttle takes an injectable clock now (defaults to monotonic);
+    # freeze it — no wall-clock patching needed
+    _frozen = [1000.0]
+    th = _StreamThrottle(0.1, clock=lambda: _frozen[0])
+    for i in range(1000):
+        th.update(f"tok{i}")
+        frame = th.maybe_flush()
+        if i == 0:
+            assert frame == "tok0", f"first update must flush, got {frame!r}"
+        else:
+            assert frame is None, "burst updates must be absorbed"
+    assert th.frames == 1, th.frames
+    assert th.suppressed == 999, th.suppressed
+    # no text dropped: the buffered frame is always the LATEST text
+    final = th.flush()
+    assert final == "tok999", f"flush must return latest text, got {final!r}"
+    assert th.frames == 2, th.frames
+    assert th.flush() is None, "empty flush must return None"
     print("PASS  throttle: 1000 rapid updates -> 1 frame + final flush "
           "(999 absorbed), latest text never dropped")
 

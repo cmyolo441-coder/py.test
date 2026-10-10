@@ -189,11 +189,20 @@ def _headless_print(prompt: str, ns) -> int:
     def _noop(*a, **k):
         pass
 
+    def _on_status(s: str) -> None:
+        # worker 9/20 — live per-call progress in headless mode; stderr
+        # so stdout stays clean for --print piping / --output-format json
+        if s.startswith("progress:"):
+            from .callprogress import format_status
+            text = format_status(s)
+            if text:
+                print(text, file=sys.stderr, flush=True)
+
     turn = agent.run_turn(
         prompt,
         on_token=_noop, on_reasoning=_noop,
         on_tool_call=_noop, on_tool_update=_noop,
-        on_status=_noop, approve=lambda tool, args: True,
+        on_status=_on_status, approve=lambda tool, args: True,
     )
     if getattr(ns, "output_format", "text") == "json":
         from . import jsonout

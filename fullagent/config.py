@@ -56,6 +56,19 @@ MAX_TOOL_ITERATIONS = 200
 # round-trips at ~2.5s each was the 500s+ hang. 25 calls is plenty for a
 # single turn; the model can say "continue".
 MAX_TOOL_CALLS_PER_TURN = 25
+# PERF (worker 8/20): adaptive turn cap — a fixed 25 is dumb. Fast calls
+# (<5s rolling avg) may run up to ADAPTIVE_CAP_FAST; slow calls (>15s
+# rolling avg) are reined in to ADAPTIVE_CAP_SLOW calls / a smaller time
+# budget. Whichever of the call cap or the time budget hits first stops
+# the turn; the stop message says which one and invites "continue".
+# See fullagent/adaptivecap.py (AdaptiveTurnCap).
+ADAPTIVE_CAP_FAST = 40
+ADAPTIVE_CAP_SLOW = 12
+FAST_CALL_AVG_THRESHOLD_S = 5.0
+SLOW_CALL_AVG_THRESHOLD_S = 15.0
+# Time budget for tool-call wall time per turn (ev.duration summed).
+TURN_TIME_BUDGET_S = 180.0
+TURN_TIME_BUDGET_SLOW_S = 120.0
 # PERF: stop early when the same tool call returns an identical result
 # this many times in a row (no-progress loop).
 NO_PROGRESS_STALL_LIMIT = 3
@@ -64,7 +77,67 @@ MAX_TOOL_OUTPUT_CHARS = 24_000
 MAX_TOKENS = 200_000
 # Backends reject a request when input + max_tokens exceeds the model's
 # context window. Every request's max_tokens is clamped to fit (client.py).
-DEFAULT_CONTEXT_WINDOW = 262_144
+#
+# Per-model context windows, researched 2026-10-10 (worker 17/20).
+# Free-tier gateways sometimes serve LESS than the lab's headline number
+# (e.g. Ling 3.1 Flash targets 1M but the free trial is capped at 256K),
+# so values below are the SERVED window where documented, conservative
+# otherwise. The backend can still teach a smaller window at runtime
+# (client.learn_context_window) — that only ever shrinks these.
+MODEL_CONTEXT_WINDOWS: dict[str, int] = {
+    # Kilo Code gateway docs.
+    "stealth/union-alpha": 262_144,
+    # Shanghai AI Lab: 256K documented support (weights config carries a
+    # 1M field, but the lab's own guidance says treat 256K as supported).
+    "atria-dawn-preview": 262_144,
+    # StepFun advertises 1M for Step 5; the kios free-tier cap is
+    # unverified, so stay conservative until the backend teaches us more.
+    "step-5-preview-free": 262_144,
+    # inclusionAI: 262K documented; the launch free trial capped at 256K.
+    "ling-3.1-flash": 262_144,
+    # Command Code / Vercel AI Gateway docs: 256K token context.
+    "glyph-cluster": 262_144,
+    # OpenCode Zen listing (models.dev metadata, verified against the
+    # live /zen/v1/models catalog 2026-10-02): 1M context / 524K output.
+    "space-bunny-free": 1_000_000,
+}
+# Default for models NOT in the table above: assume a small window rather
+# than risk a ~44s doomed request against an unknown cap. A request we can
+# prove won't fit is never sent (see client.build_payload).
+UNKNOWN_MODEL_WINDOW = 128_000
+
+
+def model_context_window(model_id: str) -> int:
+    """Context window for a model id: the researched table value, or the
+    conservative default for unknown models."""
+    return MODEL_CONTEXT_WINDOWS.get(model_id, UNKNOWN_MODEL_WINDOW)
+
+
+DEFAULT_CONTEXT_WINDOW = UNKNOWN_MODEL_WINDOW
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read an int setting from the environment; garbage/missing -> default.
+
+    Never raises at import time — a typo'd env var must not kill startup.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return default
+
+
+# Hard pre-send payload ceiling (estimated input tokens). When a request's
+# input exceeds this, client.build_payload prunes history (oldest tool
+# results first, then old assistant texts) BEFORE sending — some providers
+# reject oversized payloads with invalid_request_error only after a long
+# wait, and the window clamp above does not protect against that. Set well
+# under typical 128k/200k windows to leave headroom. Override with
+# FULLAGENT_MAX_PAYLOAD_TOKENS.
+MAX_PAYLOAD_TOKENS = _env_int("FULLAGENT_MAX_PAYLOAD_TOKENS", 100_000)
 
 
 @dataclass(frozen=True)
@@ -151,17 +224,23 @@ PROVIDERS: dict[str, Provider] = {
 
 MODELS: list[Model] = [
     Model("stealth/union-alpha", "kilo", "Union Alpha",
-          supports_tools=True, context_window=262_144),
+          supports_tools=True,
+          context_window=model_context_window("stealth/union-alpha")),
     Model("atria-dawn-preview", "kios", "Atria Dawn Preview",
-          tag="preview", supports_tools=True),
+          tag="preview", supports_tools=True,
+          context_window=model_context_window("atria-dawn-preview")),
     Model("step-5-preview-free", "kios", "Step 5 Preview Free",
-          tag="free", supports_tools=True, context_window=262_144),
+          tag="free", supports_tools=True,
+          context_window=model_context_window("step-5-preview-free")),
     Model("ling-3.1-flash", "kios", "Ling 3.1 Flash",
-          supports_tools=True, context_window=262_144),
+          supports_tools=True,
+          context_window=model_context_window("ling-3.1-flash")),
     Model("glyph-cluster", "kios", "Glyph Cluster",
-          supports_tools=True, context_window=262_144),
+          supports_tools=True,
+          context_window=model_context_window("glyph-cluster")),
     Model("space-bunny-free", "opencode", "Space Bunny Free",
-          tag="free", supports_tools=True, context_window=262_144),
+          tag="free", supports_tools=True,
+          context_window=model_context_window("space-bunny-free")),
 ]
 
 DEFAULT_MODEL_ID = "stealth/union-alpha"
@@ -220,6 +299,9 @@ class Config:
     extra: dict = field(default_factory=dict)
     # PERF: sliding window for model-visible history. 0 = disabled (legacy).
     prune_window: int = 40
+    # PERF (worker 2/20): hard per-request prompt token budget
+    # (messages + tool schemas). 0 = disabled.
+    prompt_token_budget: int = 100_000
 
     @classmethod
     def load(cls) -> "Config":
@@ -229,7 +311,7 @@ class Config:
             if not isinstance(data, dict):
                 data = {}
             for k in ("model_id", "effort", "auto_approve", "show_reasoning",
-                      "theme", "prompt", "prune_window"):
+                      "theme", "prompt", "prune_window", "prompt_token_budget"):
                 if k not in data:
                     continue
                 if k in ("auto_approve", "show_reasoning"):
@@ -238,17 +320,18 @@ class Config:
                     # would silently disable the approval prompt
                     if isinstance(data[k], bool):
                         setattr(cfg, k, data[k])
-                elif k == "prune_window":
-                    # drift-safe int validation; 0 disables pruning
+                elif k in ("prune_window", "prompt_token_budget"):
+                    # drift-safe int validation; 0 disables the feature
                     try:
-                        cfg.prune_window = max(0, int(data[k]))
+                        setattr(cfg, k, max(0, int(data[k])))
                     except (TypeError, ValueError):
                         pass
                 else:
                     setattr(cfg, k, data[k])
             cfg.extra = {k: v for k, v in data.items()
                          if k not in ("model_id", "effort", "auto_approve",
-                                      "show_reasoning", "theme", "prompt")}
+                                      "show_reasoning", "theme", "prompt",
+                                      "prune_window", "prompt_token_budget")}
         except (OSError, ValueError):
             pass
         if model_by_id(cfg.model_id) is None:

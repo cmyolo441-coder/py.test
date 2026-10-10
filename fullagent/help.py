@@ -16,6 +16,7 @@ from __future__ import annotations
 COMMANDS: dict[str, list[tuple[str, str]]] = {
     "Session": [
         ("/new", "fresh conversation (saves the old one)"),
+        ("/reset", "clear history + per-turn caches; keep session, goal, todos"),
         ("/switch", "switch to another session by id"),
         ("/resume", "resume a previous session by id"),
         ("/sessions", "list saved sessions"),

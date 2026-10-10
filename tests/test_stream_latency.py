@@ -25,6 +25,7 @@ from unittest.mock import patch
 
 from fullagent import client
 from fullagent.client import _chat_stream_once, _iter_sse_events
+from fullagent.streamthrottle import StreamThrottle
 
 
 def _event_line(payload: dict) -> bytes:
@@ -203,6 +204,122 @@ def _selftest() -> int:
           f"(stream {stream_len:.2f}s), span {span:.2f}s -> "
           f"{'PASS: tokens delivered incrementally' if ok else 'FAIL: buffered'}")
     return 0 if ok else 1
+
+
+class _FirstGapResponse(FakeSlowResponse):
+    """FakeSlowResponse with a distinct delay before the FIRST byte —
+    like a provider that thinks for a moment, then starts streaming.
+
+    Records first_byte_at (monotonic) when the first SSE line is
+    yielded, so the test can measure provider-first-byte ->
+    TUI-first-display latency precisely.
+    """
+
+    def __init__(self, events, first_gap: float = 0.05, gap: float = 0.02):
+        super().__init__(events, gap=gap)
+        self._first_gap = first_gap
+        self.first_byte_at: float | None = None
+
+    def iter_lines(self):
+        if self._first_gap > 0:
+            time.sleep(self._first_gap)
+        for i, ev in enumerate(self._events):
+            if i == 0:
+                self.first_byte_at = time.monotonic()
+            if self._gap > 0:
+                time.sleep(self._gap)
+            yield _event_line(ev)
+            yield b""  # SSE event terminator (blank line)
+        if self._gap > 0:
+            time.sleep(self._gap)
+        yield b"data: [DONE]"
+        yield b""
+
+
+class FirstTokenDisplayLatencyTests(unittest.TestCase):
+    """Worker-6 first-token proof: once the provider starts sending, the
+    first token must REACH THE TUI's display path in <2s (ms in practice).
+
+    Drives the REAL pipeline — _chat_stream_once over a fake SSE
+    provider — and routes on_token through the REAL StreamThrottle the
+    same way tui._run_turn does (update -> maybe_flush -> displayed
+    frame). The throttle must not delay the first visible token even
+    though it caps later frames at ~10fps.
+    """
+
+    def test_first_token_reaches_tui_display_in_ms(self):
+        tokens = ["Hello", ", ", "world", "!"]
+        resp = _FirstGapResponse([_content_event(t) for t in tokens],
+                                 first_gap=0.05, gap=0.02)
+        throttle = StreamThrottle(0.1)  # the real TUI throttle
+        displayed: list[tuple[str, float]] = []
+        t_start = time.monotonic()
+
+        def on_token(piece: str):
+            # mirror of tui._run_turn's _stream_status: the throttle is
+            # the ONLY gate between the token callback and the screen
+            throttle.update(piece)
+            frame = throttle.maybe_flush()
+            if frame is not None:
+                displayed.append((frame, time.monotonic()))
+
+        with patch.object(client, "_http", return_value=FakeSession(resp)):
+            result = _chat_stream_once(
+                "http://fake/v1/chat/completions", {}, {},
+                on_token=on_token, on_reasoning=None, on_tool_start=None,
+                on_tool_args=None, should_cancel=None, timeout=30.0)
+
+        self.assertEqual(result.content, "".join(tokens))
+        self.assertTrue(displayed, "no frame ever reached the display path")
+        self.assertIsNotNone(resp.first_byte_at,
+                             "fake provider never sent its first byte")
+
+        first_text, first_display_at = displayed[0]
+        provider_to_display = first_display_at - resp.first_byte_at
+        request_to_display = first_display_at - t_start
+        print(f"\n  provider first byte -> first displayed frame: "
+              f"{provider_to_display * 1000:.1f}ms "
+              f"(request start -> display: {request_to_display * 1000:.1f}ms)")
+        # the throttle must NOT absorb the first token — it is the
+        # first thing the user sees
+        self.assertEqual(first_text, tokens[0],
+                         f"first displayed frame should be the first token, "
+                         f"got {first_text!r} — throttle delayed it")
+        # the task's hard requirement: <2s from provider-first-byte
+        self.assertLess(provider_to_display, 2.0,
+                        f"first token took {provider_to_display:.2f}s to "
+                        f"reach the display after the provider sent it")
+        self.assertLess(request_to_display, 2.0 + 0.05 + 0.5,
+                        "request start -> first display blew the budget")
+
+    def test_first_frame_immediate_despite_throttle(self):
+        """Unit-level: with a frozen clock the 10fps throttle still emits
+        the first frame instantly (the guarantee must not depend on clock
+        behaviour), while later frames stay throttled."""
+        now = [1000.0]
+        th = StreamThrottle(0.1, clock=lambda: now[0])
+        th.update("first")
+        self.assertEqual(th.maybe_flush(), "first",
+                         "first frame must flush immediately")
+        th.update("second")
+        self.assertIsNone(th.maybe_flush(),
+                          "second frame is still throttled at 10fps")
+        now[0] += 0.15
+        self.assertEqual(th.maybe_flush(), "second",
+                         "frame due after the interval")
+        self.assertEqual(th.frames, 2)
+        self.assertEqual(th.suppressed, 1)
+
+    def test_backward_clock_jump_cannot_freeze_first_token(self):
+        """An NTP step backward must not hide the first token: the
+        throttle runs on time.monotonic, which never jumps backward."""
+        th = StreamThrottle(0.1)
+        self.assertIs(th._clock, time.monotonic,
+                      "throttle must default to the monotonic clock")
+        th.update("hello")
+        self.assertEqual(th.maybe_flush(), "hello",
+                         "first frame immediate on the default clock")
+
 
 
 if __name__ == "__main__":

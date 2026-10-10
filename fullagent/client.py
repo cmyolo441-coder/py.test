@@ -497,11 +497,120 @@ def _is_reasoning_content_error(err: Exception) -> bool:
     return "reasoning_content" in msg and "required" in msg
 
 
+# -- token-limit pre-check (worker 17/20) -------------------------------------
+# ISSUE: requests that exceed the model's context window were sent as-is
+# and only failed ~44s later with invalid_request_error. This pre-check
+# runs inside build_payload — the single funnel for both send paths —
+# and prunes history FIRST when input + requested max_tokens cannot fit
+# the per-model window (config.MODEL_CONTEXT_WINDOWS). A request we can
+# prove won't fit is never sent.
+def _prune_messages_view(messages: list[dict], window: int) -> list:
+    """agent.prune_messages via lazy import (agent.py is heavy and must
+    not be imported at client import time). Falls back to a minimal
+    local pruner that keeps the system prompt plus the tail."""
+    try:
+        from .agent import prune_messages
+        return prune_messages(messages, window=window)
+    except Exception:
+        out = []
+        rest = list(messages)
+        if rest and isinstance(rest[0], dict) \
+                and rest[0].get("role") == "system":
+            out.append(rest[0])
+            rest = rest[1:]
+        out.extend(rest[-window:] if window > 0 else rest)
+        return out
+
+
+def _irreducible_core(messages: list[dict]) -> list:
+    """The smallest history still worth sending: system prompt (if any),
+    the first user message (task framing) and the latest user message."""
+    core: list = []
+    rest = [m for m in messages if isinstance(m, dict)]
+    if rest and rest[0].get("role") == "system":
+        core.append(rest[0])
+        rest = rest[1:]
+    users = [m for m in rest if m.get("role") == "user"]
+    if users:
+        core.append(users[0])
+        if len(users) > 1:
+            core.append(users[-1])
+    elif rest:
+        core.append(rest[-1])
+    return core
+
+
+def _ensure_window_fit(model: Model, messages: list[dict],
+                       tools: list[dict] | None, effort: Effort) -> int:
+    """Estimate input tokens; prune history FIRST when the request cannot
+    fit the model's context window. Returns the estimated input tokens
+    for the (possibly pruned) history.
+
+    Pruning is in place (``messages[:] = ...``) so the caller's retry /
+    overflow logic sees the same history that was actually sent. Raises
+    APIError only when even the irreducible core cannot fit — the message
+    carries "context window" so is_context_overflow routes it through the
+    existing shrink-and-retry path instead of a doomed send.
+    """
+    window = effective_window(model)
+    requested = effort.max_tokens or 0
+    # When max_tokens is unset the backend chooses the completion length;
+    # still reserve room for a minimal completion so a huge input alone
+    # can never go out unflagged.
+    completion = requested if requested else _MIN_COMPLETION_TOKENS
+
+    def _fits(n: int) -> bool:
+        margin = _context_margin(window) + n // 32
+        return n + margin + completion <= window
+
+    n = _input_tokens(model, messages, tools)
+    if _fits(n):
+        return n
+    before_msgs, before_n = len(messages), n
+    _log.warning(
+        "token pre-check: ~%d input tokens + %d max_tokens would exceed "
+        "the %s context window (%d) — pruning history first",
+        n, completion, model.label, window)
+    # Progressively tighter sliding windows (reuses agent.prune_messages:
+    # keeps the system prompt + first user message + the tail).
+    for w in (20, 10, 4):
+        cand = _prune_messages_view(messages, window=w)
+        n = _input_tokens(model, cand, tools)
+        if _fits(n):
+            messages[:] = cand
+            _log.warning(
+                "token pre-check: pruned history %d -> %d messages "
+                "(~%d -> ~%d input tokens); request now fits the window",
+                before_msgs, len(messages), before_n, n)
+            return n
+    # Last resort: the irreducible core.
+    core = _irreducible_core(messages)
+    n = _input_tokens(model, core, tools)
+    if core and _fits(n):
+        messages[:] = core
+        _log.warning(
+            "token pre-check: pruned history to the irreducible core "
+            "(%d messages, ~%d input tokens); request now fits the window",
+            len(messages), n)
+        return n
+    raise APIError(
+        f"conversation is too large for {model.label} "
+        f"(~{n:,} input tokens vs {window:,} context window) — start a "
+        f"new session (/new), rewind (/rewind), or switch to a "
+        f"larger-context model (Ctrl+T)")
+
+
 def build_payload(model: Model, effort: Effort, messages: list[dict],
                   tools: list[dict] | None, stream: bool = True) -> dict:
     # sanitize history before it hits the wire — fixes stale sessions that
     # were built before reasoning_content was preserved
     _sanitize_messages(messages)
+    # TOKEN-LIMIT PRE-CHECK (worker 17/20): estimate input tokens BEFORE
+    # anything goes on the wire; if input + requested max_tokens cannot
+    # fit the model's context window, prune history FIRST (and log it)
+    # instead of sending a request we can prove the backend will reject
+    # with invalid_request_error after ~44s.
+    input_tokens = _ensure_window_fit(model, messages, tools, effort)
     payload: dict[str, Any] = {
         "model": model.id,
         "messages": messages,
@@ -514,7 +623,6 @@ def build_payload(model: Model, effort: Effort, messages: list[dict],
         # The input estimate is computed ONCE and shared by the clamp and
         # the hard invariant below — previously the whole conversation was
         # JSON-serialized up to 4 extra times per request.
-        input_tokens = _input_tokens(model, messages, tools)
         windowed = _window_max_tokens(model, effort, messages, tools,
                                       input_tokens)
         payload["max_tokens"] = _clamp_max_tokens(model.provider, windowed)
@@ -624,6 +732,106 @@ def _message_fingerprint(obj: Any) -> tuple | None:
     return tuple(fp)
 
 
+# -- raw token estimation (worker 17/20) --------------------------------------
+# The old estimator was a flat chars/3.2 division. The raw estimate is now
+# segment-aware instead: tiktoken's cl100k_base BPE when the package
+# happens to be installed (a good generic stand-in for the unknown
+# tokenizers behind these gateways), else a BPE-aware heuristic that beats
+# chars/4 by counting ASCII words (~1.32 tok/word), CJK chars (~1.0
+# tok/char — common CJK chars are often a single token; rare ones cost
+# more and the learned correction absorbs the difference) and leftover
+# punctuation/whitespace/JSON framing (~1 tok per 2.5 chars) separately. Either raw estimate is then pulled toward the
+# backend's REAL counts by the per-model learned correction multiplier
+# below, so the very first request of a session is already sane and every
+# later one tracks reality.
+#
+# tiktoken is OPTIONAL and imported lazily (it is heavy; module import
+# must stay fast). Everything here never raises.
+_tiktoken_enc = None
+_tiktoken_unavailable = False
+
+
+def _tiktoken_count(text: str) -> int | None:
+    """Token count via tiktoken cl100k_base, or None when tiktoken is not
+    installed or fails. Never raises."""
+    global _tiktoken_enc, _tiktoken_unavailable
+    if _tiktoken_unavailable:
+        return None
+    try:
+        if _tiktoken_enc is None:
+            with _token_cache_lock:
+                if _tiktoken_enc is None and not _tiktoken_unavailable:
+                    import tiktoken
+                    _tiktoken_enc = tiktoken.get_encoding("cl100k_base")
+        return len(_tiktoken_enc.encode(text))
+    except Exception:
+        _tiktoken_unavailable = True
+        return None
+
+
+_WORD_RE = re.compile(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?")
+
+
+def _is_cjk(ch: str) -> bool:
+    o = ord(ch)
+    return (0x4E00 <= o <= 0x9FFF or 0x3400 <= o <= 0x4DBF
+            or 0x3040 <= o <= 0x30FF or 0xF900 <= o <= 0xFAFF
+            or 0xAC00 <= o <= 0xD7AF or 0xFF00 <= o <= 0xFFEF)
+
+
+def _word_tokens(w: str) -> float:
+    """Token estimate for one whitespace-free run. Short runs are usually
+    a single BPE token (~1.32 with the trailing space); hash/base64/uuid-
+    like runs (mixed digits+uppercase) tokenize ~2 chars/token; other
+    long runs (URLs, paths) ~3 chars/token past the first 8."""
+    alnum = 0
+    mixed = 0
+    for ch in w:
+        if ch.isalnum():
+            alnum += 1
+            if ch.isdigit() or "A" <= ch <= "Z":
+                mixed += 1
+    if alnum >= 4 and mixed / alnum >= 0.4:
+        return max(2.0, len(w) / 2.0)
+    if len(w) <= 8:
+        return 1.32
+    return 1.32 + (len(w) - 8) / 3.0
+
+
+def _heuristic_token_count(text: str) -> int:
+    """BPE-aware fallback when tiktoken is unavailable. Deliberately a
+    touch generous: for the pre-send fit check it is safer to over-count
+    (prune early) than to under-count (send a doomed request and wait ~44s
+    for invalid_request_error)."""
+    if not text:
+        return 0
+    words = _WORD_RE.findall(text)
+    word_chars = 0
+    word_tokens = 0.0
+    for w in words:
+        word_chars += len(w)
+        word_tokens += _word_tokens(w)
+    cjk = 0
+    spaces = 0
+    for ch in text:
+        if _is_cjk(ch):
+            cjk += 1
+        elif ch.isspace():
+            spaces += 1
+    # Punctuation / JSON framing (~1 tok per 2.5 chars); whitespace mostly
+    # merges into neighbouring BPE tokens, so it counts far less.
+    punct = len(text) - word_chars - cjk - spaces
+    return max(1, int(word_tokens + cjk * 1.0 + punct / 2.5 + spaces / 8.0))
+
+
+def _raw_token_estimate(text: str) -> int:
+    """Best raw token estimate for a string, before per-model correction."""
+    n = _tiktoken_count(text)
+    if n is not None:
+        return max(1, n)
+    return _heuristic_token_count(text)
+
+
 def _token_cache_key(payload: str, model_id: str) -> tuple[str, str, int]:
     digest = hashlib.blake2b(payload.encode("utf-8"),
                              digest_size=16).hexdigest()
@@ -633,9 +841,10 @@ def _token_cache_key(payload: str, model_id: str) -> tuple[str, str, int]:
 def _count_payload(payload: str, model_id: str = "") -> int:
     """Token count for an already-serialized payload, via the content cache.
 
-    Cache hit: O(1) dict lookup. Miss: one cheap blake2b + the same
-    ``len / ratio`` math ``estimate_tokens`` always used, so displayed
-    counts are unchanged.
+    Cache hit: O(1) dict lookup. Miss: one cheap blake2b + the raw
+    estimate (tiktoken if available, else the BPE-aware heuristic) times
+    the per-model learned correction, so displayed counts track the
+    backend's real tokenizer after the first few responses.
     """
     key = _token_cache_key(payload, model_id)
     with _token_cache_lock:
@@ -643,7 +852,8 @@ def _count_payload(payload: str, model_id: str = "") -> int:
         if hit is not None:
             _token_cache.move_to_end(key)
             return hit
-    count = max(1, int(len(payload) / _chars_per_token(model_id)))
+    count = max(1, int(_raw_token_estimate(payload)
+                       * _correction_factor(model_id)))
     with _token_cache_lock:
         _token_cache[key] = count
         _token_cache.move_to_end(key)
@@ -674,7 +884,8 @@ def _count_uncached(obj: Any, model_id: str,
 
 
 def estimate_tokens_fast(text: str, model_id: str = "") -> int:
-    """Hot-path token estimate for plain text (chars/ratio, cached).
+    """Hot-path token estimate for plain text (raw estimate x per-model
+    correction, cached).
 
     Strings are immutable and the count depends only on ``len(text)`` for
     a given calibration, so the key ``(id, len, model bucket, epoch)``
@@ -690,7 +901,8 @@ def estimate_tokens_fast(text: str, model_id: str = "") -> int:
         if hit is not None:
             _token_cache.move_to_end(key)
             return hit
-    count = max(1, int(len(text) / _chars_per_token(model_id)))
+    count = max(1, int(_raw_token_estimate(text)
+                       * _correction_factor(model_id)))
     with _token_cache_lock:
         _token_cache[key] = count
         _token_cache.move_to_end(key)
@@ -729,12 +941,12 @@ def estimate_tokens(obj: Any, model_id: str = "") -> int:
     return _count_uncached(obj, model_id, fingerprint)
 
 
-# -- learned tokenizer calibration ------------------------------------------
+# -- learned tokenizer calibration (schema 2: correction multipliers) ---------
 # The backend rejects a request when input + max_tokens exceeds the model's
-# context window, and it counts input with ITS OWN tokenizer. A fixed
-# chars/token guess always drifts from reality (code, unicode, tool schemas
-# all tokenize differently), so we learn the real ratio from every response
-# and keep a safety margin on top.
+# context window, and it counts input with ITS OWN tokenizer. The raw
+# estimate (tiktoken when installed, else the BPE-aware heuristic) only
+# approximates it, so we learn a per-model correction multiplier from
+# every response and keep a safety margin on top.
 #
 # Enterprise hardening:
 #   * calibration is keyed by model id — switching models mid-session can
@@ -744,16 +956,20 @@ def estimate_tokens(obj: Any, model_id: str = "") -> int:
 #   * the context window itself is learned: when a backend error reports a
 #     smaller window than configured, we remember it for that model.
 
-_BASELINE_CHARS_PER_TOKEN = 3.2   # conservative start (real code is denser)
-_MIN_CHARS_PER_TOKEN = 2.0        # never assume text is cheaper than this
-_RATIO_SAMPLES_MAX = 8            # rolling window of recent measurements
-_ratio_samples: dict[str, list[float]] = {}   # model id -> measured ratios
+_ESTIMATOR_SCHEMA = 2
+# NOTE (worker 17/20): schema 2 replaced the old chars/token ratios
+# (schema 1). Old persisted samples are ignored on load, never mixed in.
+_BASELINE_CORRECTION = 1.0
+_MIN_CORRECTION = 0.05           # ignore absurdly cheap usage reports
+_MAX_CORRECTION = 20.0          # ignore absurdly expensive ones
+_CORRECTION_SAMPLES_MAX = 8     # rolling window of recent measurements
+_correction_samples: dict[str, list[float]] = {}  # model id -> multipliers
 _learned_windows: dict[str, int] = {}         # model id -> real window
 _calibration_loaded = False
 _CALIBRATION_FILE = config.APP_DIR / "calibration.json"
 
-# Bumped every time the learned chars/token ratios change. The token-count
-# cache below keys on this epoch so a freshly learned ratio instantly
+# Bumped every time the learned correction changes. The token-count
+# cache keys on this epoch so a freshly learned multiplier instantly
 # invalidates stale counts (displayed numbers keep tracking reality).
 _calibration_epoch = 0
 
@@ -778,21 +994,24 @@ def _load_calibration() -> None:
         data = json.loads(_CALIBRATION_FILE.read_text())
     except (OSError, ValueError):
         return
-    ratios = data.get("ratios") or {}
-    for key, samples in ratios.items():
-        if isinstance(samples, list):
-            clean = [float(s) for s in samples
-                     if isinstance(s, (int, float))
-                     and _MIN_CHARS_PER_TOKEN * 0.5 <= float(s) <= 16.0]
-            if clean:
-                _ratio_samples[key] = clean[-_RATIO_SAMPLES_MAX:]
+    # Schema 2: per-model correction multipliers. Schema-1 "ratios"
+    # (chars/token) are deliberately NOT migrated — different units.
+    if data.get("schema") == _ESTIMATOR_SCHEMA:
+        corrections = data.get("corrections") or {}
+        for key, samples in corrections.items():
+            if isinstance(samples, list):
+                clean = [float(s) for s in samples
+                         if isinstance(s, (int, float))
+                         and _MIN_CORRECTION <= float(s) <= _MAX_CORRECTION]
+                if clean:
+                    _correction_samples[key] = clean[-_CORRECTION_SAMPLES_MAX:]
     windows = data.get("windows") or {}
     for key, win in windows.items():
         if isinstance(win, int) and win > 0:
             _learned_windows[key] = win
-    if _ratio_samples:
-        # Disk state changed the learned ratios -> cached counts computed
-        # under the old ratios must go.
+    if _correction_samples:
+        # Disk state changed the learned multipliers -> cached counts
+        # computed under the old ones must go.
         _bump_calibration_epoch()
 
 
@@ -805,7 +1024,8 @@ def _save_calibration() -> None:
         # losing all calibration on the next load.
         tmp = _CALIBRATION_FILE.with_name(_CALIBRATION_FILE.name + ".tmp")
         tmp.write_text(json.dumps({
-            "ratios": _ratio_samples,
+            "schema": _ESTIMATOR_SCHEMA,
+            "corrections": _correction_samples,
             "windows": _learned_windows,
         }))
         tmp.replace(_CALIBRATION_FILE)
@@ -813,32 +1033,35 @@ def _save_calibration() -> None:
         pass  # persistence is an optimisation, never a failure path
 
 
-def _chars_per_token(model_id: str = "") -> float:
-    """Current best chars/token for this model: the mean of its recent
-    real measurements when we have any, else the conservative baseline."""
+def _correction_factor(model_id: str = "") -> float:
+    """Current per-model correction multiplier: the mean of recent
+    actual/raw measurements when we have any, else 1.0 (the raw
+    estimate is used as-is)."""
     _load_calibration()
-    samples = _ratio_samples.get(_cal_key(model_id)) \
-        or _ratio_samples.get("_default")
+    samples = _correction_samples.get(_cal_key(model_id)) \
+        or _correction_samples.get("_default")
     if not samples:
-        return _BASELINE_CHARS_PER_TOKEN
+        return _BASELINE_CORRECTION
     return sum(samples) / len(samples)
 
 
-def learn_token_ratio(sent_chars: int, actual_tokens: int,
-                      model_id: str = "") -> None:
-    """Record one real (chars, tokens) measurement from a backend response.
-    Called after every completion whose usage reports prompt_tokens."""
-    if sent_chars <= 0 or actual_tokens <= 0:
+def learn_token_correction(raw_tokens: float, actual_tokens: int,
+                           model_id: str = "") -> None:
+    """Record one real (raw estimate, actual) measurement from a backend
+    response. Called after every completion whose usage reports
+    prompt_tokens. (worker 17/20: renamed from learn_token_ratio — the
+    first argument is now the RAW ESTIMATED TOKEN COUNT, not chars.)"""
+    if raw_tokens <= 0 or actual_tokens <= 0:
         return
-    ratio = sent_chars / actual_tokens
+    mult = actual_tokens / raw_tokens
     # ignore implausible outliers (broken usage reporting)
-    if not (_MIN_CHARS_PER_TOKEN * 0.5 <= ratio <= 16.0):
+    if not (_MIN_CORRECTION <= mult <= _MAX_CORRECTION):
         return
     key = _cal_key(model_id)
-    samples = _ratio_samples.setdefault(key, [])
-    samples.append(ratio)
-    if len(samples) > _RATIO_SAMPLES_MAX:
-        del samples[: len(samples) - _RATIO_SAMPLES_MAX]
+    samples = _correction_samples.setdefault(key, [])
+    samples.append(mult)
+    if len(samples) > _CORRECTION_SAMPLES_MAX:
+        del samples[: len(samples) - _CORRECTION_SAMPLES_MAX]
     _bump_calibration_epoch()  # new ground truth -> drop cached counts
     _save_calibration()
 
@@ -866,14 +1089,22 @@ def effective_window(model: Model) -> int:
     return min(model.context_window, learned)
 
 
+def _prompt_payload_text(messages: list[dict],
+                         tools: list[dict] | None) -> str:
+    """Serialized form of exactly what we send as the prompt. The raw
+    token estimator and the calibration learner both work from this
+    text (not just its length) so the estimate tracks the backend's
+    real tokenizer."""
+    try:
+        return json.dumps({"messages": messages, "tools": tools or []},
+                          ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return str(messages) + str(tools or [])
+
+
 def _prompt_chars(messages: list[dict], tools: list[dict] | None) -> int:
     """Character count of exactly what we send as the prompt."""
-    try:
-        payload = json.dumps({"messages": messages, "tools": tools or []},
-                             ensure_ascii=False, default=str)
-    except (TypeError, ValueError):
-        payload = str(messages) + str(tools or [])
-    return len(payload)
+    return len(_prompt_payload_text(messages, tools))
 
 
 # Safety headroom between the estimated input and the window. Scales with
@@ -881,6 +1112,13 @@ def _prompt_chars(messages: list[dict], tools: list[dict] | None) -> int:
 # error can be, so the margin grows instead of staying a fixed constant.
 CONTEXT_MARGIN = 8_192
 _MIN_COMPLETION_TOKENS = 1_024    # never clamp max_tokens below this
+
+
+def _context_margin(window: int) -> int:
+    """Fixed safety margin, scaled down for small windows so the fit
+    check stays meaningful (an 8k margin on an 8k window could never
+    fit anything). Unchanged for all production windows (>= 128k)."""
+    return min(CONTEXT_MARGIN, window // 8)
 
 
 def _input_tokens(model: Model, messages: list[dict],
@@ -900,11 +1138,12 @@ def _window_max_tokens(model: Model, effort: Effort, messages: list[dict],
     """Clamp the requested max_tokens so that input + max_tokens fits in
     the model's context window. Backends reject the whole request when
     the sum exceeds the window (e.g. 'maximum context length of 262144
-    tokens'). The input size is estimated with the learned per-model
-    chars/token ratio (see estimate_tokens) plus a size-scaled margin, so
-    the clamp stays correct even as the conversation grows for hours. If
-    the input alone overflows the window, raise a clear, recoverable
-    error instead of sending a doomed request."""
+    tokens'). The input size is estimated with the BPE-aware raw estimate
+    times the learned per-model correction (see estimate_tokens) plus a
+    size-scaled margin, so the clamp stays correct even as the
+    conversation grows for hours. If the input alone overflows the
+    window, raise a clear, recoverable error instead of sending a doomed
+    request."""
     requested = effort.max_tokens or 0
     if not requested:
         return 0
@@ -913,7 +1152,7 @@ def _window_max_tokens(model: Model, effort: Effort, messages: list[dict],
         input_tokens = _input_tokens(model, messages, tools)
     # margin grows with the prompt: ~1 extra token of headroom per 32
     # estimated input tokens, on top of the fixed floor
-    margin = CONTEXT_MARGIN + input_tokens // 32
+    margin = _context_margin(window) + input_tokens // 32
     if input_tokens + margin + _MIN_COMPLETION_TOKENS > window:
         raise APIError(
             f"conversation is too large for {model.label} "
@@ -1132,6 +1371,22 @@ def _iter_sse_events_cancellable(
         yield item
 
 
+def _with_error_type(msg: str, err: dict) -> str:
+    """Prefix the provider's machine-readable error type (e.g.
+    ``invalid_request_error``) when the message doesn't already carry it.
+
+    Downstream recovery keys on the type — without it a 400 is
+    indistinguishable from any other 400 and the turn dies as a dead
+    error box. Never raises; purely cosmetic."""
+    try:
+        t = err.get("type") or err.get("code")
+    except Exception:  # noqa: BLE001 — defensive: err shape is untrusted
+        return msg
+    if isinstance(t, str) and t.strip() and t.strip().lower() not in msg.lower():
+        return f"{t.strip()}: {msg}"
+    return msg
+
+
 def _extract_error_message(body: str) -> str:
     try:
         obj = json.loads(body)
@@ -1142,7 +1397,7 @@ def _extract_error_message(body: str) -> str:
         return body[:500]
     err = obj.get("error")
     if isinstance(err, dict):
-        return str(err.get("message") or err)
+        return _with_error_type(str(err.get("message") or err), err)
     if isinstance(err, str):
         return err
     return body[:500]
@@ -1288,9 +1543,9 @@ def _fit_max_tokens_from_actual(model: Model, info: dict,
     return min(requested, headroom)
 
 
-def _learn_from_usage(usage: dict | None, sent_chars: int,
+def _learn_from_usage(usage: dict | None, sent_text: str,
                      model_id: str = "") -> None:
-    """Calibrate the chars/token estimator with the backend's real count.
+    """Calibrate the token estimator with the backend's real count.
 
     Delegates to safe_token_counts: a non-dict usage (string/int from a
     sloppy provider) used to raise AttributeError on usage.get() here,
@@ -1299,8 +1554,9 @@ def _learn_from_usage(usage: dict | None, sent_chars: int,
     if not usage:
         return
     prompt_tokens, _ = safe_token_counts(usage)
-    if prompt_tokens > 0 and sent_chars > 0:
-        learn_token_ratio(sent_chars, prompt_tokens, model_id)
+    if prompt_tokens > 0 and sent_text:
+        learn_token_correction(_raw_token_estimate(sent_text),
+                               prompt_tokens, model_id)
 
 
 def shrink_tool_outputs(messages: list[dict], keep: int = 1,
@@ -1393,6 +1649,9 @@ def chat_stream(provider: Provider, model: Model, effort: Effort,
     headers = _base_headers(provider, stream=True)
     current_effort = effort
     shrinks_used = 0
+    # invalid_request_error auto-recovery (worker 18/20): exactly one
+    # prune-and-retry per call, enforced by maybe_recover_invalid_request.
+    invalid_retried = False
 
     # Tracks whether ANY output reached the UI during the current attempt.
     # A retry replays the WHOLE request — once tokens/tool-args have been
@@ -1425,7 +1684,7 @@ def chat_stream(provider: Provider, model: Model, effort: Effort,
     on_tool_args_w = _mark_emitted_args(on_tool_args)
 
     for overflow_attempt in range(OVERFLOW_RETRIES + OVERFLOW_SHRINKS + 1):
-        sent_chars = _prompt_chars(messages, tools)
+        sent_text = _prompt_payload_text(messages, tools)
         try:
             payload = build_payload(model, current_effort, messages, tools,
                                     stream=True)
@@ -1442,7 +1701,7 @@ def chat_stream(provider: Provider, model: Model, effort: Effort,
                 url, headers, payload, on_token_w, on_reasoning_w,
                 on_tool_start, on_tool_args_w, should_cancel, timeout,
                 on_status=on_status)
-            _learn_from_usage(result.usage, sent_chars, model.id)
+            _learn_from_usage(result.usage, sent_text, model.id)
             return result
         except APIError as e:
             # reasoning_content validation — heal history and retry once,
@@ -1465,8 +1724,20 @@ def chat_stream(provider: Provider, model: Model, effort: Effort,
                 # non-retryable failures; healing or shrinking now would
                 # replay the request on top of the partial output
                 raise
+            # invalid_request_error auto-recovery (worker 18/20): diagnose
+            # + log a full payload summary, prune the oldest half of tool
+            # pairs, and retry ONCE with the cleaned history. The helper
+            # raises a helpful error (never a bare "invalid request") when
+            # the single retry is exhausted or nothing was prunable.
+            # Imported lazily: errorrecovery imports from .client at call
+            # time, so a top-level import would be circular.
+            from . import errorrecovery as _errrec
+            if _errrec.maybe_recover_invalid_request(
+                    e, messages, tools, on_status, invalid_retried):
+                invalid_retried = True
+                continue
             healed = _heal_overflow(model, current_effort, e,
-                                    overflow_attempt, sent_chars)
+                                    overflow_attempt, sent_text)
             if healed is not None:
                 current_effort = healed
                 continue
@@ -1489,7 +1760,7 @@ OVERFLOW_SHRINKS = 2   # shrink-the-conversation-and-retry attempts
 
 
 def _heal_overflow(model: Model, effort: Effort, error: APIError,
-                   attempt: int, sent_chars: int = 0) -> Effort | None:
+                   attempt: int, sent_text: str = "") -> Effort | None:
     """Turn a backend overflow error into a tighter Effort, or None when
     the input itself no longer fits (nothing a clamp can fix)."""
     if not is_context_overflow(str(error)):
@@ -1499,8 +1770,9 @@ def _heal_overflow(model: Model, effort: Effort, error: APIError,
     info = _parse_overflow(str(error)) or {}
     # the backend just told us the real input size — calibrate the
     # per-model estimator with it so every later clamp is accurate
-    if info.get("input_tokens") and sent_chars > 0:
-        learn_token_ratio(sent_chars, info["input_tokens"], model.id)
+    if info.get("input_tokens") and sent_text:
+        learn_token_correction(_raw_token_estimate(sent_text),
+                               info["input_tokens"], model.id)
     fitted = _fit_max_tokens_from_actual(model, info, effort)
     if fitted is None:
         return None
@@ -1798,6 +2070,8 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
                 _raw_msg = err.get("message") if isinstance(err, dict) else err
                 msg = (_raw_msg if isinstance(_raw_msg, str) and _raw_msg
                        else str(err))
+                if isinstance(err, dict):
+                    msg = _with_error_type(msg, err)
                 raise APIError(msg, status=_sse_error_status(err))
             # HARDEN: choices may be a string or other non-list shape —
             # indexing a string yields a str whose .get() raises
@@ -1946,7 +2220,10 @@ def _result_from_json(data: dict, model_id: str) -> StreamResult:
     # with a string message, same contract as the streaming event path.
     if data.get("error"):
         err = data["error"]
-        raise APIError(_error_obj_message(err),
+        _envelope_msg = _error_obj_message(err)
+        if isinstance(err, dict):
+            _envelope_msg = _with_error_type(_envelope_msg, err)
+        raise APIError(_envelope_msg,
                        status=_sse_error_status(err))
     result = StreamResult(
         model=(_strict_str(data.get("model"))
@@ -2102,7 +2379,7 @@ def chat_blocking(provider: Provider, model: Model, effort: Effort,
     shrinks_used = 0
 
     for overflow_attempt in range(OVERFLOW_RETRIES + OVERFLOW_SHRINKS + 1):
-        sent_chars = _prompt_chars(messages, tools)
+        sent_text = _prompt_payload_text(messages, tools)
         try:
             payload = build_payload(model, current_effort, messages, tools,
                                     stream=False)
@@ -2125,7 +2402,7 @@ def chat_blocking(provider: Provider, model: Model, effort: Effort,
                     f"{err} — history was sanitized but provider still "
                     f"rejects. Try /new or /rewind.") from err
             healed = _heal_overflow(model, current_effort, err,
-                                    overflow_attempt, sent_chars)
+                                    overflow_attempt, sent_text)
             if healed is not None:
                 current_effort = healed
                 continue
@@ -2135,7 +2412,7 @@ def chat_blocking(provider: Provider, model: Model, effort: Effort,
                 continue
             raise
         result = _result_from_json(data, model.id)
-        _learn_from_usage(result.usage, sent_chars, model.id)
+        _learn_from_usage(result.usage, sent_text, model.id)
         return result
 
     raise APIError(
@@ -2311,27 +2588,32 @@ if __name__ == "__main__":  # dead block (a later __main__ wins); kept as refere
 
 
 if __name__ == "__main__":
-    # -- token-count speed self-test -------------------------------------
+    # -- token-count + pre-check self-test (worker 17/20) ---------------------
     # Proves: (1) repeated counts of the SAME object are ~free (identity
-    # tier: no serialization, no hashing) vs the old pay-every-call path;
+    # tier: no serialization, no hashing) vs the uncached path;
     # (2) counts are unchanged by the cache (same math as before);
     # (3) mutations (append/pop/in-place truncate, tool-call edits)
     # recount correctly; (4) calibration updates invalidate the cache;
     # (5) the approximation stays within a sane bound of a chars/4-style
-    # real-tokenizer guess.
+    # real-tokenizer guess; (6) the raw estimator beats flat chars/4
+    # (tiktoken when installed, else the BPE-aware heuristic);
+    # (7) MODEL_CONTEXT_WINDOWS holds researched values with a 128k
+    # default; (8) build_payload prunes history FIRST when input +
+    # max_tokens would exceed the window, logs it, and never sends a
+    # request it can prove won't fit.
     import tempfile as _tempfile
     import time as _t
     from pathlib import Path as _Path
 
     _self_test_lazy_imports()  # import-time perf: requests must stay lazy
 
-    # Hermetic calibration: the test learns ratios, so point the
+    # Hermetic calibration: the test learns corrections, so point the
     # calibration file at a temp dir — never touch the user's real one,
     # and stay deterministic across reruns.
     _CALIBRATION_FILE = (_Path(_tempfile.mkdtemp(prefix="toktest_"))
                          / "calibration.json")
     _calibration_loaded = False
-    _ratio_samples.clear()
+    _correction_samples.clear()
     _learned_windows.clear()
     _token_cache.clear()
     _id_cache.clear()
@@ -2345,9 +2627,10 @@ if __name__ == "__main__":
 
     MID = "selftest-model-xyz"
 
-    def _old_path(obj, model_id=MID):  # the pre-fix hot path: no cache
+    def _raw_path(obj, model_id=MID):  # uncached: same math, no cache
         p = json.dumps(obj, ensure_ascii=False, default=str)
-        return max(1, int(len(p) / _BASELINE_CHARS_PER_TOKEN))
+        return max(1, int(_raw_token_estimate(p)
+                          * _correction_factor(model_id)))
 
     # -- fixtures: ~100KB prompt and ~1MB history (the SAME objects are
     #    reused across calls, exactly like agent.messages) ----------------
@@ -2365,24 +2648,24 @@ if __name__ == "__main__":
         return (_t.perf_counter() - t0) / iters * 1000.0
 
     # -- 1. identical results with/without cache -------------------------
-    check("count == old path (100KB)",
-          estimate_tokens(prompt100k, MID) == _old_path(prompt100k))
-    check("count == old path (1MB)",
-          estimate_tokens(hist1m, MID) == _old_path(hist1m))
+    check("count == raw path (100KB)",
+          estimate_tokens(prompt100k, MID) == _raw_path(prompt100k))
+    check("count == raw path (1MB)",
+          estimate_tokens(hist1m, MID) == _raw_path(hist1m))
 
-    # -- 2. speed: old path vs identity-tier repeated counts ---------------
-    t_old_100k = _bench(lambda: _old_path(prompt100k))
+    # -- 2. speed: uncached path vs identity-tier repeated counts ---------
+    t_old_100k = _bench(lambda: _raw_path(prompt100k))
     estimate_tokens(prompt100k, MID)          # warm: miss populates tier 1
     t_hit_100k = _bench(lambda: estimate_tokens(prompt100k, MID), 500)
-    print(f"100KB: old path {t_old_100k:.2f} ms/call, "
+    print(f"100KB: raw path {t_old_100k:.2f} ms/call, "
           f"identity hit {t_hit_100k * 1000:.1f} us/call")
     check("100KB repeated count >= 50x faster",
           t_hit_100k * 50 < t_old_100k)
 
-    t_old_1m = _bench(lambda: _old_path(hist1m))
+    t_old_1m = _bench(lambda: _raw_path(hist1m))
     estimate_tokens(hist1m, MID)             # warm
     t_hit_1m = _bench(lambda: estimate_tokens(hist1m, MID), 500)
-    print(f"1MB:   old path {t_old_1m:.2f} ms/call, "
+    print(f"1MB:   raw path {t_old_1m:.2f} ms/call, "
           f"identity hit {t_hit_1m * 1000:.1f} us/call")
     check("1MB repeated count >= 50x faster", t_hit_1m * 50 < t_old_1m)
     check("1MB hit under 1ms", t_hit_1m < 1.0)
@@ -2406,7 +2689,7 @@ if __name__ == "__main__":
     msgs[0]["content"] = "hello world, this is a much longer message now"
     n3 = estimate_tokens(msgs, MID)
     check("in-place content edit changes count", n3 > n0)
-    check("in-place edit count is exact", n3 == _old_path(msgs))
+    check("in-place edit count is exact", n3 == _raw_path(msgs))
     msgs2 = [{"role": "assistant", "content": "",
               "tool_calls": [{"id": "1", "type": "function",
                               "function": {"name": "read",
@@ -2415,24 +2698,50 @@ if __name__ == "__main__":
     msgs2[0]["tool_calls"][0]["function"]["arguments"] = '{"p": "x' * 500
     b = estimate_tokens(msgs2, MID)
     check("tool-call arg growth changes count", b > a)
-    check("tool-call count exact", b == _old_path(msgs2))
+    check("tool-call count exact", b == _raw_path(msgs2))
 
     # -- 4. calibration learn invalidates the cache -------------------------
     before = estimate_tokens(prompt100k, MID)
-    learn_token_ratio(sent_chars=size100k, actual_tokens=10_000,
-                      model_id=MID)  # ratio 10 -> cheaper than baseline 3.2
+    raw = _raw_token_estimate(json.dumps(prompt100k, ensure_ascii=False))
+    learn_token_correction(raw_tokens=raw, actual_tokens=raw // 2,
+                           model_id=MID)  # backend says: half the raw guess
     after = estimate_tokens(prompt100k, MID)
-    check("learned ratio changes the count (epoch bump)", after < before)
+    check("learned correction changes the count (epoch bump)",
+          after < before)
+    check("learned count ~= half of raw", abs(after - before // 2) <= 2)
     check("learned count still sane", after > 0)
+    _correction_samples.clear()  # hermetic: don't leak into later checks
+    _bump_calibration_epoch()
 
     # -- 5. approximation within sane bounds ---------------------------------
     guess = size100k / 4.0
-    check("within 4x of chars/4 guess",
-          guess / 4.0 <= after <= guess * 4.0)
-    check("never more tokens than chars", after <= size100k)
-    check("never fewer than chars/16", after >= size100k / 16.0)
+    now = estimate_tokens(prompt100k, MID)
+    check("within 4x of chars/4 guess", guess / 4.0 <= now <= guess * 4.0)
+    check("never more tokens than chars", now <= size100k)
+    check("never fewer than chars/16", now >= size100k / 16.0)
 
-    # -- 6. caches stay bounded ----------------------------------------------
+    # -- 6. raw estimator quality --------------------------------------------
+    _samples = {
+        "prose": ("The quick brown fox jumps over the lazy dog. " * 40),
+        "code": ("def foo(bar):\n    return bar + 1  # comment\n" * 40),
+        "json": ('{"role": "user", "content": "hello world"}' * 60),
+        "cjk": ("中文测试内容" * 60),
+    }
+    for _name, _text in _samples.items():
+        _h = _heuristic_token_count(_text)
+        _tk = _tiktoken_count(_text)
+        if _tk is not None:
+            check(f"heuristic within 2x of tiktoken ({_name})",
+                  _tk / 2.0 <= _h <= _tk * 2.0)
+            print(f"  {_name}: heuristic={_h} tiktoken={_tk}")
+        else:
+            _g = len(_text) / 4.0
+            check(f"heuristic within 4x of chars/4 ({_name})",
+                  _g / 4.0 <= _h <= _g * 4.0)
+            print(f"  {_name}: heuristic={_h} chars/4={_g:.0f} (no tiktoken)")
+    check("tiktoken path never raises", True)
+
+    # -- 7. caches stay bounded ----------------------------------------------
     for i in range(_TOKEN_CACHE_MAX + 200):
         estimate_tokens_fast(f"unique-content-{i}", MID)
     check("digest cache evicts oldest (bounded)",
@@ -2441,7 +2750,7 @@ if __name__ == "__main__":
         estimate_tokens([{"role": "user", "content": f"m{i}"}], MID)
     check("identity cache bounded", len(_id_cache) <= _ID_CACHE_MAX)
 
-    # -- 7. degenerate inputs never crash --------------------------------------
+    # -- 8. degenerate inputs never crash --------------------------------------
     for weird in ("", [], {}, None, 0):
         try:
             n = estimate_tokens(weird, MID)
@@ -2449,11 +2758,59 @@ if __name__ == "__main__":
         except Exception as e:  # noqa: BLE001
             check(f"weird {weird!r} no crash ({e})", False)
 
+    # -- 9. per-model window table ----------------------------------------------
+    check("space-bunny-free window is 1M",
+          config.model_context_window("space-bunny-free") == 1_000_000)
+    check("ling-3.1-flash window is 262144",
+          config.model_context_window("ling-3.1-flash") == 262_144)
+    check("unknown model defaults to 128k",
+          config.model_context_window("nope-xyz") == 128_000)
+    check("every shipped model has a sane window",
+          all(m.context_window >= 128_000 for m in config.MODELS))
+    check("table covers every shipped model",
+          all(m.id in config.MODEL_CONTEXT_WINDOWS for m in config.MODELS))
+
+    # -- 10. pre-check: prune FIRST, never send a doomed request ------------------
+    _tiny = Model(id="selftest-tiny", provider="kios", label="Tiny",
+                  context_window=8_000)
+    _eff = Effort(key="t", label="T", color="", max_tokens=1_000,
+                  temperature=0.0, reasoning_effort=None, description="")
+    _sys = {"role": "system", "content": "sys"}
+    _hist = [_sys] + [{"role": "user", "content": f"question {i} " + "x" * 500}
+                      for i in range(90)]
+    _hist.append({"role": "user", "content": "LATEST-USER-MESSAGE"})
+    _n_before = _input_tokens(_tiny, _hist, None)
+    check("fixture actually overflows the tiny window",
+          _n_before + _context_margin(8_000) + _n_before // 32
+          + 1_000 > 8_000)
+    _payload = build_payload(_tiny, _eff, _hist, None, stream=False)
+    _n_after = _input_tokens(_tiny, _payload["messages"], None)
+    check("build_payload pruned instead of raising", True)
+    check("pruned history is smaller", len(_payload["messages"]) < 92)
+    check("system prompt survives the prune",
+          _payload["messages"][0].get("role") == "system")
+    check("latest user message survives the prune",
+          _payload["messages"][-1].get("content") == "LATEST-USER-MESSAGE")
+    check("request provably fits: input + max_tokens <= window",
+          _n_after + _payload["max_tokens"] <= 8_000)
+    check("input estimate returned sane", _n_after > 0)
+
+    # -- 11. unshrinkable payload raises pre-send (never a doomed send) ------------
+    _huge = [_sys, {"role": "user", "content": "LATEST " + "z" * 60_000}]
+    try:
+        build_payload(_tiny, _eff, _huge, None, stream=False)
+        check("unfittable payload raises APIError", False)
+    except APIError as e:
+        check("unfittable payload raises APIError", True)
+        check("error recognised as context overflow (on_overflow path)",
+              is_context_overflow(str(e)))
+
     print()
     if fails:
         print(f"{len(fails)} FAILURES")
         raise SystemExit(1)
     print("ALL TOKEN-COUNT SELF-TESTS PASS")
+
 
 
 if __name__ == "__main__":

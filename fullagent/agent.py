@@ -32,6 +32,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ._foundation import get_logger
+from .adaptivecap import AdaptiveTurnCap
+from .earlyexit import EarlyExitTracker as _EarlyExitTracker
 from .loopdetect import LoopDetector as _RetryLoopDetector, normalize_error
 
 _log = get_logger("agent")
@@ -77,6 +79,9 @@ _LAZY_IMPORTS: dict[str, str] = {
     "default_drafter": ".compiler",
     "Budget": ".cortex",
     "BudgetGovernor": ".cortex",
+    "bound_prompt": ".promptbudget",
+    "schemas_tokens": ".promptbudget",
+    "prompt_wire_tokens": ".promptbudget",
     "LoopDetector": ".cortex",
     "Council": ".council",
     "DebateTournament": ".debate",
@@ -587,6 +592,11 @@ class Agent:
         # SPEED: compaction gate — the full token re-estimate only runs
         # after ~15% conversation growth, not before every model call
         self._compact_check_chars = 0
+        # Worker 5/20 (flight prewarm): overlaps the provider streaming
+        # wait with next-iteration prep — compact analysis, prompt
+        # skeleton, read-only env probes — on a background thread.
+        from .prewarm import FlightPrewarmer
+        self._flight_prewarmer = FlightPrewarmer()
 
     def _ensure_session(self) -> None:
         """Run the deferred (expensive) half of __init__ exactly once.
@@ -922,6 +932,16 @@ class Agent:
         # Worker 8/20: deferred session start — registers the full tool
         # set, feature modules, cassette, session.start, env probe.
         self._ensure_session()
+        # Continue-from-summary (continueresume): "continue" after a capped
+        # turn must NOT re-send the full capped-turn history (providers
+        # answer the bloated replay with invalid_request_error). Reseed
+        # the model-visible history as [system, original request, compact
+        # summary]; the user's "continue" message is appended as usual.
+        try:
+            from .continueresume import seed_continue_history
+            seed_continue_history(self, user_text)
+        except Exception:  # noqa: BLE001 — resume is a nicety, not a crash path
+            pass
         # Feature: per-turn model override (/model <name> --once)
         try:
             from .modelpick import get_effective_model, clear_turn_model
@@ -1026,13 +1046,19 @@ class Agent:
                                   actor="human", provenance="user")
 
         iterations = 0
-        # PERF: hard cap on tool calls per turn + no-progress detection.
+        # PERF: adaptive cap on tool calls per turn + no-progress detection.
         # 200 LLM round-trips at ~2.5s each was the 500s+ hang.
         tool_calls_this_turn = 0
+        # Worker 8/20: fixed 25 was dumb — fast calls (<5s rolling avg)
+        # get up to 40, slow calls (>15s) stop at 12 calls / 120s tool
+        # time. _turn_cap makes the stop decision; the plain counter
+        # above stays for the live per-call progress display.
+        _turn_cap = AdaptiveTurnCap()
         _last_tool_sig = None
         _stall_count = 0
         turn_stopped = False
         _retry_loop_det = _RetryLoopDetector()  # loopdetect: per-turn detector
+        _exit_tracker = _EarlyExitTracker()  # earlyexit: per-turn novelty
         self._turn_status = on_status
         try:
             while iterations < config.MAX_TOOL_ITERATIONS:
@@ -1053,13 +1079,26 @@ class Agent:
                 on_status("thinking")
                 # keep the context under the window — compact stale turns
                 # before asking the model (I9: input budget governor)
+                # Worker 5/20 (flight prewarm): consume the bundle
+                # prewarmed on a background thread during the previous
+                # API wait — compact analysis, prompt skeleton, env
+                # probes. None on the first iteration or whenever the
+                # snapshot was invalidated; the normal path then runs
+                # unchanged.
+                _prewarmer = getattr(self, "_flight_prewarmer", None)
                 try:
-                    self._maybe_compact()
+                    _flight = (_prewarmer.consume(self)
+                               if _prewarmer is not None else None)
+                except Exception:
+                    _flight = None
+                try:
+                    self._maybe_compact(_prewarmed=_flight)
                 except Exception:
                     pass
                 result = self._complete(on_token, on_reasoning, on_status,
                                         should_cancel,
-                                        on_tool_args=on_tool_args)
+                                        on_tool_args=on_tool_args,
+                                        _prewarmed=_flight)
 
                 if result.reasoning:
                     turn.reasoning += result.reasoning
@@ -1142,13 +1181,17 @@ class Agent:
                         # the turn immediately, not after the next model call
                         if should_cancel is not None and should_cancel():
                             raise TurnCancelled()
-                        # PERF: tool-call cap + no-progress detection
+                        # PERF (worker 8/20): adaptive tool-call cap —
+                        # rolling avg of per-call wall time picks the tier
+                        # (fast <5s: up to 40 calls; slow >15s: 12 calls /
+                        # 120s tool time; else 25 calls / 180s). The stop
+                        # message says WHY (call count vs time budget) and
+                        # invites "continue".
                         tool_calls_this_turn += 1
-                        if tool_calls_this_turn >= config.MAX_TOOL_CALLS_PER_TURN:
+                        _cap_msg = _turn_cap.note(ev.duration)
+                        if _cap_msg is not None:
                             turn_stopped = True
-                            turn.error = (
-                                "Turn stopped after 25 tool calls — ask me "
-                                "to continue.")
+                            turn.error = _cap_msg
                         else:
                             try:
                                 _sig = (name,
@@ -1175,9 +1218,40 @@ class Agent:
                             else:
                                 _stall_count = 0
                             _last_tool_sig = _sig
+                        # earlyexit hook (Worker 10/20): cheap per-result
+                        # novelty check. Never stops the turn — when the
+                        # last few calls added nothing new after a
+                        # substantial run, inject a soft nudge so a model
+                        # that keeps "verifying" compulsively gets a cheap
+                        # chance to finish instead of burning all 25 calls.
+                        # At most one nudge per turn; failures are skipped
+                        # (loopdetect owns those).
+                        try:
+                            _ee_hint = _exit_tracker.note(
+                                name, ev.args, ev.result, ev.status)
+                            if _ee_hint:
+                                self.messages.append(
+                                    {"role": "system", "content": _ee_hint})
+                        except Exception:
+                            pass  # novelty is insight, never a crash path
 
+                    # Worker 9/20 — live per-call progress: each tool call
+                    # emits one cheap on_status line
+                    # ("progress:12:25:45:read_file:aegisscan.py") right
+                    # before it executes, so a long turn never looks hung.
+                    # The TUI renders it in the bottom status line and
+                    # headless mode prints it via on_status. It never
+                    # touches the event log (no spam), and indices are
+                    # pre-assigned from the finished-call count so
+                    # parallel batches report consecutive numbers.
+                    from .callprogress import wrap_execute as _wrap_progress
+                    _exec_progress = _wrap_progress(
+                        self._execute_tool, on_status, started,
+                        config.MAX_TOOL_CALLS_PER_TURN,
+                        tool_calls_this_turn,
+                        [ev for _, ev in pending])
                     dispatch_block(
-                        self._execute_tool, _finish_one, pending,
+                        _exec_progress, _finish_one, pending,
                         approve=approve, on_status=on_status,
                         causation_id=user_ev.id,
                         on_tool_output=on_tool_output,
@@ -1308,7 +1382,7 @@ class Agent:
                   f"this paste.]\n\n"
                 + tail)
 
-    def _maybe_compact(self) -> None:
+    def _maybe_compact(self, _prewarmed=None) -> None:
         """Keep the conversation under the model's context window.
 
         Three escalating passes, run only when needed:
@@ -1322,11 +1396,31 @@ class Agent:
 
         SPEED: the expensive token estimate (a JSON dump of the whole
         conversation) runs only when the conversation has measurably
-        grown since the last check — the cheap char-count is the gate."""
+        grown since the last check — the cheap char-count is the gate.
+
+        Worker 5/20 (flight prewarm): when _prewarmed carries the
+        compact analysis computed on a background thread during the
+        previous API wait, the fit check reuses it incrementally
+        (est(snapshot) + est(small appended delta)) instead of
+        re-dumping the whole conversation."""
         schemas = self._tool_schemas()
         schema_tokens = (estimate_tokens(schemas, self.model.id)
                          if schemas else 0)
         budget = self._fit_budget()
+        if _prewarmed is not None:
+            try:
+                from .prewarm import compact_fits, message_chars
+                if compact_fits(self.messages, _prewarmed, schema_tokens,
+                                budget, self.model.id):
+                    # fits with margin — the same early return the normal
+                    # path takes, minus the full-conversation JSON dump.
+                    # Gate bookkeeping stays identical.
+                    self._compact_check_chars = max(
+                        _prewarmed.chars + message_chars(
+                            self.messages[_prewarmed.snapshot_len:]), 1)
+                    return
+            except Exception:
+                pass  # fall through to the normal path on any doubt
         chars = self._messages_chars()
         if self._compact_check_chars > 0 and \
                 chars <= self._compact_check_chars * 1.15:
@@ -1548,23 +1642,57 @@ class Agent:
                 self.goal.prove_clause(clause.id, True, "human_approval",
                                        detail="model claim, advisory clause")
 
-    def _prune_for_model(self) -> list:
-        """PERF: model-visible message view — sliding window prune.
+    def _prune_for_model(self, reserved_tokens: int = 0) -> list:
+        """PERF: model-visible message view — sliding window prune plus a
+        hard per-request token budget (promptbudget.bound_prompt).
 
         self.messages stays canonical (event log, checkpoints keep
-        everything); only the API payload shrinks.
+        everything); only the API payload shrinks. reserved_tokens is
+        the token cost of the tool schemas, so messages + schemas stay
+        under cfg.prompt_token_budget together.
         """
+        _resolve_lazy("bound_prompt")
         try:
             window = int(getattr(self.cfg, "prune_window", 40) or 0)
         except (TypeError, ValueError):
             window = 40
-        return prune_messages(self.messages, window=window)
+        try:
+            budget = int(getattr(self.cfg, "prompt_token_budget", 0) or 0)
+        except (TypeError, ValueError):
+            budget = 0
+        msgs = prune_messages(self.messages, window=window)
+        if budget > 0:
+            msgs = bound_prompt(
+                msgs, budget_tokens=budget,
+                model_id=getattr(self.model, "id", ""),
+                reserved_tokens=reserved_tokens)
+        return msgs
 
     def _complete(self, on_token, on_reasoning, on_status, should_cancel=None,
-                  on_tool_args=None):
+                  on_tool_args=None, _prewarmed=None):
         schemas = self._tool_schemas()
-        # PERF: send the pruned view, not the full history
-        model_msgs = self._prune_for_model()
+        # PERF: send the pruned, budget-capped view — never the full
+        # history. reserved_tokens keeps messages + tool schemas under
+        # the prompt_token_budget ceiling together.
+        _resolve_lazy("schemas_tokens")
+        _reserved = schemas_tokens(schemas, getattr(self.model, "id", ""))
+        if _prewarmed is not None:
+            # Worker 5/20 (flight prewarm): O(window) patch of the prompt
+            # skeleton prebuilt during the previous API wait —
+            # byte-identical to _prune_for_model(); falls back to the
+            # normal path on any doubt.
+            try:
+                from .prewarm import patched_prune_for_model
+                model_msgs = patched_prune_for_model(self, _prewarmed,
+                                                     _reserved)
+            except Exception:
+                model_msgs = None
+            if model_msgs is None:
+                model_msgs = self._prune_for_model(
+                    reserved_tokens=_reserved)
+        else:
+            model_msgs = self._prune_for_model(
+                reserved_tokens=_reserved)
         # cassette replay: zero API cost, fully deterministic (§20.2)
         if self.cassette is not None and self.cassette.mode == "replay":
             from .client import StreamResult
@@ -1582,6 +1710,20 @@ class Agent:
                                 tool_calls=stored.get("tool_calls", []),
                                 usage=stored.get("usage"),
                                 model=self.model.id)
+        # Worker 5/20 (flight prewarm): snapshot the conversation and
+        # start the background prewarm for the NEXT iteration — compact
+        # analysis, prompt skeleton and read-only env probes run while
+        # the provider streams, instead of serially after the response
+        # lands. Read-only and snapshot-isolated; any mutation during
+        # the wait invalidates the flight at consume time.
+        try:
+            _fp = getattr(self, "_flight_prewarmer", None)
+            if _fp is None:
+                from .prewarm import FlightPrewarmer
+                _fp = self._flight_prewarmer = FlightPrewarmer()
+            _fp.launch(self)
+        except Exception:
+            pass
         def _attempt():
             return chat_stream(self.provider, self.model, self.effort,
                                model_msgs, schemas,
@@ -1616,8 +1758,11 @@ class Agent:
                                      on_status=on_status)
             elif e.status == 400 and "tool" in msg and schemas:
                 on_status("retrying (no tools)")
+                # NOTE: model_msgs (pruned + budget-capped), NOT
+                # self.messages — the unpruned history must never go on
+                # the wire (worker 2/20 prompt-size audit).
                 result = chat_stream(self.provider, self.model, self.effort,
-                                     self.messages, None,
+                                     model_msgs, None,
                                      on_token=on_token,
                                      on_reasoning=on_reasoning,
                                      should_cancel=should_cancel,

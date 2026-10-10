@@ -56,7 +56,7 @@ class StreamingTests(unittest.TestCase):
             frames.append("".join(text for _, text in ui._bottom_fragments()))
             return Turn(text, assistant_text="first second ")
         ui.agent.run_turn = run
-        with patch("fullagent.tui.time.time", side_effect=_ticking_clock()):
+        with patch("fullagent.tui.time.monotonic", side_effect=_ticking_clock()):
             ui._run_turn_thread("hello")
         self.assertIn("first", frames[0])
         self.assertNotIn("second", frames[0])
@@ -73,7 +73,7 @@ class StreamingTests(unittest.TestCase):
             snapshots.append(ui._status_text)
             return Turn(text, assistant_text="first line\nlast")
         ui.agent.run_turn = run
-        with patch("fullagent.tui.time.time", side_effect=_ticking_clock()):
+        with patch("fullagent.tui.time.monotonic", side_effect=_ticking_clock()):
             ui._run_turn_thread("hello")
         self.assertIn("first line\n", snapshots[0])
         self.assertIn("last", snapshots[1])
@@ -89,7 +89,7 @@ class StreamingTests(unittest.TestCase):
             snapshots.extend([ui._status_text, ui.output.getvalue()])
             return Turn(text, assistant_text="first last")
         ui.agent.run_turn = run
-        with patch("fullagent.tui.time.time", side_effect=_ticking_clock()):
+        with patch("fullagent.tui.time.monotonic", side_effect=_ticking_clock()):
             ui._run_turn_thread("hello")
         self.assertIn("last", snapshots[0])
         self.assertNotIn("first last", snapshots[1])
@@ -166,7 +166,7 @@ class StreamingTests(unittest.TestCase):
             return Turn(text, assistant_text=" ".join(words))
 
         ui.agent.run_turn = run
-        with patch("fullagent.tui.time.time", return_value=100.0):
+        with patch("fullagent.tui.time.monotonic", return_value=100.0):
             ui._run_turn_thread("hello")
         out = ui.output.getvalue()
         # no text lost: every token appears in the printed output

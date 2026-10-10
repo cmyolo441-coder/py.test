@@ -58,6 +58,30 @@ def register(agent) -> None:
         pass
 
 
+def clear(agent) -> None:
+    """Drop the agent's file-stat baselines (e.g. on ``/reset``).
+
+    Never raises: a failed cache clear must never kill a turn.
+    """
+    try:
+        with _lock:
+            store = None
+            try:
+                store = _agent_stores.get(agent)
+            except TypeError:
+                store = _id_stores.get(id(agent))
+            if store is not None:
+                store.clear()
+            try:
+                # keep the attribute pointing at the same (now empty) store
+                if store is not None:
+                    agent._file_stats = store
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def _store_for(agent) -> dict[str, tuple[int, int]]:
     """Resolve the stat store for an agent (or the current/global one)."""
     with _lock:
