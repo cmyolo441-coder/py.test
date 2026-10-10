@@ -1414,8 +1414,35 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
         # resets the timer — reasoning pieces alone still trigger the
         # warning, which is exactly the incident being fixed.
         stall = StallWatcher()
+        # The stall check MUST run on a background timer, not inside the
+        # event loop — if the stream stalls (no events), the loop never
+        # iterates and the check never fires. This was the 140s bug.
+        import threading as _th
+        _stall_stop = _th.Event()
 
         def _stall_check() -> None:
+            warning = stall.check()
+            if warning is None:
+                return
+            if on_status is not None:
+                try:
+                    on_status(warning)
+                except Exception:
+                    pass
+            elif on_reasoning is not None:
+                try:
+                    on_reasoning(warning)
+                except Exception:
+                    pass
+
+        def _stall_timer() -> None:
+            while not _stall_stop.wait(5.0):  # check every 5s
+                _stall_check()
+
+        _timer = _th.Thread(target=_stall_timer, daemon=True)
+        _timer.start()
+
+        def _stall_check_inline() -> None:
             warning = stall.check()
             if warning is None:
                 return
@@ -1430,15 +1457,20 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
                 on_reasoning(warning)
 
         for event in events:
-            _stall_check()
+            _stall_check_inline()
             if should_cancel is not None and should_cancel():
+                _stall_stop.set()
                 raise TurnCancelled()
             if not isinstance(event, dict):
                 continue
             if event.get("model"):
                 result.model = event["model"]
             if event.get("usage"):
-                result.usage = event["usage"]
+                # Some providers return usage as a string or malformed type.
+                # Only accept dicts to prevent AttributeError downstream.
+                _u = event["usage"]
+                if isinstance(_u, dict):
+                    result.usage = _u
             if event.get("error"):
                 err = event["error"]
                 msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
@@ -1499,6 +1531,7 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
             "function": {"name": acc.name, "arguments": acc.arguments},
         })
 
+    _stall_stop.set()  # stop the background stall timer
     return result
 
 

@@ -1398,7 +1398,14 @@ class UI:
     def _crew_visible(self) -> bool:
         # Show the panel while any crew activity exists. Completed agents
         # stay visible (collapsed to one line each) so results aren't lost.
-        return self.crew_panel.has_activity()
+        # Hysteresis: once visible, stay visible for 5s after activity stops
+        # to prevent the prompt box from jumping up/down on rapid toggles.
+        import time as _t
+        if self.crew_panel.has_activity():
+            self._crew_last_active = _t.time()
+            return True
+        _last = getattr(self, "_crew_last_active", 0)
+        return (_t.time() - _last) < 5.0
 
     def _crew_fragments(self) -> list:
         # Poll for new crew events on every render frame — poll_log() is

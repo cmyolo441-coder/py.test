@@ -713,10 +713,12 @@ class Crew:
                     result = self._chat(provider, model, self.effort,
                                         agent.messages, schemas, 120.0)
                 if result.usage:
+                    # Defensive: usage must be a dict (some providers return strings)
+                    _usage = result.usage if isinstance(result.usage, dict) else {}
                     agent.tokens_in += int(
-                        result.usage.get("prompt_tokens", 0) or 0)
+                        _usage.get("prompt_tokens", 0) or 0)
                     agent.tokens_out += int(
-                        result.usage.get("completion_tokens", 0) or 0)
+                        _usage.get("completion_tokens", 0) or 0)
                 if not result.tool_calls:
                     break
                 from .client import assistant_message
