@@ -2401,16 +2401,26 @@ class Agent:
                 and model_by_id(explicit) is not None:
             return explicit
         # auto-pick: same provider first, then any capable model
+        # CRITICAL: only pick models that HAVE an API key configured.
+        # Picking a keyless model (e.g. kilo without KILO_API_KEY) just
+        # trades one error for another.
+        from .config import MODELS, _provider_api_key
         current = self.model
-        from .config import MODELS
+        def _has_key(m) -> bool:
+            try:
+                return bool(_provider_api_key(m.provider))
+            except Exception:
+                return False
         same_provider = [m for m in MODELS
                          if m.provider == current.provider
                          and m.id != current.id
-                         and m.supports_tools >= current.supports_tools]
+                         and m.supports_tools >= current.supports_tools
+                         and _has_key(m)]
         others = [m for m in MODELS
                   if m.provider != current.provider
                   and m.id != current.id
-                  and m.supports_tools >= current.supports_tools]
+                  and m.supports_tools >= current.supports_tools
+                  and _has_key(m)]
         candidates = same_provider + others
         return candidates[0].id if candidates else None
 

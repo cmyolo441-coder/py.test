@@ -1676,7 +1676,7 @@ class UI:
             style=STYLE,
             key_bindings=self._build_key_bindings(),
             full_screen=False,
-            min_redraw_interval=0.03,
+            min_redraw_interval=0.25,
             mouse_support=False,
         )
 
