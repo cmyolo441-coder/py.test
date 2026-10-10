@@ -1646,24 +1646,40 @@ class UI:
             self.overlay._top = max(0, self.overlay.index - OverlayList.WINDOW + 1)
 
         # --- completion menu: PgUp/PgDn also navigate it ---
+        # eager=True ensures these win over prompt_toolkit's default
+        # PgUp/PgDn (buffer scroll) bindings.
         @kb.add(Keys.PageDown, filter=focused & ~ov & idle &
-                Condition(self._completion_active))
+                Condition(self._completion_active), eager=True)
         def _cm_pgdn(event):
             self.buffer.complete_next(5)
 
         @kb.add(Keys.PageUp, filter=focused & ~ov & idle &
-                Condition(self._completion_active))
+                Condition(self._completion_active), eager=True)
         def _cm_pgup(event):
             self.buffer.complete_previous(5)
+
+        # --- completion menu: Up/Down navigate it (not history) ---
+        # These must win over the history bindings below, hence eager=True.
+        @kb.add(Keys.Down, filter=focused & ~ov & idle &
+                Condition(self._completion_active), eager=True)
+        def _cm_down(event):
+            self.buffer.complete_next()
+
+        @kb.add(Keys.Up, filter=focused & ~ov & idle &
+                Condition(self._completion_active), eager=True)
+        def _cm_up(event):
+            self.buffer.complete_previous()
 
         # --- input ---
         @kb.add(Keys.Enter, filter=can_submit)
         def _enter(event):
             b = self.buffer
             if b.complete_state is not None:
-                # the highlighted completion is already previewed in the
-                # buffer — close the menu and submit the text as-is
+                # First Enter with menu open: accept the highlighted
+                # completion (fill text) but DON'T submit — user can edit
+                # or press Enter again to run the command.
                 b.complete_state = None
+                return
             if not b.text.strip():
                 return
             b.validate_and_handle()
