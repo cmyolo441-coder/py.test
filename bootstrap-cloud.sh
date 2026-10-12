@@ -29,7 +29,11 @@ export PATH="$HOME/.local/bin:$PATH"
 
 echo ">> [1/6] Stopping any previous cloud server/tunnel..."
 pkill -f "cloudserve\.py" 2>/dev/null || true
-pkill -f "cloudflared tunnel" 2>/dev/null || true
+# Kill ONLY our own previous tunnel (matched by its exact --url). Never use a
+# bare "cloudflared tunnel" pattern here: on 2Z2-style sandbox VMs the remote
+# desktop itself is served by another cloudflared tunnel, and killing it
+# drops the user's desktop access mid-deploy.
+pkill -f "cloudflared tunnel --url http://127.0.0.1:${PORT}" 2>/dev/null || true
 sleep 1
 
 echo ">> [2/6] Python environment..."
