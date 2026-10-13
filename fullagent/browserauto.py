@@ -26,6 +26,8 @@ nothing is faked or simulated. Never imports ``.agent``.
 
 from __future__ import annotations
 
+import os
+import shutil
 import threading
 
 __all__ = ["register", "browser_available", "NOT_INSTALLED_MSG",
@@ -36,6 +38,9 @@ SNAPSHOT_CAP = 8_000         # max chars of the accessibility snapshot
 
 NOT_INSTALLED_MSG = ("playwright not installed (pip install playwright) "
                      "— browser tools are unavailable until it is installed.")
+BROWSER_MISSING_MSG = (
+    "Chromium browser not found. Run 'python -m playwright install chromium' "
+    "or install Chromium and put it on PATH.")
 
 
 # ---------------------------------------------------------------------------
@@ -51,9 +56,45 @@ def _import_playwright():
         return None
 
 
+def _resolve_chromium_executable(chromium=None) -> str | None:
+    """Prefer an explicit, system, or Playwright-managed Chromium binary."""
+    configured = os.environ.get("FULLAGENT_CHROMIUM_EXECUTABLE", "").strip()
+    if configured:
+        if os.path.isfile(configured) and os.access(configured, os.X_OK):
+            return configured
+        return None
+    if chromium is not None:
+        try:
+            bundled = chromium.executable_path
+            if bundled and os.path.isfile(bundled):
+                return bundled
+        except Exception:
+            pass
+    for name in ("chromium", "chromium-browser", "google-chrome",
+                 "google-chrome-stable", "chrome"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
 def browser_available() -> bool:
-    """True when the real playwright package can be imported."""
-    return _import_playwright() is not None
+    """True when Playwright and a usable Chromium executable are available."""
+    sync_api = _import_playwright()
+    if sync_api is None:
+        return False
+    pw = None
+    try:
+        pw = sync_api.sync_playwright().start()
+        return _resolve_chromium_executable(pw.chromium) is not None
+    except Exception:
+        return False
+    finally:
+        if pw is not None:
+            try:
+                pw.stop()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -83,8 +124,13 @@ class _BrowserSession:
         pw = browser = None
         try:
             pw = sync_api.sync_playwright().start()
+            executable = _resolve_chromium_executable(pw.chromium)
+            if executable is None:
+                pw.stop()
+                return BROWSER_MISSING_MSG
             browser = pw.chromium.launch(
                 headless=True,
+                executable_path=executable,
                 args=["--no-sandbox", "--disable-dev-shm-usage"])
             page = browser.new_page()
             page.set_default_timeout(self._timeout)
@@ -157,10 +203,31 @@ class _BrowserSession:
         err, page = self._ensure()
         if err:
             return err
+        tree = None
         try:
-            tree = page.accessibility.snapshot()
-        except Exception as e:  # noqa: BLE001
-            return f"ERROR: {type(e).__name__}: {e}"
+            accessibility = getattr(page, "accessibility", None)
+            if accessibility is not None:
+                tree = accessibility.snapshot()
+        except Exception:
+            # Newer Playwright releases removed page.accessibility; fall
+            # back to Locator.aria_snapshot() or visible page text below.
+            tree = None
+        if tree is None:
+            try:
+                tree = page.locator("body").aria_snapshot()
+            except Exception:
+                tree = None
+        if isinstance(tree, str):
+            out = tree.strip()
+            if not out:
+                try:
+                    out = page.locator("body").inner_text().strip()
+                except Exception:
+                    out = ""
+            if len(out) > SNAPSHOT_CAP:
+                out = out[:SNAPSHOT_CAP].rsplit("\n", 1)[0] + \
+                    f"\n… [{len(out) - SNAPSHOT_CAP} chars truncated]"
+            return out or "(empty page)"
         if not tree:
             # Empty AX tree (e.g. canvas-only page): fall back to raw text.
             try:
@@ -263,9 +330,8 @@ def register(agent) -> None:
 # ---------------------------------------------------------------------------
 # Self-test: python3 -m fullagent.browserauto  →  PASS
 #
-# With playwright installed: opens real https://example.com, checks the
-# title, snapshots the page, closes. Without it: every tool returns the
-# clear not-installed message instead of raising. Either path passes.
+# With Playwright and Chromium: opens a local data URL, snapshots and clicks.
+# Without either dependency: tools return an actionable message, not a crash.
 # ---------------------------------------------------------------------------
 
 def _selftest() -> None:
@@ -277,17 +343,18 @@ def _selftest() -> None:
         if not cond:
             fails += 1
 
-    have_pw = browser_available()
-    print("playwright present:", have_pw)
+    have_browser = browser_available()
+    print("browser available:", have_browser)
 
-    if not have_pw:
-        # --- graceful degradation: tools return the message, never raise ---
+    if not have_browser:
+        # --- graceful degradation when Playwright or Chromium is absent ---
+        expected = (NOT_INSTALLED_MSG if _import_playwright() is None
+                    else BROWSER_MISSING_MSG)
         session = _BrowserSession()
         for name, call in (
             ("BrowserOpen", lambda: session.open_url("https://example.com")),
             ("BrowserSnapshot", session.snapshot),
             ("BrowserClick", lambda: session.click("button")),
-            ("BrowserClose", session.close),
         ):
             try:
                 out = call()
@@ -296,10 +363,13 @@ def _selftest() -> None:
                       False)
                 print("   raised:", e)
                 continue
-            check(f"{name} returns not-installed message when missing",
-                  out == NOT_INSTALLED_MSG)
-            check(f"{name} message names pip install",
-                  "pip install playwright" in out)
+            check(f"{name} returns actionable unavailable message",
+                  out == expected)
+        close_expected = (NOT_INSTALLED_MSG
+                          if _import_playwright() is None
+                          else "browser already closed")
+        check("BrowserClose is safe when unavailable",
+              session.close() == close_expected)
 
         # register() works on a duck-typed agent and wires 4 tools
         class _FakeAgent:
@@ -324,16 +394,16 @@ def _selftest() -> None:
                                 else h())
             except Exception as e:  # noqa: BLE001
                 tool_outs.append(f"RAISED {e}")
-        check("tool handlers return not-installed message",
-              all(o == NOT_INSTALLED_MSG for o in tool_outs))
+        check("tool handlers return actionable unavailable message",
+              all(o == expected for o in tool_outs))
         try:
             close_out = agent.tools["BrowserClose"].handler()
         except Exception as e:  # noqa: BLE001
             close_out = f"RAISED {e}"
-        check("BrowserClose returns not-installed message",
-              close_out == NOT_INSTALLED_MSG)
+        check("BrowserClose is safe when unavailable",
+              close_out == close_expected)
     else:
-        # --- real playwright path: live run against example.com ------------
+        # --- local data URL: deterministic, no internet required -----------
         class _FakeAgent:
             def __init__(self):
                 self.tools = {}
@@ -344,7 +414,12 @@ def _selftest() -> None:
               {"BrowserOpen", "BrowserSnapshot", "BrowserClick",
                "BrowserClose"} <= set(agent.tools))
 
-        out = agent.tools["BrowserOpen"].handler("https://example.com")
+        from urllib.parse import quote
+        page_url = "data:text/html;charset=utf-8," + quote(
+            "<html><head><title>Example</title></head><body>"
+            "<main><h1>Example page</h1><a href='#more'>More information</a>"
+            "<p id='more'>Browser automation works.</p></main></body></html>")
+        out = agent.tools["BrowserOpen"].handler(page_url)
         check("BrowserOpen returns output (no exception)", bool(out))
         print("   open:", out.replace("\n", " | ")[:120])
         check("title contains 'Example'", "Example" in out)
@@ -356,7 +431,7 @@ def _selftest() -> None:
         check("snapshot contains page text",
               "Example" in snap or "example" in snap)
 
-        # real click: the "More information..." link on example.com
+        # real click on the local test page
         click_out = agent.tools["BrowserClick"].handler("a")
         check("BrowserClick returns (no exception)", bool(click_out))
         print("   click:", click_out[:100])
@@ -367,7 +442,7 @@ def _selftest() -> None:
         print("   close:", close_out)
 
         # after close, lazy re-init works (session still functional)
-        out2 = agent.tools["BrowserOpen"].handler("https://example.com")
+        out2 = agent.tools["BrowserOpen"].handler(page_url)
         check("re-open after close works", "Example" in out2)
         final = agent.tools["BrowserClose"].handler()
         check("final close clean", final == "browser closed")

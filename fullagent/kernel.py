@@ -70,7 +70,7 @@ class Event:
     data: dict
     # §7.1 causal envelope — every event is attributable and traceable
     session: str = ""
-    actor: str = "system"            # sovereign | scout:N | human | system | …
+    actor: str = "system"            # sovereign | human | system | …
     causation_id: str | None = None  # the event that directly caused this one
     correlation_id: str | None = None  # the root goal clause this serves
     provenance: str = "system"       # system | user | tool_output | web | file | model

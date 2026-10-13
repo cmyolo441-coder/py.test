@@ -22,20 +22,7 @@ jobs:
       - name: Compile check
         run: python -m compileall -q fullagent
       - name: Run every module self-test
-        run: |
-          fail=0
-          for m in attention autopilot bandit brain cassette causal ci compiler \
-                   cortex council cov crew daemon dashboard debate dual evolution \
-                   fabric forge formal fuzz goal healer homeo judge kernel kgraph \
-                   market mastermind mcts memory merge mesh meta mutate nexus \
-                   oracle race report router semantic skills snapshots speculate \
-                   synth systemprompt taint team theater tower tuner world workflows; do
-            if ! python -m fullagent.$m >/dev/null 2>&1; then
-              echo "SELF-TEST FAILED: $m"
-              fail=1
-            fi
-          done
-          exit $fail
+        run: python run_selftests.py
 
   build:
     needs: selftest
@@ -103,11 +90,11 @@ jobs:
 
           | Platform | How to install |
           |---|---|
-          | Linux x64 | `curl -fsSL https://raw.githubusercontent.com/cmyolo441-coder/perfectagent/main/install.sh \| bash` |
+          | Linux x64 | `curl -fsSL https://raw.githubusercontent.com/cmyolo441-coder/py.test/main/install.sh \| bash` |
           | Windows x64 | download `fullagent-windows-x64.exe`, rename to `fullagent.exe`, put on PATH |
           | macOS (Apple Silicon) | download `fullagent-darwin-arm64`, `chmod +x`, move to /usr/local/bin |
-          | Termux (Android) | `curl -fsSL https://raw.githubusercontent.com/cmyolo441-coder/perfectagent/main/install-termux.sh \| bash` |
-          | Any OS with Python 3.9+ | `pip install git+https://github.com/cmyolo441-coder/perfectagent.git` |
+          | Termux (Android) | `curl -fsSL https://raw.githubusercontent.com/cmyolo441-coder/py.test/main/install-termux.sh \| bash` |
+          | Any OS with Python 3.9+ | `pip install git+https://github.com/cmyolo441-coder/py.test.git` |
           EOF
           sed -i 's/^          //' notes.md
       - name: Create GitHub release

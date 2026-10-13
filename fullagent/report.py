@@ -4,7 +4,7 @@ Two capabilities, both pure folds over the event log (deterministic,
 zero model calls):
 
   * EXPORT — a full audit report of the session: timeline, tool calls,
-    judge verdicts, goal outcome, costs, subagent activity. Markdown or
+    judge verdicts, goal outcome, and costs. Markdown or
     self-contained HTML — for handoff, review, or compliance.
   * FORECAST — projection from measured reality: tokens per turn, cost
     per turn, goal velocity -> estimated turns remaining; per-model
@@ -25,7 +25,7 @@ _log = get_logger("report")
 INTERESTING = ("user.message", "assistant.message", "tool.call",
                "tool.result", "judge.verdict", "clause.proven",
                "clause.regressed", "goal.closed", "focus.stop",
-               "workflow.done", "crew.done",
+               "workflow.done",
                "snapshot.taken", "autonomy.changed")
 
 

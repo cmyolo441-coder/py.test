@@ -86,26 +86,17 @@ _LAZY_IMPORTS: dict[str, str] = {
     "Council": ".council",
     "DebateTournament": ".debate",
     "DualProcess": ".dual",
-    "EvolutionEngine": ".evolution",
-    "default_benchmark": ".evolution",
     "KnowledgeFabric": ".fabric",
     "ModelChecker": ".formal",
     "Homeostasis": ".homeo",
-    "TaskMarket": ".market",
     "TreeSearch": ".mcts",
     "TimelineMerger": ".merge",
-    "MeshNode": ".mesh",
-    "RoleForge": ".meta",
-    # aliased import: from .meta import default_drafter as role_drafter
-    "role_drafter": (".meta", "default_drafter"),
     "TERMINAL_STATES": ".goal",
     "GoalContract": ".goal",
     "export_html": ".report",
     "export_markdown": ".report",
     "forecast": ".report",
     "format_forecast": ".report",
-    "WorkflowEngine": ".workflows",
-    "WorkflowError": ".workflows",
     "CoverageEngine": ".cov",
     "Daemon": ".daemon",
     "Dashboard": ".dashboard",
@@ -127,14 +118,10 @@ _LAZY_IMPORTS: dict[str, str] = {
     "SnapshotStore": ".snapshots",
     "Speculator": ".speculate",
     "SPECULATIVE_TOOLS": ".speculate",
-    "RacingUniverses": ".race",
     "ProgramSynthesizer": ".synth",
     "SynthSpec": ".synth",
     "default_generator": ".synth",
     "StaticAnalyzer": ".taint",
-    "MAX_SUMMARY_CHARS": ".team",
-    "WorkerReport": ".team",
-    "parse_worker_final": ".team",
     "Theater": ".theater",
     "RISK_CONFIRM": ".tools",
     "Tool": ".tools",
@@ -144,7 +131,6 @@ _LAZY_IMPORTS: dict[str, str] = {
     "Tower": ".tower",
     "ParzenTuner": ".tuner",
     "WorldModel": ".world",
-    "Crew": ".crew",
 }
 
 
@@ -295,11 +281,7 @@ def prune_messages(messages: list, window: int = 40,
 
 
 
-NOTIFY_EVENTS = ("goal.closed", "focus.stop", "workflow.done",
-                 "crew.done", "provider.failover")
-
-# provider errors that justify an automatic model failover
-_FAILOVER_STATUSES = {408, 429, 500, 502, 503, 504}
+NOTIFY_EVENTS = ("goal.closed", "focus.stop", "workflow.done")
 
 # MEMORY BOUNDS (worker 19/20): every unbounded runtime structure gets a
 # cap. These are live UI/detection state only — the event log is the
@@ -416,44 +398,24 @@ class Agent:
     # touch attributes that exist right after __init__ (cfg, log, tools,
     # mastermind, messages, session_id) or other lazy subsystems.
     _SUBSYSTEM_FACTORIES: dict[str, Callable[["Agent"], Any]] = {
-        "crew": lambda self: Crew(
-            self.log, self.provider, self.model,
-            # cfg.effort is a STRING key ("ultra high") — Crew needs the
-            # Effort object. Passing the raw string caused
-            # AttributeError: 'str' object has no attribute 'temperature'.
-            config.effort_by_key(self.cfg.effort) or config.effort_by_key(
-                config.DEFAULT_EFFORT),
-            mastermind=self.mastermind),
         "store": lambda self: SnapshotStore(config.APP_DIR / "store"),
         "memory": lambda self: Hippocampus(self.log),
         "judge": lambda self: Judge(self.log),
         "goal": lambda self: GoalContract(self.log, judge=self.judge),
         "brain": lambda self: Brain(self.log, config.APP_DIR / "brain.json"),
         "compiler": lambda self: IntentCompiler(
-            self.log,
-            default_drafter(self.provider, self.model, self.effort),
-            executor=self._compile_wave),
-        "evolution": lambda self: EvolutionEngine(
-            self.log, self._evolution_mutator, self._evolution_evaluator),
+            self.log, default_drafter(self.provider, self.model, self.effort)),
         "merger": lambda self: TimelineMerger(self.log),
         "theater": lambda self: Theater(self.log),
         "debate": lambda self: DebateTournament(
             self.log, self._debate_speaker,
             [m.id for m in config.MODELS if m.supports_tools][:4]),
-        "market": lambda self: TaskMarket(self.log,
-                                          executor=self._market_exec),
         "tower": lambda self: Tower(self),
         "formal": lambda self: ModelChecker(self.log),
         "mcts": lambda self: TreeSearch(self.log, self._mcts_evaluator),
         "causal": lambda self: CausalEngine(self.log),
         "bandit": lambda self: BanditRouter(
             self.log, [m.id for m in config.MODELS[:8]]),
-        "mesh": lambda self: MeshNode(self.log, self.session_id,
-                                      executor=self._mesh_exec),
-        "roleforge": lambda self: RoleForge(
-            self.log,
-            role_drafter(self.provider, self.model, self.effort),
-            self._role_audition),
         "synth": lambda self: ProgramSynthesizer(
             self.log,
             default_generator(self.provider, self.model, self.effort),
@@ -467,8 +429,6 @@ class Agent:
         "dual": lambda self: DualProcess(self.log, self._dual_fast,
                                          self._dual_slow, brain=self.brain),
         "world": lambda self: WorldModel(self.log, root=Path.cwd()),
-        "racer": lambda self: RacingUniverses(self.log, self._race_runner,
-                                              self._race_verify),
         "homeo": lambda self: Homeostasis(self.log, repairs={
             "tool_error_rate": self._repair_reseed_prompts,
             "loop_alerts": self._repair_consolidate,
@@ -498,9 +458,6 @@ class Agent:
         "static": lambda self: StaticAnalyzer(self.log),
         "coverage": lambda self: CoverageEngine(self.log),
         "fuzzer": lambda self: Fuzzer(self.log),
-        "workflows": lambda self: WorkflowEngine(
-            self.log, config.APP_DIR / "workflows",
-            executor=self._workflow_step, judge=self.judge),
     }
 
     def __getattr__(self, name: str) -> Any:
@@ -534,7 +491,7 @@ class Agent:
         self.session_id = uuid.uuid4().hex[:8]
         self.turns: list[Turn] = []
         # Cancellation flag — the TUI sets this on Esc/Ctrl+C. The turn
-        # loop and long-running tools (run_command, crew) check it to
+        # loop and long-running tools (for example, run_command) check it to
         # stop promptly. Cleared at the start of every turn.
         import threading
         self._cancel_flag = threading.Event()
@@ -567,14 +524,13 @@ class Agent:
 
         self.autonomy = 3
         # live status pipe for the current turn (set in run_turn) — lets
-        # long-running tools (crew) stream progress into the UI border
+        # long-running tools stream progress into the UI border
         self._turn_status: Callable[[str], None] | None = None
         # Focus Mode (deep work): distance history drives stall detection
         self._focus_history: list[float] = []
         self.notifier = Notifier(self.log)
         self._notify_seq = self.log.head()
         self.health = {"model_errors": {}, "failovers": 0}
-        self._failed_over = False            # at most one failover per turn
         self._turn_start_seq = 0
         self._compact_digests: list[str] = []  # knowledge kept on compaction
         self._error_counts: dict[str, int] = {}
@@ -614,6 +570,7 @@ class Agent:
         self._register_advanced_tools()
         self._register_persisted_skills()
         self._register_feature_modules()
+        self._register_subagent_tools()
         # cassette: record/replay model calls (FULLAGENT_CASSETTE=path,
         # FULLAGENT_CASSETTE_MODE=record|replay|off)
         cassette_path = os.environ.get("FULLAGENT_CASSETTE")
@@ -649,7 +606,7 @@ class Agent:
             "filestat",
             "webfetch", "checkpoints", "hooks",
             # Round 2 advanced features
-            "mcp", "skills", "agenttypes", "doctor", "statuscmd",
+            "mcp", "skills", "doctor", "statuscmd",
             "permrules", "configcmd", "images", "export", "vimmode",
             "thinking", "undocmd", "diffpreview", "costtrack",
             "jsonout", "ctxmeter", "prreview", "smartctx",
@@ -847,7 +804,7 @@ class Agent:
             _tf = None
         n = len(self.tools)
         # Filter only when we know the current turn's user text; any
-        # other path (autopilot, subagents outside a turn) gets the
+        # other path (non-turn callers) gets the
         # full set — fail-open, never silently tool-less.
         user_text = getattr(self, "_turn_user_text", "") or ""
         # Cache key covers both the filter selection AND the progressive-
@@ -962,7 +919,6 @@ class Agent:
             _dedup_reset(self)
         except Exception:  # noqa: BLE001
             pass
-        self._failed_over = False
         # Fresh turn: clear any stale cancellation from a previous turn
         self._cancel_flag.clear()
         # Unify the two cancellation doors: the caller-supplied
@@ -1127,7 +1083,7 @@ class Agent:
                         # entry and skip unrecoverable ones. A malformed
                         # entry must never reach tc["function"] as
                         # AttributeError: 'str' object has no attribute
-                        # 'get' (the reported subagent crash).
+                        # 'get' (the reported malformed-call crash).
                         tc = _norm_tc(raw_tc)
                         if tc is None:
                             continue
@@ -1281,7 +1237,7 @@ class Agent:
                 )
         except APIError as e:
             # the status pipe must never outlive the turn — a stale
-            # callback would receive the NEXT turn's (or a crew thread's)
+            # callback would receive the NEXT turn's
             # status lines after this one died
             self._turn_status = None
             turn.error = str(e)
@@ -1783,26 +1739,16 @@ class Agent:
                 on_status("retrying (non-stream)")
                 result = chat_blocking(self.provider, self.model,
                                        self.effort, model_msgs, schemas,
-                                       on_overflow=self._overflow_shrink)
+                                       on_overflow=self._overflow_shrink,
+                                       should_cancel=should_cancel,
+                                       on_status=on_status)
             else:
-                # enterprise failover: provider outage -> switch model once
+                # Provider errors never change the selected model. Record
+                # the failure and surface it so the user can choose whether
+                # to retry or manually select another model.
                 self.health["model_errors"][self.cfg.model_id] = \
                     self.health["model_errors"].get(self.cfg.model_id, 0) + 1
-                fallback = self._failover_candidate(e)
-                if fallback is None:
-                    raise
-                old_id = self.cfg.model_id
-                self.cfg.model_id = fallback
-                self._failed_over = True
-                self.health["failovers"] += 1
-                self.log.append("provider.failover",
-                                {"from": old_id, "to": fallback,
-                                 "error": str(e)[:140]},
-                                actor="kernel")
-                label = model_by_id(fallback)
-                self._push_status(
-                    f"⚠ provider failover → {label.label if label else fallback}")
-                result = _attempt()
+                raise
         if self.cassette is not None and self.cassette.mode == "record":
             self.cassette.record(self.model.id, model_msgs, schemas,
                                  {"content": result.content,
@@ -1909,7 +1855,7 @@ class Agent:
 
     def _push_status(self, text: str) -> None:
         """Stream a live status line into the current turn's UI (if any).
-        Used by long-running tools (crew) so subagent work is never
+        Used by long-running tools so progress is never
         invisible."""
         cb = self._turn_status
         if cb is None:
@@ -2361,12 +2307,6 @@ class Agent:
             except Exception:
                 pass
 
-    # -- enterprise: workflows ----------------------------------------------------
-
-    def _workflow_step(self, item: dict) -> dict:
-        """Crew feature removed — returns error."""
-        return {"status": "error", "summary": "Crew feature has been removed"}
-
     def export_report(self, fmt: str = "md") -> Path:
         _resolve_lazy("export_html", "export_markdown")
         """Write the enterprise audit report (md or html) to the cwd."""
@@ -2386,43 +2326,7 @@ class Agent:
         _resolve_lazy("forecast", "format_forecast")
         return format_forecast(forecast(self.log))
 
-    # -- enterprise: provider health + failover ------------------------------------
-
-    def _failover_candidate(self, err: APIError) -> str | None:
-        """Pick the model to fail over to after a provider failure, or
-        None if failover is impossible/not allowed right now."""
-        if self._failed_over:
-            return None  # at most one failover per turn
-        status = getattr(err, "status", None)
-        if status is not None and status not in _FAILOVER_STATUSES:
-            return None  # 4xx (except timeouts) are not provider outages
-        explicit = str(self.cfg.extra.get("failover_model", "") or "")
-        if explicit and explicit != self.cfg.model_id \
-                and model_by_id(explicit) is not None:
-            return explicit
-        # auto-pick: same provider first, then any capable model
-        # CRITICAL: only pick models that HAVE an API key configured.
-        # Picking a keyless model (e.g. kilo without KILO_API_KEY) just
-        # trades one error for another.
-        from .config import MODELS, _provider_api_key
-        current = self.model
-        def _has_key(m) -> bool:
-            try:
-                return bool(_provider_api_key(m.provider))
-            except Exception:
-                return False
-        same_provider = [m for m in MODELS
-                         if m.provider == current.provider
-                         and m.id != current.id
-                         and m.supports_tools >= current.supports_tools
-                         and _has_key(m)]
-        others = [m for m in MODELS
-                  if m.provider != current.provider
-                  and m.id != current.id
-                  and m.supports_tools >= current.supports_tools
-                  and _has_key(m)]
-        candidates = same_provider + others
-        return candidates[0].id if candidates else None
+    # -- enterprise: provider health ------------------------------------------
 
     # -- enterprise: turn scorecard ---------------------------------------------------
 
@@ -2658,138 +2562,6 @@ class Agent:
                 "path": {"type": "string"}}, "required": ["name"]},
             code_impact)
 
-        self._register_task_tool()
-
-    def _register_task_tool(self) -> None:
-        """Claude Code-style Task tool: spawn parallel subagents.
-
-        The LLM calls this to delegate work to subagents that run
-        concurrently. Each subagent streams progress to the TUI via
-        crew.* events, so the user sees live parallel activity —
-        exactly like Claude Code's Task tool with its subagent list.
-        """
-        crew = self.crew
-
-        def task(description: str, prompt: str, subagent_type: str = "general",
-                 run_in_background: bool = False) -> str:
-            """Spawn a subagent to handle a task.
-
-            Args:
-                description: Short (3-5 word) description of the task.
-                prompt: The full task for the subagent to perform.
-                subagent_type: The type of subagent (general, coder,
-                    researcher, reviewer).
-                run_in_background: If True, don't wait — return immediately
-                    and let it run while you continue.
-            """
-            role_map = {
-                "general": "researcher",
-                "coder": "coder",
-                "researcher": "researcher",
-                "reviewer": "reviewer",
-            }
-            # Custom markdown-defined subagent types (agenttypes module)
-            _custom = getattr(self, "custom_agent_types", None) or {}
-            for _name in _custom:
-                role_map.setdefault(_name.lower(), _name)
-            role = role_map.get(subagent_type.lower(), "researcher")
-            try:
-                handle = crew.spawn(task=prompt, role=role,
-                                    name=description[:40])
-            except Exception as e:
-                return f"ERROR: could not spawn subagent: {e}"
-            agent_id = handle.id
-            if run_in_background:
-                return (f"Subagent '{description}' launched in background "
-                        f"(id: {agent_id}). Use TaskOutput to check it.")
-            # Foreground: wait for completion and return the result
-            try:
-                crew.wait([agent_id], timeout=600,
-                          should_cancel=self._cancel_flag.is_set)
-                agent = crew.get(agent_id)
-            except Exception as e:
-                return f"ERROR: subagent failed: {e}"
-            if agent is None:
-                return f"ERROR: subagent {agent_id} not found"
-            summary = agent.summary or "(no summary)"
-            return f"Subagent '{description}' [{agent.state}]:\n{summary}"
-
-        def task_output(task_id: str, timeout: int = 60) -> str:
-            """Check the output of a background subagent.
-
-            Args:
-                task_id: The subagent id returned by Task.
-                timeout: Max seconds to wait for completion.
-            """
-            try:
-                crew.wait([task_id], timeout=timeout,
-                          should_cancel=self._cancel_flag.is_set)
-                agent = crew.get(task_id)
-            except Exception as e:
-                return f"ERROR: {e}"
-            if agent is None:
-                return f"ERROR: subagent {task_id} not found"
-            summary = agent.summary or "(no summary)"
-            return f"Subagent {task_id} [{agent.state}]:\n{summary}"
-
-        def task_list() -> str:
-            """List all running subagents and their status."""
-            agents = crew.list()
-            if not agents:
-                return "No subagents running."
-            lines = []
-            for a in agents:
-                task = (a.task or "")[:60]
-                lines.append(f"- {a.id} [{a.state}] {a.nickname}: {task}")
-            return "\n".join(lines)
-
-        def task_stop(task_id: str) -> str:
-            """Force-stop a running subagent.
-
-            Args:
-                task_id: The subagent id to stop.
-            """
-            try:
-                crew.close(task_id)
-                return f"Subagent {task_id} stopped."
-            except Exception as e:
-                return f"ERROR: {e}"
-
-        self.tools["Task"] = Tool(
-            "Task",
-            "Spawn a subagent to handle a task independently. Use for "
-            "parallel work, codebase exploration, or delegating subtasks. "
-            "Args: description (short), prompt (full task), "
-            "subagent_type (general/coder/researcher/reviewer), "
-            "run_in_background (bool).",
-            {"type": "object", "properties": {
-                "description": {"type": "string"},
-                "prompt": {"type": "string"},
-                "subagent_type": {"type": "string"},
-                "run_in_background": {"type": "boolean"}},
-             "required": ["description", "prompt"]},
-            task)
-        self.tools["TaskOutput"] = Tool(
-            "TaskOutput",
-            "Get the output of a background subagent. "
-            "Args: task_id, timeout (seconds).",
-            {"type": "object", "properties": {
-                "task_id": {"type": "string"},
-                "timeout": {"type": "integer"}},
-             "required": ["task_id"]},
-            task_output)
-        self.tools["TaskList"] = Tool(
-            "TaskList",
-            "List all running subagents and their status. No args.",
-            {"type": "object", "properties": {}},
-            lambda: task_list())
-        self.tools["TaskStop"] = Tool(
-            "TaskStop",
-            "Force-stop a running subagent. Args: task_id.",
-            {"type": "object", "properties": {
-                "task_id": {"type": "string"}},
-             "required": ["task_id"]},
-            task_stop)
 
     def _register_v4_tools(self) -> None:
         """Add the deterministic v4 engineering tools (rung 2-4) to the
@@ -2974,36 +2746,20 @@ class Agent:
         except Exception as e:
             return f"ERROR: {type(e).__name__}: {e}"
 
-    def _run_worker_serial(self, tasks: list[dict],
-                           read_only: bool = False) -> list[WorkerReport]:
-        """Crew feature removed — returns error reports."""
-        reports: list[WorkerReport] = []
-        for t in tasks:
-            task = str(t.get("task", "") or "").strip()
-            role = str(t.get("role", "") or "").strip() or "coder"
-            if not task:
-                continue
-            reports.append(WorkerReport(
-                task=task, role=role, status="error",
-                error="Crew feature has been removed"))
-        return reports
-
     def _daemon_step(self, task: str) -> str:
-        """Run one daemon mission step. A step is executed as a read-only
-        researcher probe by default — the daemon advances missions without
-        mutating the world unless a write is explicitly part of the task.
-        Returns 'ERROR: …' on failure so the daemon can retry/block."""
+        """Run one daemon mission step directly, without delegated agents."""
         try:
-            reports = self._run_worker_serial(
-                [{"task": task, "role": "researcher"}], read_only=True)
+            result = chat_blocking(
+                self.provider, self.model, self.effort,
+                [{"role": "system", "content":
+                  "Complete the requested mission step using your available "
+                  "knowledge. Be concise and state blockers plainly."},
+                 {"role": "user", "content": str(task)}],
+                None, timeout=120.0)
+            content = (result.content or "").strip()
+            return f"OK: {content}" if content else "ERROR: empty mission result"
         except Exception as e:
             return f"ERROR: {type(e).__name__}: {e}"
-        if not reports:
-            return "ERROR: daemon step produced no report"
-        r = reports[0]
-        if r.status == "error":
-            return f"ERROR: {r.error or 'step failed'}"
-        return f"OK: {r.summary[:400]}"
 
     def _council_speaker(self, role: str, brief: str) -> str:
         """Produce one council position through the model (blocking, no
@@ -3019,60 +2775,6 @@ class Agent:
 
     # -- v5 advanced subsystem bridges ---------------------------------------
 
-    def _compile_wave(self, wave: list[dict]) -> list[dict]:
-        """Executor for the Intent Compiler: one compiled wave runs as a
-        serial batch of crew subagents (one at a time)."""
-        tasks = [{"task": it["task"], "role": it["role"]} for it in wave]
-        self._push_status(f"⚙ compiled wave · {len(tasks)} item(s)")
-        reports = self._run_worker_serial(
-            tasks, read_only=self.autonomy <= 1)
-        return [r.to_dict() for r in reports]
-
-    def _evolution_mutator(self, role: str, incumbent: str, k: int
-                           ) -> list[str]:
-        """LLM mutator: k candidate rewrites of a role brief."""
-        messages = [
-            {"role": "system", "content":
-                "You improve agent role briefs. Output ONLY candidate "
-                "briefs separated by lines with exactly --- . No prose "
-                "around them."},
-            {"role": "user", "content":
-                f"Current brief for the '{role}' worker:\n{incumbent}\n\n"
-                f"Write {k} improved variants. Each must be one "
-                f"paragraph, more specific and actionable than the "
-                f"original, keeping the same scope."}]
-        result = chat_blocking(self.provider, self.model, self.effort,
-                               messages, None, timeout=120.0)
-        parts = [p.strip() for p in
-                 (result.content or "").split("\n---")]
-        return [p for p in parts if len(p) > 40][:k]
-
-    def _evolution_evaluator(self, role: str, brief: str
-                             ) -> tuple[str, float]:
-        """Real evaluation: run the fixed benchmark with the candidate
-        brief as the worker's system prompt; score deterministically from
-        the reply's structure (STATUS/SUMMARY contract + substance)."""
-        from . import systemprompt
-        system = systemprompt.WORKER.format(role_brief=brief)
-        result = chat_blocking(
-            self.provider, self.model, self.effort,
-            [{"role": "system", "content": system},
-             {"role": "user",
-              "content": default_benchmark(role)}],
-            None, timeout=180.0)
-        content = result.content or ""
-        status, summary = parse_worker_final(content)
-        score = 0.0
-        if status == "done":
-            score += 0.5
-        if summary and summary != content.strip():
-            score += 0.2                       # followed the format
-        if len(summary) > 60:
-            score += 0.2                       # real substance
-        if any(ch.isdigit() for ch in summary) or "/" in summary:
-            score += 0.1                       # concrete paths/numbers
-        return content, min(1.0, score)
-
     def _debate_speaker(self, model_id: str, prompt: str) -> str:
         """Route one tournament turn to its participant model."""
         m = model_by_id(model_id) or self.model
@@ -3086,27 +2788,13 @@ class Agent:
             None, timeout=120.0)
         return result.content or ""
 
-    def _market_exec(self, task: str, role: str) -> dict:
-        """Market executor: the awarded contract runs as a real serial
-        crew worker; its report settles the auction."""
-        reports = self._run_worker_serial(
-            [{"task": task, "role": role}],
-            read_only=self.autonomy <= 1)
-        if not reports:
-            return {"status": "error", "summary": "no report returned",
-                    "tool_calls": 0}
-        r = reports[0]
-        return {"status": r.status,
-                "summary": r.summary or r.error or "",
-                "tool_calls": r.tool_calls}
-
     # -- v6 frontier subsystem bridges --------------------------------------
 
     def _mcts_evaluator(self, assignment: dict) -> float:
         """Rollout scorer for the strategy tree: mechanical role-task
         fit (write verbs want write-capable roles, run verbs want
         runners) — cheap by design, MCTS supplies the exploration."""
-        from .team import ROLES
+        from .roles import ROLES
         if not hasattr(self, "_mcts_items"):
             return 0.0
         fit = 0.0
@@ -3127,28 +2815,6 @@ class Agent:
                 fit += 1
         n = max(1, len(self._mcts_items))
         return min(1.0, fit / (n * 1.5))
-
-    def _mesh_exec(self, task: str, role: str) -> dict:
-        """A task delegated over the mesh runs as a real local worker."""
-        return self._market_exec(task, role)
-
-    def _role_audition(self, draft) -> float:
-        """Run the drafted role's own benchmark with its brief; score
-        the reply's structure (same yardstick as evolution)."""
-        from . import systemprompt
-        from .team import MAX_WORKERS
-        system = systemprompt.WORKER.format(role_brief=draft.brief,
-                                            max_workers=MAX_WORKERS)
-        result = chat_blocking(
-            self.provider, self.model, self.effort,
-            [{"role": "system", "content": system},
-             {"role": "user", "content": draft.benchmark}],
-            None, timeout=180.0)
-        status, summary = parse_worker_final(result.content or "")
-        score = 0.5 if status == "done" else 0.0
-        if summary and len(summary) > 60:
-            score += 0.4
-        return min(1.0, score)
 
     def _ci_runner(self, tests: list[str]) -> tuple[bool, str]:
         """Run the impacted tests through the real shell."""
@@ -3181,23 +2847,6 @@ class Agent:
                 f"debate, champion {result.champion_model}] "
                 f"{result.verdict}")
 
-    def _race_runner(self, strategy: dict, task: str, cancel) -> str:
-        """One racing universe: a real serial crew worker under its
-        strategy."""
-        if cancel.is_set():
-            return "CANCELLED"
-        reports = self._run_worker_serial(
-            [{"task": f"{strategy['instructions']}\n\nTASK: {task}",
-              "role": strategy["role"]}],
-            read_only=self.autonomy <= 1)
-        if not reports:
-            return "ERROR: no report"
-        r = reports[0]
-        return f"STATUS: {r.status.upper()}\nSUMMARY: {r.summary or r.error}"
-
-    def _race_verify(self, task: str, result: str) -> bool:
-        return "STATUS: DONE" in result and "ERROR" not in result
-
     def _repair_reseed_prompts(self) -> bool:
         """Re-seal every vault prompt — cures prompt drift."""
         for name in self.mastermind.vault.names():
@@ -3216,35 +2865,260 @@ class Agent:
     def _repair_warm_caches(self) -> bool:
         """Latency: rebuild the shared context so speculative caches
         refill."""
-        self.scout_context()
+        self.build_shared_context()
         return True
 
+    def _subagent_runtime(self, model_id: str = "") -> tuple:
+        """Resolve each child against an explicitly selected configured model.
+
+        There is intentionally no router/fallback here: workers use the same
+        configured model unless a caller supplies a known model id.
+        """
+        _resolve_lazy("model_by_id", "PROVIDERS")
+        model = model_by_id(model_id) if model_id else self.model
+        if model is None:
+            raise ValueError(f"unknown model id: {model_id}")
+        provider = PROVIDERS.get(model.provider)
+        if provider is None:
+            raise ValueError(f"provider {model.provider!r} is not configured")
+        return provider, model, self.effort
+
+    def _snapshot_subagent_write(self, worker, tool: Tool,
+                                 args: dict) -> str | None:
+        """Enforce the same recover-before-write invariant for child agents."""
+        paths = self._snapshot_paths(tool.name, args)
+        if not paths:
+            return "delegated write blocked: no snapshot target was identified"
+        try:
+            snap = self.store.take(paths)
+            self.log.append(
+                "snapshot.taken",
+                {"tree": snap["tree"], "paths": list(snap["paths"]),
+                 "before_tool": tool.name, "subagent_id": worker.id},
+                actor="kernel",
+                causation_id=worker.spawn_event_id or None)
+        except Exception as exc:  # fail closed: no recovery point, no write
+            return ("delegated write blocked: recovery snapshot failed "
+                    f"({type(exc).__name__}: {exc})")
+        return None
+
+    def _after_subagent_write(self, worker, tool: Tool, args: dict) -> str:
+        """Re-check active goal anti-clauses after successful child writes."""
+        try:
+            violations = self.goal.check_anti_clauses()
+        except Exception:
+            return ""
+        if not violations:
+            return ""
+        v = violations[0]
+        return (f"WARNING: anti-clause {v['clause']} violated — {v['detail']}. "
+                "The run cannot close until this is repaired or rewound.")
+
+    def _register_subagent_tools(self) -> None:
+        """Add bounded background delegation and approved parallel coding."""
+        _resolve_lazy("Tool", "RISK_CONFIRM")
+        from .roles import ROLES
+        from .subagents import ParallelSubagents, SubagentError
+
+        manager = ParallelSubagents(
+            self.log, self.tools, self._subagent_runtime,
+            before_write=self._snapshot_subagent_write,
+            after_write=self._after_subagent_write,
+            workspace=Path.cwd())
+        self.subagents = manager
+
+        def _task_error(fn):
+            try:
+                return fn()
+            except (SubagentError, TypeError, ValueError) as exc:
+                return f"ERROR: {exc}"
+
+        def task(task: str, subagent_type: str = "researcher",
+                 context: str = "", name: str = "",
+                 model_id: str = "") -> str:
+            """Start one read-only specialist in the background."""
+            def start():
+                worker = manager.spawn(
+                    task, role=subagent_type, context=context, name=name,
+                    model_id=model_id, allow_writes=False)
+                return (f"Started batch {worker.batch_id}: {worker.id} "
+                        f"({worker.role}, model {worker.model_id}). "
+                        "Use TaskCollect with this batch_id to collect its "
+                        "result or TaskList to inspect all workers.")
+            return _task_error(start)
+
+        def task_group(tasks: list, context: str = "",
+                       role: str = "researcher", model_id: str = "") -> str:
+            """Atomically launch up to eight parallel read-only specialists."""
+            def start():
+                workers = manager.spawn_many(
+                    tasks, role=role, context=context, model_id=model_id,
+                    allow_writes=False)
+                batch_id = workers[0].batch_id if workers else "none"
+                return (f"Launched batch {batch_id} with {len(workers)} "
+                        "parallel read-only subagent(s): "
+                        + ", ".join(w.id for w in workers)
+                        + ". Use TaskCollect with batch_id for all reports; "
+                        "TaskList shows live status.")
+            return _task_error(start)
+
+        def task_write_group(tasks: list, context: str = "",
+                             model_id: str = "") -> str:
+            """Launch parallel coders, each restricted to confirmed paths."""
+            def start():
+                workers = manager.spawn_many(
+                    tasks, role="coder", context=context,
+                    model_id=model_id, allow_writes=True)
+                batch_id = workers[0].batch_id if workers else "none"
+                return (f"Launched scoped write batch {batch_id} with "
+                        f"{len(workers)} specialist(s): "
+                        + ", ".join(
+                            f"{w.id} ({w.role}) [{', '.join(w.write_scope)}]"
+                            for w in workers)
+                        + ". Their writes are snapshot-backed; use TaskOutput "
+                        "or TaskCollect with batch_id to collect reports.")
+            return _task_error(start)
+
+        def task_output(task_id: str, wait_seconds: float = 30.0,
+                        should_cancel=None) -> str:
+            def collect():
+                worker = manager.get(task_id)
+                if worker is None:
+                    return f"ERROR: unknown subagent: {task_id}"
+                manager.wait([task_id], timeout=wait_seconds,
+                             should_cancel=should_cancel)
+                return manager.format_worker(worker)
+            return _task_error(collect)
+
+        def task_collect(batch_id: str = "", task_ids: list | None = None,
+                         wait_seconds: float = 30.0,
+                         should_cancel=None) -> str:
+            """Wait once and return all reports for one named batch."""
+            return _task_error(lambda: manager.collect(
+                batch_id=batch_id, worker_ids=task_ids,
+                timeout=wait_seconds, should_cancel=should_cancel))
+
+        def task_list() -> str:
+            return manager.format_status()
+
+        def task_stop(task_id: str) -> str:
+            def stop():
+                worker = manager.stop(task_id)
+                return manager.format_worker(worker)
+            return _task_error(stop)
+
+        roles = sorted(ROLES)
+        read_roles = sorted(role for role, spec in ROLES.items()
+                            if not spec.get("writes"))
+        write_roles = sorted(role for role, spec in ROLES.items()
+                             if spec.get("writes"))
+        task_item = {
+            "type": "object",
+            "properties": {
+                "task": {"type": "string"},
+                "role": {"type": "string", "enum": roles},
+                "name": {"type": "string"},
+                "context": {"type": "string"},
+                "model_id": {"type": "string"},
+            },
+            "required": ["task"],
+        }
+        write_item = {
+            "type": "object",
+            "properties": {
+                "task": {"type": "string"},
+                "role": {"type": "string", "enum": write_roles},
+                "name": {"type": "string"},
+                "context": {"type": "string"},
+                "model_id": {"type": "string",
+                             "description": "Optional explicitly selected configured model; otherwise use the current model."},
+                "write_scope": {
+                    "type": "array", "items": {"type": "string"},
+                    "minItems": 1, "maxItems": 16,
+                    "description": "Exact workspace files or directories "
+                                   "this coder may change.",
+                },
+            },
+            "required": ["task", "write_scope"],
+        }
+        self.tools["Task"] = Tool(
+            "Task",
+            "Start one independent read-only specialist in the background. "
+            "Choose the closest role; use TaskCollect with the returned batch_id "
+            "to collect its report, or TaskOutput for one worker.",
+            {"type": "object", "properties": {
+                "task": {"type": "string"},
+                "subagent_type": {"type": "string", "enum": roles,
+                                   "description": "Focused specialist: security, reviewer, debugger, planner, researcher, tester, analyst, optimizer, architect, integrator, documenter, devops, or coder."},
+                "context": {"type": "string"}, "name": {"type": "string"},
+                "model_id": {"type": "string"}},
+             "required": ["task"]}, task)
+        self.tools["TaskGroup"] = Tool(
+            "TaskGroup",
+            "Submit up to eight independent, individually scoped read-only specialists as one "
+            "parallel batch; up to four model calls run at once and excess work "
+            "queues. Use for reviews, exploration, design, or test analysis; "
+            "each task can select its own role and explicit configured model; "
+            "all tasks are validated before any are started. Collect the whole "
+            "batch with TaskCollect.",
+            {"type": "object", "properties": {
+                "tasks": {"type": "array", "items": task_item,
+                          "minItems": 1, "maxItems": 8},
+                "context": {"type": "string"},
+                "role": {"type": "string", "enum": read_roles},
+                "model_id": {"type": "string"}},
+             "required": ["tasks"]}, task_group)
+        self.tools["TaskWriteGroup"] = Tool(
+            "TaskWriteGroup",
+            "Launch up to eight scoped implementation specialists (four model calls at once) with "
+            "distinct, explicit workspace write_scope paths. This operation "
+            "requires the existing permission gate; "
+            "writers cannot use shell, delete, move, copy, or arbitrary patch tools, "
+            "and every file write is preceded by a recovery snapshot. Each task "
+            "can choose an appropriate write-enabled role and model; collect via TaskCollect.",
+            {"type": "object", "properties": {
+                "tasks": {"type": "array", "items": write_item,
+                          "minItems": 1, "maxItems": 8},
+                "context": {"type": "string"},
+                "model_id": {"type": "string"}},
+             "required": ["tasks"]}, task_write_group, risk=RISK_CONFIRM)
+        self.tools["TaskOutput"] = Tool(
+            "TaskOutput",
+            "Wait briefly for one subagent and return its state, findings, "
+            "verification, token counts, and any blocker.",
+            {"type": "object", "properties": {
+                "task_id": {"type": "string"},
+                "wait_seconds": {"type": "number", "minimum": 0,
+                                 "maximum": 90}},
+             "required": ["task_id"]}, task_output)
+        self.tools["TaskCollect"] = Tool(
+            "TaskCollect",
+            "Wait once for a named batch (or up to eight explicit task IDs) and "
+            "return every report with state, evidence, verification, usage, and blockers. "
+            "If neither selector is supplied, collect the latest batch.",
+            {"type": "object", "properties": {
+                "batch_id": {"type": "string",
+                             "description": "Batch ID returned by Task, TaskGroup, or TaskWriteGroup."},
+                "task_ids": {"type": "array", "items": {"type": "string"},
+                             "minItems": 1, "maxItems": 8},
+                "wait_seconds": {"type": "number", "minimum": 0,
+                                 "maximum": 90}},
+             "additionalProperties": False}, task_collect)
+        self.tools["TaskList"] = Tool(
+            "TaskList", "List retained parallel subagents and their live states.",
+            {"type": "object", "properties": {}}, task_list)
+        self.tools["TaskStop"] = Tool(
+            "TaskStop", "Request cancellation of one queued or running subagent.",
+            {"type": "object", "properties": {
+                "task_id": {"type": "string"}},
+             "required": ["task_id"]}, task_stop)
+
     def _register_advanced_tools(self) -> None:
-        """Give the model the v5 powers: intent compilation, debates,
-        the task market, cognitive recall, and causal self-inspection."""
-        compiler = self.compiler
+        """Register planning, debate, recall, and self-inspection tools."""
         debate = self.debate
-        market = self.market
         brain = self.brain
         theater = self.theater
-
-        def compile_and_run(goal: str, read_only: bool = False) -> str:
-            """Compile the goal into an optimized wave plan, then execute
-            it wave by wave, each worker serially."""
-            goal = str(goal or "").strip()
-            if not goal:
-                return "ERROR: goal must be a non-empty string"
-            plan = compiler.compile(goal)
-            out = [compiler.format(plan)]
-            if not plan.waves:
-                return "\n".join(out + ["ERROR: compilation produced no "
-                                       "work items — rephrase the goal"])
-            result = compiler.execute(plan)
-            out.append(f"\nEXECUTED: {result['items']} items in "
-                       f"{result['waves']} waves · {result['done']} done · "
-                       f"{result['blocked']} blocked · {result['error']} "
-                       f"error")
-            return "\n".join(out)
+        compiler = self.compiler
 
         def run_debate(question: str, rounds: int = 3) -> str:
             """Run a multi-model debate tournament on a question and
@@ -3260,19 +3134,6 @@ class Agent:
                               f"{rounds} rounds")
             result = debate.run(question, rounds=rounds)
             return debate.format(result)
-
-        def run_market(tasks: list) -> str:
-            """Put tasks on the market: every specialist role bids, the
-            best bid wins and executes the contract for real."""
-            if not isinstance(tasks, list) or not tasks:
-                return "ERROR: tasks must be a non-empty list of strings"
-            clean = [str(t).strip() for t in tasks if str(t).strip()]
-            if not clean:
-                return "ERROR: no valid tasks"
-            self._push_status(f"💰 market · {len(clean)} contract(s) "
-                              f"up for auction")
-            contracts = market.run(clean)
-            return market.format(contracts)
 
         def brain_recall(query: str) -> str:
             """Recall knowledge from the cognitive memory (forgetting
@@ -3292,19 +3153,6 @@ class Agent:
                 return "ERROR: seq must be an integer"
             return theater.why(seq)
 
-        self.tools["compile_and_run"] = Tool(
-            "compile_and_run",
-            "COMPILE the goal through the Intent Compiler: it is drafted "
-            "into typed work items, then deterministic optimizer passes "
-            "(dedupe, dead-dependency pruning, topological layering, "
-            "write-lock scheduling) build ordered waves, and each wave "
-            "executes as REAL serial workers. Best for multi-step goals "
-            "where order matters.",
-            {"type": "object", "properties": {
-                "goal": {"type": "string"}, "read_only": {"type":
-                                                          "boolean"}},
-                "required": ["goal"]},
-            compile_and_run)
         self.tools["run_debate"] = Tool(
             "run_debate",
             "Run a MULTI-MODEL debate tournament on a hard question: "
@@ -3316,17 +3164,6 @@ class Agent:
                 "rounds": {"type": "integer"}},
                 "required": ["question"]},
             run_debate)
-        self.tools["run_market"] = Tool(
-            "run_market",
-            "Put tasks on the AGENT TASK MARKET: every specialist role "
-            "bids (capability × trust ÷ pace), the auctioneer awards "
-            "each contract to the best bidder, and the winner executes "
-            "it as a real worker. Trust updates from every outcome — the "
-            "market learns which roles deliver.",
-            {"type": "object", "properties": {
-                "tasks": {"type": "array", "items": {"type": "string"}}},
-                "required": ["tasks"]},
-            run_market)
         self.tools["brain_recall"] = Tool(
             "brain_recall",
             "Recall knowledge from the cognitive memory — the four-store "
@@ -3409,16 +3246,6 @@ class Agent:
             impact = self.world.predict_impact(str(path or ""))
             return impact.format()
 
-        def race_strategies(task: str) -> str:
-            """Try 3 strategy universes one at a time on one task; the
-            first verified result wins, the rest are skipped."""
-            task = str(task or "").strip()
-            if not task:
-                return "ERROR: task must be a non-empty string"
-            self._push_status("⚡ race · 3 universes queued")
-            result = self.racer.race(task, timeout=420.0)
-            return self.racer.format(result)
-
         def knowledge_ask(subject: str, predicate: str,
                           at: float | None = None) -> str:
             """Query the bitemporal knowledge graph: the live truth, or
@@ -3476,16 +3303,6 @@ class Agent:
                 "path": {"type": "string"}},
                 "required": ["path"]},
             predict_impact)
-        self.tools["race_strategies"] = Tool(
-            "race_strategies",
-            "RACE three strategy universes one at a time on one task "
-            "(direct / careful / split approaches); the first "
-            "verified result WINS and the rest are skipped. Use for "
-            "hard problems where you are unsure which approach works.",
-            {"type": "object", "properties": {
-                "task": {"type": "string"}},
-                "required": ["task"]},
-            race_strategies)
         self.tools["knowledge_ask"] = Tool(
             "knowledge_ask",
             "Query the bitemporal knowledge graph — facts with validity "
@@ -3535,14 +3352,11 @@ class Agent:
         self.tools[name] = Tool(name, skill.description or name,
                                 schema, handler)
 
-    # -- shared subagent context ------------------------------------------------
+    # -- shared session context ------------------------------------------------
 
-    def scout_context(self, max_chars: int = 4000) -> str:
+    def build_shared_context(self, max_chars: int = 4000) -> str:
         _resolve_lazy("fold")
-        """Shared read-only context handed to every subagent (each gets
-        a fresh minimal context — its task plus a little shared state).
-        Subagents get little else, so anything they must reason about has
-        to be in here: where we are, what the goal is, what is known."""
+        """Build a concise read-only summary of the current session state."""
         parts: list[str] = [f"Working directory: {Path.cwd()}"]
         try:
             entries = sorted(p.name + ("/" if p.is_dir() else "")

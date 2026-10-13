@@ -238,7 +238,7 @@ def register(agent: Any) -> PermissionRulesManager:
 
 # ---------------------------------------------------------------------------
 # TUI handler — the coordinator wires `/permissions rules ...` to this.
-# Returns text; the TUI prints it (same pattern as agentscmd.handle).
+# Returns text; the TUI prints it (same pattern as the TUI help handler).
 # ---------------------------------------------------------------------------
 
 def handle_permissions_rules(ui: Any, arg: str) -> str:

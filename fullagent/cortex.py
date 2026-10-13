@@ -9,7 +9,7 @@ mechanisms live here, all rung 1 (pure Python, free, deterministic):
     serialise (§16.1).
   * Hierarchical budget governor (§13.5): a run budget with slices per
     subtree. Breaching any axis PAUSES — never silently kills — and emits
-    budget.event. A runaway sub-agent cannot consume the parent's budget.
+    budget.event. A child operation cannot consume its parent's budget.
   * Loop / thrash / oscillation detectors (§13.4): exact-repeat tool
     calls, file-content A-B-A-B oscillation, and cost-slope breaches are
     detected from the event log and sealed as loop.alert events.
@@ -315,7 +315,7 @@ class BudgetGovernor:
         return False
 
     def slice_for(self, subtree: str) -> float:
-        """USD slice for a subtree — a hard cap a sub-agent cannot borrow
+        """USD slice for a subtree — a hard cap a child operation cannot borrow
         past (§13.5)."""
         frac = self.budget.slices.get(subtree, 0.0)
         return self.budget.max_usd * frac
@@ -423,10 +423,10 @@ if __name__ == "__main__":
         budget_events = fold(log).budget_events
         assert budget_events and budget_events[-1]["kind"] == "exceeded"
 
-        # slices: a sub-agent's hard cap
+        # slices: a child operation's hard cap
         gov2 = BudgetGovernor(log, Budget(max_usd=10.0,
-                                          slices={"scouts": 0.05}))
-        assert abs(gov2.slice_for("scouts") - 0.5) < 1e-9
+                                          slices={"analysis": 0.05}))
+        assert abs(gov2.slice_for("analysis") - 0.5) < 1e-9
 
         # -- loop detector (§13.4) ---------------------------------------------
         log2 = EventLog(Path(td) / "loops.jsonl")

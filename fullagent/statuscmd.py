@@ -3,7 +3,7 @@
 Claude Code-style: one panel showing version, model/provider, session id,
 uptime, context-window usage, todo progress, background tasks and the
 permission mode. All integration points are optional and guarded with
-``getattr`` so a missing module (todos, crew, bgsh, permissions) can never
+``getattr`` so a missing module (todos, bgsh, permissions) can never
 crash the dashboard.
 
 Public API:
@@ -66,25 +66,15 @@ def _todo_progress(agent):
 
 
 def _background_tasks(agent) -> int:
-    """Running crew subagents + bgsh background jobs, guarded."""
-    count = 0
+    """Count active bgsh shell jobs, guarded against missing integration."""
     try:
-        crew = getattr(agent, "crew", None)
-        if crew is not None and hasattr(crew, "list"):
-            count += len(crew.list() or [])
+        from . import bgsh
+        tasks = bgsh.list_background_tasks() or []
+        return sum(1 for task in tasks
+                   if isinstance(task, dict)
+                   and task.get("status") not in ("done", "failed", "killed"))
     except Exception:
-        pass
-    try:
-        from . import bgsh as _bgsh_mod
-        tasks = _bgsh_mod.list_background_tasks() or []
-        count += sum(1 for t in tasks
-                     if isinstance(t, dict)
-                     and t.get("status") not in ("done", "failed", "killed"))
-    except Exception:
-        pass
-    return count
-
-
+        return 0
 def _permission_mode(agent) -> str:
     """Current permission mode string, guarded."""
     try:
@@ -221,8 +211,8 @@ def _selftest() -> int:
 
     # 2. full agent: all optional modules present
     class FakeModel:
-        id = "space-bunny-free"
-        provider = "opencode"
+        id = "kilo-auto/free"
+        provider = "kilo"
         context_window = 128000
 
     class FakeTodoManager:
@@ -232,10 +222,6 @@ def _selftest() -> int:
             {"content": "c", "status": "pending"},
         ]
 
-    class FakeCrew:
-        def list(self):
-            return [SimpleNamespace(id="x1"), SimpleNamespace(id="x2")]
-
     class FakePerms:
         def mode(self):
             return "plan"
@@ -244,15 +230,14 @@ def _selftest() -> int:
                            session_id="abc12345",
                            messages=[{"role": "user", "content": "hi"}],
                            todo_manager=FakeTodoManager(),
-                           crew=FakeCrew(),
                            permissions=FakePerms())
     register(full)
     info2 = full.status_info()
-    check("full model id", info2["model"] == "space-bunny-free")
-    check("full provider", info2["provider"] == "opencode")
+    check("full model id", info2["model"] == "kilo-auto/free")
+    check("full provider", info2["provider"] == "kilo")
     check("full session", info2["session_id"] == "abc12345")
     check("full todos 2/3", info2["todos_done"] == 2 and info2["todos_total"] == 3)
-    check("full crew 2 bg", info2["background_tasks"] == 2)
+    check("full background defaults empty", info2["background_tasks"] == 0)
     check("full perms plan", info2["permission_mode"] == "plan")
     check("full context sane", 0 <= info2["context_pct"] <= 100)
 
@@ -273,7 +258,7 @@ def _selftest() -> int:
     handle_status(ui, "")
     panel = "\n".join(ui.out)
     check("handle prints version line", "version:" in panel)
-    check("handle prints model line", "space-bunny-free (opencode)" in panel)
+    check("handle prints model line", "kilo-auto/free (kilo)" in panel)
     check("handle prints context line", "context:" in panel)
     check("handle prints todos line", "todos:" in panel)
     check("handle prints perms line", "perms:      plan" in panel)

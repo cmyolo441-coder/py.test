@@ -4,8 +4,6 @@ set -euo pipefail
 
 REPO="cmyolo441-coder/py.test"
 NAME="fullagent"
-VERSION="v1.0.0"          # GitHub release tag
-PKG_VERSION="3.1.0"       # fullagent package version — must match fullagent/__init__.py __version__
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 
 # Add INSTALL_DIR to PATH via the user's shell rc files if it isn't there.
@@ -40,7 +38,7 @@ OS="$(uname -s)"
 echo ">> FullAgent installer ($OS/$ARCH)"
 
 # ---------------------------------------------------------------------------
-# x86_64 Linux: download the standalone binary (29MB, no Python needed)
+# x86_64 Linux: download the latest standalone binary (no Python needed)
 # ---------------------------------------------------------------------------
 if [ "$OS" = "Linux" ] && { [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; }; then
   echo ">> Downloading standalone binary..."
@@ -50,21 +48,21 @@ if [ "$OS" = "Linux" ] && { [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; }; 
   mkdir -p "$INSTALL_DIR"
   TMP="$(mktemp -d)"
   trap 'rm -rf "$TMP"' EXIT
-  curl -fsSL "https://github.com/${REPO}/releases/download/${VERSION}/fullagent-${VERSION}-linux.tar.gz" -o "$TMP/fa.tar.gz"
-  tar -xzf "$TMP/fa.tar.gz" -C "$TMP"
-  chmod +x "$TMP/fullagent"
-  mv "$TMP/fullagent" "$INSTALL_DIR/$NAME"
-  echo ">> Installed: $INSTALL_DIR/$NAME"
-  ensure_path
-  echo ">> Run: $NAME"
-  exit 0
+  if curl -fsSL "https://github.com/${REPO}/releases/latest/download/fullagent-linux-x64" -o "$TMP/fullagent"; then
+    chmod +x "$TMP/fullagent"
+    mv "$TMP/fullagent" "$INSTALL_DIR/$NAME"
+    echo ">> Installed: $INSTALL_DIR/$NAME"
+    ensure_path
+    echo ">> Run: $NAME"
+    exit 0
+  fi
+  echo ">> No Linux release binary found; falling back to source install..."
 fi
 
 # ---------------------------------------------------------------------------
-# Everything else (ARM64 Linux, macOS, etc.): ultra-light install.
-# Downloads a 389KB prebuilt wheel — no git clone, no build step.
+# Everything else (ARM64 Linux, macOS, etc.): install from source via pip.
 # ---------------------------------------------------------------------------
-echo ">> Lightweight install for $ARCH (~1MB download)..."
+echo ">> Source install for $ARCH..."
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "!! python3 is required" >&2; exit 1
@@ -85,8 +83,7 @@ fi
 
 echo ">> Installing FullAgent..."
 "$VENV_DIR/bin/pip" install -q --upgrade pip
-# Prebuilt wheel (389KB) + deps — way faster than git+https install
-"$VENV_DIR/bin/pip" install -q "https://github.com/${REPO}/releases/download/${VERSION}/fullagent-${PKG_VERSION}-py3-none-any.whl"
+"$VENV_DIR/bin/pip" install -q --upgrade "git+https://github.com/${REPO}.git"
 
 mkdir -p "$INSTALL_DIR"
 cat > "$INSTALL_DIR/$NAME" <<EOF

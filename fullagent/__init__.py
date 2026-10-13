@@ -11,9 +11,7 @@ Package layout:
     memory.py       Hippocampus: episodic memory + dead-end ledger
     goal.py         goal contracts with machine-checkable done-criteria
     judge.py        deterministic verification (no LLM judging)
-    team.py         shared subagent substrate: roles, reports, write lock
-    crew.py         persistent Codex-style subagents (spawn/send/wait/
-                    close/resume) — SERIAL execution, one agent at a time
+    roles.py        capability catalog used by deterministic planners
     workflows.py    saved multi-step pipelines — phased orchestration
     report.py       enterprise audit export (md/html) + forecasting
     autopilot.py    self-routing brain: auto-enables goal / web
@@ -39,4 +37,4 @@ Package layout:
     __main__.py     entry point
 """
 
-__version__ = "3.1.0"
+__version__ = "3.2.0"

@@ -160,10 +160,6 @@ STYLE = Style.from_dict({
     "completion-menu.multi-column-meta": "bg:#282a36 #6272a4",
     "scrollbar.background": "bg:#282a36",
     "scrollbar.button": "bg:#6272a4",
-    "crew.header": f"bold {C['accent']}",
-    "crew.running": C["fg"],
-    "crew.done": C["green"],
-    "crew.error": C["red"],
 })
 
 EFFORT_COLORS = {e.key: e.color for e in EFFORTS}
@@ -209,62 +205,6 @@ def _truncate_w(s: str, maxw: int) -> str:
         w += cw
     return "".join(out) + "…"
 
-
-def _trunc_err_mid(s: str, maxw: int) -> str:
-    """Middle-cut an error message to at most maxw COLUMNS.
-
-    The diagnostic payload of an exception (e.g. the attribute name in
-    ``AttributeError: 'str' object has no attribute 'X'``) sits at the
-    END of the message, so head-truncation hides exactly what the user
-    needs. Keep the head (exception class) and the tail (the diagnostic
-    detail), marking the cut with an ellipsis. Never splits wide chars.
-    """
-    s = s if isinstance(s, str) else str(s)
-    if maxw <= 1 or _disp_width(s) <= maxw:
-        return s
-    tail_budget = maxw // 2
-    head_budget = maxw - tail_budget - 1  # 1 column for the ellipsis
-
-    def _take(text, budget, rev=False):
-        out: list[str] = []
-        w = 0
-        seq = reversed(text) if rev else text
-        for ch in seq:
-            cw = (2 if unicodedata.east_asian_width(ch) in _WIDE_CATS
-                  else 1)
-            if w + cw > budget:
-                break
-            out.append(ch)
-            w += cw
-        return "".join(reversed(out)) if rev else "".join(out)
-
-    return (_take(s, head_budget) + "…" + _take(s, tail_budget, rev=True))
-
-
-def _fit_err_row(icon: str, name, err, width: int) -> str:
-    """One crew-panel error row, pre-fitted to the panel width.
-
-    The row is a single line: if we let the row overflow and rely on
-    the final width clamp, the clamp head-cuts the message and eats the
-    diagnostic tail (the attribute name in AttributeError) even when the
-    panel HAS the space for it. Middle-truncating to the exact budget
-    guarantees the tail is always on screen. The full text stays
-    available via ParallelAgentsPanel.error_detail() and the
-    /agents errors command.
-    """
-    prefix = f"{icon} {name} \u00b7 "
-    budget = max(10, width - 2) - _disp_width(prefix)
-    err_s = err if isinstance(err, str) else str(err)
-    if _disp_width(err_s) > max(1, budget):
-        # The one-line row cannot fit everything: drop the trailing
-        # operation-context clause (" (while …)" / " (unexpected …)")
-        # so the exception itself — class + message + the attribute
-        # name — is what stays on screen. The full text WITH context is
-        # still in ParallelAgentsPanel.error_detail() and /agents errors.
-        m = re.match(r"^(.*) \([a-z][^()]{0,120}\)$", err_s)
-        if m:
-            err_s = m.group(1)
-    return prefix + _trunc_err_mid(err_s, max(1, budget))
 
 # ---------------------------------------------------------------------------
 # Rich markdown rendering tweaks (used for non-streamed output)
@@ -336,90 +276,7 @@ def make_console() -> Console:
 # Slash-command completion
 # ---------------------------------------------------------------------------
 
-SLASH_COMMANDS = [
-    ("/model", "select model — PgUp/PgDn/Tab to navigate"),
-    ("/effort", "low · medium · high · extrahigh · ultrahigh"),
-    ("/goal", "goal contract — set · prove · close · status · waive · clear"),
-    ("/autonomy", "autonomy level 0-5 (observer → autonomous)"),
-    ("/focus", "deep-work mode — /focus <1-20> auto-continues until done"),
-    ("/render", "toggle rendered-markdown replies — /render [on|off]"),
-    ("/workflow", "saved pipelines — /workflow [list|run <name>|delete <name>]"),
-    ("/export", "export conversation — /export [markdown|html] [path]"),
-    ("/backup", "backup ~/.fullagent — /backup [create|list]"),
-    ("/webhooks", "list incoming HTTP webhooks — WebhookAdd to register"),
-    ("/restore", "restore a backup — /restore <file> [--yes]"),
-    ("/export-report", "enterprise audit report — /export-report [md|html]"),
-    ("/forecast", "projection from measured velocity + usage"),
-    ("/health", "provider health — model errors + failovers"),
-    ("/notify", "event notifications — /notify <url|file:path|off>"),
-    ("/resume", "resume a previous session — /resume [branch]"),
-    ("/resume-turn", "resume a crashed turn — /resume-turn [session-id]"),
-    ("/state", "live projection of the event log (cost, goal, dead-ends)"),
-    ("/rewind", "rewind timeline + files to a seq — /rewind <seq>"),
-    ("/revert", "revert FILES only to a seq (agent keeps memory)"),
-    ("/fork", "fork the timeline into a new branch — /fork [name]"),
-    ("/why", "causal chain for an event — /why <seq>"),
-    ("/impact", "code impact analysis — /impact <symbol> [path]"),
-    ("/forge", "environment digest + drift — /forge [probe|drift]"),
-    ("/oracle", "post-run analysis, calibration, facts"),
-    ("/budget", "budget governor status/extend — /budget steps N|usd X|reset"),
-    ("/constitution", "standing rules — /constitution [show|edit]"),
-    ("/replay", "replay the session log as a film (text)"),
-    ("/memory", "recent episodes + dead-end ledger"),
-    ("/judge", "deterministic check — /judge <type> <json-or-args>"),
-    ("/compile", "intent compiler: goal → optimized ordered waves"),
-    ("/evolve", "evolve a role brief — /evolve [role|rollback <role>]"),
-    ("/brain", "cognitive memory — /brain <query>|sleep|stats"),
-    ("/merge", "semantic timeline merge — /merge <branchA> <branchB>"),
-    ("/theater", "time-travel debugger — /theater <seq|why N|cf N|diff A B>"),
-    ("/debate", "multi-model debate tournament — /debate <question>"),
-    ("/market", "task market auction — /market <t1> | <t2>"),
-    ("/tower", "web control tower dashboard — /tower [port]"),
-    ("/verify", "formal LTL verification — /verify <goal>|log"),
-    ("/mcts", "tree-of-agents strategy search — /mcts <i1>; <i2>; …"),
-    ("/causal", "causal analysis — /causal | /causal do <feature>"),
-    ("/bandit", "thompson router — /bandit | /bandit <task>"),
-    ("/mesh", "agent-to-agent network — /mesh serve|discover|delegate"),
-    ("/roleforge", "create a NEW specialist role — /roleforge <mission>"),
-    ("/synth", "synthesize a new tool — /synth {json spec}"),
-    ("/ci", "CI pilot — /ci start|stop|status"),
-    ("/tune", "auto-tune knobs (TPE) — /tune [trials]"),
-    ("/dual", "system 1/2 routing — /dual <q>|stats"),
-    ("/predict", "predict change impact — /predict <path>"),
-    ("/race", "racing strategy universes — /race <task>"),
-    ("/vitals", "homeostasis check + self-repair"),
-    ("/attention", "last context token auction"),
-    ("/fabric", "bitemporal knowledge — /fabric ask|assert|history"),
-    ("/auto", "autopilot self-routing — /auto [on|off|status]"),
-    ("/prompt", "system prompt — /prompt [main|master|list]"),
-    ("/mastermind", "prompt coherence ledger — sealed prompts, gate, lineage"),
-    ("/dashboard", "live observability — cost, goal, agents, router, spec"),
-    ("/router", "smart model routing — decisions + savings"),
-    ("/spec", "speculative execution — prefetch stats + hit-rate"),
-    ("/recall", "semantic memory — /recall <question>"),
-    ("/mission", "daemon missions — /mission [start|tick|list|abandon]"),
-    ("/heal", "self-healing ledger — root causes captured + healed"),
-    ("/skills", "skill forge — self-authored tools"),
-    ("/council", "adversarial debate — /council <proposition>"),
-    ("/analyze", "static analysis — /analyze <path> (taint, complexity, cycles)"),
-    ("/graph", "knowledge graph — /graph [index <path>|query <name>|impact <name>]"),
-    ("/coverage", "line-coverage ledger — last measured runs"),
-    ("/fuzz", "fuzzing ledger — runs, crashes, shrunk reproducers"),
-    ("/mutate", "mutation testing — /mutate <file> <suite-command>"),
-    ("/cron", "cron scheduler — /cron [add \"<expr>\" \"<cmd>\"|list|remove <id>|log <id>]"),
-    ("/help", "commands and key bindings"),
-    ("/clear", "clear the screen"),
-    ("/new", "new session — /new [name] (old session snapshotted)"),
-    ("/reset", "reset history — clear messages + per-turn caches, keep session/goal/todos"),
-    ("/switch", "switch session — /switch <id> (bare: list)"),
-    ("/history", "browse previous turns"),
-    ("/save", "save session to disk"),
-    ("/approve", "toggle auto-approve for tools"),
-    ("/reasoning", "toggle showing model reasoning"),
-    ("/usage", "token usage for this session"),
-    ("/about", "about FullAgent"),
-    ("/exit", "quit FullAgent"),
-]
+from .slashcatalog import SLASH_COMMANDS
 
 
 class SlashCompleter(Completer):
@@ -720,536 +577,12 @@ class OverlayList:
 # ---------------------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------------
-# Parallel agents panel — live subagent tracking without flicker or jank
-# ---------------------------------------------------------------------------
-
-
-class ParallelAgentsPanel:
-    """Live tracker for parallel subagents, driven by crew.* events.
-
-    Smoothness and speed by design:
-    - O(1) per event: agents keyed by id in a dict; no log scans, ever.
-    - Dirty-row caching: only rows whose state changed are reformatted;
-      the rest are served from cache.
-    - Throttled: renders are rate-limited to 10/sec (100ms); callers ask
-      via maybe_render() which returns None when throttled.
-    - Stable ordering: agents are kept in spawn order (insertion order);
-      rows never jump around.
-    - Differential: ingest() returns True only when display state
-      actually changed, so the UI invalidates only on real changes.
-    - Spinner isolation: the animated spinner char is composed at render
-      time, NOT cached — so spinner ticks don't invalidate row caches.
-
-    Event contract (defensive — crew.py may or may not emit all of these):
-    - crew.spawn   {id, nickname, role, task}      -> agent starts
-    - crew.progress {id, step, tools}              -> step update
-    - crew.done     {id, nickname, state, error, elapsed_ms, ...} -> finished
-    - crew.force_stop {}                           -> running -> stopped
-    - crew.closed  {}                              -> running -> stopped
-    """
-
-    # max renders per second for the panel (smoothness throttle)
-    RENDER_INTERVAL = 0.1
-
-    # statuses
-    RUNNING = "running"
-    DONE = "done"
-    ERROR = "error"
-    STOPPED = "stopped"
-
-    def __init__(self) -> None:
-        # agent_id -> state dict. O(1) lookup, the hot path.
-        self._agents: dict[str, dict] = {}
-        # agent_ids in spawn order. Append-only; never re-sorted, so rows
-        # are stable and don't jump.
-        self._order: list[str] = []
-        # agent_id -> formatted row text (WITHOUT spinner prefix).
-        self._row_cache: dict[str, str] = {}
-        # agent_ids whose cached row is stale and must be reformatted.
-        self._dirty: set[str] = set()
-        # event-log cursor: highest seq ingested, so poll_log() only
-        # reads new events.
-        self._last_seq: int = -1
-        # first-poll flag (distinct from _last_seq == -1): a first poll
-        # against an EMPTY log must not arm the history-skip for the
-        # next poll, or the first real crew events would be swallowed
-        # as "history".
-        self._initialized: bool = False
-        # throttle bookkeeping
-        self._last_emit: float = 0.0
-        # spinner frame, advanced by the caller on each tick
-        self._spin_i: int = 0
-        # structural change flag: set when agents are added or a status
-        # flips (forces a render even if throttle would skip it — status
-        # changes must never feel laggy).
-        self._structural: bool = False
-        # render-thread <-> tick-thread race guard: poll_log() (spinner
-        # tick) mutates _agents/_order/_dirty/_row_cache while the render
-        # thread reads them in _fragments(). Without this, list(self._dirty)
-        # in _reformat_dirty could raise "Set changed size during
-        # iteration" mid-render and kill the frame.
-        self._lock = threading.RLock()
-        # last rendered fragments + width: served when throttled so the
-        # panel never collapses to a blank frame between renders.
-        self._last_fragments: list | None = None
-        self._last_width: int = 0
-
-    # -- event ingestion (O(1) per event) ------------------------------------
-
-    # -- defensive event helpers (the panel must NEVER crash the TUI) -------
-
-    @staticmethod
-    def _safe_type(ev) -> str:
-        """Best-effort event type; '' when missing/non-string."""
-        t = getattr(ev, "type", None)
-        return t if isinstance(t, str) else ""
-
-    @staticmethod
-    def _safe_seq(ev) -> int:
-        """Best-effort event seq; -1 when missing/non-int."""
-        s = getattr(ev, "seq", None)
-        if isinstance(s, bool) or not isinstance(s, int):
-            return -1
-        return s
-
-    @staticmethod
-    def _safe_data(ev) -> dict:
-        """Best-effort event payload; {} when missing/non-dict.
-
-        A malformed crew.* event can carry a STRING payload. Passing it
-        straight into ingest() makes _on_spawn()'s data.get() raise
-        AttributeError: 'str' object has no attribute 'get' — killing the
-        whole TUI frame. Coerce here, once, for every entry point."""
-        d = getattr(ev, "data", None)
-        return d if isinstance(d, dict) else {}
-
-    def ingest(self, ev_type: str, data: dict, seq: int = -1) -> bool:
-        """Feed one crew event. Returns True if the display changed.
-
-        Fully defensive: data may be a string/None (malformed event),
-        ev_type may be non-string, seq may be non-int. Nothing here may
-        raise."""
-        with self._lock:
-            # Provider boundary (typeguards): central guards at the
-            # panel ingest — a malformed event can never raise here.
-            data = ensure_dict(data)
-            ev_type = ensure_str(ev_type)
-            if isinstance(seq, bool) or not isinstance(seq, int):
-                seq = -1
-            if seq >= 0:
-                self._last_seq = max(self._last_seq, seq)
-            if ev_type == "crew.spawn":
-                return self._on_spawn(data)
-            if ev_type == "crew.progress":
-                return self._on_progress(data)
-            if ev_type == "crew.done":
-                return self._on_done(data)
-            if ev_type == "crew.resumed":
-                return self._on_resumed(data)
-            if ev_type == "crew.force_stop":
-                return self._on_force_stop(data)
-            if ev_type == "crew.closed":
-                return self._on_closed(data)
-            return False
-
-    def poll_log(self, log) -> bool:
-        """Ingest all crew events since the last poll. O(new events).
-
-        Every event attribute is read defensively: event objects that
-        lack seq/type/data (or carry non-string types / non-dict
-        payloads) are skipped or coerced, never allowed to raise into
-        the TUI."""
-        with self._lock:
-            changed = False
-            # Reverse-walk from the head and stop at the cursor: only new
-            # events are visited.
-            pending: list = []
-            try:
-                events = list(log.events())
-            except Exception:
-                return False
-            # FIRST POLL: skip all historical events (from previous
-            # sessions). Otherwise the panel shows stale failed agents
-            # from old sessions, confusing users into thinking current
-            # subagents are broken. Uses _initialized (not
-            # _last_seq == -1): a first poll against an empty log must
-            # not swallow the first real events as "history" on the
-            # next poll.
-            if not self._initialized:
-                self._initialized = True
-                if events:
-                    seqs = [self._safe_seq(ev) for ev in events]
-                    self._last_seq = max(seqs) if seqs else -1
-                return False
-            for ev in reversed(events):
-                if self._safe_seq(ev) <= self._last_seq:
-                    break
-                if self._safe_type(ev).startswith("crew."):
-                    pending.append(ev)
-            for ev in reversed(pending):
-                if self.ingest(self._safe_type(ev),
-                               self._safe_data(ev),
-                               self._safe_seq(ev)):
-                    changed = True
-            return changed
-
-    def _on_spawn(self, data: dict) -> bool:
-        if not isinstance(data, dict):
-            return False
-        aid = str(data.get("id", ""))
-        if not aid or aid in self._agents:
-            return False
-        now = time.time()
-        self._agents[aid] = {
-            "id": aid,
-            "name": str(data.get("nickname") or aid),
-            "role": str(data.get("role") or ""),
-            "task": str(data.get("task") or ""),
-            "status": self.RUNNING,
-            "step": 0,
-            "tools": [],
-            "spawn_ts": now,
-            "elapsed_ms": 0,
-            "error": "",
-            "files": 0,
-        }
-        self._order.append(aid)
-        self._dirty.add(aid)
-        self._structural = True
-        return True
-
-    def _on_progress(self, data: dict) -> bool:
-        if not isinstance(data, dict):
-            return False
-        aid = str(data.get("id", ""))
-        st = self._agents.get(aid)
-        if st is None:
-            # progress for an agent we never saw spawn (e.g. a resumed
-            # agent — resume() seals crew.resumed, not crew.spawn — or the
-            # panel attached mid-run). Synthesize a minimal entry so the
-            # activity is visible instead of silently dropped.
-            self._on_spawn({"id": aid,
-                            "nickname": data.get("nickname"),
-                            "role": data.get("role"),
-                            "task": data.get("task")})
-            st = self._agents.get(aid)
-            if st is None:
-                return False
-        if st["status"] != self.RUNNING:
-            return False
-        step = data.get("step", st["step"])
-        try:
-            step = int(step)
-        except (TypeError, ValueError):
-            step = st["step"]
-        # coerce defensively — a non-string tool name would blow up
-        # ", ".join at render time and kill the whole frame. Also: a bare
-        # STRING payload would iterate char-by-char into garbage rows
-        # ("bash" -> "b, a, s, h"), and a non-iterable (int/None) would
-        # raise TypeError here.
-        raw_tools = data.get("tools")
-        if raw_tools is None:
-            raw_tools = []
-        elif isinstance(raw_tools, str):
-            raw_tools = [raw_tools]
-        try:
-            tools = [str(t) for t in raw_tools]
-        except TypeError:
-            tools = []
-        if step == st["step"] and tools == st["tools"]:
-            return False  # no visible change — skip reformat entirely
-        st["step"] = step
-        st["tools"] = tools[:6]
-        self._dirty.add(aid)
-        return True
-
-    def _on_done(self, data: dict) -> bool:
-        if not isinstance(data, dict):
-            return False
-        aid = str(data.get("id", ""))
-        st = self._agents.get(aid)
-        if st is None:
-            # Defensive: a done for an agent we never saw spawn (e.g. the
-            # panel attached mid-run). Synthesize a minimal entry so the
-            # completion is still visible.
-            self._on_spawn({"id": aid,
-                            "nickname": data.get("nickname"),
-                            "role": data.get("role"),
-                            "task": data.get("task")})
-            st = self._agents.get(aid)
-            if st is None:
-                return False
-        if st["status"] != self.RUNNING:
-            return False
-        err = str(data.get("error") or "")
-        st["status"] = self.ERROR if err else self.DONE
-        # Store the FULL error text here — crew.py seals the complete
-        # message in the crew.done event. Head-truncating at ingest
-        # (e.g. err[:120]) would silently eat the diagnostic tail of
-        # long errors (the attribute name in AttributeError) before the
-        # row renderer ever sees it. Width-fitting with tail
-        # preservation happens in _fit_err_row; error_detail() and
-        # /agents errors expose the full text on demand.
-        st["error"] = err
-        try:
-            st["elapsed_ms"] = int(data.get("elapsed_ms") or 0)
-        except (TypeError, ValueError):
-            st["elapsed_ms"] = 0
-        files = data.get("files_touched") or []
-        st["files"] = len(files) if isinstance(files, list) else 0
-        self._dirty.add(aid)
-        self._structural = True
-        return True
-
-    def _on_force_stop(self, data: dict) -> bool:
-        if not isinstance(data, dict):
-            return False
-        return self._mark_stopped("stopped by user")
-
-    def _on_resumed(self, data: dict) -> bool:
-        if not isinstance(data, dict):
-            return False
-        """A retired agent brought back to life (crew.resumed) — flip its
-        row back to running instead of leaving the stale terminal state
-        on screen forever."""
-        aid = str(data.get("id", ""))
-        st = self._agents.get(aid)
-        if st is None:
-            return self._on_spawn({"id": aid,
-                                   "nickname": data.get("nickname"),
-                                   "role": data.get("role"),
-                                   "task": data.get("task")})
-        if st["status"] == self.RUNNING:
-            return False
-        st["status"] = self.RUNNING
-        st["error"] = ""
-        st["step"] = 0
-        st["tools"] = []
-        st["spawn_ts"] = time.time()
-        st["elapsed_ms"] = 0
-        self._dirty.add(aid)
-        self._structural = True
-        return True
-
-    def _on_closed(self, data: dict) -> bool:
-        if not isinstance(data, dict):
-            return False
-        # crew.closed carries ONE agent id (unlike crew.force_stop which
-        # is roster-wide). Only that agent is retired — never flip every
-        # other running agent to stopped.
-        aid = str(data.get("id") or "")
-        st = self._agents.get(aid)
-        if st is not None and st["status"] == self.RUNNING:
-            st["status"] = self.STOPPED
-            st["error"] = "crew closed"
-            self._dirty.add(aid)
-            self._structural = True
-            return True
-        return False
-
-    def _mark_stopped(self, reason: str) -> bool:
-        changed = False
-        for aid in self._order:
-            st = self._agents[aid]
-            if st["status"] == self.RUNNING:
-                st["status"] = self.STOPPED
-                st["error"] = reason
-                self._dirty.add(aid)
-                changed = True
-        if changed:
-            self._structural = True
-        return changed
-
-    # -- queries ---------------------------------------------------------------
-
-    @staticmethod
-    def _status_of(st) -> str:
-        """status of an agent state entry that may be corrupted (a
-        non-dict, or a dict missing keys). Never raises — a bad entry
-        reads as "" (not running), never kills the frame."""
-        if isinstance(st, dict):
-            s = st.get("status")
-            return s if isinstance(s, str) else ""
-        return ""
-
-    @property
-    def active_count(self) -> int:
-        """Number of currently-running agents. O(n) but n is tiny (crew
-        capacity is bounded); cheap enough to not need caching."""
-        with self._lock:
-            return sum(1 for aid in self._order
-                       if self._status_of(self._agents.get(aid))
-                       == self.RUNNING)
-
-    @property
-    def total_count(self) -> int:
-        with self._lock:
-            return len(self._order)
-
-    def has_activity(self) -> bool:
-        with self._lock:
-            return bool(self._order)
-
-    # -- rendering ---------------------------------------------------------------
-
-    def tick_spinner(self) -> None:
-        """Advance the spinner frame. Cheap: does NOT invalidate caches."""
-        self._spin_i = (self._spin_i + 1) % len(SPINNER_FRAMES)
-
-    def maybe_render(self, width: int, force: bool = False) -> list | None:
-        """Return prompt_toolkit fragments for the panel, or None if
-        there is nothing to show.
-
-        Throttle rule: structural changes (spawn/done) always render
-        immediately; pure progress updates are capped at 10/sec. When
-        throttled, the last rendered frame is served from cache — the old
-        code returned None here, which collapsed the panel window to zero
-        height on every other render frame (a visible blink while agents
-        were running).
-        """
-        with self._lock:
-            if not self._order:
-                return None
-            now = time.time()
-            if (not force and not self._structural
-                    and self._last_fragments is not None
-                    and width == self._last_width
-                    and now - self._last_emit < self.RENDER_INTERVAL):
-                return self._last_fragments
-            self._last_emit = now
-            self._structural = False
-            frags = self._fragments(width)
-            self._last_fragments = frags
-            self._last_width = width
-            return frags
-
-    def render_text(self, width: int = 80) -> list[str]:
-        """Plain-text rows (for dashboard / non-prompt_toolkit use)."""
-        with self._lock:
-            self._reformat_dirty(width)
-            out: list[str] = []
-            spin = SPINNER_FRAMES[self._spin_i % len(SPINNER_FRAMES)]
-            for aid in self._order:
-                st = self._agents.get(aid)
-                row = self._row_cache.get(aid, "")
-                if self._status_of(st) == self.RUNNING:
-                    out.append(f"{spin} {row}")
-                else:
-                    out.append(row)
-            return out
-
-    def _fragments(self, width: int) -> list:
-        """prompt_toolkit fragments. Only dirty rows are reformatted."""
-        self._reformat_dirty(width)
-        spin = SPINNER_FRAMES[self._spin_i % len(SPINNER_FRAMES)]
-        frags: list = []
-        n_running = self.active_count
-        header = (f" PARALLEL AGENTS \u2014 {n_running} running / "
-                  f"{len(self._order)} total ")
-        frags.append(("class:crew.header", _truncate_w(header, width) + "\n"))
-        for aid in self._order:
-            st = self._agents.get(aid)
-            row = self._row_cache.get(aid, "")
-            status = self._status_of(st)
-            if status == self.RUNNING:
-                style = "class:crew.running"
-                text = f" {spin} {row}"
-            elif status == self.DONE:
-                style = "class:crew.done"
-                text = f" {row}"
-            else:
-                style = "class:crew.error"
-                text = f" {row}"
-            frags.append((style, _truncate_w(text, width) + "\n"))
-        return frags
-
-    def _reformat_dirty(self, width: int) -> None:
-        """Reformat only rows in the dirty set. O(dirty), not O(agents)."""
-        if not self._dirty:
-            return
-        now = time.time()
-        for aid in list(self._dirty):
-            st = self._agents.get(aid)
-            if st is not None:
-                self._row_cache[aid] = self._format_row(st, width, now)
-        self._dirty.clear()
-
-    def _format_row(self, st: dict, width: int, now: float) -> str:
-        """Format one row (no spinner — composed at render time).
-
-        Defensive: a corrupted/partial agent state dict (missing keys
-        or wrong-typed values — e.g. a test or a bug surgically
-        removing keys) must render a degraded row, never KeyError /
-        TypeError into the TUI frame."""
-        if not isinstance(st, dict):
-            return "  (invalid agent state)"
-        name = str(st.get("name") or "?")
-        role = str(st.get("role") or "")
-        task = " ".join(str(st.get("task") or "").split())  # collapse ws
-        status = st.get("status") or ""
-        if status == self.RUNNING:
-            try:
-                elapsed = self._fmt_elapsed(
-                    now - float(st.get("spawn_ts") or now))
-            except (TypeError, ValueError):
-                elapsed = self._fmt_elapsed(0)
-            parts = [name]
-            if role:
-                parts.append(role)
-            if task:
-                parts.append(task[:60])
-            detail = " \u00b7 ".join(parts)
-            step = st.get("step") or 0
-            step_bit = f" \u00b7 step {step}" if step else ""
-            tools = st.get("tools") or []
-            if isinstance(tools, str):
-                tools = [tools]
-            elif not isinstance(tools, (list, tuple)):
-                tools = []
-            tools_bit = (f" \u00b7 {', '.join(str(t) for t in tools[:3])}"
-                         if tools else "")
-            row = f"  {detail}{step_bit}{tools_bit} \u00b7 {elapsed}"
-        elif status == self.DONE:
-            try:
-                ms = int(st.get("elapsed_ms") or 0)
-            except (TypeError, ValueError):
-                ms = 0
-            elapsed = self._fmt_elapsed(ms / 1000.0) if ms else "\u2014"
-            try:
-                files = int(st.get("files") or 0)
-            except (TypeError, ValueError):
-                files = 0
-            files_bit = f" \u00b7 {files} files" if files else ""
-            row = f"\u2713 {name} \u00b7 done in {elapsed}{files_bit}"
-        elif status == self.ERROR:
-            row = _fit_err_row("\u2717", name,
-                               str(st.get("error") or "failed"), width)
-        else:  # STOPPED (and any unknown status degrades here)
-            row = _fit_err_row("\u25a0", name,
-                               str(st.get("error") or "stopped"), width)
-        return _truncate_w(row, max(10, width - 2))
-
-    @staticmethod
-    def _fmt_elapsed(seconds: float) -> str:
-        seconds = max(0, int(seconds))
-        if seconds < 60:
-            return f"{seconds}s"
-        m, s = divmod(seconds, 60)
-        if m < 60:
-            return f"{m}m{s:02d}s"
-        h, m = divmod(m, 60)
-        return f"{h}h{m:02d}m"
-
-
 class UI:
     def __init__(self, cfg: Config, agent: Agent):
         self.cfg = cfg
         self.agent = agent
         self.console = make_console()
         self.overlay: OverlayList | None = None
-        # parallel subagent panel: live crew.* tracking, additive
-        self.crew_panel = ParallelAgentsPanel()
 
         # turn state
         self._busy = False
@@ -1257,10 +590,6 @@ class UI:
         self._spinner_i = 0
         self._spinner_gen = 0
         self._spinner_on = False
-        # crew-watcher: after a turn ends, the spinner tick keeps running
-        # while subagents are still alive so the parallel-agents panel
-        # animates to completion instead of freezing
-        self._crew_watch = False
         self._turn_start_ts = 0.0
         self._cancel_flag = threading.Event()
         self._last_flush = 0.0
@@ -1429,14 +758,6 @@ class UI:
                          else C["red"])
             segs.append((f" ◉ ctx {self._ctx_cache}% ",
                          f"bold {ctx_color}"))
-        # parallel agents indicator — O(1) count from the crew panel; the
-        # full panel renders below the top bar while crew is active
-        try:
-            _crew_n = self.crew_panel.active_count
-        except Exception:
-            _crew_n = 0
-        if _crew_n:
-            segs.append((f" ⚡ {_crew_n} ", f"bold {C['accent']}"))
         segs.append((f" ⌛ session: {self.agent.session_id} ", "class:box.session"))
 
         # fixed = corners (2) + first dash (1) + "──" before each later seg
@@ -1540,31 +861,23 @@ class UI:
             return self.overlay.fragments(self._width())
         return []
 
-    # -- parallel agents panel ---------------------------------------------------------
+    # -- background shell/progress panel ---------------------------------------
 
-    def _crew_visible(self) -> bool:
-        # Show the panel while any crew activity exists. Completed agents
-        # stay visible (collapsed to one line each) so results aren't lost.
-        # Hysteresis: once visible, stay visible for 5s after activity stops
-        # to prevent the prompt box from jumping up/down on rapid toggles.
-        import time as _t
-        if self.crew_panel.has_activity():
-            self._crew_last_active = _t.time()
-            return True
-        _last = getattr(self, "_crew_last_active", 0)
-        return (_t.time() - _last) < 5.0
-
-    def _crew_fragments(self) -> list:
-        # Poll for new crew events on every render frame — poll_log() is
-        # O(new events) and maybe_render() throttles to 10/sec, so this is
-        # cheap. Spinner ticks for smooth animation.
+    def _background_visible(self) -> bool:
         try:
-            self.crew_panel.poll_log(self.agent.log)
+            from .bgtui import has_activity
+            if has_activity(self.agent):
+                return True
         except Exception:
             pass
-        self.crew_panel.tick_spinner()
-        frags = self.crew_panel.maybe_render(self._width())
-        # Feature: background task panel (bgsh shells) below crew panel
+        try:
+            tracker = getattr(self.agent, "progress_tracker", None)
+            return bool(tracker and tracker.progress_bar_lines())
+        except Exception:
+            return False
+
+    def _background_fragments(self) -> list:
+        frags: list = []
         try:
             from .bgtui import BackgroundPanel, has_activity
             if getattr(self, "bg_panel", None) is None:
@@ -1574,7 +887,6 @@ class UI:
                     frags.append(("class:bg.line", line + "\n"))
         except Exception:
             pass
-        # Feature: active progress bars (Progress* tools) below panels
         try:
             tracker = getattr(self.agent, "progress_tracker", None)
             if tracker is not None:
@@ -1582,20 +894,7 @@ class UI:
                     frags.append(("class:bg.line", line + "\n"))
         except Exception:
             pass
-        return frags or []
-
-    def poll_crew(self) -> bool:
-        """Ingest pending crew events; True if the panel changed.
-
-        Called from background threads (e.g. the spinner tick) to keep
-        the panel live even when prompt_toolkit isn't rendering."""
-        try:
-            changed = self.crew_panel.poll_log(self.agent.log)
-        except Exception:
-            return False
-        if changed:
-            self._invalidate()
-        return changed
+        return frags
 
     # -- construction ----------------------------------------------------------------
 
@@ -1642,11 +941,9 @@ class UI:
         overlay_window = Window(
             FormattedTextControl(self._overlay_fragments),
             dont_extend_height=True)
-        # parallel agents panel: live crew.* rows, shown only while there
-        # is crew activity. ConditionalContainer show/hide is flicker-free;
-        # the panel itself throttles to 10 renders/sec.
-        crew_window = Window(
-            FormattedTextControl(self._crew_fragments),
+        # Background shell jobs and progress bars remain visible while active.
+        background_window = Window(
+            FormattedTextControl(self._background_fragments),
             dont_extend_height=True)
 
         root = FloatContainer(
@@ -1656,8 +953,8 @@ class UI:
                     filter=Condition(self._overlay_open)),
                 top_window,
                 ConditionalContainer(
-                    crew_window,
-                    filter=Condition(self._crew_visible)),
+                    background_window,
+                    filter=Condition(self._background_visible)),
                 VSplit([left_window, input_window, right_window], padding=0),
                 bottom_window,
                 ConditionalContainer(self.search_toolbar,
@@ -1900,11 +1197,7 @@ class UI:
         return kb
 
     def _request_cancel(self) -> None:
-        """Idempotent cancel: stop this UI's turn flag, the agent's own
-        cancel flag, and force-stop any running subagents. Every step is
-        guarded — the original Esc/Ctrl+C crash was an AttributeError on
-        agent._cancel_flag, and this path must never raise back into the
-        key handler."""
+        """Idempotently cancel this UI turn and the agent's request flag."""
         self._cancel_flag.set()
         flag = getattr(self.agent, "_cancel_flag", None)
         if flag is not None:
@@ -1912,10 +1205,7 @@ class UI:
                 flag.set()
             except Exception:
                 pass
-        try:
-            self.agent.crew.force_stop()
-        except Exception:
-            pass
+        # Agent and provider requests share the same cancellation flag.
         # Watchdog: if the turn thread is stuck (e.g. blocked in input()
         # or a hung subprocess), force-clear the busy state after 10s so
         # the UI never shows "cancelling…" forever.
@@ -2083,6 +1373,7 @@ class UI:
         if cmd in ("/exit", "/quit", "/q"):
             self.print_info(f"bye — session {self.agent.session_id} saved",
                             C["dim"])
+            self._shutdown_subagents()
             self.agent.save_session()
             self.app.exit()
         elif cmd == "/new":
@@ -2175,16 +1466,15 @@ class UI:
                 self.open_effort_selector()
         elif cmd == "/help":
             from .help import format_help
-            self.print_info(format_help(), C["fg"])
+            self.print_info(format_help(arg), C["fg"])
+        elif cmd == "/agents":
+            self._cmd_agents(arg)
         elif cmd == "/init":
             from .codeinit import run_init_command
             run_init_command(self, arg)
         elif cmd == "/review":
             from .review import run_review_command
             run_review_command(self, arg)
-        elif cmd == "/agents":
-            from . import agentscmd
-            self.print_info(agentscmd.handle(self, arg), C["fg"])
         # ---- Round 2 advanced features ----
         elif cmd == "/mcp":
             from .mcp import handle_mcp
@@ -2342,8 +1632,6 @@ class UI:
             self._cmd_focus(arg)
         elif cmd == "/render":
             self._cmd_render(arg)
-        elif cmd == "/workflow":
-            self._cmd_workflow(arg)
         elif cmd == "/export":
             from .export import handle_export
             handle_export(self, arg)
@@ -2423,8 +1711,6 @@ class UI:
             self._cmd_judge(arg)
         elif cmd == "/compile":
             self._cmd_compile(arg)
-        elif cmd == "/evolve":
-            self._cmd_evolve(arg)
         elif cmd == "/brain":
             self._cmd_brain(arg)
         elif cmd == "/merge":
@@ -2433,8 +1719,6 @@ class UI:
             self._cmd_theater(arg)
         elif cmd == "/debate":
             self._cmd_debate(arg)
-        elif cmd == "/market":
-            self._cmd_market(arg)
         elif cmd == "/tower":
             self._cmd_tower(arg)
         elif cmd == "/verify":
@@ -2445,10 +1729,6 @@ class UI:
             self._cmd_causal(arg)
         elif cmd == "/bandit":
             self._cmd_bandit(arg)
-        elif cmd == "/mesh":
-            self._cmd_mesh(arg)
-        elif cmd == "/roleforge":
-            self._cmd_roleforge(arg)
         elif cmd == "/synth":
             self._cmd_synth(arg)
         elif cmd == "/ci":
@@ -2459,8 +1739,6 @@ class UI:
             self._cmd_dual(arg)
         elif cmd == "/predict":
             self._cmd_predict_impact(arg)
-        elif cmd == "/race":
-            self._cmd_race(arg)
         elif cmd == "/vitals":
             self.print_info(self.agent.homeo.check_and_repair()
                             .format(), C["cyan"])
@@ -2512,6 +1790,212 @@ class UI:
                 self._dispatch(prompt)
             else:
                 self.print_error(f"unknown command: {cmd} — try /help")
+
+    def _shutdown_subagents(self) -> None:
+        """Cancel active child work without creating the lazy runtime."""
+        manager = self.agent.__dict__.get("subagents")
+        if manager is not None:
+            try:
+                manager.shutdown(wait=False)
+            except Exception:
+                pass
+
+    def _print_agents_dashboard(self, manager) -> None:
+        """Render a compact live board for the current parallel crew."""
+        from rich import box
+        from rich.console import Group
+        from rich.text import Text
+
+        snapshot = manager.snapshot()
+        counts = snapshot["counts"]
+        state_styles = {
+            "queued": C["dim"], "running": C["green"],
+            "cancelling": C["yellow"], "done": C["cyan"],
+            "blocked": C["orange"], "error": C["red"],
+            "cancelled": C["dim"],
+        }
+        state_icons = {"queued": "○", "running": "●", "cancelling": "◌",
+                       "done": "✓", "blocked": "!", "error": "×",
+                       "cancelled": "–"}
+        from .roles import role_label
+        cards = []
+        for row in snapshot["workers"]:
+            state = row["state"]
+            color = state_styles.get(state, C["fg"])
+            seconds = row["elapsed_ms"] / 1000
+            task = " ".join(row["task"].split())
+            if len(task) > 360:
+                task = task[:357] + "..."
+            activity = row["current_action"] if state in {
+                "queued", "running", "cancelling"} else row["summary"]
+            activity = " ".join(activity.split())
+            if len(activity) > 180:
+                activity = activity[:177] + "..."
+            heading = Text()
+            heading.append(state_icons.get(state, "·") + "  ",
+                           style=f"bold {color}")
+            heading.append(state.upper(), style=f"bold {color}")
+            heading.append(f"  {row['id']}  ·  {row['batch_id']}",
+                           style=C["dim"])
+            work = Text(
+                f"{role_label(row['role'])} · {row['name']}  |  "
+                f"{row['steps']} steps · {row['tool_calls']} tools  |  "
+                f"{row['tokens_in']}→{row['tokens_out']} tokens · {seconds:.1f}s",
+                style=C["dim"])
+            task_line = Text("Task  ", style=f"bold {C['cyan']}")
+            task_line.append(task)
+            contents = [heading, work, task_line]
+            if activity:
+                contents.append(Text("↳ " + activity, style=C["dim"]))
+            cards.append(Panel(
+                Group(*contents), box=box.ROUNDED, border_style=color,
+                padding=(0, 1), expand=True))
+
+        summary = Text()
+        summary.append(f" {snapshot['active']:02d}/{snapshot['max_active']:02d} ACTIVE ",
+                       style=f"bold {C['green']}")
+        summary.append(f" · {counts['running']}/{snapshot['max_workers']} worker slots")
+        for state, label, color in (("queued", "queued", C["dim"]),
+                                    ("done", "done", C["cyan"]),
+                                    ("blocked", "blocked", C["orange"]),
+                                    ("error", "errors", C["red"])):
+            summary.append(f" · {counts[state]} {label}", style=color)
+        summary.append(f" · {snapshot['tokens_in']}→{snapshot['tokens_out']} tokens",
+                       style=C["dim"])
+        if not snapshot["workers"]:
+            body = Group(summary, Text(
+                "No workers yet. Use TaskGroup for read-only parallel work or "
+                "TaskWriteGroup for approval-gated, path-scoped edits.",
+                style=C["dim"]))
+        else:
+            body = Group(summary, *cards)
+        self.console.print(Panel(
+            body, title=f"[bold {C['accent']}]Parallel crew[/]",
+            subtitle=(f"latest {snapshot['latest_batch_id']} · "
+                      "/agents roles · detail <id> · results [batch] · stop all"),
+            border_style=C["border"], padding=(0, 1), expand=True))
+
+    def _print_agent_roles(self) -> None:
+        """Show the available specialist modes and their capability boundary."""
+        from rich import box
+        from rich.console import Group
+        from rich.text import Text
+        from .roles import ROLE_GUIDANCE, ROLES, role_label
+
+        cards = []
+        for role in sorted(ROLES):
+            writes = bool(ROLES[role].get("writes"))
+            access = "SCOPED WRITES · approval-gated" if writes else "READ-ONLY"
+            title = Text(f"{role_label(role)}  ·  {role}",
+                         style=f"bold {C['accent']}")
+            title.append(f"  [{access}]",
+                         style=C["yellow"] if writes else C["green"])
+            cards.append(Panel(
+                Group(title, Text(ROLE_GUIDANCE[role], style=C["dim"])),
+                box=box.SIMPLE, border_style=C["border"],
+                padding=(0, 1), expand=True))
+        self.console.print(Panel(
+            Group(*cards), title=f"[bold {C['accent']}]Specialist roster · "
+                                 f"{len(ROLES)} roles[/]",
+            subtitle="Every worker uses its role allowlist; writes stay scoped and approval-gated.",
+            border_style=C["border"], padding=(0, 1), expand=True))
+
+    def _cmd_agents(self, arg: str) -> None:
+        """Inspect or control the current session's parallel subagents."""
+        try:
+            self.agent._ensure_session()
+            manager = self.agent.subagents
+        except Exception as exc:  # keep the TUI usable if an optional part fails
+            self.print_error(f"subagents unavailable: {exc}")
+            return
+        text = (arg or "").strip()
+        if not text or text.lower() in ("list", "status"):
+            self._print_agents_dashboard(manager)
+            return
+        parts = text.split(None, 2)
+        action = parts[0].lower()
+        if action in ("roles", "specialists"):
+            self._print_agent_roles()
+            return
+        if action in ("detail", "show"):
+            if len(parts) < 2:
+                self.print_error("usage: /agents detail <id>")
+                return
+            from rich.text import Text
+            self.console.print(Panel(
+                Text(manager.format_worker(manager.get(parts[1]))),
+                title=f"[bold {C['accent']}]Subagent detail[/]",
+                border_style=C["border"], expand=False))
+            return
+        if action in ("results", "collect"):
+            batch_id = parts[1] if len(parts) > 1 else ""
+            try:
+                from rich.text import Text
+                reports = manager.collect(batch_id=batch_id, timeout=0)
+                self.console.print(Panel(
+                    Text(reports),
+                    title=f"[bold {C['accent']}]Batch results[/]",
+                    border_style=C["border"], expand=True))
+            except Exception as exc:
+                self.print_error(str(exc))
+            return
+        if action == "spawn":
+            rest = text[len(parts[0]):].strip()
+            role = "researcher"
+            task_text = rest
+            if rest:
+                first, _, tail = rest.partition(" ")
+                from .roles import ROLES
+                if first in ROLES:
+                    role, task_text = first, tail.strip()
+            if not task_text:
+                self.print_error(
+                    "usage: /agents spawn [role] <read-only investigation task>")
+                return
+            try:
+                worker = manager.spawn(task_text, role=role,
+                                       allow_writes=False)
+                from .roles import role_label
+                self.print_info(
+                    f"✓ started {worker.id} · {role_label(worker.role)} · "
+                    f"batch {worker.batch_id} (read-only); use /agents results "
+                    f"{worker.batch_id} or /agents list",
+                    C["green"])
+            except Exception as exc:
+                self.print_error(str(exc))
+            return
+        if action == "wait":
+            selector = parts[1] if len(parts) > 1 else "all"
+            ids = [selector] if selector.lower() != "all" else None
+            try:
+                manager.wait(ids, timeout=30)
+                self._print_agents_dashboard(manager)
+            except Exception as exc:
+                self.print_error(str(exc))
+            return
+        if action == "stop":
+            if len(parts) < 2:
+                self.print_error("usage: /agents stop <id|all>")
+                return
+            try:
+                if parts[1].lower() == "all":
+                    active = [worker for worker in manager.list()
+                              if worker.state in {"queued", "running", "cancelling"}]
+                    for worker in active:
+                        manager.stop(worker.id)
+                    self.print_info(
+                        f"Cancellation requested for {len(active)} active worker(s).",
+                        C["yellow"])
+                else:
+                    worker = manager.stop(parts[1])
+                    self.print_info(manager.format_worker(worker), C["yellow"])
+            except Exception as exc:
+                self.print_error(str(exc))
+            return
+        self.print_error(
+            "usage: /agents [list | roles | spawn [role] <read-only task> | "
+            "detail <id> | results [batch-id] | wait [id|all] | "
+            "stop <id|all>] — scoped coding delegation is approval-gated")
 
     # -- event-log commands ------------------------------------------------------
 
@@ -2750,38 +2234,6 @@ class UI:
                         f"{'ON (replies render as rich Markdown)' if new_state else 'OFF (raw streaming)'}",
                         C["green"])
 
-    def _cmd_workflow(self, arg: str) -> None:
-        """Saved enterprise pipelines: /workflow [list|run|delete]."""
-        from .workflows import WorkflowError
-        wf = self.agent.workflows
-        parts = arg.split(None, 1)
-        sub = parts[0].lower() if parts else "list"
-        rest = parts[1].strip() if len(parts) > 1 else ""
-        if sub in ("", "list"):
-            self.print_info(wf.format_list(), C["cyan"])
-            return
-        if sub == "run":
-            if not rest:
-                self.print_error("usage: /workflow run <name>")
-                return
-            self.print_info(f"⚙ running workflow {rest!r} …", C["dim"])
-            try:
-                report = wf.run(rest)
-            except WorkflowError as e:
-                self.print_error(str(e))
-                return
-            color = C["green"] if report["state"] == "DONE" else C["red"]
-            self.print_info(wf.format_report(report), color)
-            return
-        if sub == "delete":
-            if wf.delete(rest):
-                self.print_info(f"✓ workflow {rest!r} deleted", C["yellow"])
-            else:
-                self.print_error(f"no such workflow: {rest!r}")
-            return
-        self.print_error("workflow subcommands: list · run <name> · "
-                         "delete <name>")
-
     def _cmd_export(self, arg: str) -> None:
         fmt = arg.strip().lower()
         if fmt not in ("", "md", "markdown", "html"):
@@ -2804,7 +2256,7 @@ class UI:
                 lines.append(f"  model errors           : {m} × {n}")
         else:
             lines.append("  model errors           : none")
-        lines.append("  failover              : disabled (manual model selection)")
+        lines.append("  automatic model switch: disabled (manual selection only)")
         self.print_info("\n".join(lines), C["cyan"])
 
     def _cmd_notify(self, arg: str) -> None:
@@ -3130,51 +2582,17 @@ class UI:
     # -- v5 advanced subsystem commands ----------------------------------
 
     def _cmd_compile(self, arg: str) -> None:
-        """Intent Compiler: goal → optimized ordered waves → execute."""
+        """Compile a goal into a plan without delegated execution."""
         goal = arg.strip()
         if not goal:
-            self.print_error("usage: /compile <goal>  — the compiler "
-                             "plans + executes it in ordered waves")
+            self.print_error("usage: /compile <goal>")
             return
-        self.print_info("⚙ compiling…", C["pink"])
-
+        self.print_info("planning…", C["pink"])
         def run():
             plan = self.agent.compiler.compile(goal)
             self.console.print(Text(self.agent.compiler.format(plan),
                                     style=C["fg"]))
-            if not plan.waves:
-                return
-            self.print_info(f"⚙ executing {len(plan.waves)} wave(s)…",
-                            C["pink"])
-            result = self.agent.compiler.execute(plan)
-            self.print_info(
-                f"✓ {result['items']} items · {result['done']} done · "
-                f"{result['blocked']} blocked · {result['error']} error",
-                C["green"] if result["error"] == 0 else C["yellow"])
-
         self._bg(run)
-
-    def _cmd_evolve(self, arg: str) -> None:
-        """Evolution Engine: mutate → evaluate → deploy one role brief."""
-        parts = arg.split()
-        if parts and parts[0].lower() == "rollback":
-            if len(parts) < 2:
-                self.print_error("usage: /evolve rollback <role>")
-                return
-            self.print_info(self.agent.evolution.rollback(parts[1]),
-                            C["cyan"])
-            return
-        role = parts[0] if parts else ""
-
-        def run():
-            self.print_info("🧬 evolving — benchmark runs are real "
-                            "worker calls…", C["pink"])
-            gen = self.agent.evolution.evolve(role or None)
-            color = C["green"] if gen.deployed else C["yellow"]
-            self.print_info(self.agent.evolution.format(gen), color)
-
-        self._bg(run)
-
     def _cmd_brain(self, arg: str) -> None:
         """Cognitive memory: query it, put it to sleep, or read stats."""
         sub = arg.strip().lower()
@@ -3279,22 +2697,6 @@ class UI:
 
         self._bg(run)
 
-    def _cmd_market(self, arg: str) -> None:
-        """Task market: auctions the given tasks to bidding specialists."""
-        tasks = [t.strip() for t in arg.split("|") if t.strip()]
-        if not tasks:
-            self.print_error("usage: /market <task1> | <task2> | …")
-            return
-
-        def run():
-            self.print_info(f"💰 {len(tasks)} contract(s) up for "
-                            "auction…", C["pink"])
-            contracts = self.agent.market.run(tasks)
-            self.console.print(Text(self.agent.market.format(contracts),
-                                    style=C["fg"]))
-
-        self._bg(run)
-
     def _cmd_tower(self, arg: str) -> None:
         """Web Control Tower: mission-control dashboard in the browser."""
         try:
@@ -3307,7 +2709,7 @@ class UI:
             return
         url = self.agent.tower.start(port=port)
         self.print_info(f"🖥 control tower LIVE at {url} — event river, "
-                        "timeline scrubber, crew status, live command "
+                        "timeline scrubber, live command "
                         "box", C["green"])
 
     # -- v6 frontier commands ------------------------------------------------
@@ -3393,62 +2795,6 @@ class UI:
         self.print_info(f"bandit recommends [{rec.arm}] for this "
                         f"{rec.context} task", C["green"])
 
-    def _cmd_mesh(self, arg: str) -> None:
-        ag = self.agent
-        parts = arg.split()
-        if not parts or parts[0].lower() == "serve":
-            port_arg = parts[1] if len(parts) > 1 else "0"
-            try:
-                want = int(port_arg)
-            except ValueError:
-                self.print_error(f"bad port: {port_arg!r} — usage: /mesh "
-                                 f"serve [port]")
-                return
-            port = ag.mesh.serve(want)
-            self.print_info(f"📡 mesh node '{ag.mesh.node_id}' serving "
-                            f"on port {port}", C["green"])
-            return
-        if parts[0].lower() == "discover" and len(parts) > 1:
-            host, _, port = parts[1].partition(":")
-            try:
-                port_num = int(port or 7861)
-            except ValueError:
-                self.print_error(f"bad port: {port!r} — usage: /mesh "
-                                 f"discover host:port")
-                return
-            peer = ag.mesh.discover(host, port_num)
-            if peer:
-                self.print_info(f"discovered peer {peer.capabilities}",
-                                C["green"])
-            else:
-                self.print_error(f"no FullAgent mesh at {parts[1]}")
-            return
-        if parts[0].lower() == "delegate" and len(parts) > 1:
-            reply = ag.mesh.delegate(arg.split(None, 1)[1])
-            self.print_info(str(reply), C["cyan"])
-            return
-        if parts[0].lower() == "status":
-            self.print_info(f"peers: {list(ag.mesh.peers) or 'none'} · "
-                            f"handled {ag.mesh.handled} task(s)",
-                            C["cyan"])
-            return
-        self.print_error("usage: /mesh [serve [port] | discover "
-                         "host:port | delegate <task> | status]")
-
-    def _cmd_roleforge(self, arg: str) -> None:
-        mission = arg.strip()
-        if not mission:
-            self.print_error("usage: /roleforge <what specialist do you "
-                             "need and why>")
-            return
-
-        def run():
-            status, msg = self.agent.roleforge.forge(mission)
-            self.print_info(msg, C["green"] if status == "sealed"
-                            else C["yellow"])
-
-        self._bg(run)
-
     def _cmd_synth(self, arg: str) -> None:
         """Synthesize a tool from a JSON spec: name, description,
         examples ([{"args": {...}, "want": ...}])."""
@@ -3526,19 +2872,6 @@ class UI:
             return
         impact = self.agent.world.predict_impact(path)
         self.print_info(impact.format(), C["cyan"])
-
-    def _cmd_race(self, arg: str) -> None:
-        task = arg.strip()
-        if not task:
-            self.print_error("usage: /race <task>")
-            return
-
-        def run():
-            result = self.agent.racer.race(task, timeout=420.0)
-            self.print_info(self.agent.racer.format(result),
-                            C["green"] if result.winner else C["yellow"])
-
-        self._bg(run)
 
     def _cmd_fabric(self, arg: str) -> None:
         """Bitemporal knowledge graph: ask, assert, or see history."""
@@ -4142,10 +3475,7 @@ class UI:
             self._set_status(f"running {ev.name}…")
 
         def on_tool_update(ev: ToolEvent):
-            if ev.name == "wait_for_agents" and ev.status == "done":
-                # subagent reports deserve a real panel, not one line
-                self.console.print(self._subagent_panel(ev))
-            elif ev.name in ("write_file", "edit_file", "apply_patch") \
+            if ev.name in ("write_file", "edit_file", "apply_patch") \
                     and ev.status in ("done", "error") \
                     and live_f["count"] > 0:
                 # change already streamed live — flush the last partial line
@@ -4337,49 +3667,17 @@ class UI:
         self.console.print(t)
 
     def _start_spinner(self) -> None:
-        # generation token: back-to-back turns used to leak tick threads
-        # (old thread wakes from sleep after the flag flips and keeps
-        # looping) — a stale generation exits instead
         self._spinner_gen = getattr(self, "_spinner_gen", 0) + 1
         gen = self._spinner_gen
         self._spinner_on = True
-        self._crew_watch = False
-
         def tick():
-            # The tick doubles as the crew panel's heartbeat: it polls crew
-            # events and invalidates the layout. After the turn ends it
-            # keeps running while subagents are still alive, so the panel
-            # animates to completion instead of freezing on stale
-            # "running" rows. A new turn bumps the generation and the old
-            # tick exits on its next wake (<=90ms) — no leak.
-            while (self._spinner_on or self._crew_watch) \
-                    and gen == self._spinner_gen:
+            while self._spinner_on and gen == self._spinner_gen:
                 self._spinner_i = (self._spinner_i + 1) % len(SPINNER_FRAMES)
-                # keep the parallel-agents panel live: poll crew events on
-                # the tick (O(new events); panel throttles renders to 10/s)
-                try:
-                    self.poll_crew()
-                except Exception:
-                    pass
-                try:
-                    self._crew_watch = self.crew_panel.active_count > 0
-                except Exception:
-                    self._crew_watch = False
                 self._invalidate()
                 time.sleep(0.09)
-
         threading.Thread(target=tick, daemon=True).start()
-
     def _stop_spinner(self) -> None:
         self._spinner_on = False
-        # NOTE: the generation is deliberately NOT bumped here — the tick
-        # must survive the turn end while crew agents are still running
-        # (see _start_spinner). A new turn's _start_spinner bumps the
-        # generation and retires the old tick.
-        try:
-            self._crew_watch = self.crew_panel.active_count > 0
-        except Exception:
-            self._crew_watch = False
 
     # -- approval (in-app) ------------------------------------------------------------------------
 
@@ -4589,6 +3887,7 @@ class UI:
                 self.print_info("⊘ no interactive terminal — run fullagent "
                                 "in a real TTY, or use headless commands "
                                 "(python main.py --help)", C["yellow"])
+        self._shutdown_subagents()
         self.agent.save_session()
 
     def print_banner(self) -> None:
@@ -4626,7 +3925,7 @@ class UI:
             banner.append("  ·  Event-Sourced Kernel  ·  Goal Contracts  ·  Self-Healing", style=C["dim"])
             banner.append("\n")
             n_prov = len(PROVIDERS)
-            banner.append(f"  ⚡ 40+ Commands · 16 Tools · {n_prov} Providers · Real-time Web · Crew & Daemon", style=C["dim"])
+            banner.append(f"  ⚡ 40+ Commands · 16 Tools · {n_prov} Providers · Real-time Web · Daemon", style=C["dim"])
             self.console.print(Panel(banner, width=width,
                                      border_style=C["border"], padding=(0, 1),
                                      title=f"[bold {C['accent']}]FullAgent[/]",
@@ -5072,15 +4371,6 @@ class UI:
         t.append(first[:200] if first else f"{nlines} line(s) written",
                  style=C["green"])
         return t
-
-    def _subagent_panel(self, ev: ToolEvent) -> Panel:
-        """Render a subagent tool result as a bordered panel."""
-        title = {"wait_for_agents": "⚡ CREW RESULTS"}.get(ev.name,
-                                                          "⚡ SUBAGENTS")
-        color = C["green"] if ev.status == "done" else C["red"]
-        body = Text(ev.result[:6000], style=C["fg"])
-        return Panel(body, title=title, border_style=color, expand=False,
-                     padding=(0, 1))
 
     def print_reasoning(self, text: str) -> None:
         preview = " ".join(text.strip().split())

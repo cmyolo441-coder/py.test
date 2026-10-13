@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from .kernel import EventLog, fold
-from .team import ROLES
+from .roles import ROLES
 from ._foundation import get_logger
 
 _log = get_logger("compiler")

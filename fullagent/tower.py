@@ -5,7 +5,7 @@ dependencies) that streams the whole agent's world to a dark, animated
 single-page dashboard:
 
     /api/state      live snapshot: cost, tokens, tool calls, errors,
-                    goal, crew roster, budget, branches, brain stats —
+                    goal, budget, branches, brain stats —
                     one JSON, one poll
     /api/events     the event river: every new kernel event since a seq
                     (the page polls and paints them as they seal)
@@ -81,7 +81,7 @@ button:hover{background:#388bfd}
 <div class="grid" id="cards"></div>
 <div class="cols">
  <div class="panel"><h2>Event river — live</h2><div id="river"></div></div>
-  <div><div class="panel"><h2>Crew / brain</h2><div id="crew"
+  <div><div class="panel"><h2>Brain</h2><div id="brain"
   class="muted">—</div></div>
  <div class="panel" style="margin-top:12px"><h2>Timeline scrubber</h2>
   <div id="tl"></div><div id="frame" class="muted" style="margin-top:8px">
@@ -98,16 +98,11 @@ async function pollState(){try{const r=await fetch('/api/state');
 const s=await r.json();const c=s.cards||{};
 $('cards').innerHTML=[['cost',s.cost],['tokens',s.tokens],
 ['tool calls',s.tool_calls],['errors',s.errors],['messages',s.messages],
-['files',s.files],['crew agents',s.crew_agents],['branches',s.branches]]
+['files',s.files],['branches',s.branches]]
 .map(([l,v])=>`<div class="card"><div class="v">${esc(v)}</div>
 <div class="l">${l}</div></div>`).join('');
 $('branch').textContent=' · '+s.branch;
-$('crew').innerHTML=(s.crew||[]).map(a=>`${a.icon} <b>${esc(a.nickname)}
-</b> <span class="muted">(${a.role})</span> ${a.state==='done'?
-'<span class=ok>✓</span>':a.state==='error'?'<span class=bad>✗</span>':
-a.state}</>`).join('<br>')||'crew is idle';
-if(s.brain)$('crew').innerHTML+=`<br><span class="pink">brain:</span>
-${s.brain}`;}catch(e){}}
+$('brain').innerHTML=esc(s.brain||'brain is idle');}catch(e){}}
 async function pollEvents(){try{const r=await fetch(
 '/api/events?since='+lastSeq);const evs=await r.json();
 for(const e of evs){lastSeq=Math.max(lastSeq,e.seq);
@@ -155,12 +150,6 @@ class Tower:
     def state(self) -> dict:
         st = fold(self.log)
         ag = self.agent
-        crew = []
-        crew_obj = getattr(ag, "crew", None)
-        if crew_obj is not None:
-            crew = [a.to_dict() for a in crew_obj.list()[:12]]
-            for a, d in zip(crew_obj.list()[:12], crew):
-                d["icon"] = a.icon
         brain = getattr(ag, "brain", None)
         brain_txt = ""
         if brain is not None:
@@ -174,9 +163,8 @@ class Tower:
                 "tool_calls": st.tool_calls, "errors": st.tool_errors,
                 "messages": len(st.messages),
                 "files": len(st.files_touched),
-                "crew_agents": len(crew),
                 "branches": len(self.log.branches()),
-                "crew": crew, "brain": brain_txt}
+                "brain": brain_txt}
 
     # -- command execution -----------------------------------------------------------
 
@@ -350,7 +338,7 @@ if __name__ == "__main__":
         log.append("tool.call", {"name": "read_file",
                                  "args": {"path": "x.py"}})
         log.append("assistant.message", {"text": "done reading"})
-        fake = SimpleNamespace(log=log, crew=None, brain=None)
+        fake = SimpleNamespace(log=log, brain=None)
         tower = Tower(fake)
         url = tower.start(port=0, open_browser=False)
         assert url.startswith("http://")

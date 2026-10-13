@@ -84,7 +84,7 @@ def _is_capped_stop(error: str) -> bool:
 # ---------------------------------------------------------------------------
 
 _SUM_GOAL_CAP = 300
-_SUM_TOOL_CAP = 8         # max tool lines in the summary (newest-first window)
+_SUM_TOOL_CAP = 5         # max tool lines in the summary (newest-first window)
 _SUM_RESULT_PREVIEW = 60
 _SUM_TEXT_CAP = 1600      # hard ceiling for the whole summary body
 

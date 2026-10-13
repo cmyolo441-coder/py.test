@@ -141,4 +141,4 @@ if __name__ == "__main__":
     hg = note_failure("some_new_tool", "ERROR: boom2")
     assert hg is not None and "2 failed some_new_tool attempts" in hg
 
-    print("retryhint self-test: OK")
+    print("PASS: retryhint self-test")

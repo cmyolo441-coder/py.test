@@ -5,7 +5,7 @@ provider shape into a canonical StreamResult-safe dict BEFORE parsing,
 so no shape can raise ``AttributeError: 'str' object has no attribute
 ...`` inside a turn.
 
-Shapes covered (observed against kilo/kios/opencode-class gateways):
+Shapes covered (observed against OpenAI-compatible gateways):
   * usage as a string
   * tool_calls as a bare string, or a list containing strings
   * missing choices
@@ -48,7 +48,7 @@ class NormalizeUnitTests(unittest.TestCase):
     def test_usage_as_string(self):
         data = {"model": "m", "usage": "prompt_tokens=12,total=34",
                 "choices": []}
-        norm = normalize_provider_response(data, "kios")
+        norm = normalize_provider_response(data, "kilo")
         self.assertIsNone(norm["usage"])
         self.assertEqual(norm["model"], "m")
         self.assertEqual(norm["choices"], [])
@@ -71,7 +71,7 @@ class NormalizeUnitTests(unittest.TestCase):
 
     def test_choices_as_single_dict(self):
         data = {"choices": {"message": {"content": "hi"}}}
-        norm = normalize_provider_response(data, "opencode")
+        norm = normalize_provider_response(data, "kilo")
         self.assertEqual(len(norm["choices"]), 1)
         self.assertEqual(norm["choices"][0]["message"]["content"], "hi")
 
@@ -148,7 +148,7 @@ class NormalizeUnitTests(unittest.TestCase):
                         or isinstance(res.finish_reason, str))
 
     def test_model_non_string(self):
-        norm = normalize_provider_response({"model": 123}, "kios")
+        norm = normalize_provider_response({"model": 123}, "kilo")
         self.assertIsInstance(norm["model"], str)
 
     def test_non_dict_top_level_raises_apierror(self):
@@ -160,7 +160,7 @@ class NormalizeUnitTests(unittest.TestCase):
 
     def test_delta_as_string_stream_mode(self):
         event = {"choices": [{"delta": "just a string"}]}
-        norm = normalize_provider_response(event, "kios", for_stream=True)
+        norm = normalize_provider_response(event, "kilo", for_stream=True)
         delta = norm["choices"][0]["delta"]
         # the exact access pattern of the _chat_stream_once event loop
         # must work on the normalized event
@@ -180,7 +180,7 @@ class NormalizeUnitTests(unittest.TestCase):
 
     def test_stream_tool_calls_as_string(self):
         event = {"choices": [{"delta": {"tool_calls": "read,write"}}]}
-        norm = normalize_provider_response(event, "opencode",
+        norm = normalize_provider_response(event, "kilo",
                                            for_stream=True)
         tcs = norm["choices"][0]["delta"]["tool_calls"]
         self.assertEqual(tcs, [])
@@ -194,7 +194,7 @@ class NormalizeUnitTests(unittest.TestCase):
                                                      "text": "hi"}],
                                         "tool_calls": ["x"]}}]}
         snapshot = copy.deepcopy(data)
-        normalize_provider_response(data, "kios")
+        normalize_provider_response(data, "kilo")
         self.assertEqual(data, snapshot)
 
     def test_canonical_shape_type_invariants(self):
@@ -203,7 +203,7 @@ class NormalizeUnitTests(unittest.TestCase):
                 "choices": [{"delta": {"content": 7,
                                        "tool_calls": [{"index": None}]},
                              "finish_reason": 5}]}
-        norm = normalize_provider_response(data, "kios", for_stream=True)
+        norm = normalize_provider_response(data, "kilo", for_stream=True)
         self.assertIsInstance(norm["model"], str)
         self.assertTrue(norm["usage"] is None
                         or isinstance(norm["usage"], dict))
@@ -246,6 +246,17 @@ def _serve(handler):
                 if not chunk:
                     break
                 data += chunk
+            header, _, body = data.partition(b"\r\n\r\n")
+            content_length = 0
+            for line in header.split(b"\r\n")[1:]:
+                if line.lower().startswith(b"content-length:"):
+                    content_length = int(line.split(b":", 1)[1].strip())
+                    break
+            while len(body) < content_length:
+                chunk = conn.recv(min(65536, content_length - len(body)))
+                if not chunk:
+                    break
+                body += chunk
         except OSError:
             pass
 

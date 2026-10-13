@@ -1,6 +1,6 @@
 """SSE malformed-shape hardening tests.
 
-The user reported subagents dying with
+Malformed provider data previously caused
 `AttributeError: 'str' object has no attribute ...` when a provider sends
 unexpected event shapes. `_iter_sse_events` yields whatever `json.loads`
 returns — strings, ints, lists — and every `.get()` downstream was a

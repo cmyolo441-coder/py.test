@@ -21,7 +21,8 @@ implements a strict 4-step policy:
    and suggests ``/reset`` or rephrasing. Never a bare "invalid request".
 
 The raised error keeps ``status=400`` so the agent's existing 400 fallbacks
-(no-tools retry, non-stream retry, model failover) still trigger on it.
+(no-tools retry, non-stream retry) still trigger on it. Provider errors do
+not switch models automatically; model selection remains under user control.
 
 Design notes:
 
@@ -251,8 +252,7 @@ def helpful_invalid_request_error(err: BaseException,
 
     Always explains what was wrong and what to do — never a bare
     "invalid request". Keeps ``status=400`` so the agent's existing 400
-    fallbacks (no-tools retry, non-stream retry, model failover) still
-    trigger on it.
+    fallbacks (no-tools retry, non-stream retry) still trigger on it.
     """
     from .client import APIError
     provider_msg = str(err).strip().replace("\n", " ")

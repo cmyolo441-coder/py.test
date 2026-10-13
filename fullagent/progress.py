@@ -1,6 +1,6 @@
 """Progress bars — real, thread-safe progress tracking for background work.
 
-Background threads (subagents, shell jobs, downloads) report progress
+Background tasks (shell jobs, downloads) report progress
 through :class:`ProgressTracker`; the TUI renders active trackers as
 fragment lines like::
 

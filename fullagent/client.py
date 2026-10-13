@@ -9,6 +9,7 @@ import random
 import re
 import threading
 import time
+from email.utils import parsedate_to_datetime
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterator
@@ -39,11 +40,13 @@ from .cancelguard import (TurnCancelled, run_cancellable,
 # client is its only consumer.
 from .stallwatch import StallWatcher
 from . import typeguards as _typeguards  # central provider-boundary guards
-
 _log = get_logger("client")
-
+_CONTENT_PLACEHOLDER = " "
+HISTORY_MAX_MESSAGE_CHARS = 100_000
 RETRY_STATUSES = {408, 429, 500, 502, 503, 504}
 MAX_RETRIES = 3
+RATE_LIMIT_BASE_WAIT = 2.0
+RATE_LIMIT_MAX_WAIT = 60.0
 # Fail fast on TCP/TLS connect; the (long) read budget stays untouched for
 # slow streams. A dead provider hangs 10s here, not the full 300s timeout.
 CONNECT_TIMEOUT = 10.0
@@ -55,9 +58,11 @@ CONNECT_TIMEOUT = 10.0
 STREAM_STALL_TIMEOUT = 60.0
 
 class APIError(Exception):
-    def __init__(self, message: str, status: int | None = None):
+    def __init__(self, message: str, status: int | None = None,
+                 retry_after: float | None = None):
         super().__init__(message)
         self.status = status
+        self.retry_after = retry_after
 
 
 class APITimeoutError(APIError):
@@ -134,13 +139,60 @@ def _backoff(attempt: int) -> float:
     return base * random.uniform(0.8, 1.2)
 
 
+def _parse_retry_after(value: Any) -> float | None:
+    """Parse Retry-After as seconds or an HTTP date; invalid values vanish."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = value.strip()
+    try:
+        return max(0.0, min(float(raw), 3600.0))
+    except ValueError:
+        try:
+            when = parsedate_to_datetime(raw)
+            if when.tzinfo is None:
+                return None
+            return max(0.0, min(when.timestamp() - time.time(), 3600.0))
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+
+def _rate_limit_delay(error: APIError, attempt: int) -> float:
+    """Prefer the server's wait hint; otherwise use capped exponential backoff."""
+    if error.retry_after is not None:
+        return max(0.0, min(float(error.retry_after), 3600.0))
+    base = min(RATE_LIMIT_MAX_WAIT,
+               RATE_LIMIT_BASE_WAIT * (2 ** min(attempt, 8)))
+    return min(RATE_LIMIT_MAX_WAIT,
+               base + random.uniform(0.0, min(2.0, base * 0.2)))
+
+
+def _is_rate_limited(error: APIError) -> bool:
+    if error.status == 429:
+        return True
+    message = str(error).lower().replace("_", " ").replace("-", " ")
+    return ("rate limit" in message or "too many requests" in message
+            or "throttl" in message)
+
+
+def _wait_for_rate_limit(error: APIError, attempt: int,
+                         should_cancel: Callable[[], bool] | None,
+                         on_status: Callable[[str], None] | None = None) -> None:
+    delay = _rate_limit_delay(error, attempt)
+    if on_status:
+        try:
+            on_status(f"Kilo rate limit reached (429); retrying in "
+                      f"{delay:.0f}s (Ctrl+C to cancel)")
+        except Exception:
+            pass
+    sleep_cancellable(delay, should_cancel)
+
+
 def _base_headers(provider: Provider, stream: bool) -> dict[str, str]:
     """The per-request headers. Built from one place so every call path
     (streaming, blocking, overflow-retry) sends the identical set."""
-    headers = {
-        "Authorization": f"Bearer {provider.api_key}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Content-Type": "application/json"}
+    if provider.api_key:
+        headers["Authorization"] = f"Bearer {provider.api_key}"
     if stream:
         headers["Accept"] = "text/event-stream"
     return headers
@@ -160,6 +212,8 @@ def prewarm_connection(provider) -> None:
     cost. Runs in a background thread — never blocks the UI. The connection
     sits in the pool ready for the first real request. Warmups for the same
     provider within the TTL are skipped (no redundant API calls)."""
+    if provider.key == "kilo" and not provider.api_key:
+        return  # do not spend anonymous free-route requests on /models warmup
     def _warm():
         key = provider.base_url
         now = time.monotonic()
@@ -168,8 +222,9 @@ def prewarm_connection(provider) -> None:
         _warm_at[key] = now
         try:
             url = provider.base_url.rstrip("/") + "/models"
-            _http().get(url, timeout=_timeouts(5),
-                        headers={"Authorization": f"Bearer {provider.api_key}"})
+            warm_headers = ({"Authorization": f"Bearer {provider.api_key}"}
+                            if provider.api_key else {})
+            _http().get(url, timeout=_timeouts(5), headers=warm_headers)
         except Exception:
             pass  # prewarming is best-effort, never a crash path
 
@@ -250,7 +305,7 @@ _tc_fallback_seq = [0]
 def normalize_tool_call(tc: Any) -> dict | None:
     """Canonicalize ANY value into a valid OpenAI-style tool_call dict.
 
-    The tool_calls pipeline (client.py parsing -> crew.py execution ->
+    The tool_calls pipeline (client parsing -> sequential tool execution ->
     agent.py history) has crashed repeatedly with
     `AttributeError: 'str' object has no attribute 'get'` because
     providers (and old history/cassettes) can hand us strings, None,
@@ -417,6 +472,10 @@ def assistant_message(content: str | None, tool_calls: list[dict],
                 calls.append(norm)
     if calls:
         msg["tool_calls"] = calls
+        # A few OpenAI-compatible gateways reject null/empty content on an
+        # assistant tool-call turn even though the protocol permits it.
+        if not isinstance(msg.get("content"), str) or not msg["content"]:
+            msg["content"] = _CONTENT_PLACEHOLDER
     # Always carry reasoning_content when reasoning exists OR when the
     # turn carried tool_calls (history validation requires it).  Set
     # both keys for maximum provider compatibility.
@@ -438,55 +497,300 @@ def assistant_message(content: str | None, tool_calls: list[dict],
     return msg
 
 
-def _sanitize_messages(messages: list[dict]) -> bool:
-    """Ensure history satisfies thinking validation.
+@dataclass(frozen=True)
+class HistoryDiagnostic:
+    code: str
+    index: int
+    severity: str
+    detail: str
 
-    Mutates `messages` in place: any assistant message with tool_calls
-    that lacks reasoning_content/reasoning gets an empty
-    reasoning_content. Every assistant tool_call is also run through
-    normalize_tool_call so malformed history entries (restored from
-    stale session JSON, old cassettes, provider quirks) can never reach
-    the wire — one bad entry would otherwise become a provider 400 or
-    an AttributeError downstream. Returns True if anything was fixed.
 
-    Note: an existing empty string ("") counts as present — the
-    provider only requires the field to exist, not to be non-empty.
-    """
-    fixed = False
-    # Collect all tool_call_ids that have responses
-    tool_response_ids = set()
-    for m in messages:
-        if isinstance(m, dict) and m.get("role") == "tool":
-            _tid = m.get("tool_call_id")
-            if _tid:
-                tool_response_ids.add(str(_tid))
-    for m in messages:
-        if not isinstance(m, dict):
+def validate_history(history: Any) -> list[HistoryDiagnostic]:
+    """Describe malformed chat history without mutating it or raising."""
+    if not isinstance(history, list):
+        return [HistoryDiagnostic("history_not_a_list", -1, "error",
+                                  "history must be a list")]
+    out: list[HistoryDiagnostic] = []
+    known_roles = {"system", "user", "assistant", "tool"}
+    calls: dict[str, int] = {}
+    call_order: list[tuple[int, str]] = []
+    tool_rows: list[tuple[int, str | None]] = []
+    for index, message in enumerate(history):
+        if not isinstance(message, dict):
+            out.append(HistoryDiagnostic("non_dict_message", index,
+                                         "error", "message is not an object"))
             continue
-        tcs = m.get("tool_calls")
-        if tcs:
-            normed = [c for c in (normalize_tool_call(tc) for tc
-                                  in (tcs if isinstance(tcs, (list, tuple))
-                                      else [tcs]))
-                      if c is not None]
-            # Drop orphaned tool_calls (no matching tool response).
-            # Orphaned calls cause provider invalid_request_error.
-            normed = [c for c in normed
-                      if str(c.get("id", "")) in tool_response_ids
-                      or not tool_response_ids]
-            if len(normed) != (len(tcs) if isinstance(tcs, (list, tuple))
-                               else 1):
-                fixed = True
-            if normed:
-                m["tool_calls"] = normed
+        role = message.get("role")
+        if not isinstance(role, str) or role not in known_roles:
+            out.append(HistoryDiagnostic("unknown_role", index, "error",
+                                         f"unknown role: {role!r}"))
+        try:
+            size = len(json.dumps(message, ensure_ascii=False, default=str))
+        except Exception:
+            size = HISTORY_MAX_MESSAGE_CHARS + 1
+        if size > HISTORY_MAX_MESSAGE_CHARS:
+            out.append(HistoryDiagnostic(
+                "oversize_message", index, "warning",
+                f"serialized message is {size} characters"))
+        if role == "assistant":
+            raw_calls = message.get("tool_calls")
+            if raw_calls is None:
+                raw_calls = []
+            elif not isinstance(raw_calls, (list, tuple)):
+                raw_calls = [raw_calls]
+            if raw_calls:
+                content = message.get("content")
+                if not isinstance(content, str) or not content:
+                    out.append(HistoryDiagnostic(
+                        "empty_content_with_tool_calls", index, "warning",
+                        "assistant tool-call message has empty content"))
+            for call in raw_calls:
+                if not isinstance(call, dict) or not isinstance(call.get("id"), str) \
+                        or not call.get("id"):
+                    out.append(HistoryDiagnostic(
+                        "tool_call_missing_id", index, "error",
+                        "assistant tool call has no non-empty string id"))
+                    continue
+                call_id = call["id"]
+                if call_id in calls:
+                    out.append(HistoryDiagnostic(
+                        "duplicate_tool_call_id", index, "error",
+                        f"tool call id {call_id!r} was already issued"))
+                else:
+                    calls[call_id] = index
+                    call_order.append((index, call_id))
+        elif role == "tool":
+            tid = message.get("tool_call_id")
+            if not isinstance(tid, str) or not tid:
+                out.append(HistoryDiagnostic(
+                    "tool_response_missing_id", index, "error",
+                    "tool response has no non-empty string tool_call_id"))
+                tool_rows.append((index, None))
             else:
-                m.pop("tool_calls", None)
-        if m.get("role") == "assistant" and m.get("tool_calls"):
-            has_rc = m.get("reasoning_content") is not None
-            has_r = m.get("reasoning") is not None
-            if has_rc or has_r:
+                tool_rows.append((index, tid))
+    seen_responses: set[str] = set()
+    for index, tid in tool_rows:
+        if tid is None:
+            continue
+        if tid in seen_responses:
+            out.append(HistoryDiagnostic(
+                "duplicate_tool_response_id", index, "error",
+                f"tool call id {tid!r} has more than one response"))
+            continue
+        seen_responses.add(tid)
+        owner = calls.get(tid)
+        if owner is None:
+            # Distinguish an out-of-order response from an id never issued.
+            future = any(call_id == tid and call_index > index
+                         for call_index, call_id in call_order)
+            code = "tool_response_out_of_order" if future else "orphan_tool_response"
+            out.append(HistoryDiagnostic(
+                code, index, "error",
+                f"tool response {tid!r} has no preceding assistant call"))
+        elif owner >= index:
+            out.append(HistoryDiagnostic(
+                "tool_response_out_of_order", index, "error",
+                f"tool response {tid!r} precedes its assistant call"))
+    for index, call_id in call_order:
+        if call_id not in seen_responses:
+            out.append(HistoryDiagnostic(
+                "orphan_tool_call", index, "error",
+                f"tool call {call_id!r} has no response"))
+    return out
+
+
+def _repair_role_sequence(messages: list, ) -> list[str]:
+    """Repair role ordering and tool-call adjacency in place.
+
+    Invalid messages are dropped, adjacent assistant messages are merged,
+    and valid tool replies are moved directly after their issuing turn.
+    Tool replies without an issuing call are removed.
+    """
+    repairs: list[str] = []
+    if not isinstance(messages, list):
+        return ["history is not a list"]
+    valid: list[dict] = []
+    for message in messages:
+        if (not isinstance(message, dict)
+                or message.get("role") not in {"system", "user", "assistant", "tool"}):
+            repairs.append("dropped invalid role or non-dict message")
+            continue
+        valid.append(message)
+    merged: list[dict] = []
+    for message in valid:
+        if message.get("role") == "assistant" and merged \
+                and merged[-1].get("role") == "assistant":
+            previous = merged[-1]
+            left, right = previous.get("content"), message.get("content")
+            parts = [str(x) for x in (left, right) if x not in (None, "")]
+            previous["content"] = "\n".join(parts) if parts else None
+            calls = previous.get("tool_calls") or []
+            other = message.get("tool_calls") or []
+            if isinstance(calls, dict):
+                calls = [calls]
+            if isinstance(other, dict):
+                other = [other]
+            previous["tool_calls"] = list(calls) + list(other)
+            for key in ("reasoning_content", "reasoning"):
+                if message.get(key) and not previous.get(key):
+                    previous[key] = message[key]
+            repairs.append("merged consecutive assistant messages")
+        else:
+            merged.append(message)
+
+    owners: dict[str, int] = {}
+    for index, message in enumerate(merged):
+        if message.get("role") != "assistant":
+            continue
+        raw_calls = message.get("tool_calls") or []
+        if isinstance(raw_calls, dict):
+            raw_calls = [raw_calls]
+        for call in raw_calls if isinstance(raw_calls, (list, tuple)) else []:
+            if isinstance(call, dict) and isinstance(call.get("id"), str) and call["id"]:
+                owners.setdefault(call["id"], index)
+    tools_by_owner: dict[int, list[dict]] = {}
+    for message_index, message in enumerate(merged):
+        if message.get("role") != "tool":
+            continue
+        tid = message.get("tool_call_id")
+        owner = owners.get(tid) if isinstance(tid, str) else None
+        if owner is None:
+            if not any(m.get("role") in {"system", "user"}
+                       for m in merged[:message_index]):
+                repairs.append("dropped leading tool response")
+            else:
+                repairs.append("dropped orphan tool response")
+        else:
+            tools_by_owner.setdefault(owner, []).append(message)
+    repaired: list[dict] = []
+    for index, message in enumerate(merged):
+        if message.get("role") == "tool":
+            continue
+        repaired.append(message)
+        if message.get("role") == "assistant":
+            tool_rows = tools_by_owner.get(index, [])
+            if tool_rows:
+                repaired.extend(tool_rows)
+    if repaired != merged:
+        # Reordering is a repair, even when all the same dict objects survive.
+        before_ids = [id(m) for m in merged]
+        after_ids = [id(m) for m in repaired]
+        if before_ids != after_ids and not any("reordered" in r for r in repairs):
+            repairs.append("reordered tool responses after issuing assistant")
+    if not any(m.get("role") == "user" for m in repaired):
+        insert_at = 1 if repaired and repaired[0].get("role") == "system" else 0
+        repaired.insert(insert_at, {"role": "user", "content": "(continue)"})
+        repairs.append("inserted placeholder user message")
+    if repaired and repaired[0].get("role") not in {"system", "user"}:
+        repaired.insert(0, {"role": "user", "content": "(continue)"})
+        repairs.append("inserted placeholder user message")
+    messages[:] = repaired
+    return repairs
+
+
+def _sanitize_messages(messages: list[dict]) -> bool:
+    """Canonicalize tool history and preserve only well-paired calls.
+
+    The operation is in-place, defensive, and returns whether any repair
+    was made. Orphan/duplicate calls and responses are removed before the
+    payload reaches a provider.
+    """
+    if not isinstance(messages, list):
+        return False
+    fixed = False
+    issued: dict[str, tuple[int, dict]] = {}
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        raw = message.get("tool_calls")
+        if raw is None:
+            continue
+        items = raw if isinstance(raw, (list, tuple)) else [raw]
+        normalized: list[dict] = []
+        for call in items:
+            if not isinstance(call, dict):
+                fixed = True
                 continue
-            m["reasoning_content"] = ""
+            call_id = call.get("id")
+            if not isinstance(call_id, str) or not call_id:
+                fixed = True
+                continue
+            canon = normalize_tool_call(call)
+            if canon is None or call_id in issued:
+                fixed = True
+                continue
+            normalized.append(canon)
+            issued[call_id] = (index, canon)
+        if len(normalized) != len(items):
+            fixed = True
+        if normalized:
+            if message.get("tool_calls") != normalized:
+                message["tool_calls"] = normalized
+                fixed = True
+        elif "tool_calls" in message:
+            message.pop("tool_calls", None)
+            fixed = True
+            # Remove an assistant turn made empty by dropping its only call.
+            if not message.get("content"):
+                message["_sanitize_empty_tool_turn"] = True
+
+    seen_responses: set[str] = set()
+    kept_responses: list[str] = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            continue
+        tid = message.get("tool_call_id")
+        owner = issued.get(tid) if isinstance(tid, str) else None
+        if owner is None or owner[0] >= index or tid in seen_responses:
+            message["_sanitize_drop_tool"] = True
+            fixed = True
+            continue
+        seen_responses.add(tid)
+        kept_responses.append(tid)
+    missing = set(issued) - seen_responses
+    if missing:
+        for message in messages:
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            raw = message.get("tool_calls") or []
+            if isinstance(raw, dict):
+                raw = [raw]
+            kept = [call for call in raw if isinstance(call, dict)
+                    and call.get("id") not in missing]
+            if len(kept) != len(raw):
+                fixed = True
+                if kept:
+                    message["tool_calls"] = kept
+                else:
+                    message.pop("tool_calls", None)
+                    if not message.get("content"):
+                        message["_sanitize_empty_tool_turn"] = True
+    if fixed:
+        cleaned = []
+        for message in messages:
+            if not isinstance(message, dict):
+                cleaned.append(message)
+                continue
+            if message.pop("_sanitize_drop_tool", False):
+                continue
+            if message.pop("_sanitize_empty_tool_turn", False):
+                continue
+            cleaned.append(message)
+        messages[:] = cleaned
+    # Ensure all surviving tool-call turns satisfy both provider quirks.
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant" \
+                or not message.get("tool_calls"):
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            message["content"] = _coerce_text(content) or _CONTENT_PLACEHOLDER
+            fixed = True
+        elif not content:
+            message["content"] = _CONTENT_PLACEHOLDER
+            fixed = True
+        if message.get("reasoning_content") is None and message.get("reasoning") is None:
+            message["reasoning_content"] = ""
             fixed = True
     return fixed
 
@@ -602,8 +906,18 @@ def _ensure_window_fit(model: Model, messages: list[dict],
 
 def build_payload(model: Model, effort: Effort, messages: list[dict],
                   tools: list[dict] | None, stream: bool = True) -> dict:
-    # sanitize history before it hits the wire — fixes stale sessions that
-    # were built before reasoning_content was preserved
+    # Diagnose the original history before repairing it so malformed
+    # sessions produce actionable logs rather than silently losing context.
+    diagnostics = validate_history(messages)
+    for diagnostic in diagnostics:
+        _log.warning("history validation %s at message %s: %s",
+                     diagnostic.code, diagnostic.index, diagnostic.detail)
+        if diagnostic.index >= 0 and diagnostic.index < len(messages):
+            _log.debug("history validation offender: %r",
+                       messages[diagnostic.index])
+    _repair_role_sequence(messages)
+    # Sanitize history before it hits the wire — fixes stale sessions that
+    # were built before reasoning_content was preserved.
     _sanitize_messages(messages)
     # TOKEN-LIMIT PRE-CHECK (worker 17/20): estimate input tokens BEFORE
     # anything goes on the wire; if input + requested max_tokens cannot
@@ -1166,7 +1480,9 @@ def _window_max_tokens(model: Model, effort: Effort, messages: list[dict],
 # FullAgent asks for 200k output tokens everywhere, but each backend has its
 # own hard ceiling. Clamp at send time so the request is never rejected for
 # an oversized max_tokens; providers without a known cap pass through.
-_MAX_TOKENS_CAP: dict[str, int] = {"kilo": 131_072}
+_MAX_TOKENS_CAP: dict[str, int] = {
+    "kilo": 131_072,
+}
 
 
 def _clamp_max_tokens(provider_key: str, value: int) -> int:
@@ -1180,6 +1496,7 @@ def _clamp_max_tokens(provider_key: str, value: int) -> int:
 # Not a real event â dict-checking consumers skip it, but the stall
 # watchdog treats it as proof the stream is alive.
 _KEEPALIVE = object()
+_SSE_QUEUE_BATCH_SIZE = 32
 
 
 def _iter_sse_events(resp: requests.Response) -> Iterator[dict]:
@@ -1325,45 +1642,98 @@ def _iter_sse_events_cancellable(
     _END = object()
 
     def _produce() -> None:
+        batch: list[Any] = []
+        error: Exception | None = None
+        batch_lock = threading.Lock()
+        timer_token = None
+        timer_handle = None
+
+        def _flush_due(token) -> None:
+            nonlocal batch, timer_token, timer_handle
+            with batch_lock:
+                if token is not timer_token:
+                    return
+                timer_token = None
+                timer_handle = None
+                if batch:
+                    q.put(batch)
+                    batch = []
+
         try:
             for event in _iter_sse_events(resp):
-                q.put(event)
+                with batch_lock:
+                    batch.append(event)
+                    if len(batch) >= _SSE_QUEUE_BATCH_SIZE:
+                        if timer_handle is not None:
+                            timer_handle.cancel()
+                        timer_token = None
+                        timer_handle = None
+                        q.put(batch)
+                        batch = []
+                    elif timer_handle is None:
+                        token = object()
+                        timer_token = token
+                        timer_handle = threading.Timer(
+                            0.002, _flush_due, args=(token,))
+                        timer_handle.daemon = True
+                        timer_handle.start()
         except Exception as e:  # noqa: BLE001 — re-raised in the consumer
-            q.put(e)
+            error = e
         finally:
-            q.put(_END)
+            with batch_lock:
+                if timer_handle is not None:
+                    timer_handle.cancel()
+                timer_token = None
+                timer_handle = None
+                if batch:
+                    q.put(batch)
+                    batch = []
+                if error is not None:
+                    q.put(error)
+                q.put(_END)
 
     thread = threading.Thread(target=_produce, daemon=True,
                               name="sse-producer")
     thread.start()
     last_data = time.monotonic()
+    pending = iter(())
     while True:
         try:
-            item = q.get(timeout=0.25)
-        except queue.Empty:
-            if should_cancel is not None and should_cancel():
-                # Abort the response: unblocks the producer's socket
-                # read (a plain close here or in the finally would block
-                # on the socket read lock until the read times out).
-                # The finally in _chat_stream_once then closes an
-                # already-dead socket.
-                _abort_response(resp)
-                raise TurnCancelled()
-            if time.monotonic() - last_data > stall_timeout:
-                # Abort (not just close): the producer thread is blocked
-                # in socket recv() holding the read lock — a plain
-                # resp.close() would block on that lock until the read
-                # times out. _abort_response shuts the socket down first
-                # so the recv returns immediately and close() proceeds.
-                _abort_response(resp)
-                raise APITimeoutError(
-                    f"stream stalled: no data for {stall_timeout:g}s — "
-                    f"the provider stopped sending; /retry to resend")
-            continue
+            item = next(pending)
+        except StopIteration:
+            try:
+                packet = q.get(timeout=0.25)
+            except queue.Empty:
+                if should_cancel is not None and should_cancel():
+                    # Abort the response: unblocks the producer's socket
+                    # read (a plain close here or in the finally would block
+                    # on the socket read lock until the read times out).
+                    # The finally in _chat_stream_once then closes an
+                    # already-dead socket.
+                    _abort_response(resp)
+                    raise TurnCancelled()
+                if time.monotonic() - last_data > stall_timeout:
+                    # Abort (not just close): the producer thread is blocked
+                    # in socket recv() holding the read lock — a plain
+                    # resp.close() would block on that lock until the read
+                    # times out. _abort_response shuts the socket down first
+                    # so the recv returns immediately and close() proceeds.
+                    _abort_response(resp)
+                    raise APITimeoutError(
+                        f"stream stalled: no data for {stall_timeout:g}s — "
+                        f"the provider stopped sending; /retry to resend")
+                continue
+            if isinstance(packet, list):
+                pending = iter(packet)
+                continue
+            item = packet
         if item is _END:
             return
         if isinstance(item, Exception):
             raise item
+        if should_cancel is not None and should_cancel():
+            _abort_response(resp)
+            raise TurnCancelled()
         # Any event or keepalive comment proves the stream is alive.
         last_data = time.monotonic()
         if item is _KEEPALIVE:
@@ -1400,6 +1770,9 @@ def _extract_error_message(body: str) -> str:
         return _with_error_type(str(err.get("message") or err), err)
     if isinstance(err, str):
         return err
+    message = obj.get("message")
+    if isinstance(message, str):
+        return _with_error_type(message, obj)
     return body[:500]
 
 
@@ -1434,7 +1807,7 @@ def _coerce_text(value: Any) -> str:
     Plain strings pass through; Anthropic-style content blocks
     ([{"type": "text", "text": "hi"}]) are joined on their text parts;
     every other shape (None, int, dict, ...) becomes "". Providers
-    (kios/kilo/opencode gateways) have all been observed sending
+    (including Kilo's gateway) have been observed sending
     non-string content."""
     if isinstance(value, str):
         return value
@@ -1543,26 +1916,34 @@ def _fit_max_tokens_from_actual(model: Model, info: dict,
     return min(requested, headroom)
 
 
-def _learn_from_usage(usage: dict | None, sent_text: str,
-                     model_id: str = "") -> None:
-    """Calibrate the token estimator with the backend's real count.
+def _learn_from_usage(usage: Any, sent_text: str | int | None = None,
+                     model_id: str = "", *,
+                     sent_chars: int | None = None) -> None:
+    """Calibrate from provider usage without trusting either input shape.
 
-    Delegates to safe_token_counts: a non-dict usage (string/int from a
-    sloppy provider) used to raise AttributeError on usage.get() here,
-    which the old try/except did not catch.
+    Production callers pass the serialized prompt text. Older callers may
+    provide its character count positionally or as ``sent_chars``; for that
+    form use a bounded, conservative four-characters-per-token estimate.
+    Malformed usage and prompt metadata are ignored rather than raised.
     """
-    if not usage:
-        return
     prompt_tokens, _ = safe_token_counts(usage)
-    if prompt_tokens > 0 and sent_text:
-        learn_token_correction(_raw_token_estimate(sent_text),
-                               prompt_tokens, model_id)
+    if prompt_tokens <= 0:
+        return
+    if isinstance(sent_text, str):
+        raw_tokens = _raw_token_estimate(sent_text)
+    else:
+        char_count = _coerce_token_count(
+            sent_chars if sent_chars is not None else sent_text)
+        if char_count <= 0:
+            return
+        raw_tokens = max(1, (char_count + 3) // 4)
+    learn_token_correction(raw_tokens, prompt_tokens, model_id)
 
 
 def shrink_tool_outputs(messages: list[dict], keep: int = 1,
                         max_chars: int = 400) -> bool:
     """In-place overflow shrinker for any message list. Used as the
-    on_overflow callback by sub-agents (scouts, workers) whose own tool
+    on_overflow callback by isolated chat consumers whose own tool
     loop can bloat their context — the same protection the main agent
     gets. Three escalating passes, all pairing-safe:
       1. truncate the OLDEST tool results to short summaries (keeping the
@@ -1605,9 +1986,12 @@ def shrink_tool_outputs(messages: list[dict], keep: int = 1,
     return False
 
 
-def _check_api_key(provider: Provider) -> None:
-    """Fail fast with actionable guidance instead of an opaque 401."""
+def _check_api_key(provider: Provider, model: Model | None = None) -> None:
+    """Require credentials except for Kilo's documented anonymous free route."""
     if not provider.api_key:
+        if (provider.key == "kilo" and model is not None
+                and model.id == "kilo-auto/free"):
+            return
         env_name = f"{provider.key.upper()}_API_KEY"
         raise APIError(
             f"no API key configured for {provider.name}. Set the "
@@ -1644,7 +2028,7 @@ def chat_stream(provider: Provider, model: Model, effort: Effort,
          retry with the shrunken messages.
     The payload invariant is re-asserted before every send: the request
     that goes out always satisfies input + max_tokens <= window."""
-    _check_api_key(provider)
+    _check_api_key(provider, model)
     url = provider.base_url.rstrip("/") + "/chat/completions"
     headers = _base_headers(provider, stream=True)
     current_effort = effort
@@ -1797,10 +2181,10 @@ def _chat_stream_with_retries(
     top of the partial output, so mid-output failures surface immediately
     instead of being retried.
 
-    TOTAL per-call budget: every attempt shares one deadline
-    (start + `timeout`). A dead provider used to cost MAX_RETRIES x
-    timeout — over 900s of silence before the user saw an error; now the
-    whole call, retries included, can never exceed `timeout`."""
+    Transient non-rate-limit failures share a per-call deadline. HTTP 429
+    responses retry until success or cancellation, using Retry-After when
+    provided and capped backoff otherwise; each resumed request receives a
+    fresh per-attempt timeout."""
     last_error: Exception | None = None
     attempt = 0
     emitted = {"out": False}
@@ -1823,7 +2207,8 @@ def _chat_stream_with_retries(
         if on_tool_args:
             on_tool_args(name, chunk)
 
-    while attempt < MAX_RETRIES:
+    rate_attempt = 0
+    while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             # The whole per-call budget is spent — fail fast instead of
@@ -1840,11 +2225,14 @@ def _chat_stream_with_retries(
             raise
         except APIError as e:
             last_error = e
-            if e.status in RETRY_STATUSES and attempt < MAX_RETRIES - 1:
-                # fast first retry, then escalate — rate limits resolve
-                # quickly on free tiers; never stall the UI for seconds
-                # CANCEL: backoff sleeps honour Esc — the old bare sleep() ignored
-                # the cancel flag for the whole backoff window
+            if _is_rate_limited(e) and not emitted["out"]:
+                _wait_for_rate_limit(e, rate_attempt, should_cancel, on_status)
+                rate_attempt += 1
+                attempt = 0
+                deadline = time.monotonic() + timeout
+                continue
+            if (e.status in RETRY_STATUSES and attempt < MAX_RETRIES - 1
+                    and not emitted["out"]):
                 _sleep_capped_cancellable(_backoff(attempt), deadline,
                                           should_cancel)
                 attempt += 1
@@ -1942,9 +2330,10 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
             # error bodies are small, but a hostile server could still
             # stall .text until the read timeout — keep it guarded too
             body = r.text
+            retry_after = _parse_retry_after(r.headers.get("Retry-After"))
             r.close()  # release the pooled connection on the error path
             raise APIError(_extract_error_message(body),
-                           status=r.status_code)
+                           status=r.status_code, retry_after=retry_after)
         return r
     resp = run_cancellable(_send, should_cancel, name="model request")
 
@@ -2047,11 +2436,13 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
             if should_cancel is not None and should_cancel():
                 _stall_stop.set()
                 raise TurnCancelled()
-            # Provider boundary (typeguards): the loop assumes a dict
-            # everywhere below — a malformed event (string, JSON array,
-            # keepalive sentinel) becomes {} and is skipped downstream
-            # instead of crashing on .get().
-            event = _typeguards.ensure_dict(event)
+            # Canonicalize untrusted provider events before touching nested
+            # choice/delta fields. Non-object SSE payloads are ignored here;
+            # the same malformed shape in a final JSON response is an APIError.
+            try:
+                event = normalize_provider_response(event, for_stream=True)
+            except APIError:
+                continue
             if event.get("model"):
                 # HARDEN: model must stay a str — a non-str model
                 # (int/dict from a sloppy provider) would violate the
@@ -2075,7 +2466,7 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
                 raise APIError(msg, status=_sse_error_status(err))
             # HARDEN: choices may be a string or other non-list shape —
             # indexing a string yields a str whose .get() raises
-            # AttributeError (the reported subagent crash). Coerce every
+            # AttributeError (the reported malformed-call crash). Coerce every
             # level; a malformed entry is skipped, never fatal.
             choices = _typeguards.ensure_list(event.get("choices"))
             if not choices:
@@ -2198,6 +2589,100 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
     return result
 
 
+def normalize_provider_response(data: Any, provider: str = "",
+                                for_stream: bool = False) -> dict:
+    """Return a defensive, canonical OpenAI-compatible response object.
+
+    Gateways vary widely in the shape of ``choices``, usage, content and
+    tool calls. This boundary copies rather than mutates input, normalizes
+    every nested value, and raises APIError (never AttributeError) for a
+    non-object response envelope.
+    """
+    if not isinstance(data, dict):
+        label = f" from {provider}" if provider else ""
+        raise APIError(f"provider{label} returned unexpected response shape "
+                       f"({type(data).__name__}): {str(data)[:200]}")
+    model = _strict_str(data.get("model"))
+    usage = data.get("usage")
+    usage = dict(usage) if isinstance(usage, dict) else None
+    raw_choices = data.get("choices")
+    if isinstance(raw_choices, dict):
+        raw_choices = [raw_choices]
+    if not isinstance(raw_choices, list):
+        raw_choices = []
+
+    def normalize_message(raw: Any, streaming: bool) -> dict:
+        source = raw if isinstance(raw, dict) else {}
+        result = {
+            "content": _coerce_text(source.get("content")),
+            "reasoning": _coerce_text(source.get("reasoning_content")
+                                       or source.get("reasoning")),
+            "tool_calls": [],
+        }
+        # Preserve the spelling used by the provider as well as the
+        # canonical short key consumed by the stream loop.
+        result["reasoning_content"] = result["reasoning"]
+        raw_calls = source.get("tool_calls")
+        if not isinstance(raw_calls, list):
+            raw_calls = []
+        for raw_call in raw_calls:
+            if not isinstance(raw_call, dict):
+                continue
+            function = raw_call.get("function")
+            if isinstance(function, str):
+                try:
+                    decoded = json.loads(function)
+                    function = decoded if isinstance(decoded, dict) else {
+                        "name": function}
+                except (ValueError, TypeError):
+                    function = {"name": function}
+            if not isinstance(function, dict):
+                function = {}
+            if streaming:
+                index = raw_call.get("index", 0)
+                try:
+                    index = int(index)
+                except (TypeError, ValueError, OverflowError):
+                    index = 0
+                result["tool_calls"].append({
+                    "index": index,
+                    "id": _strict_str(raw_call.get("id")),
+                    "type": "function",
+                    "function": {
+                        "name": _strict_str(function.get("name")),
+                        "arguments": _coerce_arguments(
+                            function.get("arguments")),
+                    },
+                })
+            else:
+                normalized = normalize_tool_call(raw_call)
+                if normalized is not None:
+                    result["tool_calls"].append(normalized)
+        return result
+
+    choices: list[dict] = []
+    for raw_choice in raw_choices:
+        choice = raw_choice if isinstance(raw_choice, dict) else {}
+        finish_reason = choice.get("finish_reason")
+        if finish_reason is not None:
+            finish_reason = _strict_str(finish_reason)
+        normalized_choice = {
+            "index": choice.get("index", 0),
+            "finish_reason": finish_reason,
+            "message": normalize_message(choice.get("message"), False),
+            "delta": normalize_message(choice.get("delta"), True),
+        }
+        choices.append(normalized_choice)
+    normalized = {"model": model, "usage": usage, "choices": choices}
+    # Preserve provider error envelopes and useful top-level metadata.
+    if "error" in data:
+        normalized["error"] = data["error"]
+    for key in ("id", "created", "object"):
+        if key in data:
+            normalized[key] = data[key]
+    return normalized
+
+
 def _result_from_json(data: dict, model_id: str) -> StreamResult:
     """Parse a non-streamed chat.completion JSON body into a StreamResult
     (shared by blocking mode and the stream-mode JSON fallback)."""
@@ -2210,8 +2695,8 @@ def _result_from_json(data: dict, model_id: str) -> StreamResult:
         raise APIError(
             f"provider returned unexpected JSON shape "
             f"({type(data).__name__}): {str(data)[:200]}")
-    data = _typeguards.ensure_dict(data)
-    # HARDEN (provider shapes): some gateways (kilo/opencode-class) return
+    data = normalize_provider_response(data, for_stream=False)
+    # HARDEN (provider shapes): some gateways return
     # HTTP 200 with an error ENVELOPE — {"error": {"message": ...,
     # "code": 429}} or {"error": "bare string"} — instead of an error
     # status. Without this check the error silently becomes an EMPTY
@@ -2233,7 +2718,7 @@ def _result_from_json(data: dict, model_id: str) -> StreamResult:
     # HARDEN: choices may be a string ("gateway blew up"), a single dict,
     # or a list containing non-dicts — indexing a string yields a str
     # whose .get() raises AttributeError: 'str' object has no attribute
-    # 'get' (the reported subagent crash). Coerce every level; malformed
+    # 'get' (the reported malformed-call crash). Coerce every level; malformed
     # entries are skipped, never fatal.
     raw_choices = data.get("choices")
     if isinstance(raw_choices, dict):
@@ -2273,7 +2758,8 @@ def _result_from_json(data: dict, model_id: str) -> StreamResult:
 
 def _post_blocking(url: str, headers: dict, payload: dict,
                    timeout: float,
-                   should_cancel: Callable[[], bool] | None = None) -> dict:
+                   should_cancel: Callable[[], bool] | None = None,
+                   on_status: Callable[[str], None] | None = None) -> dict:
     """POST with the same retry policy as the streaming path (rate limits,
     timeouts, connection errors). Blocking calls have no partial output,
     so every attempt is replay-safe — unlike the stream path there is no
@@ -2287,12 +2773,14 @@ def _post_blocking(url: str, headers: dict, payload: dict,
     The response is ALWAYS closed (try/finally): leaking it would pin a
     pooled connection and eventually starve the session pool.
 
-    TOTAL per-call budget: every attempt shares one deadline
-    (start + `timeout`), so a hung endpoint fails after ~`timeout`
-    seconds total — never MAX_RETRIES x timeout."""
+    Transient non-rate-limit failures share one deadline. HTTP 429 responses
+    retry until success or cancellation, and each resumed request receives a
+    fresh per-attempt timeout."""
     last_error: Exception | None = None
     deadline = time.monotonic() + timeout
-    for attempt in range(MAX_RETRIES):
+    attempt = 0
+    rate_attempt = 0
+    while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise APITimeoutError(
@@ -2309,6 +2797,7 @@ def _post_blocking(url: str, headers: dict, payload: dict,
             if attempt < MAX_RETRIES - 1:
                 _sleep_capped_cancellable(_backoff(attempt), deadline,
                                           should_cancel)
+                attempt += 1
                 continue
             raise APITimeoutError(
                 f"request timed out after {timeout:g}s") from e
@@ -2318,6 +2807,7 @@ def _post_blocking(url: str, headers: dict, payload: dict,
             if attempt < MAX_RETRIES - 1:
                 _sleep_capped_cancellable(_backoff(attempt), deadline,
                                           should_cancel)
+                attempt += 1
                 continue
             raise APIError(f"connection failed: {e}") from e
         except requests.exceptions.RequestException as e:
@@ -2330,8 +2820,11 @@ def _post_blocking(url: str, headers: dict, payload: dict,
             if resp.status_code != 200:
                 body = run_cancellable(lambda: resp.text, should_cancel,
                                        name="error body")
+                retry_after = _parse_retry_after(
+                    resp.headers.get("Retry-After"))
                 raise APIError(_extract_error_message(body),
-                               status=resp.status_code)
+                               status=resp.status_code,
+                               retry_after=retry_after)
             try:
                 data = run_cancellable(resp.json, should_cancel,
                                        name="model response")
@@ -2351,9 +2844,16 @@ def _post_blocking(url: str, headers: dict, payload: dict,
         except TurnCancelled:
             raise
         except APIError as e:
+            if _is_rate_limited(e):
+                _wait_for_rate_limit(e, rate_attempt, should_cancel, on_status)
+                rate_attempt += 1
+                attempt = 0
+                deadline = time.monotonic() + timeout
+                continue
             if e.status in RETRY_STATUSES and attempt < MAX_RETRIES - 1:
                 _sleep_capped_cancellable(_backoff(attempt), deadline,
                                           should_cancel)
+                attempt += 1
                 continue
             raise
         finally:
@@ -2365,14 +2865,15 @@ def chat_blocking(provider: Provider, model: Model, effort: Effort,
                   messages: list[dict], tools: list[dict] | None,
                   on_overflow: Callable[[], bool] | None = None,
                   timeout: float = config.DEFAULT_TIMEOUT,
-                  should_cancel: Callable[[], bool] | None = None
+                  should_cancel: Callable[[], bool] | None = None,
+                  on_status: Callable[[str], None] | None = None
                   ) -> StreamResult:
     """Non-streaming fallback (used when a provider rejects stream=true).
 
     Carries the same three-layer context-overflow recovery as chat_stream:
     pre-flight clamp, re-clamp-and-retry on rejection, and (when the input
     itself is too big) caller-driven shrink-and-retry via on_overflow."""
-    _check_api_key(provider)
+    _check_api_key(provider, model)
     url = provider.base_url.rstrip("/") + "/chat/completions"
     headers = _base_headers(provider, stream=False)
     current_effort = effort
@@ -2393,7 +2894,8 @@ def chat_blocking(provider: Provider, model: Model, effort: Effort,
             raise
         try:
             data = _post_blocking(url, headers, payload, timeout,
-                                  should_cancel=should_cancel)
+                                  should_cancel=should_cancel,
+                                  on_status=on_status)
         except APIError as err:
             if _is_reasoning_content_error(err):
                 if _sanitize_messages(messages):
@@ -2418,6 +2920,26 @@ def chat_blocking(provider: Provider, model: Model, effort: Effort,
     raise APIError(
         f"conversation is too large for {model.label} even after "
         f"re-clamping — start a new session (/new) or rewind (/rewind)")
+
+
+def chat_with_retry(provider: Provider, model: Model, effort: Effort,
+                    messages: list[dict], tools: list[dict] | None,
+                    timeout: float, should_cancel=None,
+                    on_status: Callable[[str], None] | None = None) -> StreamResult:
+    """Use blocking chat; keep retrying rate limits until success/cancel."""
+    rate_attempt = 0
+    while True:
+        try:
+            return chat_blocking(
+                provider, model, effort, messages, tools,
+                on_overflow=lambda: shrink_tool_outputs(messages),
+                timeout=timeout, should_cancel=should_cancel,
+                on_status=on_status)
+        except APIError as err:
+            if not _is_rate_limited(err):
+                raise
+            _wait_for_rate_limit(err, rate_attempt, should_cancel, on_status)
+            rate_attempt += 1
 
 
 # ---------------------------------------------------------------------------
@@ -2759,10 +3281,8 @@ if __name__ == "__main__":
             check(f"weird {weird!r} no crash ({e})", False)
 
     # -- 9. per-model window table ----------------------------------------------
-    check("space-bunny-free window is 1M",
-          config.model_context_window("space-bunny-free") == 1_000_000)
-    check("ling-3.1-flash window is 262144",
-          config.model_context_window("ling-3.1-flash") == 262_144)
+    check("Kilo Auto Free window is 262144",
+          config.model_context_window("kilo-auto/free") == 262_144)
     check("unknown model defaults to 128k",
           config.model_context_window("nope-xyz") == 128_000)
     check("every shipped model has a sane window",
@@ -2771,7 +3291,7 @@ if __name__ == "__main__":
           all(m.id in config.MODEL_CONTEXT_WINDOWS for m in config.MODELS))
 
     # -- 10. pre-check: prune FIRST, never send a doomed request ------------------
-    _tiny = Model(id="selftest-tiny", provider="kios", label="Tiny",
+    _tiny = Model(id="selftest-tiny", provider="kilo", label="Tiny",
                   context_window=8_000)
     _eff = Effort(key="t", label="T", color="", max_tokens=1_000,
                   temperature=0.0, reasoning_effort=None, description="")

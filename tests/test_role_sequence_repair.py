@@ -236,7 +236,7 @@ def test_build_payload_end_to_end():
         {"role": "user", "content": "surgery"},
         tool("z1", "res"),
     ]
-    model = Model(id="t", provider="kiosai", label="t",
+    model = Model(id="t", provider="kilo", label="t",
                   supports_tools=False, supports_reasoning=False)
     effort = Effort(key="low", label="low", color="grey", max_tokens=64,
                     temperature=0.2, reasoning_effort=None,

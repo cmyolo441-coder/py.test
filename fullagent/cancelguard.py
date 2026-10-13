@@ -1,10 +1,10 @@
 """CANCELGUARD — prompt-cancellation primitives for the turn path.
 
 Every blocking wait a turn can hit (model HTTP calls, retry backoffs,
-web fetches, speculative prefetches, subagent chat calls) goes through
+web fetches and speculative prefetches) goes through
 here, so Esc/Ctrl+C interrupts within ~CANCEL_POLL seconds instead of
 hanging for minutes (the user reported Esc taking 203s — that was a
-subagent's rate-limit backoff sleeping ~254s with zero cancel checks,
+rate-limit backoff sleeping ~254s with zero cancel checks,
 plus model POSTs that blocked in connect/DNS with no timeout at all).
 
 Design rules:
@@ -31,8 +31,8 @@ from typing import Any, Callable
 class TurnCancelled(Exception):
     """Raised when the user cancels the turn (Esc/Ctrl+C).
 
-    Lives here (a leaf module) so client.py, tools.py, crew.py,
-    speculate.py and agent.py can all share it without import cycles.
+    Lives here (a leaf module) so client.py, tools.py, speculate.py
+    and agent.py can all share it without import cycles.
     client.py re-exports it for backwards compatibility.
     """
 

@@ -458,7 +458,16 @@ if __name__ == "__main__":
     check("empty answer proceeds", ok is True)
 
     # -- preview_and_confirm: plain stdout fallback (ui=None) ---------------------------------
-    ok = preview_and_confirm("run_command", {"command": "x"}, None)
+    class FakeStdin:
+        def isatty(self):
+            return False
+
+    real_stdin = sys.stdin
+    try:
+        sys.stdin = FakeStdin()
+        ok = preview_and_confirm("run_command", {"command": "x"}, None)
+    finally:
+        sys.stdin = real_stdin
     check("non-tty fallback proceeds", ok is True)
 
     # -- register: bypassPermissions skips ---------------------------------------------------

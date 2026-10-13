@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import difflib
 
-from .config import MODELS, Model, model_by_id
+from .config import DEFAULT_MODEL_ID, MODELS, Model, model_by_id
 
 __all__ = [
     "list_models",
@@ -163,19 +163,15 @@ def _selftest() -> None:
     checks.append(("list count > 0", len(all_models) > 0))
     checks.append(("empty filter == all", list_models("") == all_models))
 
-    # 2. fuzzy "bunny" resolves space-bunny-free
-    m = resolve_model("bunny")
-    checks.append(("fuzzy 'bunny' -> space-bunny-free",
-                   m is not None and m.id == "space-bunny-free"))
-    # exact id and label still work
-    checks.append(("exact id", (resolve_model("glyph-cluster") or Model("", "", "")).id == "glyph-cluster"))
-    checks.append(("label match", (resolve_model("Space Bunny Free") or Model("", "", "")).id == "space-bunny-free"))
+    # 2. exact id, label and fuzzy free-route name
+    checks.append(("exact id", (resolve_model(DEFAULT_MODEL_ID) or Model("", "", "")).id == DEFAULT_MODEL_ID))
+    checks.append(("label match", (resolve_model("Kilo Auto Free") or Model("", "", "")).id == DEFAULT_MODEL_ID))
+    checks.append(("fuzzy 'kilo auto'", (resolve_model("kilo auto") or Model("", "", "")).id == DEFAULT_MODEL_ID))
     checks.append(("unknown -> None", resolve_model("no-such-model-zzz") is None))
-    # filter narrows (id/label search; provider is NOT searched per spec)
+    # filter finds the configured free route
     filt = list_models("free")
-    checks.append(("substring filter narrows",
-                   0 < len(filt) < len(all_models)
-                   and all("free" in (x["id"] + x["label"]).lower() for x in filt)))
+    checks.append(("substring filter finds free model",
+                   len(filt) == 1 and filt[0]["id"] == DEFAULT_MODEL_ID))
 
     # 3. format contains columns
     txt = format_model_list(all_models)
@@ -186,17 +182,17 @@ def _selftest() -> None:
 
     # 4. override set / get / clear
     class FakeAgent:
-        model = model_by_id("stealth/union-alpha")
+        model = model_by_id(DEFAULT_MODEL_ID)
 
     a = FakeAgent()
-    checks.append(("set known id -> True", set_turn_model(a, "space-bunny-free")))
-    checks.append(("get override", get_effective_model(a).id == "space-bunny-free"))
+    checks.append(("set known id -> True", set_turn_model(a, DEFAULT_MODEL_ID)))
+    checks.append(("get override", get_effective_model(a).id == DEFAULT_MODEL_ID))
     checks.append(("set unknown id -> False", not set_turn_model(a, "nope-zzz")))
     clear_turn_model(a)
-    checks.append(("clear -> base model", get_effective_model(a).id == "stealth/union-alpha"))
+    checks.append(("clear -> base model", get_effective_model(a).id == DEFAULT_MODEL_ID))
     # stale override id falls back to base model
     a.turn_model_override = "deleted-model-zzz"
-    checks.append(("stale override falls back", get_effective_model(a).id == "stealth/union-alpha"))
+    checks.append(("stale override falls back", get_effective_model(a).id == DEFAULT_MODEL_ID))
 
     failed = [name for name, ok in checks if not ok]
     for name, ok in checks:

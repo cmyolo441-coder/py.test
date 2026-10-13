@@ -13,7 +13,7 @@ context. This module shrinks that in two independent, safe ways:
    correctly.
 
 2. FILTERING — per turn, only *relevant* tools are sent:
-   - CORE tools (files, shell, search, web, Task, todos, planning,
+   - CORE tools (files, shell, search, web, todos, planning,
      reasoning backbone) are always included.
    - ADVANCED tools (docker, git, db, ssh, browser, jobs, cron, ...)
      are included only when the user's message mentions them
@@ -144,13 +144,11 @@ CORE_TOOLS = frozenset({
     "measure_coverage",
     # web
     "web_fetch", "web_search",
-    # subagents
-    "Task", "TaskOutput", "TaskList", "TaskStop",
     # planning / review
     "TodoWrite", "TodoRead", "PlanWrite", "ReviewChanges",
     # reasoning backbone
     "brain_recall", "inspect_why", "verify_plan", "predict_impact",
-    "knowledge_ask", "compile_and_run",
+    "knowledge_ask",
     # sessions / misc small
     "SessionList", "SessionNew", "SessionSwitch",
     "ImageRead", "OutputStyle", "NotebookRead",
@@ -209,12 +207,13 @@ KEYWORD_GROUPS: tuple[tuple[frozenset[str], frozenset[str]], ...] = (
      frozenset({"ReviewPR"})),
     (frozenset({"debate"}),
      frozenset({"run_debate"})),
-    (frozenset({"market", "bids"}),
-     frozenset({"run_market"})),
+    (frozenset({r"\bsubagents?\b", r"\bagents?\b", "parallel",
+                "delegat", "task group", "specialists", "fan out",
+                "team of", "independent tasks"}),
+     frozenset({"Task", "TaskGroup", "TaskWriteGroup", "TaskOutput",
+                "TaskCollect", "TaskList", "TaskStop"})),
     (frozenset({"mcts", "monte carlo"}),
      frozenset({"mcts_solve"})),
-    (frozenset({"race", "strategies"}),
-     frozenset({"race_strategies"})),
     (frozenset({"synthesi", "new tool", "create a tool"}),
      frozenset({"synthesize_tool"})),
     (frozenset({"fuzz"}),
@@ -299,6 +298,11 @@ def selected_schemas(registry: dict, user_text: str,
 # first. A tool's relevance for a hint = its best (lowest) position across
 # all groups whose keywords match.
 RANK_HINTS: tuple[tuple[frozenset[str], tuple[str, ...]], ...] = (
+    (frozenset({r"\bsubagents?\b", r"\bagents?\b", "parallel",
+                "delegat", "task group", "specialists", "fan out",
+                "team of", "independent tasks"}),
+     ("TaskGroup", "TaskWriteGroup", "TaskCollect", "TaskOutput", "TaskList",
+      "TaskStop", "Task")),
     (frozenset({"edit", "fix", "patch", "modify", "rewrite", "update",
                 "refactor", "rename variable"}),
      ("MultiEdit", "edit_file", "apply_patch", "write_file", "read_file")),
@@ -312,7 +316,7 @@ RANK_HINTS: tuple[tuple[frozenset[str], tuple[str, ...]], ...] = (
      ("read_file", "list_dir", "file_info", "ImageRead", "NotebookRead")),
     (frozenset({"run", "test", "execute", "pytest", "check", "build",
                 "compile", "script"}),
-     ("run_command", "compile_and_run", "live_shell", "BashBG",
+     ("run_command", "live_shell", "BashBG",
       "BashOutput", "RetryRun", "RetryShell", "measure_coverage",
       "fuzz_target")),
     (frozenset({"git", "commit", "branch", "push", "pull", "merge",
@@ -346,8 +350,6 @@ RANK_HINTS: tuple[tuple[frozenset[str], tuple[str, ...]], ...] = (
      ("EmailSend", "EmailConfig")),
     (frozenset({"ssh", "remote"}),
      ("SshRun", "SshTest")),
-    (frozenset({r"\btask\b", "subagent", "delegate", "agent team"}),
-     ("Task", "TaskList", "TaskOutput", "TaskStop")),
     (frozenset({"todo", "plan", "planning", "roadmap"}),
      ("TodoWrite", "TodoRead", "PlanWrite", "ReviewChanges",
       "verify_plan")),
@@ -391,12 +393,8 @@ RANK_HINTS: tuple[tuple[frozenset[str], tuple[str, ...]], ...] = (
      ("brain_recall", "knowledge_ask", "inspect_why")),
     (frozenset({"debate"}),
      ("run_debate",)),
-    (frozenset({"market", "bids"}),
-     ("run_market",)),
     (frozenset({"mcts", "monte carlo"}),
      ("mcts_solve",)),
-    (frozenset({"race", "strategies"}),
-     ("race_strategies",)),
     (frozenset({"synthesi", "new tool", "create a tool"}),
      ("synthesize_tool",)),
     (frozenset({"config", "settings", "preferences"}),
@@ -463,7 +461,7 @@ def build_full_registry():
     mods = ("todos", "multiedit", "bgsh", "planmode", "codeinit",
             "review", "notebook", "permissions", "outstyle",
             "webfetch", "checkpoints", "hooks",
-            "mcp", "skills", "agenttypes", "doctor", "statuscmd",
+            "mcp", "skills", "doctor", "statuscmd",
             "permrules", "configcmd", "images", "export", "vimmode",
             "thinking", "undocmd", "diffpreview", "costtrack",
             "jsonout", "ctxmeter", "prreview", "smartctx",
@@ -485,9 +483,39 @@ def build_full_registry():
             mod.register(fake)
         except Exception:
             pass  # same tolerance as Agent._register_feature_modules
+    from fullagent.roles import ROLES as _ROLES
+    _role_names = sorted(_ROLES)
+    _read_roles = sorted(role for role, spec in _ROLES.items()
+                         if not spec.get("writes"))
+    _task_item = {
+        "type": "object",
+        "properties": {
+            "task": {"type": "string"},
+            "role": {"type": "string", "enum": _role_names},
+            "name": {"type": "string"},
+            "context": {"type": "string"},
+            "model_id": {"type": "string"},
+        },
+        "required": ["task"],
+    }
+    _write_item = {
+        "type": "object",
+        "properties": {
+            "task": {"type": "string"},
+            "name": {"type": "string"},
+            "context": {"type": "string"},
+            "write_scope": {
+                "type": "array", "items": {"type": "string"},
+                "minItems": 1, "maxItems": 16,
+            },
+        },
+        "required": ["task", "write_scope"],
+    }
     # Tool() literals inside Agent._register_*_tools (need real
     # agent internals to run, so extract statically instead)
-    _ns = {"_STR": {"type": "string"}}
+    _ns = {"_STR": {"type": "string"}, "roles": _role_names,
+           "read_roles": _read_roles, "task_item": _task_item,
+           "write_item": _write_item}
     tree = _ast.parse(open(os.path.join(
         _REPO, "fullagent", "agent.py")).read())
 
@@ -498,6 +526,8 @@ def build_full_registry():
                 and isinstance(node.op, _ast.Add)):
             return _ev(node.left) + _ev(node.right)
         if isinstance(node, _ast.Name):
+            if node.id not in _ns:
+                raise ValueError(f"non-literal name: {node.id}")
             return _ns[node.id]
         if isinstance(node, _ast.Dict):
             return {_ev(k): _ev(v)
@@ -538,7 +568,16 @@ def build_full_registry():
 if __name__ == "__main__":
     reg = build_full_registry()
     n_total = len(reg)
-    assert n_total >= 110, f"expected ~117 tools, got {n_total}"
+    assert n_total >= 100, f"expected at least 100 supported tools, got {n_total}"
+    removed = {"spawn_agent", "spawn_parallel", "send_to_agent",
+               "wait_for_agents", "close_agent", "resume_agent",
+               "run_market", "race_strategies"}
+    assert removed.isdisjoint(reg), f"removed delegation tools remain: {removed & reg.keys()}"
+    required_subagent_tools = {"Task", "TaskGroup", "TaskWriteGroup",
+                               "TaskOutput", "TaskCollect", "TaskList",
+                               "TaskStop"}
+    assert required_subagent_tools <= set(reg), (
+        f"subagent tools missing: {required_subagent_tools - set(reg)}")
     # every tool still registered AND callable
     for tname, tool in reg.items():
         assert callable(tool.handler), f"{tname}: handler not callable"

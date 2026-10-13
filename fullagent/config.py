@@ -85,21 +85,9 @@ MAX_TOKENS = 200_000
 # otherwise. The backend can still teach a smaller window at runtime
 # (client.learn_context_window) — that only ever shrinks these.
 MODEL_CONTEXT_WINDOWS: dict[str, int] = {
-    # Kilo Code gateway docs.
-    "stealth/union-alpha": 262_144,
-    # Shanghai AI Lab: 256K documented support (weights config carries a
-    # 1M field, but the lab's own guidance says treat 256K as supported).
-    "atria-dawn-preview": 262_144,
-    # StepFun advertises 1M for Step 5; the kios free-tier cap is
-    # unverified, so stay conservative until the backend teaches us more.
-    "step-5-preview-free": 262_144,
-    # inclusionAI: 262K documented; the launch free trial capped at 256K.
-    "ling-3.1-flash": 262_144,
-    # Command Code / Vercel AI Gateway docs: 256K token context.
-    "glyph-cluster": 262_144,
-    # OpenCode Zen listing (models.dev metadata, verified against the
-    # live /zen/v1/models catalog 2026-10-02): 1M context / 524K output.
-    "space-bunny-free": 1_000_000,
+    # Kilo's anonymous auto-free route can change its backing model;
+    # conservatively cap it at 256K regardless of the current candidate.
+    "kilo-auto/free": 262_144,
 }
 # Default for models NOT in the table above: assume a small window rather
 # than risk a ~44s doomed request against an unknown cap. A request we can
@@ -164,12 +152,8 @@ class Model:
 
 
 def _provider_api_key(provider: str) -> str:
-    # Priority: env var > key file > embedded fallback. An empty or
-    # whitespace-only value does NOT count as "present" — it falls
-    # through to the next source instead of shadowing the embedded
-    # zero-config key with a dead empty string (e.g. KIOS_API_KEY=""
-    # left in a shell or docker env would otherwise silently break
-    # authentication).
+    # Priority: environment variable > per-user key file. Empty or
+    # whitespace-only values fall through rather than shadowing a key file.
     key = os.environ.get(f"{provider.upper()}_API_KEY", "").strip()
     if key:
         return key
@@ -183,19 +167,7 @@ def _provider_api_key(provider: str) -> str:
         key = ""
     if key:
         return key
-    # Embedded fallback: zero-config — the key ships in the build so the
-    # user never has to configure anything. Env var / key file above
-    # still take precedence when present.
-    return _EMBEDDED_KEYS.get(provider, "")
-
-
-# Build-time embedded API keys (zero-config). These ship inside the
-# wheel/binary. Override anytime via <PROVIDER>_API_KEY env var or
-# ~/.fullagent/<provider>_api_key file.
-_EMBEDDED_KEYS: dict[str, str] = {
-    "opencode": "oc_sk_beca47bb4fdd_mMprAdOncMckiWrjDmlcfTM0sxN73fX7",
-    "kios": "sk-cFXQ576lsIctpudkYD5lPniF5UgHGLy1nKeXDscCEvK1LMZV",
-}
+    return ""
 
 
 PROVIDERS: dict[str, Provider] = {
@@ -206,44 +178,14 @@ PROVIDERS: dict[str, Provider] = {
         api_key=_provider_api_key("kilo"),
         color="#f1fa8c",
     ),
-    "kios": Provider(
-        key="kios",
-        name="Kios API",
-        base_url="https://kiosapi.com/v1",
-        api_key=_provider_api_key("kios"),
-        color="#8be9fd",
-    ),
-    "opencode": Provider(
-        key="opencode",
-        name="OpenCode Zen",
-        base_url="https://opencode.ai/zen/v1",
-        api_key=_provider_api_key("opencode"),
-        color="#ff79c6",
-    ),
 }
 
 MODELS: list[Model] = [
-    Model("stealth/union-alpha", "kilo", "Union Alpha",
-          supports_tools=True,
-          context_window=model_context_window("stealth/union-alpha")),
-    Model("atria-dawn-preview", "kios", "Atria Dawn Preview",
-          tag="preview", supports_tools=True,
-          context_window=model_context_window("atria-dawn-preview")),
-    Model("step-5-preview-free", "kios", "Step 5 Preview Free",
+    Model("kilo-auto/free", "kilo", "Kilo Auto Free",
           tag="free", supports_tools=True,
-          context_window=model_context_window("step-5-preview-free")),
-    Model("ling-3.1-flash", "kios", "Ling 3.1 Flash",
-          supports_tools=True,
-          context_window=model_context_window("ling-3.1-flash")),
-    Model("glyph-cluster", "kios", "Glyph Cluster",
-          supports_tools=True,
-          context_window=model_context_window("glyph-cluster")),
-    Model("space-bunny-free", "opencode", "Space Bunny Free",
-          tag="free", supports_tools=True,
-          context_window=model_context_window("space-bunny-free")),
+          context_window=model_context_window("kilo-auto/free")),
 ]
-
-DEFAULT_MODEL_ID = "stealth/union-alpha"
+DEFAULT_MODEL_ID = "kilo-auto/free"
 
 
 @dataclass(frozen=True)
@@ -402,4 +344,3 @@ def _self_check() -> None:
 
 if __name__ == "__main__":
     _self_check()
-

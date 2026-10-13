@@ -1,6 +1,6 @@
 """Type guards for provider/data boundaries (deep-reliability audit, worker 13/20).
 
-Why: subagents were failing with ``AttributeError: 'str' object has no
+Why: malformed provider entries caused ``AttributeError: 'str' object has no
 attribute 'get'`` (and siblings) whenever a provider returned an
 unexpected shape — a usage string instead of a dict, a tool_calls list
 containing strings, an SSE event that parsed to a JSON array instead of
@@ -8,7 +8,7 @@ an object, content blocks where a plain string was assumed.
 
 These four tiny functions are the systemic fix: apply them at every
 place where untrusted provider data enters our code (client.py's SSE
-loop and JSON parser, crew.py's turn loop, ...).  They never raise;
+loop and JSON parser, ...). They never raise;
 they never try to be clever (``ensure_dict`` on a string returns the
 default — it deliberately does NOT attempt JSON parsing, that is a
 different function's job); they just hand back a value of the promised

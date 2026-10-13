@@ -1,4 +1,4 @@
-"""Malformed-provider simulation test (crew audit, worker 14/20).
+"""Malformed-provider simulation test (provider-boundary regression).
 
 Adversarial harness driving the REAL parsing functions in fullagent.client
 against ~70 malformed provider payloads. Proves the reported incident

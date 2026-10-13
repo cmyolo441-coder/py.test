@@ -13,7 +13,7 @@ nobody shipped, it writes it:
                 contract
     register    a passing function becomes a REAL Tool in the agent's
                 registry with a JSON schema — callable by the main
-                agent and by every subagent that inherits the registry
+                agent and by the main agent that uses the registry
 
 Nothing unvalidated ever runs. The self-test synthesizes a real
 tool offline and calls it; a poisoned draft (exec smuggling) is

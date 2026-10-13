@@ -1,26 +1,12 @@
 """CANCELPROOF — proof that Esc interrupts every blocking point fast.
 
-The user reported Esc taking 203 SECONDS to cancel a turn. The audit
-(worker 14/20) found these unbounded blocking points on the turn path:
+The user reported Esc taking 203 SECONDS to cancel a turn. The audit found these unbounded blocking points on the turn path:
 
-  1. client._chat_stream_once — the initial requests.post() blocked in
-     DNS/connect/TLS with NO cancel check (requests' timeout does not
-     cover DNS).
-  2. client._chat_stream_once — non-stream JSON fallback resp.json()
-     read the whole body bounded only by the 300s read timeout.
-  3. client._post_blocking / chat_blocking — the entire request blocked
-     up to 300s x 3 retries with ZERO cancel checks.
-  4. client retry backoff — bare time.sleep() ignored Esc.
-  5. team.chat_with_retry — rate-limit backoff slept ~254s total
-     (2+4+8+...+128s) with zero cancel checks  <-- the 203s hang.
-  6. crew._run_loop — subagent workers checked stop_event only BETWEEN
-     steps; an in-flight model call ignored Esc for the full timeout.
-  7. tools.web_fetch / web_search — requests calls with 30s timeouts,
-     no cancel checks.
-  8. speculate.speculate — blocked the turn on a ThreadPoolExecutor
-     until every prefetch finished.
-  9. agent._execute_tool — swallowed TurnCancelled from handlers into
-     an "ERROR: ..." string, so the turn kept going after Esc.
+  1. provider POSTs could block in DNS/connect/TLS or response reads.
+  2. retry backoff sleeps ignored the user's cancel request.
+  3. web fetch/search requests could block without cancel checks.
+  4. speculative prefetch could block the turn on its worker pool.
+  5. tool handlers could swallow cancellation as an ordinary error.
 
 All are fixed via fullagent/cancelguard.py (run_cancellable /
 sleep_cancellable, 0.25s poll). This module PROVES it: each test starts
@@ -189,7 +175,7 @@ def test_hung_stream_post() -> None:
 def test_rate_limit_backoff() -> None:
     """BLOCKER 5: chat_with_retry's ~254s rate-limit backoff (the 203s
     hang). A 429-always provider must not hold Esc hostage."""
-    from .team import chat_with_retry
+    from .client import chat_with_retry
     srv = HTTPServer(("127.0.0.1", 0), _Always429)
     port = srv.server_address[1]
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -298,54 +284,6 @@ def test_cancellable_sleep() -> None:
     _timed("120s sleep interrupted", _run)
 
 
-def test_subagent_worker_cancel() -> None:
-    """BLOCKER 6: a subagent stuck in a hung model call stops on Esc.
-
-    Uses the real production chat path (chat_with_retry -> chat_blocking
-    with the worker's stop_event threaded through as should_cancel)."""
-    import tempfile
-    from pathlib import Path
-    from .crew import Crew
-    from .kernel import EventLog
-    bh = Blackhole()
-    try:
-        with tempfile.TemporaryDirectory() as td:
-            log = EventLog(Path(td) / "k.jsonl")
-            crew = Crew(log, _fake_provider(bh.url), _fake_model(),
-                        _fake_effort(), max_agents=2)
-            assert crew._chat_takes_cancel, \
-                "production chat path must accept should_cancel"
-            agent = crew.spawn("hang forever :: x", role="researcher")
-            # grab the worker's future directly: we must prove the
-            # THREAD dies promptly, not just that the state flips
-            fut = None
-            deadline = time.monotonic() + 5.0
-            while fut is None and time.monotonic() < deadline:
-                with crew._lock:
-                    fut = crew._futures.get(agent.id)
-                time.sleep(0.05)
-            assert fut is not None, "worker future never registered"
-            time.sleep(TRIGGER_AFTER)
-            assert not fut.done(), "worker finished before Esc (test bug)"
-            t0 = time.monotonic()
-            crew.force_stop()  # what the TUI does on Esc
-            try:
-                fut.result(timeout=LIMIT)
-            except Exception as e:  # noqa: BLE001 — TimeoutError etc.
-                raise AssertionError(
-                    f"worker thread did not die within {LIMIT}s: {e}")
-            dt = time.monotonic() - t0
-            states = crew.wait([agent.id], timeout=5.0)
-            crew.shutdown()
-            assert states[agent.id] == "closed", states
-            status = "OK " if dt < LIMIT else "FAIL"
-            print(f"  [{status}] hung subagent worker thread died: "
-                  f"{dt:.2f}s (limit {LIMIT:.0f}s)")
-            assert dt < LIMIT, f"subagent cancel took {dt:.2f}s"
-    finally:
-        bh.close()
-
-
 def test_speculate_nonblocking() -> None:
     """BLOCKER 8: speculate() returns at once even with a hung runner."""
     import tempfile
@@ -405,7 +343,6 @@ TESTS = [
     test_web_fetch_hung,
     test_web_search_hung,
     test_cancellable_sleep,
-    test_subagent_worker_cancel,
     test_speculate_nonblocking,
     test_handler_cancel_wiring,
     test_run_cancellable_sanity,

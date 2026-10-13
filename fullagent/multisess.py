@@ -236,6 +236,14 @@ def _snapshot_current(agent: Any) -> None:
         pass
 
 
+def _reset_subagents(agent: Any, next_session_id: str) -> None:
+    """Stop outgoing-session workers before changing the event-log session."""
+    manager = getattr(agent, "subagents", None)
+    reset = getattr(manager, "reset_session", None)
+    if callable(reset):
+        reset(next_session_id)
+
+
 def create_session(agent: Any, name: str = "") -> str:
     """Create a new session, snapshot the current one, switch to the new."""
     with _meta_lock:
@@ -246,6 +254,7 @@ def create_session(agent: Any, name: str = "") -> str:
         sid = _new_id(meta)
         _record(meta, sid, name=name)
         save_meta(meta)
+    _reset_subagents(agent, sid)
     # snapshot the outgoing session BEFORE reseating state
     _snapshot_current(agent)
 
@@ -300,6 +309,7 @@ def switch_session(agent: Any, sid: str) -> str:
     if full == current:
         return full
 
+    _reset_subagents(agent, full)
     # NEVER corrupt the outgoing session: snapshot it before touching it.
     _snapshot_current(agent)
 

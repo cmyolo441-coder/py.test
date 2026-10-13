@@ -118,7 +118,7 @@ def test_result_from_json_garbage_tool_calls():
 
 
 def test_downstream_get_never_crashes():
-    """Simulate the crew/agent downstream pattern on normalizer output."""
+    """Simulate the tool-loop downstream pattern on normalizer output."""
     for inp, _ in CASES:
         out = normalize_tool_call(inp)
         if out is None:

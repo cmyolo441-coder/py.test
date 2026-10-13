@@ -35,7 +35,7 @@ BUDGET_S = 2.0
 # importing fullagent.agent and constructing an Agent. (fullagent.tools
 # is expected — build_registry() runs at construction.)
 HEAVY_DENYLIST = [
-    "fullagent.crew", "fullagent.judge", "fullagent.debate",
+    "fullagent.judge", "fullagent.debate",
     "fullagent.workflows", "fullagent.daemon", "fullagent.council",
     "fullagent.nexus", "fullagent.oracle", "fullagent.forge",
     "fullagent.brain", "fullagent.goal", "fullagent.memory",

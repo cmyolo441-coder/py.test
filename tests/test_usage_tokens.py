@@ -7,7 +7,7 @@ to return -- and never raises. Covers the reported crash:
     AttributeError: 'str' object has no attribute 'get'
 
 from ``result.usage.get("prompt_tokens")`` when a provider returns usage
-as a string (crew.py / client.py / agent.py / tui.py call sites).
+as a string (client.py / agent.py / tui.py call sites).
 
 Also exercises the thin wrappers that now delegate to usage_tokens:
 client._learn_from_usage, agent.Agent._emit_cost, jsonout._usage.
@@ -140,8 +140,8 @@ class UsageTokensTest(unittest.TestCase):
                 else:
                     self.assertEqual(dummy.log.events, [], name)
 
-    def test_crew_accumulation_pattern(self):
-        # Mirrors crew.py: agent.tokens_in/out += usage_tokens(result.usage)
+    def test_token_accumulation_pattern(self):
+        # Mirrors cumulative usage accounting: total += usage_tokens(result.usage)
         tokens_in = tokens_out = 0
         for shape in ("bad string", 42, None, {},
                       {"prompt_tokens": "15", "completion_tokens": None}):

@@ -24,7 +24,7 @@ Hard rules (mechanical):
     there (never silently skipped) — the run report says exactly which
     step stopped and why.
   * Step execution is injected (`executor`), so the engine is fully
-    testable without a live model; the agent binds it to the Crew.
+    testable without a live model; callers inject a serial executor, which can run with or without a model.
 """
 
 from __future__ import annotations
@@ -133,7 +133,7 @@ class WorkflowEngine:
 
     `executor(step_dict) -> dict` runs ONE step and returns
     {"status": "done|blocked|error", "summary": str}. The agent binds
-    this to the Crew; tests inject a stub. `judge` (optional) verifies
+    callers inject a stub. `judge` (optional) verifies
     `expect` predicates after each step.
     """
 
@@ -223,9 +223,8 @@ class WorkflowEngine:
             for phase_num, steps in ordered:
                 if state != "RUNNING":
                     break
-                # steps within a phase run one at a time, in the order the
-                # executor is bound to (the Crew's serial queue); a blocked
-                # or failing step stops the remaining steps right there
+                # Steps within a phase run one at a time in declaration
+                # order; a blocked or failing step stops the remaining steps.
                 for n, step in steps:
                     rep = self._run_step(
                         {"task": step.task, "role": step.role,

@@ -8,11 +8,13 @@ anywhere.
 
 from __future__ import annotations
 
+from .slashcatalog import SLASH_COMMANDS
 
-# COMMANDS: categorized command reference. Every entry is (command, one-line
-# description). The set covers the real commands handled by tui.py
-# `_route_slash` plus the commands introduced by this feature batch
-# (/sessions, /compact, /output-style, /agents, /init, /review, /permissions).
+
+
+# Curated categories for the common commands. `_complete_command_groups()`
+# merges in every other implemented command from the shared slash catalog.
+# Each entry is a (command, one-line description) pair.
 COMMANDS: dict[str, list[tuple[str, str]]] = {
     "Session": [
         ("/new", "fresh conversation (saves the old one)"),
@@ -36,10 +38,9 @@ COMMANDS: dict[str, list[tuple[str, str]]] = {
         ("/output-style", "concise · detailed · code-only output style"),
         ("/voice", "record mic → real whisper transcription (needs faster-whisper)"),
     ],
-    "Subagents": [
-        ("/agents", "list / spawn / manage subagents (crew)"),
+    "Reasoning": [
         ("/council", "run a review council over a proposal"),
-        ("/debate", "multi-agent debate on a decision"),
+        ("/debate", "multi-model debate on a decision"),
     ],
     "Project": [
         ("/init", "scaffold a project structure"),
@@ -87,16 +88,38 @@ def resolve_alias(cmd: str) -> str:
     return ALIASES.get(cmd, cmd)
 
 
-def format_help() -> str:
-    """Return the full categorized help text, columns aligned."""
-    width = max(len(cmd) for cmds in COMMANDS.values() for cmd, _ in cmds)
+def _complete_command_groups() -> dict[str, list[tuple[str, str]]]:
+    """Merge the curated help categories with the full completion catalog."""
+    groups = {name: list(commands) for name, commands in COMMANDS.items()}
+    known = {cmd for commands in groups.values() for cmd, _ in commands}
+    additional = [(cmd, desc) for cmd, desc in SLASH_COMMANDS
+                  if cmd not in known]
+    if additional:
+        groups["Additional"] = additional
+    return groups
+
+
+def format_help(command: str | None = None) -> str:
+    """Return all command help, or a single command’s description."""
+    groups = _complete_command_groups()
+    if command:
+        name = command.strip().split()[0].lower()
+        if not name.startswith("/"):
+            name = "/" + name
+        name = resolve_alias(name)
+        for commands in groups.values():
+            for cmd, desc in commands:
+                if cmd == name:
+                    return f"{cmd}  {desc}\n"
+        return f"Unknown slash command {name!r}. Run /help for the catalog.\n"
+
+    width = max(len(cmd) for cmds in groups.values() for cmd, _ in cmds)
     lines: list[str] = []
-    for category, cmds in COMMANDS.items():
+    for category, cmds in groups.items():
         lines.append(f"{category}:")
         for cmd, desc in cmds:
             lines.append(f"  {cmd:<{width}}  {desc}")
         lines.append("")
-    lines.append("Type /help <command> is not supported yet — ask a follow-up.")
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -192,10 +215,16 @@ def _self_test() -> None:
     check(resolve_alias(" /n ") == "/new", "alias trims whitespace")
 
     text = format_help()
-    check("Session:" in text and "Models:" in text and "Subagents:" in text
+    check("Session:" in text and "Models:" in text and "Reasoning:" in text
           and "Project:" in text and "System:" in text,
           "format_help has all categories")
     check("/exit" in text and "/review" in text, "format_help lists commands")
+    check("/mcp" in text and "/doctor" in text and "/terminal-setup" in text,
+          "format_help includes commands absent from the old help subset")
+    check("/model" in format_help("model"),
+          "format_help supports one-command lookup")
+    check("Unknown slash command" in format_help("not-a-command"),
+          "format_help reports unknown command names")
 
     err_case = suggest_followups({"tools_used": ["run_command"],
                                   "had_error": True,

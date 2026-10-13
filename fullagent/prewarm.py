@@ -29,9 +29,8 @@ SAFETY (mechanical, not advisory):
   * consume() validates element-identity prefix: every snapshot element
     must still be the identical object at the same index, and the
     captured model_id / prune window must be unchanged. ANY mutation
-    during the wait (compaction, overflow-shrink, message seal,
-    failover model switch) invalidates the bundle and the normal path
-    runs instead.
+    during the wait (compaction, overflow-shrink, message seal, manual
+    model switch) invalidates the bundle and the normal path runs instead.
   * Generation counter: a late-finishing worker can never overwrite a
     newer flight's bundle, and a stale bundle can never be consumed.
   * The worker never raises — everything is wrapped; a dead worker just

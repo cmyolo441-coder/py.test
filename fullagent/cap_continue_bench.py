@@ -26,11 +26,10 @@ network):
      tool_calls) and sizes (input + max_tokens inside the model
      window). Zero hard violations => the request would NOT produce
      invalid_request_error.
-  5. Legacy contrast (sensitivity proof): the same pre-reseed history
-     sent WITHOUT the reseed — the old behaviour — through the real
-     ``_prune_for_model`` + ``build_payload`` path. It must show hard
-     violations (orphaned tool response from the sliding-window cut),
-     proving this test FAILS when the bug is present.
+  5. Legacy contrast: the same pre-reseed history is checked before
+     ``build_payload`` sanitizes it, where the old sliding-window cut
+     must show an orphaned tool response. The real wire payload is then
+     checked separately to ensure the newer sanitizer repairs the history.
   6. Budgets: total simulated time < 120s; history sent on continue
      < 15% of the capped turn's history.
 
@@ -392,7 +391,7 @@ def run_bench():
                 f"continue request INVALID ({len(hard)} hard "
                 f"violations): {hard[0]}")
 
-        # -- legacy contrast: old behaviour must be invalid ------------
+        # -- legacy contrast: identify and repair old malformed history -
         # (a) the raw captured history, re-sent without the reseed —
         #     informational: incidental hint messages make the exact
         #     window cut nondeterministic, so this is reported, not
@@ -420,9 +419,7 @@ def run_bench():
         #     cut provably lands mid-pair (the tail starts with
         #     tool_006's response whose assistant message was cut) —
         #     the exact shape that makes providers answer
-        #     invalid_request_error. The old code sent this; the
-        #     validator must flag it, or this bench could not catch
-        #     the bug.
+        #     invalid_request_error before the newer wire sanitizer runs.
         def _canon():
             msgs = [m for m in full_history if isinstance(m, dict)]
             if not msgs or msgs[0].get("role") != "system":
@@ -462,21 +459,31 @@ def run_bench():
         else:
             legacy = canonical + [{"role": "user", "content": "continue"}]
             legacy_pruned = prune_messages(legacy, window=cfg.prune_window)
+            # Validate the pruned legacy history directly. build_payload()
+            # now repairs orphaned tool responses, so validating only its
+            # output would incorrectly mark this old history as bug-free.
+            legacy_hard, legacy_soft = validate_wire_messages(
+                legacy_pruned, 1024, agent.model)
             legacy_payload = build_payload(
                 agent.model, agent.effort,
                 copy.deepcopy(legacy_pruned), schemas)
-            legacy_hard, legacy_soft = validate_wire_messages(
+            sanitized_hard, sanitized_soft = validate_wire_messages(
                 legacy_payload["messages"],
                 legacy_payload.get("max_tokens", 0), agent.model)
+            report["legacy_sanitized_hard"] = sanitized_hard
+            report["legacy_sanitized_soft"] = sanitized_soft
         report["legacy_hard"] = legacy_hard
         report["legacy_soft"] = legacy_soft
         report["legacy_pruned_messages"] = len(legacy_pruned) \
             if probe_ok else 0
         if probe_ok and not legacy_hard:
             report["failures"].append(
-                "sensitivity check failed: the UNRESEEDED (legacy) "
-                "continue request validates clean — this test would "
-                "not catch the bug")
+                "sensitivity check failed: unreseeded history has no "
+                "orphaned tool-call violations before wire sanitization")
+        if probe_ok and report.get("legacy_sanitized_hard"):
+            report["failures"].append(
+                "wire sanitizer did not repair legacy history: "
+                f"{report['legacy_sanitized_hard'][0]}")
 
         # -- history-size ratio -----------------------------------------
         full_chars = _history_chars(full_history[1:])      # excl. system
@@ -541,9 +548,12 @@ if __name__ == "__main__":
            rep.get("reseeded") is True)
     _check(failures, "continue request has zero hard violations",
            not rep.get("continue_hard"), str(rep.get("continue_hard")))
-    _check(failures, "legacy (unreseeded) request shows the bug",
+    _check(failures, "unreseeded history exposes the old malformed cut",
            bool(rep.get("legacy_hard")),
-           "no violations found on the old path")
+           "no violations found before wire sanitization")
+    _check(failures, "wire sanitizer repairs legacy history",
+           not rep.get("legacy_sanitized_hard"),
+           str(rep.get("legacy_sanitized_hard")))
     _check(failures, "continue history < 15% of capped turn history",
            rep.get("history_ratio", 1.0) < _HISTORY_RATIO_MAX,
            f"ratio={rep.get('history_ratio')}")

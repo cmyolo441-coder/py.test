@@ -20,7 +20,7 @@ Design:
     agent it is bound to a model call through the Mastermind gate; in tests
     it is a stub. The council itself is deterministic orchestration.
   * Positions run one at a time (thesis, then antithesis) — no parallel
-    subagents.
+    independent model perspectives.
   * The synthesis prompt is built mechanically from the two positions and
     carries NO other context — the blindness is structural.
 """

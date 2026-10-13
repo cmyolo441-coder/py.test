@@ -1,4 +1,4 @@
-"""Turn summary on tool-call cap (worker 7/20).
+"""Standalone extractive summary helper for capped turns (worker 7/20).
 
 When a turn trips MAX_TOOL_CALLS_PER_TURN, the full 25-call history would
 be re-sent on "continue" and the provider chokes (invalid_request_error).
@@ -7,7 +7,9 @@ no extra API call, nothing to fail on — and prunes the model-visible
 history down to: system prompt + user request + summary. The continue turn
 then starts from that compact state instead of 25 calls of history.
 
-Nothing here touches _EMBEDDED_KEYS or the provider config.
+The live agent continuation hook is in ``continueresume``; this module keeps
+the standalone pure summarization and history-pruning helpers. Nothing here
+touches _EMBEDDED_KEYS or the provider config.
 """
 
 from __future__ import annotations
@@ -218,60 +220,8 @@ if __name__ == "__main__":
     check("works with empty history (falls back to user_text)",
           len(no_user) == 2 and no_user[0]["content"] == "fallback req")
 
-    # 4. end-to-end through a REAL Agent: a capped turn must shrink
-    # self.messages via the exact finalization hook the turn loop calls
-    import tempfile
-    from pathlib import Path
-    from .agent import Agent, ToolEvent
-    from .config import Config
-    from .kernel import EventLog as _EventLog
-
-    _td = tempfile.mkdtemp(prefix="cap_summary_selftest_")
-    agent = Agent(Config())
-    agent.log.close()
-    agent.log = _EventLog(Path(_td) / "events.jsonl",
-                          session=agent.session_id)
-    agent.messages = [{"role": "system", "content": "sys prompt"},
-                      {"role": "user", "content": "do the big task"}]
-    real_tools = [
-        ToolEvent(name="write_file",
-                  args={"path": f"/tmp/f{i}.py", "content": "y" * 100},
-                  result=("ok " * 3000), status="done")
-        for i in range(25)
-    ]
-    for i in range(25):
-        agent.messages.append(
-            {"role": "assistant", "content": f"c{i}",
-             "tool_calls": [{"id": f"t{i}"}]})
-        agent.messages.append(
-            {"role": "tool", "tool_call_id": f"t{i}",
-             "content": "ok " * 3000})
-    import fullagent.agent as _agent_mod
-    cap_turn = _agent_mod.Turn(user_text="do the big task",
-                              assistant_text="half the files written",
-                              tools=real_tools,
-                              error="Turn stopped after 25 tool calls — ask "
-                                    "me to continue.",
-                              cap_stopped=True)
-    n_before = len(agent.messages)
-    chars_before = agent._messages_chars()
-    agent._compact_cap_hit(cap_turn)
-    chars_after = agent._messages_chars()
-    check("Turn.summary populated on cap",
-          isinstance(cap_turn.summary, str) and len(cap_turn.summary) > 100)
-    check(f"agent history pruned {n_before} -> {len(agent.messages)} msgs",
-          len(agent.messages) == 3)
-    check(f"agent history chars shrank "
-          f"({chars_before:,} -> {chars_after:,})",
-          chars_after < chars_before // 10)
-    check("compacted history is system+user+summary",
-          [m.get("role") for m in agent.messages]
-          == ["system", "user", "assistant"]
-          and agent.messages[2]["content"] == cap_turn.summary)
-    check("compaction logged to event log",
-          any(getattr(e, "type", "") == "turn.capped_compact"
-              for e in agent.log._events))
-    agent.log.close()
+    # 4. The active Agent integration is tested by ``continueresume``;
+    # this legacy standalone utility intentionally has no Agent hook.
 
     print()
     if failures:

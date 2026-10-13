@@ -9,20 +9,20 @@
 ╚═╝      ╚═════╝ ╚═════╝╚════╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝  ╚═╝
 ```
 
-<h1>FullAgent <sup><code>v3.1.0</code></sup></h1>
+<h1>FullAgent <sup><code>v3.2.0</code></sup></h1>
 
 **Advanced Terminal AI Agent — Pure Python, Real Code, World-Class TUI**
 
 <p>
-  <a href="https://github.com/cmyolo441-coder/perfectagent/releases"><img src="https://img.shields.io/github/v/release/cmyolo441-coder/perfectagent?label=release&color=bd93f9&style=flat-square" alt="release"></a>
-  <a href="https://github.com/cmyolo441-coder/perfectagent"><img src="https://img.shields.io/badge/python-3.9%2B-8be9fd?style=flat-square&logo=python&logoColor=white" alt="python"></a>
-  <a href="https://github.com/cmyolo441-coder/perfectagent"><img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows%20%7C%20Termux-50fa7b?style=flat-square" alt="platform"></a>
-  <a href="https://github.com/cmyolo441-coder/perfectagent/blob/main/pyproject.toml"><img src="https://img.shields.io/badge/pure--python-%23FFB86C?style=flat-square" alt="pure python"></a>
-  <a href="https://github.com/cmyolo441-coder/perfectagent"><img src="https://img.shields.io/github/stars/cmyolo441-coder/perfectagent?style=flat-square&color=f1fa8c" alt="stars"></a>
-  <a href="https://github.com/cmyolo441-coder/perfectagent/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-6272a4?style=flat-square" alt="license"></a>
+  <a href="https://github.com/cmyolo441-coder/py.test/releases"><img src="https://img.shields.io/github/v/release/cmyolo441-coder/py.test?label=release&color=bd93f9&style=flat-square" alt="release"></a>
+  <a href="https://github.com/cmyolo441-coder/py.test"><img src="https://img.shields.io/badge/python-3.9%2B-8be9fd?style=flat-square&logo=python&logoColor=white" alt="python"></a>
+  <a href="https://github.com/cmyolo441-coder/py.test"><img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows%20%7C%20Termux-50fa7b?style=flat-square" alt="platform"></a>
+  <a href="https://github.com/cmyolo441-coder/py.test/blob/main/pyproject.toml"><img src="https://img.shields.io/badge/pure--python-%23FFB86C?style=flat-square" alt="pure python"></a>
+  <a href="https://github.com/cmyolo441-coder/py.test"><img src="https://img.shields.io/github/stars/cmyolo441-coder/py.test?style=flat-square&color=f1fa8c" alt="stars"></a>
+  <a href="https://github.com/cmyolo441-coder/py.test/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-6272a4?style=flat-square" alt="license"></a>
 </p>
 
-*`Event-Sourced Kernel` · `Goal Contracts` · `Persistent Crew` · `Self-Healing` · `Temporal Kernel` · `40+ Slash Commands` · `16 Tools` · `Kilo Code`*
+*`Event-Sourced Kernel` · `Goal Contracts` · `Self-Healing` · `Temporal Kernel` · `40+ Slash Commands` · `16 Tools` · `Kilo Code`*
 
 <p>
   <a href="#-install-binary--curl-one-liner"><b>Install</b></a> •
@@ -40,7 +40,7 @@
 > Terminal `python main.py` chalate hi ab naya gradient ASCII banner + session info dikhega — aur GitHub README pe yahi banner sabse upar.
 
 ```
-╭─ FullAgent ── model: Union Alpha ── effort: HIGH ── session a1b2c3d4 ─────╮
+╭─ FullAgent ── model: Kilo Auto Free ── effort: HIGH ── session a1b2c3d4 ──╮
 │ ❯ type anything… the agent reads, writes, edits files, runs commands     │
 ╰─ Enter send · Esc+Enter newline · / commands · Ctrl+T models ────────────╯
 ```
@@ -66,11 +66,11 @@ without artificial animation delays.
 <summary><b>🖼️ Terminal Banner Preview (after <code>python main.py</code>)</b></summary>
 
 ```
- ◆ FullAgent v3.1.0  ·  advanced terminal AI agent
- event-sourced kernel · goal contracts · persistent crew · self-healing
+ ◆ FullAgent v3.2.0  ·  advanced terminal AI agent
+ event-sourced kernel · goal contracts · self-healing
  ──────────────────────────────────────────────────────────────────
- ❯ model  Union Alpha   effort  high   autonomy  L4   session  a1b2c3d4
-   / commands · Ctrl+T models · Ctrl+E effort · /crew background subagents
+ ❯ model  Kilo Auto Free   effort  high   autonomy  L4   session  a1b2c3d4
+   / commands · Ctrl+T models · Ctrl+E effort · shell jobs
 ```
 
 *Full ASCII (6-line) gradient banner dikhega jab terminal ≥80 cols wide ho, warna compact fallback.*
@@ -83,11 +83,11 @@ Single-file binaries — no Python needed:
 
 | Platform | Install |
 |---|---|
-| Linux x64 | `curl -fsSL https://raw.githubusercontent.com/cmyolo441-coder/perfectagent/main/install.sh \| bash` |
-| macOS (Apple Silicon) | download `fullagent-darwin-arm64` from the [latest release](https://github.com/cmyolo441-coder/perfectagent/releases/latest), `chmod +x`, move to /usr/local/bin |
+| Linux x64 | `curl -fsSL https://raw.githubusercontent.com/cmyolo441-coder/py.test/main/install.sh \| bash` |
+| macOS (Apple Silicon) | download `fullagent-darwin-arm64` from the [latest release](https://github.com/cmyolo441-coder/py.test/releases/latest), `chmod +x`, move to /usr/local/bin |
 | Windows x64 | download `fullagent-windows-x64.exe`, rename to `fullagent.exe`, put on PATH |
-| Termux (Android) | `curl -fsSL https://raw.githubusercontent.com/cmyolo441-coder/perfectagent/main/install-termux.sh \| bash` |
-| Any OS with Python 3.9+ | `pip install git+https://github.com/cmyolo441-coder/perfectagent.git` |
+| Termux (Android) | `curl -fsSL https://raw.githubusercontent.com/cmyolo441-coder/py.test/main/install-termux.sh \| bash` |
+| Any OS with Python 3.9+ | `pip install git+https://github.com/cmyolo441-coder/py.test.git` |
 
 `install.sh` grabs the latest release binary automatically and falls back to
 a pip install from source when no binary is published yet. Set `INSTALL_DIR`
@@ -96,12 +96,23 @@ to install elsewhere (e.g. `INSTALL_DIR=$HOME/.local/bin curl -fsSL … | bash`)
 ## Run
 
 ```bash
-pip install prompt_toolkit rich requests
-export KILO_API_KEY='your-kilo-api-key'
 python main.py
 ```
 
 (ya `python -m fullagent` — dono same hain)
+
+## Provider and rate limits
+
+`Kilo Auto Free` is the only configured provider/model and works without
+manually setting an API key. The app does not impose a five-requests-per-minute
+client cap; when Kilo returns a rate-limit response, it honors `Retry-After`
+or waits with backoff and retries until the request succeeds or you cancel
+with `Ctrl+C`. Kilo still controls its own free-tier capacity and quotas, so
+the app cannot guarantee literally unlimited service.
+
+Browser automation is optional. Install it with `pip install 'fullagent[browser]'`
+and `python -m playwright install chromium`; if system Chromium is already on
+`PATH`, FullAgent can use it directly.
 
 ## What it can do
 
@@ -121,14 +132,15 @@ python main.py
   approaches land in a dead-end ledger and are blocked deterministically
 - **Judge** — claims are verified against reality with deterministic
   predicates (exit codes, file checks, regex) — never the model's own word
-- **Crew** — Codex-style **persistent** subagents with **true parallelism**:
-  `spawn_agent` launches a background worker instantly (the conversation stays
-  responsive), `spawn_parallel` fires up to 10 agents at once on a
-  ThreadPoolExecutor, `send_to_agent` iterates on its LIVING context,
-  `wait_for_agents` collects results as they finish, `close_agent` /
-  `resume_agent` manage the lifecycle. Subagents run **concurrently** —
-  each isolated, sharing only the thread-safe event log. Live progress
-  streams smoothly in the TUI panel with zero flicker.
+- **Parallel subagents** — 14 focused specialists run concurrently (up to
+  four live workers; groups can queue up to eight tasks) with per-task roles,
+  independent context, bounded steps, live status, cancellation, named batches,
+  consolidated result collection, and an audited handoff. `TaskGroup` handles
+  parallel read-only review/research; `TaskWriteGroup` enables parallel coding
+  through the existing permission gate, with distinct workspace path scopes,
+  shell/deletion tools withheld, and a recovery snapshot before every delegated
+  write. Workers stay on the selected configured model unless a model is
+  explicitly selected; automatic model switching is disabled.
 - **Focus Mode** — deep work: `/focus 10` arms auto-continuation and the
   agent keeps working turn after turn until the goal closes, progress
   stalls, or the budget pauses. Every continuation decision is a sealed
@@ -137,16 +149,12 @@ python main.py
   border and prints the finished answer as rich Markdown
 - **Instant triage** — tool errors show the healer's root-cause
   classification right on the result line
-- **Workflows** — saved multi-step pipelines (`/workflow run ship`):
-  phased orchestration that runs steps one at a time in phase order,
-  each step is a real subagent, and optional `expect` predicates block
-  the pipeline on failure
 - **Audit export** — `/export md|html` writes a self-contained session
   report: timeline, tool stats, judge verdicts, per-model usage
 - **Forecast** — `/forecast` projects turns-to-done from measured goal
   velocity and tokens-per-turn (numbers, not vibes)
-- **Provider health** — `/health` shows model errors. No alternate model
-  or provider is configured, so cross-model failover is unavailable.
+- **Provider health** — `/health` shows model errors. Automatic model
+  switching is disabled; provider failures stay on the selected model.
 - **Notifications** — `/notify <webhook|file:path>` fires kernel events
   (goal closed, focus stop, workflow done…) to your sink
 - **Session resume** — `/resume` lists branches/sessions; continue any
@@ -191,6 +199,13 @@ without asking, from read-only observer to fully autonomous.
 `/model` `/effort` `/help` `/history` `/new` `/save` `/approve`
 `/reasoning` `/usage` `/clear` `/about` `/exit`
 
+- `/agents` — rich crew dashboard; `/agents roles` shows specialist modes;
+  `/agents detail <id>` inspects one worker; `/agents results [batch-id]`
+  collects a batch; `/agents spawn [role] <read-only task>` starts one;
+  `/agents wait [id|all]` waits up to 30 seconds; `/agents stop <id|all>`
+  requests cancellation. Use natural-language tasks for parallel read-only work
+  and approved, file-scoped coding delegation.
+
 Event-log commands:
 
 - `/goal set <statement> | <clause1> | <clause2>` — set a goal contract
@@ -211,16 +226,14 @@ Event-log commands:
   or `master` (the extended 130k+ specification prompt)
 - `/mastermind` — the prompt-coherence ledger (sealed prompts, gate,
   composed context, lineage)
-- `/dashboard` — live observability: cost, goal, crew, router, spec,
+- `/dashboard` — live observability: cost, goal, councils, router, spec,
   memory, health in one screen
-- `/router` — task classification and routing history; all tasks use Union Alpha
+- `/router` — task classification and routing history; model: Kilo Auto Free
 - `/spec` — speculative execution: prefetch stats + hit-rate
 - `/recall <question>` — semantic (meaning-based) memory recall
 - `/mission [start|tick|list|abandon]` — daemon mission control
 - `/heal` — self-healing ledger: root causes captured + healed
 - `/skills` — the skill forge: self-authored, safety-gated tools
-- `/crew` — persistent subagent roster; `/crew spawn <role> <task>`,
-  `/crew send <id> <msg>`, `/crew wait`, `/crew close <id>`, `/crew resume <id>`
 - `/focus <1-20>` — deep-work mode: auto-continues until done · `/focus off`
 - `/render [on|off]` — rendered-markdown replies (streaming stays live in the border)
 - `/council <proposition>` — convene an adversarial debate
@@ -237,39 +250,28 @@ tokens, temperature, and reasoning effort.
 
 ## Models & providers
 
-Both **Kilo Code**, **Kios API**, and **OpenCode Zen** are available. The default model is
-Union Alpha; saved selections of removed models fall back to it. Custom
-providers and `models.json` loading are no longer supported.
+**Kilo Code is the only configured provider.** The default model is Kilo's
+`kilo-auto/free` route. It is intended to work after installation without
+setting an API key: Kilo documents anonymous use for free models, with an
+anonymous limit of **200 requests per hour per IP address**. This is a provider
+limit—not an unlimited quota—and free model availability/capabilities can
+change. FullAgent waits and retries on HTTP 429 responses instead of giving up
+after a small fixed number of attempts; press `Ctrl+C` to cancel the wait.
 
-- Kilo — Base URL: `https://api.kilo.ai/api/gateway`; context window
-  262,144 tokens; maximum completion 131,072 tokens; tool calling
-  supported; reasoning parameters omitted
-- Kios — Base URL: `https://kiosapi.com/v1`; model `atria-dawn-preview`
-  (OpenAI-compatible chat + tool calling)
-- OpenCode — Base URL: `https://opencode.ai/zen/v1`; model `space-bunny-free`
-  (OpenAI-compatible chat + tool calling)
+An optional Kilo Gateway API key can be supplied as `KILO_API_KEY` or stored in
+`~/.fullagent/kilo_api_key` (keep the file private). The environment variable
+takes precedence. Kilo may apply account, model, balance, or other rate limits
+even when a key is configured; the app cannot remove limits enforced by Kilo.
+No credentials are bundled in the source or binary. Saved selections of other
+providers/models fall back to `kilo-auto/free`.
 
+| Provider | Base URL | Default model | Key required by default? |
+|---|---|---|---|
+| Kilo Code | `https://api.kilo.ai/api/gateway` | `kilo-auto/free` | No (free anonymous route) |
 
-No API keys are embedded in source. Configure a key before starting:
-
-export KIOS_API_KEY='your-kios-api-key'
-python main.py
-```
-
-| Provider | Base URL | Model |
-|---|---|---|
-| Kilo Code | `https://api.kilo.ai/api/gateway` | `stealth/union-alpha` |
-| Kios API | `https://kiosapi.com/v1` | `atria-dawn-preview` |
-| OpenCode Zen | `https://opencode.ai/zen/v1` | `space-bunny-free` |
-
-`/models list` shows all models; `/model` or Ctrl+T opens the selector.
-The turn always runs on your selected model; failover happens only on a
-provider outage (see `/health`).
-Save the key instead in `~/.fullagent/kilo_api_key` or
-`~/.fullagent/kios_api_key` (permissions `600`); env vars take precedence.
-Keep keys outside the repository. Previously embedded credentials may remain
-in git history and should be rotated; removing them from current source does
-not revoke them.
+`/models list` shows configured models; `/model` or Ctrl+T opens the selector.
+The turn stays on its selected model during an outage; no automatic provider
+or model failover is performed.
 
 Config (model, effort, auto-approve) persists in
 `~/.fullagent/config.json`; sessions save to `~/.fullagent/sessions/`.
@@ -292,8 +294,7 @@ fullagent/
   memory.py        episodic memory + dead-end ledger (fold-derived)
   goal.py          goal contracts with machine-checkable done-criteria
   judge.py         deterministic verification predicates (no LLM judging)
-  team.py          shared subagent substrate — roles, reports, retry, global write lock
-  crew.py          persistent Codex-style subagents — serial execution, one at a time
+  roles.py         role capability catalog for deterministic planning
   workflows.py     saved multi-step pipelines — phased orchestration (serial steps)
   autopilot.py     self-routing: auto goal mode / real-time web
   router.py        task classification and routing through Union Alpha
@@ -316,7 +317,7 @@ fullagent/
 The event log lives at `~/.fullagent/eventlog.jsonl` (override the directory
 with `FULLAGENT_HOME`). Each module ships a self-test:
 `python -m fullagent.kernel` (and `.memory`, `.goal`, `.judge`,
-`.team`, `.crew`, `.autopilot`, `.systemprompt`, `.mastermind`, `.router`,
+`.roles`, `.autopilot`, `.systemprompt`, `.mastermind`, `.router`,
 `.semantic`, `.speculate`, `.dashboard`, `.daemon`, `.healer`, `.skills`,
 `.council`, `.taint`, `.kgraph`, `.cov`, `.fuzz`, `.mutate`).
 
@@ -329,7 +330,7 @@ Every system prompt the model ever sees lives in **`fullagent/systemprompt.py`**
 and nowhere else — the module imports it. Two structural guarantees:
 
 - **Single source of truth.** Edit a prompt in `systemprompt.py` and it
-  changes everywhere at once — main agent and all worker roles.
+  changes wherever the main agent requests are built.
 - **One delivery path.** Every message list is built through
   `systemprompt.with_system()`, which guarantees the correct prompt sits at
   position 0 before any request is sent. A model can never be called without
@@ -361,7 +362,7 @@ all deterministic Python:
 | Mechanism | What it does |
 |---|---|
 | **PromptVault** | Every prompt is sealed with a sha256 fingerprint and recorded in the event log. The vault is the only source a model ever reads a prompt from; prompts registered at runtime are sealed on demand, and a changed prompt is re-sealed — no stale copy is ever served. |
-| **PromptGate** | The single door to the model. Every request (main agent, scout, worker) passes `gate.dispatch()`, which guarantees `messages[0]` carries the sealed prompt byte-for-byte at the front, re-seats it if anything shadowed or corrupted it (an integrity restore — recorded, never punished), and seals a `prompt.dispatch` lineage event. There is no other way to reach the API. |
+| **PromptGate** | The single door to the model. Every main-agent request passes `gate.dispatch()`, which guarantees `messages[0]` carries the sealed prompt byte-for-byte at the front, re-seats it if anything shadowed or corrupted it (an integrity restore — recorded, never punished), and seals a `prompt.dispatch` lineage event. There is no other way to reach the API. |
 | **CoherenceComposer** | Live context (constitution, goal, web mode, memory) is never appended as raw text that could compete with the prompt. It is composed beneath the sealed prompt as one coherent document: each section is framed as *input to* the prompt, provenance-tagged, ordered by authority, deduplicated. The prompt stays the only voice giving direction. |
 
 There is no enforcement layer — the system observes and records
@@ -380,7 +381,7 @@ from the log.
 | **router.py** | A deterministic difficulty classifier scores each task and records routing decisions. This build routes all tasks to Union Alpha; no alternate models or cost-saving switches are available. | `/router` |
 | **semantic.py** | Hippocampus 2.0. Every episode, fact and dead-end is embedded via signed feature hashing (stdlib only, no numpy) and recalled by cosine similarity — "how did we solve a similar problem before?", including remembering what *failed*. The index is a pure projection of the log and refreshes itself. Recall is injected into the memory context section each turn. | `/recall <q>` |
 | **speculate.py** | While the model thinks, the agent predicts the read-only calls it will likely make (paths in your message, search verbs, siblings of recent reads) and prefetches them in a background pool. When the model actually asks, the result is served from cache — a hit instead of an execution. Only whitelisted read-only tools can ever be prefetched; a speculative write is structurally impossible. | `/spec` |
-| **dashboard.py** | The X-ray: cost, tokens, goal progress bar, crew reports, routing spend, speculation hit-rate, memory counts, verdicts, loop alerts and budget events — one screen, always agreeing with the kernel because it is a fold. | `/dashboard` |
+| **dashboard.py** | The X-ray: cost, tokens, goal progress bar, council activity, routing spend, speculation hit-rate, memory counts, verdicts, loop alerts and budget events — one screen, always agreeing with the kernel because it is a fold. | `/dashboard` |
 | **daemon.py** | Mission Control. A mission is a queue of steps advanced one tick at a time; every tick checkpoints, so a restart resumes from the last checkpoint (at most one in-flight tick is lost). A step that exhausts its retries BLOCKS the mission visibly — never silently skipped. Wake conditions are deterministic fold predicates. | `/mission` |
 | **healer.py** | When a tool fails, the healer captures the error, classifies it against a root-cause taxonomy (16 patterns; unknown is honest, never guessed), and seals the lesson. With a fixer + recheck attached it runs the full loop: fix → re-run the original check → only a green re-run counts as healed. Every tool error in the agent loop is captured automatically. | `/heal` |
 | **skills.py** | The self-evolving tool author. A new skill (Python function) passes four gates before it can run: parse → shape (entry fn + docstring) → safety (AST scan: no subprocess/eval/exec/forbidden imports/dunder access/globals) → its own shipped test cases. Passing skills persist to `~/.fullagent/skills/` and register as live tools; failures are sealed with the exact reason. | `/skills` |

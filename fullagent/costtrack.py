@@ -41,15 +41,7 @@ _FILENAME_RE = re.compile(r"[^A-Za-z0-9_.-]")
 # pricing — "pricing unknown" is reported in that case (see
 # :func:`cost_of`).
 PRICING: Dict[str, tuple[float, float]] = {
-    # kios provider (approximate public prices, may be stale)
-    "step-5-preview-free": (0.0, 0.0),      # free tier — no charge
-    "ling-3.1-flash": (0.6, 1.2),          # approx: cheap flash-class model
-    "glyph-cluster": (2.0, 6.0),           # approx: mid-tier cluster model
-    "atria-dawn-preview": (1.0, 3.0),       # approx: preview pricing
-    # opencode provider (approximate public prices, may be stale)
-    "space-bunny-free": (0.0, 0.0),        # free tier — no charge
-    # kilo (union-alpha ships with kilo, a paid provider; approx list price)
-    "stealth/union-alpha": (3.0, 15.0),    # approx: kilo union-class pricing
+    "kilo-auto/free": (0.0, 0.0),          # Kilo free-model route
 }
 
 USAGE = "usage:\n  /cost        show session token usage and estimated cost\n  /cost reset  clear this session's counters"
@@ -290,13 +282,11 @@ def _selftest() -> int:
         if not cond:
             failures.append(name)
 
-    # 1. pricing math on known values
-    #    ling-3.1-flash is (0.6 in / 1.2 out per 1M):
-    #    500_000 in + 250_000 out -> 0.30 + 0.30 = 0.60
+    # 1. known free-route pricing
     check("known pricing math",
-          abs(cost_of("ling-3.1-flash", 500_000, 250_000) - 0.60) < 1e-9)
-    check("pricing_for known", pricing_for("glyph-cluster") == (2.0, 6.0))
-    check("is_pricing_known true", is_pricing_known("space-bunny-free"))
+          cost_of("kilo-auto/free", 500_000, 250_000) == 0.0)
+    check("pricing_for known", pricing_for("kilo-auto/free") == (0.0, 0.0))
+    check("is_pricing_known true", is_pricing_known("kilo-auto/free"))
 
     # 2. unknown model handling
     check("unknown -> (0,0)", pricing_for("nope/mystery-9") == (0.0, 0.0))
@@ -309,19 +299,19 @@ def _selftest() -> int:
     check("register attaches tracker",
           isinstance(getattr(agent, "cost_tracker", None), CostTracker))
     t = agent.cost_tracker
-    t.add_turn("ling-3.1-flash", 500_000, 250_000)   # $0.60
-    t.add_turn("ling-3.1-flash", 500_000, 250_000)   # $0.60
+    t.add_turn("kilo-auto/free", 500_000, 250_000)
+    t.add_turn("kilo-auto/free", 500_000, 250_000)
     t.add_turn("nope/mystery-9", 1_000_000, 0)        # $0.00, unknown pricing
     tot = t.totals()
     check("totals turns", tot["turns"] == 3)
     check("totals in", tot["in_tokens"] == 2_000_000)
     check("totals out", tot["out_tokens"] == 500_000)
-    check("totals cost", abs(tot["cost_usd"] - 1.20) < 1e-9)
+    check("totals cost", tot["cost_usd"] == 0.0)
     check("breakdown two models", len(tot["by_model"]) == 2)
     check("breakdown flags unknown",
           not tot["by_model"]["nope/mystery-9"]["pricing_known"])
     check("breakdown flags known",
-          tot["by_model"]["ling-3.1-flash"]["pricing_known"])
+          tot["by_model"]["kilo-auto/free"]["pricing_known"])
 
     # 4. persistence round-trip with the temp dir
     path = os.path.join(tmp, "cost-selftest.json")
@@ -329,7 +319,7 @@ def _selftest() -> int:
     again = CostTracker("cost-selftest")
     tot2 = again.totals()
     check("reload totals match", tot2["turns"] == 3 and
-          abs(tot2["cost_usd"] - 1.20) < 1e-9)
+          tot2["cost_usd"] == 0.0)
 
     # 5. reset
     t.reset()
@@ -355,13 +345,13 @@ def _selftest() -> int:
         def print_error(self, s):
             self.errs.append(s)
 
-    t.add_turn("ling-3.1-flash", 1_000_000, 0)
-    t.add_turn("space-bunny-free", 100, 200)
+    t.add_turn("kilo-auto/free", 1_000_000, 0)
+    t.add_turn("nope/mystery-9", 100, 200)
     ui = FakeUI(agent)
     handle_cost(ui, "")
     panel = "\n".join(ui.out)
     check("handler turns line", "turns:" in panel and "2" in panel)
-    check("handler estimated $", "estimated:" in panel and "$0.60" in panel)
+    check("handler estimated $", "estimated:" in panel and "$0.00" in panel)
     check("handler per-model breakdown", "by model:" in panel)
     check("handler unknown note",
           "pricing unknown" in panel or "nope/mystery-9" not in panel)

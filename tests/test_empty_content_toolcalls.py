@@ -1,6 +1,6 @@
 """Empty-content + tool_calls test battery (sprint worker 16/20).
 
-Some strict OpenAI-compatible providers (kios, opencode zen, kilo)
+Some strict OpenAI-compatible gateways
 reject assistant turns that carry tool_calls with empty/null content:
   - content:null  -> 400 "expected a string, got null"
   - content:""    -> 400 "text content blocks must be non-empty"
@@ -64,7 +64,7 @@ def _hist(assistant_msg):
 
 
 def _model():
-    return _client.Model(id="step-5-preview-free", provider="kios",
+    return _client.Model(id="kilo-auto/free", provider="kilo",
                          label="t")
 
 

@@ -2,7 +2,7 @@
 
 The whole system is already event-sourced; the dashboard is simply the
 X-ray: a real-time projection of the ledger into one screen — cost,
-tokens, goal progress, active sub-agents, routing savings, speculation
+tokens, goal progress, council activity, routing savings, speculation
 hit-rate, dead-ends, verdicts, loop alerts, and the live event stream.
 
 Design (pure Python, stdlib only):
@@ -16,7 +16,6 @@ Design (pure Python, stdlib only):
 
 from __future__ import annotations
 
-import time
 
 from .kernel import EventLog, fold
 from ._foundation import get_logger
@@ -24,7 +23,7 @@ from ._foundation import get_logger
 _log = get_logger("dashboard")
 
 # panels the dashboard renders, in display order
-PANELS = ("cost", "goal", "agents", "router", "speculator", "memory",
+PANELS = ("cost", "goal", "councils", "router", "speculator", "memory",
           "health", "engineering", "stream")
 
 
@@ -46,159 +45,8 @@ def _safe_int(v, default: int = 0) -> int:
 
 
 def _copy_snapshot(s: dict) -> dict:
-    """Defensive copy of a snapshot for callers. The top-level dict copy
-    is not enough: the crew_agents row list/dicts are mutable, and the
-    old shallow copy let a caller corrupt the cached entry (rows edited
-    in place would persist across renders until the log head moved)."""
-    out = dict(s)
-    agents = out.get("crew_agents")
-    if isinstance(agents, list):
-        out["crew_agents"] = [dict(a) for a in agents]
-    return out
-
-
-def _fold_crew_agents(log) -> list[dict]:
-    """Fold crew.* events into per-agent display rows.
-
-    Pure fold over the event log (no state kept): spawn order is stable,
-    running agents show step/elapsed, completed ones collapse to one line.
-    Defensive — handles crew.done without a prior crew.spawn, non-dict
-    event payloads, and explicit null ids (no "None" ghost agents).
-    Mirrors the crew.py lifecycle: crew.message (follow-up send)
-    resurrects a settled agent back to running, crew.resumed restores
-    its terminal state, and crew.closed retires only the named agent
-    (unlike crew.force_stop, which stops the whole roster).
-    """
-    agents: dict[str, dict] = {}
-    order: list[str] = []
-    for ev in log.events():
-        # Hardened: an event object missing .type/.data (a legacy
-        # duck-typed entry, a mock, a corrupted row) must not kill the
-        # fold with AttributeError — coerce, never index directly.
-        t = getattr(ev, "type", "") or ""
-        raw = getattr(ev, "data", None)
-        d = raw if isinstance(raw, dict) else {}
-        if t == "crew.spawn":
-            aid = str(d.get("id") or "")
-            if aid and aid not in agents:
-                agents[aid] = {
-                    "id": aid,
-                    "name": str(d.get("nickname") or aid),
-                    "role": str(d.get("role") or ""),
-                    "task": str(d.get("task") or ""),
-                    "status": "running",
-                    "step": 0,
-                    "spawn_ts": getattr(ev, "ts", 0.0) or 0.0,
-                    "elapsed_ms": 0,
-                    "error": "",
-                    "had_error": False,
-                    "files": 0,
-                }
-                order.append(aid)
-        elif t == "crew.progress":
-            aid = str(d.get("id") or "")
-            st = agents.get(aid)
-            if st is not None and st["status"] == "running":
-                try:
-                    st["step"] = int(d.get("step", st["step"]))
-                except (TypeError, ValueError):
-                    pass
-        elif t == "crew.done":
-            aid = str(d.get("id") or "")
-            st = agents.get(aid)
-            if st is None and aid:
-                st = {"id": aid,
-                      "name": str(d.get("nickname") or aid),
-                      "role": str(d.get("role") or ""),
-                      "task": str(d.get("task") or ""),
-                      "status": "running", "step": 0,
-                      "spawn_ts": 0.0, "elapsed_ms": 0,
-                      "error": "", "had_error": False, "files": 0}
-                agents[aid] = st
-                order.append(aid)
-            if st is not None and st["status"] == "running":
-                err = str(d.get("error") or "")
-                state = str(d.get("state") or "")
-                # crew.py seals state="blocked" for agents that finished
-                # without a verdict — not an error, but not "done" either
-                if err:
-                    st["status"] = "error"
-                elif state == "blocked":
-                    st["status"] = "blocked"
-                else:
-                    st["status"] = "done"
-                st["error"] = err[:80]
-                st["had_error"] = bool(err)
-                try:
-                    st["elapsed_ms"] = int(d.get("elapsed_ms") or 0)
-                except (TypeError, ValueError):
-                    pass
-                files = d.get("files_touched") or []
-                st["files"] = len(files) if isinstance(files, list) else 0
-        elif t == "crew.message":
-            # crew.send() to a settled agent resubmits it — the agent is
-            # running again with a cleared error. Without this the row
-            # would stay frozen on its old terminal state forever.
-            aid = str(d.get("id") or "")
-            st = agents.get(aid)
-            if st is not None and st["status"] != "running":
-                st["status"] = "running"
-                st["step"] = 0
-                st["error"] = ""
-                st["had_error"] = False
-                st["spawn_ts"] = getattr(ev, "ts", 0.0) or 0.0
-        elif t == "crew.resumed":
-            # crew.resume() restores done/error from the agent's error
-            # field — mirror it via had_error so the row leaves
-            # "stopped" instead of sticking there forever
-            aid = str(d.get("id") or "")
-            st = agents.get(aid)
-            if st is not None and st["status"] != "running":
-                st["status"] = "error" if st.get("had_error") else "done"
-        elif t == "crew.closed":
-            # crew.closed carries ONE agent id (unlike crew.force_stop,
-            # which is roster-wide). Retiring one agent must not flip
-            # every other running agent to stopped. Only a running agent
-            # is affected — closing an already-finished one keeps its
-            # terminal state.
-            aid = str(d.get("id") or "")
-            st = agents.get(aid)
-            if st is not None and st["status"] == "running":
-                st["status"] = "stopped"
-                st["error"] = "closed"
-        elif t == "crew.force_stop":
-            for aid in order:
-                st = agents[aid]
-                if st["status"] == "running":
-                    st["status"] = "stopped"
-                    st["error"] = "stopped"
-    import time as _time
-    now = _time.time()
-    out: list[dict] = []
-    for aid in order:
-        st = agents[aid]
-        if st["status"] == "running":
-            if st["spawn_ts"]:
-                secs = max(0, int(now - st["spawn_ts"]))
-            else:
-                secs = 0
-            step_bit = f" step {st['step']}" if st["step"] else ""
-            task = " ".join(st["task"].split())[:50]
-            row = (f"\u25cb {st['name']} \u00b7 {st['role']} {task}"
-                   f"{step_bit} \u00b7 {secs}s")
-        elif st["status"] == "done":
-            secs = st["elapsed_ms"] / 1000.0 if st["elapsed_ms"] else 0
-            row = (f"\u2713 {st['name']} \u00b7 done in {secs:.0f}s"
-                   + (f" \u00b7 {st['files']} files" if st["files"] else ""))
-        elif st["status"] == "error":
-            row = f"\u2717 {st['name']} \u00b7 {st['error'][:60]}"
-        elif st["status"] == "blocked":
-            row = (f"\u25d0 {st['name']} \u00b7 blocked"
-                   + (f" \u00b7 {st['error'][:60]}" if st["error"] else ""))
-        else:
-            row = f"\u25a0 {st['name']} \u00b7 {st['error'][:60]}"
-        out.append({"id": aid, "status": st["status"], "row": row})
-    return out
+    """Return an isolated snapshot for callers."""
+    return dict(s)
 
 
 class Dashboard:
@@ -206,10 +54,7 @@ class Dashboard:
 
     def __init__(self, log: EventLog) -> None:
         self.log = log
-        # SPEED: snapshot() folds the log plus a full event walk for the
-        # crew count. The fold itself is incrementally cached, but the
-        # walk is O(N) per call — cache the whole snapshot keyed by the
-        # log head so repeated renders (polling tickers) are O(1).
+        # Cache the snapshot by log head so repeated renders are O(1).
         self._snap_cache: dict | None = None
         self._snap_head: int = -2
 
@@ -220,9 +65,7 @@ class Dashboard:
         if self._snap_cache is not None and self._snap_head == head:
             # Log unchanged since the last snapshot — the fold cache and
             # every count below would recompute identically. Return a
-            # defensive copy so callers can't corrupt the cached entry
-            # (the top-level copy alone would still share the mutable
-            # crew_agents rows).
+            # defensive copy so callers can't corrupt the cached entry.
             return _copy_snapshot(self._snap_cache)
         s = self._snapshot_uncached()
         self._snap_cache = s
@@ -234,10 +77,6 @@ class Dashboard:
         goal = st.goal
         proven = len(st.goal_done)
         clauses = len(goal.get("clauses") or []) if goal else 0
-
-        # sub-agent activity from the crew roster
-        crew_done = sum(1 for e in self.log.events()
-                        if e.type == "crew.done")
 
         # routing + speculation dividends
         routed = len(st.router_decisions)
@@ -278,14 +117,8 @@ class Dashboard:
         mut_last = (_safe_float(_mut_score)
                     if _mut_score is not None else None)
 
-        # parallel agents detail: per-agent rows from crew.* events.
-        # Fold is O(crew events) and runs once per log-head change thanks
-        # to the snapshot cache above.
-        crew_agents = _fold_crew_agents(self.log)
-
         return {
             "head_seq": st.head_seq,
-            "crew_agents": crew_agents,
             "cost_usd": st.cost_usd,
             "tokens_in": st.tokens_in,
             "tokens_out": st.tokens_out,
@@ -297,7 +130,6 @@ class Dashboard:
             "goal_statement": (goal or {}).get("statement", ""),
             "clauses_proven": proven,
             "clauses_total": clauses,
-            "crew_done": crew_done,
             "routed": routed,
             "routed_cost": round(routed_cost, 4),
             "spec_prefetched": prefetched,
@@ -349,14 +181,8 @@ class Dashboard:
         else:
             lines.append(" GOAL   none active")
 
-        # agents panel: per-agent rows (running with spinner step,
-        # completed collapsed to one line each)
-        agents = s.get("crew_agents") or []
-        running = sum(1 for a in agents if a["status"] == "running")
-        lines.append(f" AGENTS {running} running / {len(agents)} total   "
-                     f"crew done {s['crew_done']}   councils {s['councils']}")
-        for a in agents[:8]:  # cap: dashboard is a summary, not a ledger
-            lines.append(f"   {a['row']}")
+        # reasoning panel
+        lines.append(f" COUNCILS {s['councils']} verdicts")
 
         # router panel
         lines.append(f" ROUTER {s['routed']} routed   "
@@ -493,7 +319,7 @@ if __name__ == "__main__":
         log.append("goal.set", {"statement": "fix parser",
                                 "clauses": [{"id": "C1"}, {"id": "C2"}]})
         log.append("goal.clause.done", {"clause": "C1"})
-        log.append("router.decision", {"model": "stealth/union-alpha",
+        log.append("router.decision", {"model": "kilo-auto/free",
                                        "est_cost": 0.0})
         log.append("spec.prefetch", {"tool": "read_file"})
         log.append("spec.hit", {"tool": "read_file"})

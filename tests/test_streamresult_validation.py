@@ -1,6 +1,6 @@
-"""StreamResult field-type validation tests (deep crew audit, worker 2/20).
+"""StreamResult field-type validation tests (provider-boundary validation).
 
-The user reported subagents dying with
+Malformed provider data previously caused
 `AttributeError: 'str' object has no attribute ...`.
 
 StreamResult (fullagent/client.py) is the provider result container with

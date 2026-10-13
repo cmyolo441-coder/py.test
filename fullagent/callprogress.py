@@ -159,7 +159,7 @@ if __name__ == "__main__":
     _check("ignores-others",
            format_status("thinking") is None
            and format_status("tool:read_file") is None
-           and format_status("running:crew") is None
+           and format_status("running:background") is None
            and format_status("progress:broken") is None
            and format_status("progress:x:25:1:read_file:p") is None)
 
