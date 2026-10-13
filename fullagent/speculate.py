@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import re
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from .kernel import EventLog, fold
 from ._foundation import get_logger
@@ -245,10 +245,6 @@ class Speculator:
         return entry.result
 
     # -- housekeeping ------------------------------------------------------------
-
-    def _expire(self) -> None:
-        with self._lock:
-            self._expire_locked()
 
     def _expire_locked(self) -> None:
         """Evict stale entries. Caller must hold self._lock (lets

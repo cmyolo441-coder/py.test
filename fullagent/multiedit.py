@@ -102,20 +102,6 @@ _PARAMETERS = {
 _LARGE_FILE_LINES = 500
 
 
-def _locate_region(text: str, old: str, start_line=None, end_line=None):
-    """Return the 1-based (start_line, end_line) span of `old` in `text`,
-    or None when it does not match. Resolved through the fallback chain
-    (find_edit_span), so the reported region is the region the edit will
-    actually replace -- including whitespace-normalized and line-anchored
-    matches, not just exact ones."""
-    res = find_edit_span(text, old, start_line, end_line)
-    if not res["ok"]:
-        return None
-    start = text.count("\n", 0, res["start"]) + 1
-    end = text.count("\n", 0, max(res["end"] - 1, 0)) + 1
-    return start, end
-
-
 def _locate_fuzzy_region(text: str, start: int, end: int):
     """Return the 1-based (start_line, end_line) span of a fuzzy match
     from its character offsets into `text` (the fuzzy matcher's winning

@@ -705,6 +705,11 @@ class Agent:
         self._turn_user_text = ""
         self._reseat_system_prompt()
         self.turns = []
+        # focus stall/done detection reads _focus_history — stale ticks
+        # from a previous focus session (e.g. after /focus off mid-run)
+        # would misfire in the next one, so a reset starts it empty
+        # (resume_session and focus.stop already clear it on their paths)
+        self._focus_history.clear()
         self.session_id = uuid.uuid4().hex[:8]
         self.log.session = self.session_id
         self.log.append("session.start", {"session_id": self.session_id,
@@ -1095,8 +1100,14 @@ class Agent:
                         on_tool_call(ev)
                         pending.append((tc, ev))
 
-                    def _finish_one(tc, ev) -> None:
-                        """Per-call bookkeeping in model-emitted order."""
+                    def _finish_one(tc, ev) -> bool:
+                        """Per-call bookkeeping in model-emitted order.
+
+                        Returns True when a guardrail (adaptive cap,
+                        retry-loop detector, stall guard) stopped the turn
+                        — dispatch_block then stops the walk early instead
+                        of executing the rest of the block. A cap that fires
+                        on call 3 of 8 must not let calls 4-8 run anyway."""
                         nonlocal tool_calls_this_turn, _last_tool_sig
                         nonlocal _stall_count, turn_stopped
                         fn = tc["function"]
@@ -1172,7 +1183,11 @@ class Agent:
                                         "looping; rephrase or ask me to "
                                         "continue.")
                             else:
-                                _stall_count = 0
+                                # Count the current call as sighting #1, so
+                                # the guard fires on the 3rd identical
+                                # error in a row — matching its own message
+                                # and the retry-loop detector (both say 3).
+                                _stall_count = 1
                             _last_tool_sig = _sig
                         # earlyexit hook (Worker 10/20): cheap per-result
                         # novelty check. Never stops the turn — when the
@@ -1190,6 +1205,10 @@ class Agent:
                                     {"role": "system", "content": _ee_hint})
                         except Exception:
                             pass  # novelty is insight, never a crash path
+                        # dispatch_block stops the walk early when a
+                        # guardrail fired — the remaining calls in this
+                        # block must not execute.
+                        return turn_stopped
 
                     # Worker 9/20 — live per-call progress: each tool call
                     # emits one cheap on_status line
@@ -1213,6 +1232,45 @@ class Agent:
                         on_tool_output=on_tool_output,
                         hooks_enabled=getattr(self, "hooks_enabled", False))
                     if turn_stopped:
+                        # A guardrail (adaptive cap, retry-loop detector,
+                        # stall guard) fired mid-block: the rest of the
+                        # block never ran.
+                        # (1) Parallel-batch tail: calls that EXECUTED but
+                        # whose finish walk was cut short never got their
+                        # tool response appended — record the real results
+                        # so the transcript stays faithful.
+                        answered = {
+                            m.get("tool_call_id") for m in self.messages
+                            if m.get("role") == "tool"
+                            and m.get("tool_call_id")}
+                        for _tc, _ev in pending:
+                            _cid = _tc.get("id")
+                            if (_cid and _cid not in answered
+                                    and _ev.status in ("done", "error")):
+                                self.messages.append(
+                                    {"role": "tool",
+                                     "tool_call_id": _cid,
+                                     "content": _ev.result})
+                                answered.add(_cid)
+                        # (2) Calls that never executed: mark them blocked
+                        # so the UI doesn't show them spinning forever,
+                        # then seal their pairing — an assistant tool_call
+                        # with no tool response would poison every later
+                        # model call with a pairing/invalid_request error.
+                        for _tc, _ev in pending:
+                            if _ev.status == "running":
+                                _ev.status = "blocked"
+                                _ev.result = (
+                                    "SKIPPED — turn stopped early: "
+                                    f"{turn.error}")
+                                try:
+                                    on_tool_update(_ev)
+                                except Exception:
+                                    pass
+                        self._seal_pending_tool_calls(
+                            "SKIPPED — the turn was stopped early by a "
+                            f"guardrail ({turn.error}); do not retry "
+                            "automatically.")
                         break
                     continue
 
@@ -1241,6 +1299,13 @@ class Agent:
             # status lines after this one died
             self._turn_status = None
             turn.error = str(e)
+            # Seal any assistant tool_call left without a response (e.g.
+            # a callback raising mid-dispatch): an orphaned tool_call
+            # poisons every later model call with a pairing /
+            # invalid_request error. No-op when nothing is pending.
+            self._seal_pending_tool_calls(
+                f"tool call never executed — the turn died with "
+                f"APIError: {e}")
             # only drop this turn's user prompt when nothing else was
             # appended after it (failed first complete). After tool calls,
             # popping would orphan an assistant tool_call and the next
@@ -2951,6 +3016,8 @@ class Agent:
                        role: str = "researcher", model_id: str = "") -> str:
             """Atomically launch up to eight parallel read-only specialists."""
             def start():
+                if not tasks:
+                    raise SubagentError("tasks must be a non-empty list")
                 workers = manager.spawn_many(
                     tasks, role=role, context=context, model_id=model_id,
                     allow_writes=False)
@@ -2966,6 +3033,8 @@ class Agent:
                              model_id: str = "") -> str:
             """Launch parallel coders, each restricted to confirmed paths."""
             def start():
+                if not tasks:
+                    raise SubagentError("tasks must be a non-empty list")
                 workers = manager.spawn_many(
                     tasks, role="coder", context=context,
                     model_id=model_id, allow_writes=True)

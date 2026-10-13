@@ -41,7 +41,7 @@ import subprocess
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .tools import RISK_CONFIRM, Tool
@@ -393,7 +393,6 @@ def _selftest() -> None:
     """Prove REAL detection: temp dir, real watch, real create/modify/
     delete, and a REAL action subprocess that writes a marker file the
     test then verifies (including the env vars)."""
-    import sys
     import tempfile
 
     def check(name: str, cond: bool, detail: str = "") -> None:

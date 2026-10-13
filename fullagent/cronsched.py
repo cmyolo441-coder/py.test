@@ -18,7 +18,6 @@ for every enabled cron relative to now.
 
 from __future__ import annotations
 
-import re
 import sqlite3
 import subprocess
 import threading

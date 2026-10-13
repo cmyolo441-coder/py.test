@@ -211,8 +211,8 @@ def _selftest() -> int:
 
     # 2. full agent: all optional modules present
     class FakeModel:
-        id = "kilo-auto/free"
-        provider = "kilo"
+        id = "step-5-preview-free"
+        provider = "kios"
         context_window = 128000
 
     class FakeTodoManager:
@@ -233,8 +233,8 @@ def _selftest() -> int:
                            permissions=FakePerms())
     register(full)
     info2 = full.status_info()
-    check("full model id", info2["model"] == "kilo-auto/free")
-    check("full provider", info2["provider"] == "kilo")
+    check("full model id", info2["model"] == "step-5-preview-free")
+    check("full provider", info2["provider"] == "kios")
     check("full session", info2["session_id"] == "abc12345")
     check("full todos 2/3", info2["todos_done"] == 2 and info2["todos_total"] == 3)
     check("full background defaults empty", info2["background_tasks"] == 0)
@@ -258,7 +258,7 @@ def _selftest() -> int:
     handle_status(ui, "")
     panel = "\n".join(ui.out)
     check("handle prints version line", "version:" in panel)
-    check("handle prints model line", "kilo-auto/free (kilo)" in panel)
+    check("handle prints model line", "step-5-preview-free (kios)" in panel)
     check("handle prints context line", "context:" in panel)
     check("handle prints todos line", "todos:" in panel)
     check("handle prints perms line", "perms:      plan" in panel)

@@ -202,7 +202,6 @@ def register(agent: Any) -> None:
 if __name__ == "__main__":
     import sys
     import tempfile
-    from dataclasses import replace as _dc_replace
     from pathlib import Path
 
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))

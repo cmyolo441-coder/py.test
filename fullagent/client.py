@@ -29,7 +29,7 @@ class _LazyRequests:
 requests = _LazyRequests()  # type: ignore[assignment]
 
 from . import config
-from ._foundation import get_logger, NetworkError
+from ._foundation import get_logger
 from .config import Effort, Model, Provider
 # TurnCancelled lives in .cancelguard (a leaf module with no import
 # cycles); imported here so `from .client import TurnCancelled` keeps
@@ -114,14 +114,6 @@ def _timeouts(timeout: float) -> tuple[float, float]:
     return (min(CONNECT_TIMEOUT, timeout), timeout)
 
 
-def _sleep_capped(delay: float, deadline: float) -> None:
-    """Sleep for a retry backoff, but never past the call's deadline â
-    the budget belongs to the request, not to the wait between attempts."""
-    remaining = deadline - time.monotonic()
-    if remaining > 0:
-        time.sleep(min(delay, remaining))
-
-
 def _sleep_capped_cancellable(delay: float, deadline: float,
                               should_cancel: Callable[[], bool] | None) -> None:
     """Retry backoff that honours Esc/Ctrl+C AND never sleeps past the
@@ -180,7 +172,7 @@ def _wait_for_rate_limit(error: APIError, attempt: int,
     delay = _rate_limit_delay(error, attempt)
     if on_status:
         try:
-            on_status(f"Kilo rate limit reached (429); retrying in "
+            on_status(f"Rate limit reached (429); retrying in "
                       f"{delay:.0f}s (Ctrl+C to cancel)")
         except Exception:
             pass
@@ -212,8 +204,8 @@ def prewarm_connection(provider) -> None:
     cost. Runs in a background thread — never blocks the UI. The connection
     sits in the pool ready for the first real request. Warmups for the same
     provider within the TTL are skipped (no redundant API calls)."""
-    if provider.key == "kilo" and not provider.api_key:
-        return  # do not spend anonymous free-route requests on /models warmup
+    if not provider.api_key:
+        return  # do not spend requests on /models warmup without a key
     def _warm():
         key = provider.base_url
         now = time.monotonic()
@@ -1416,11 +1408,6 @@ def _prompt_payload_text(messages: list[dict],
         return str(messages) + str(tools or [])
 
 
-def _prompt_chars(messages: list[dict], tools: list[dict] | None) -> int:
-    """Character count of exactly what we send as the prompt."""
-    return len(_prompt_payload_text(messages, tools))
-
-
 # Safety headroom between the estimated input and the window. Scales with
 # input size: the bigger the prompt, the bigger the absolute tokenizer
 # error can be, so the margin grows instead of staying a fixed constant.
@@ -1481,7 +1468,7 @@ def _window_max_tokens(model: Model, effort: Effort, messages: list[dict],
 # own hard ceiling. Clamp at send time so the request is never rejected for
 # an oversized max_tokens; providers without a known cap pass through.
 _MAX_TOKENS_CAP: dict[str, int] = {
-    "kilo": 131_072,
+    "kios": 131_072,
 }
 
 
@@ -1757,11 +1744,26 @@ def _with_error_type(msg: str, err: dict) -> str:
     return msg
 
 
-def _extract_error_message(body: str) -> str:
+def _extract_error_message(body: str, status: int | None = None) -> str:
+    """Best-effort human-readable message from an error response body.
+
+    `status` feeds the last-resort fallback: a blank/whitespace-only body
+    used to produce a BLANK APIError message, and agent.py displays
+    str(error) with no status attached — the user got an empty error box
+    with no hint that e.g. a 503 had happened. Never raises.
+    """
+    def _blank_fallback() -> str:
+        if status is not None:
+            return (f"provider returned HTTP {status} with an empty "
+                    f"error body")
+        return "provider returned an empty error body"
+
     try:
         obj = json.loads(body)
     except ValueError:
-        return body[:500]
+        if body.strip():
+            return body[:500]
+        return _blank_fallback()
     if not isinstance(obj, dict):
         # valid JSON but not an object (array/string/number) — no shape to dig
         return body[:500]
@@ -1987,11 +1989,9 @@ def shrink_tool_outputs(messages: list[dict], keep: int = 1,
 
 
 def _check_api_key(provider: Provider, model: Model | None = None) -> None:
-    """Require credentials except for Kilo's documented anonymous free route."""
+    """Require credentials. Kios ships an embedded key (zero-config), so
+    this only fires if the user explicitly cleared it."""
     if not provider.api_key:
-        if (provider.key == "kilo" and model is not None
-                and model.id == "kilo-auto/free"):
-            return
         env_name = f"{provider.key.upper()}_API_KEY"
         raise APIError(
             f"no API key configured for {provider.name}. Set the "
@@ -2332,7 +2332,7 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
             body = r.text
             retry_after = _parse_retry_after(r.headers.get("Retry-After"))
             r.close()  # release the pooled connection on the error path
-            raise APIError(_extract_error_message(body),
+            raise APIError(_extract_error_message(body, r.status_code),
                            status=r.status_code, retry_after=retry_after)
         return r
     resp = run_cancellable(_send, should_cancel, name="model request")
@@ -2822,7 +2822,7 @@ def _post_blocking(url: str, headers: dict, payload: dict,
                                        name="error body")
                 retry_after = _parse_retry_after(
                     resp.headers.get("Retry-After"))
-                raise APIError(_extract_error_message(body),
+                raise APIError(_extract_error_message(body, resp.status_code),
                                status=resp.status_code,
                                retry_after=retry_after)
             try:
@@ -3281,8 +3281,8 @@ if __name__ == "__main__":
             check(f"weird {weird!r} no crash ({e})", False)
 
     # -- 9. per-model window table ----------------------------------------------
-    check("Kilo Auto Free window is 262144",
-          config.model_context_window("kilo-auto/free") == 262_144)
+    check("Step 5 Preview Free window is 262144",
+          config.model_context_window("step-5-preview-free") == 262_144)
     check("unknown model defaults to 128k",
           config.model_context_window("nope-xyz") == 128_000)
     check("every shipped model has a sane window",
@@ -3291,7 +3291,7 @@ if __name__ == "__main__":
           all(m.id in config.MODEL_CONTEXT_WINDOWS for m in config.MODELS))
 
     # -- 10. pre-check: prune FIRST, never send a doomed request ------------------
-    _tiny = Model(id="selftest-tiny", provider="kilo", label="Tiny",
+    _tiny = Model(id="selftest-tiny", provider="kios", label="Tiny",
                   context_window=8_000)
     _eff = Effort(key="t", label="T", color="", max_tokens=1_000,
                   temperature=0.0, reasoning_effort=None, description="")

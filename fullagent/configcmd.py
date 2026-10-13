@@ -350,7 +350,7 @@ def _selftest() -> None:
         assert cfg.set("thinking_visible", "no") is False
         assert cfg.set("output_style", "detailed") == "detailed"
         assert cfg.set("theme", "solarized") == "solarized"
-        assert cfg.set("default_model", "kilo-auto/free") == "kilo-auto/free"
+        assert cfg.set("default_model", "step-5-preview-free") == "step-5-preview-free"
 
         # validation: bad bool
         try:

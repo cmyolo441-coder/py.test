@@ -42,6 +42,12 @@ MAX_STEPS = 20
 DEFAULT_WORKERS = 4
 DEFAULT_ACTIVE_LIMIT = 8
 CALL_TIMEOUT = 120.0
+# Max seconds reset_session()/shutdown() wait for stop()ed workers to wind
+# down before giving up the drain. A cooperative worker finishes within one
+# cancel poll after stop_event is set; the bound only bites when a worker
+# ignores cancellation entirely (e.g. a stuck provider call), in which case
+# its pool thread is abandoned and reaps itself when the call returns.
+DRAIN_TIMEOUT = 5.0
 ACTIVE_STATES = frozenset({"queued", "running", "cancelling"})
 TERMINAL_STATES = frozenset({"done", "blocked", "error", "cancelled"})
 WRITE_TOOLS = frozenset({"write_file", "edit_file", "create_directory"})
@@ -402,16 +408,27 @@ class ParallelSubagents:
                     "parallel_batch": [x.id for x in created],
                 }, worker)
                 worker.spawn_event_id = str(getattr(ev, "id", "") or "")
-            for worker in created:
-                try:
+            submitted: list[str] = []
+            try:
+                for worker in created:
                     self._futures[worker.id] = self._pool.submit(
                         self._execute, worker)
-                except RuntimeError as exc:
+                    submitted.append(worker.id)
+            except RuntimeError as exc:
+                # The pool shut down mid-batch (shutdown raced the submit
+                # loop): every worker that never got a future must still
+                # reach a terminal state and emit subagent.done, or it would
+                # sit in "queued" forever, leak active capacity, and never
+                # be prunable.
+                stranded = [w for w in created if w.id not in submitted]
+                for worker in stranded:
                     worker.state = "error"
                     worker.error = f"could not schedule worker: {exc}"
                     worker.finished_at = time.time()
                     self._emit("subagent.done", worker.to_dict(), worker)
-                    raise SubagentError(worker.error) from exc
+                raise SubagentError(
+                    f"could not schedule {len(stranded)} worker(s): {exc}"
+                    ) from exc
             return created
 
     def get(self, worker_id: str) -> Subagent | None:
@@ -499,7 +516,11 @@ class ParallelSubagents:
         except (TypeError, ValueError):
             limit = 30.0
         with self._lock:
-            ids = ([str(x) for x in worker_ids] if worker_ids is not None
+            # Strip ids: get()/stop() already do, so a whitespace-padded id
+            # from the model must resolve here too instead of answering
+            # "missing" instantly and skipping the wait.
+            ids = ([str(x).strip() for x in worker_ids]
+                   if worker_ids is not None
                    else list(self._order))
             futures = [self._futures[x] for x in ids
                        if x in self._futures
@@ -507,6 +528,18 @@ class ParallelSubagents:
         deadline = time.monotonic() + limit
         while futures and time.monotonic() < deadline:
             if should_cancel is not None and should_cancel():
+                # Esc/Ctrl+C: stop exactly what we were waiting on so the
+                # workers do not keep burning model calls after this turn
+                # dies, then let the turn abort via TurnCancelled.
+                with self._lock:
+                    targets = [self._workers[aid] for aid in ids
+                               if aid in self._workers]
+                for worker in targets:
+                    if worker.state in ACTIVE_STATES:
+                        try:
+                            self.stop(worker.id)
+                        except SubagentError:
+                            pass
                 raise TurnCancelled()
             done, pending = concurrent.futures.wait(
                 futures, timeout=min(0.2, max(0.0, deadline - time.monotonic())),
@@ -522,8 +555,10 @@ class ParallelSubagents:
         """Cancel outgoing-session work, then discard its task view.
 
         Wait for every submitted future before returning so in-flight tools
-        finish before the host snapshots or switches sessions. Each worker's
-        events are also pinned to its spawn session in ``_emit``.
+        finish before the host snapshots or switches sessions. The wait is
+        bounded by DRAIN_TIMEOUT: a worker that ignores cancellation cannot
+        hang the session switch forever. Each worker's events are also
+        pinned to its spawn session in ``_emit``.
         """
         next_session = str(session_id or "")
         with self._lock:
@@ -541,7 +576,11 @@ class ParallelSubagents:
             with self._lock:
                 futures = list(self._futures.values())
             if futures:
-                concurrent.futures.wait(futures)
+                # Bounded drain: stop() set every worker's stop_event, so a
+                # cooperative worker finishes within one cancel poll. Never
+                # block a session switch on an uninterruptible worker; its
+                # pool thread reaps itself when the blocking call returns.
+                concurrent.futures.wait(futures, timeout=DRAIN_TIMEOUT)
             with self._lock:
                 self._workers.clear()
                 self._order.clear()
@@ -882,7 +921,7 @@ class ParallelSubagents:
                 "tokens_out": sum(row["tokens_out"] for row in workers),
             }
 
-    def shutdown(self, wait: bool = False) -> None:
+    def shutdown(self, wait: bool = True) -> None:
         with self._lock:
             self._closed = True
             for worker in self._workers.values():
@@ -896,7 +935,15 @@ class ParallelSubagents:
                         self._emit("subagent.cancelled", worker.to_dict(), worker)
                     else:
                         worker.state = "cancelling"
-        self._pool.shutdown(wait=wait, cancel_futures=True)
+            draining = list(self._futures.values()) if wait else []
+        if draining:
+            # Bounded drain: every active worker was stop()ed above, so a
+            # cooperative worker winds down within one cancel poll. Never
+            # hang teardown forever on a worker that ignores cancellation
+            # (e.g. a stuck provider call); its pool thread is abandoned and
+            # reaps itself when the call finally returns.
+            concurrent.futures.wait(draining, timeout=DRAIN_TIMEOUT)
+        self._pool.shutdown(wait=False, cancel_futures=True)
 
 
 def _scope_view(item: dict) -> Subagent:

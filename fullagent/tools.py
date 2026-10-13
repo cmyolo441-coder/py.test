@@ -20,7 +20,7 @@ from typing import Any, Callable
 
 from . import config
 from . import filestat  # Worker 8/20: mtime+size change detection
-from ._foundation import get_logger, ToolError, validate_path, content_hash
+from ._foundation import get_logger, validate_path
 from .cancelguard import TurnCancelled, run_cancellable
 
 _log = get_logger("tools")

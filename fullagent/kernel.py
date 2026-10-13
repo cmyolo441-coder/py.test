@@ -30,15 +30,14 @@ import hashlib
 import json
 import mmap
 import os
-import re
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
-from ._foundation import get_logger, KernelError, content_hash
+from ._foundation import get_logger
 
 _log = get_logger("kernel")
 

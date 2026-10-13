@@ -28,7 +28,7 @@ import urllib.request
 from importlib import metadata
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from .config import DEFAULT_MODEL_ID, PROVIDERS, _provider_api_key
+from .config import PROVIDERS, _provider_api_key
 
 CONNECT_TIMEOUT = 5.0  # seconds per connectivity probe
 DISK_WARN_BYTES = 1 * 1024 * 1024 * 1024  # warn when < 1 GB free
@@ -81,20 +81,16 @@ def _check_python_version() -> Dict[str, Any]:
 
 
 def _check_provider_keys() -> List[Dict[str, Any]]:
-    """One auth check per provider; Kilo's free model allows anonymous use.
+    """One auth check per provider.
 
     Uses the same lookup as the rest of the app
-    (env var > key file). Only presence is reported — key VALUES never appear.
+    (env var > key file > embedded fallback). Only presence is reported —
+    key VALUES never appear.
     """
     results = []
     for key in PROVIDERS:
         try:
             present = bool(_provider_api_key(key))
-            if key == "kilo" and not present and DEFAULT_MODEL_ID == "kilo-auto/free":
-                results.append(_result(
-                    f"api-key:{key}", True,
-                    "anonymous Kilo free model (rate limited by Kilo)"))
-                continue
         except Exception as exc:
             return [_result(f"api-key:{key}", False,
                             f"lookup failed: {type(exc).__name__}")]
@@ -244,10 +240,7 @@ def _selftest() -> None:
         names = {r["name"] for r in keyed}
         assert {f"api-key:{k}" for k in PROVIDERS} == names, names
         for r in keyed:
-            assert r["detail"] in (
-                "set", "missing",
-                "anonymous Kilo free model (rate limited by Kilo)",
-            ), r
+            assert r["detail"] in ("set", "missing"), r
             assert "secret" not in r["detail"], r
             assert "sk-test" not in r["detail"], r
     finally:

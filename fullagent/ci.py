@@ -278,7 +278,6 @@ if __name__ == "__main__":
         assert ci.streak_green == 1
 
         # a parser change runs its test: green
-        import os
         time.sleep(0.02)
         (root / "app" / "parser.py").write_text(
             "def parse(): return 42\n")

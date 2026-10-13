@@ -3,7 +3,7 @@ from __future__ import annotations
 
 SLASH_COMMANDS = [
     ("/model", "select model — PgUp/PgDn/Tab to navigate"),
-    ("/agents", "parallel crew dashboard — roles, detail, results, wait, stop"),
+    ("/agents", "parallel crew dashboard — roles, detail, results, wait, errors, stop"),
     ("/models", "list all models and providers"),
     ("/effort", "low · medium · high · extrahigh · ultrahigh"),
     ("/goal", "goal contract — set · prove · close · status · waive · clear"),

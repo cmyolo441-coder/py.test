@@ -22,7 +22,6 @@ Hard rules (mechanical):
 from __future__ import annotations
 
 import threading
-import time
 from dataclasses import dataclass, field
 
 from .kernel import EventLog, fold

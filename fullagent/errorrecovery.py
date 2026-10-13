@@ -328,7 +328,6 @@ def maybe_recover_invalid_request(err: BaseException,
 if __name__ == "__main__":
     import socket as _socket
     import threading as _threading
-    import time as _time
 
     from .client import APIError, Provider, chat_stream
     try:

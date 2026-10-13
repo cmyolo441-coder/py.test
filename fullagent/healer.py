@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from .kernel import EventLog, fold
 from ._foundation import get_logger

@@ -85,9 +85,10 @@ MAX_TOKENS = 200_000
 # otherwise. The backend can still teach a smaller window at runtime
 # (client.learn_context_window) — that only ever shrinks these.
 MODEL_CONTEXT_WINDOWS: dict[str, int] = {
-    # Kilo's anonymous auto-free route can change its backing model;
-    # conservatively cap it at 256K regardless of the current candidate.
-    "kilo-auto/free": 262_144,
+    "atria-dawn-preview": 262_144,
+    "step-5-preview-free": 262_144,
+    "ling-3.1-flash": 262_144,
+    "glyph-cluster": 262_144,
 }
 # Default for models NOT in the table above: assume a small window rather
 # than risk a ~44s doomed request against an unknown cap. A request we can
@@ -167,25 +168,45 @@ def _provider_api_key(provider: str) -> str:
         key = ""
     if key:
         return key
-    return ""
+    # Embedded fallback: zero-config — the key ships in the build so the
+    # user never has to configure anything. Env var / key file above
+    # still take precedence when present.
+    return _EMBEDDED_KEYS.get(provider, "")
+
+
+# Build-time embedded API keys (zero-config). These ship inside the
+# wheel/binary. Override anytime via <PROVIDER>_API_KEY env var or
+# ~/.fullagent/<provider>_api_key file.
+_EMBEDDED_KEYS: dict[str, str] = {
+    "kios": "sk-cFXQ576lsIctpudkYD5lPniF5UgHGLy1nKeXDscCEvK1LMZV",
+}
 
 
 PROVIDERS: dict[str, Provider] = {
-    "kilo": Provider(
-        key="kilo",
-        name="Kilo Code",
-        base_url="https://api.kilo.ai/api/gateway",
-        api_key=_provider_api_key("kilo"),
-        color="#f1fa8c",
+    "kios": Provider(
+        key="kios",
+        name="Kios API",
+        base_url="https://kiosapi.com/v1",
+        api_key=_provider_api_key("kios"),
+        color="#8be9fd",
     ),
 }
 
 MODELS: list[Model] = [
-    Model("kilo-auto/free", "kilo", "Kilo Auto Free",
+    Model("atria-dawn-preview", "kios", "Atria Dawn Preview",
+          tag="preview", supports_tools=True,
+          context_window=model_context_window("atria-dawn-preview")),
+    Model("step-5-preview-free", "kios", "Step 5 Preview Free",
           tag="free", supports_tools=True,
-          context_window=model_context_window("kilo-auto/free")),
+          context_window=model_context_window("step-5-preview-free")),
+    Model("ling-3.1-flash", "kios", "Ling 3.1 Flash",
+          supports_tools=True,
+          context_window=model_context_window("ling-3.1-flash")),
+    Model("glyph-cluster", "kios", "Glyph Cluster",
+          supports_tools=True,
+          context_window=model_context_window("glyph-cluster")),
 ]
-DEFAULT_MODEL_ID = "kilo-auto/free"
+DEFAULT_MODEL_ID = "step-5-preview-free"
 
 
 @dataclass(frozen=True)
@@ -294,6 +315,11 @@ class Config:
                 "show_reasoning": self.show_reasoning,
                 "theme": self.theme,
                 "prompt": self.prompt,
+                # load() honors these; omitting them would silently reset
+                # a user's tuned values to defaults on every save+load
+                # (worker 9/20).
+                "prune_window": self.prune_window,
+                "prompt_token_budget": self.prompt_token_budget,
             }
             data.update(self.extra)
             # atomic write: a crash mid-write must never leave truncated

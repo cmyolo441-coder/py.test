@@ -39,9 +39,18 @@ _log = get_logger("router")
 # cost_in/out: relative $ per 1k tokens (free tiers are 0). These are
 # relative units used to compare routes, not billing truth.
 MODEL_TABLE: dict[str, dict[str, Any]] = {
-    "kilo-auto/free": {"capability": 0.95, "cost_in": 0.0,
+    "step-5-preview-free": {"capability": 0.95, "cost_in": 0.0,
+                            "cost_out": 0.0, "tools": True,
+                            "reasoning": False},
+    "atria-dawn-preview": {"capability": 0.9, "cost_in": 0.0,
+                           "cost_out": 0.0, "tools": True,
+                           "reasoning": True},
+    "ling-3.1-flash": {"capability": 0.85, "cost_in": 0.0,
                        "cost_out": 0.0, "tools": True,
                        "reasoning": False},
+    "glyph-cluster": {"capability": 0.85, "cost_in": 0.0,
+                      "cost_out": 0.0, "tools": True,
+                      "reasoning": False},
 }
 
 # the strongest model in the DEFAULT table — the escalation ceiling when no

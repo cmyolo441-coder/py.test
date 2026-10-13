@@ -22,7 +22,7 @@
   <a href="https://github.com/cmyolo441-coder/py.test/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-6272a4?style=flat-square" alt="license"></a>
 </p>
 
-*`Event-Sourced Kernel` · `Goal Contracts` · `Self-Healing` · `Temporal Kernel` · `40+ Slash Commands` · `16 Tools` · `Kilo Code`*
+*`Event-Sourced Kernel` · `Goal Contracts` · `Self-Healing` · `Temporal Kernel` · `40+ Slash Commands` · `16 Tools` · `Kios API`*
 
 <p>
   <a href="#-install-binary--curl-one-liner"><b>Install</b></a> •
@@ -40,7 +40,7 @@
 > Terminal `python main.py` chalate hi ab naya gradient ASCII banner + session info dikhega — aur GitHub README pe yahi banner sabse upar.
 
 ```
-╭─ FullAgent ── model: Kilo Auto Free ── effort: HIGH ── session a1b2c3d4 ──╮
+╭─ FullAgent ── model: Step 5 Preview Free ── effort: HIGH ── session a1b2c3d4 ──╮
 │ ❯ type anything… the agent reads, writes, edits files, runs commands     │
 ╰─ Enter send · Esc+Enter newline · / commands · Ctrl+T models ────────────╯
 ```
@@ -69,7 +69,7 @@ without artificial animation delays.
  ◆ FullAgent v3.2.0  ·  advanced terminal AI agent
  event-sourced kernel · goal contracts · self-healing
  ──────────────────────────────────────────────────────────────────
- ❯ model  Kilo Auto Free   effort  high   autonomy  L4   session  a1b2c3d4
+ ❯ model  Step 5 Preview Free   effort  high   autonomy  L4   session  a1b2c3d4
    / commands · Ctrl+T models · Ctrl+E effort · shell jobs
 ```
 
@@ -103,11 +103,11 @@ python main.py
 
 ## Provider and rate limits
 
-`Kilo Auto Free` is the only configured provider/model and works without
+`Step 5 Preview Free` (Kios API) is the default configured model and works without
 manually setting an API key. The app does not impose a five-requests-per-minute
-client cap; when Kilo returns a rate-limit response, it honors `Retry-After`
+client cap; when Kios returns a rate-limit response, it honors `Retry-After`
 or waits with backoff and retries until the request succeeds or you cancel
-with `Ctrl+C`. Kilo still controls its own free-tier capacity and quotas, so
+with `Ctrl+C`. Kios still controls its own free-tier capacity and quotas, so
 the app cannot guarantee literally unlimited service.
 
 Browser automation is optional. Install it with `pip install 'fullagent[browser]'`
@@ -228,7 +228,7 @@ Event-log commands:
   composed context, lineage)
 - `/dashboard` — live observability: cost, goal, councils, router, spec,
   memory, health in one screen
-- `/router` — task classification and routing history; model: Kilo Auto Free
+- `/router` — task classification and routing history; model: Step 5 Preview Free
 - `/spec` — speculative execution: prefetch stats + hit-rate
 - `/recall <question>` — semantic (meaning-based) memory recall
 - `/mission [start|tick|list|abandon]` — daemon mission control
@@ -250,24 +250,23 @@ tokens, temperature, and reasoning effort.
 
 ## Models & providers
 
-**Kilo Code is the only configured provider.** The default model is Kilo's
-`kilo-auto/free` route. It is intended to work after installation without
-setting an API key: Kilo documents anonymous use for free models, with an
-anonymous limit of **200 requests per hour per IP address**. This is a provider
-limit—not an unlimited quota—and free model availability/capabilities can
-change. FullAgent waits and retries on HTTP 429 responses instead of giving up
-after a small fixed number of attempts; press `Ctrl+C` to cancel the wait.
+**Kios API is the only configured provider.** Four models ship, all on Kios:
 
-An optional Kilo Gateway API key can be supplied as `KILO_API_KEY` or stored in
-`~/.fullagent/kilo_api_key` (keep the file private). The environment variable
-takes precedence. Kilo may apply account, model, balance, or other rate limits
-even when a key is configured; the app cannot remove limits enforced by Kilo.
-No credentials are bundled in the source or binary. Saved selections of other
-providers/models fall back to `kilo-auto/free`.
+| Model | Tag | Context |
+|---|---|---|
+| `step-5-preview-free` (default) | free | 262k |
+| `atria-dawn-preview` | preview | 262k |
+| `ling-3.1-flash` | — | 262k |
+| `glyph-cluster` | — | 262k |
 
-| Provider | Base URL | Default model | Key required by default? |
-|---|---|---|---|
-| Kilo Code | `https://api.kilo.ai/api/gateway` | `kilo-auto/free` | No (free anonymous route) |
+Zero-config: a Kios API key is embedded in the build, so it works right after
+installation with no setup. Override anytime via the `KIOS_API_KEY` environment
+variable or `~/.fullagent/kios_api_key` (keep the file private); the env var
+takes precedence, then the key file, then the embedded key.
+
+| Provider | Base URL | Key required? |
+|---|---|---|
+| Kios API | `https://kiosapi.com/v1` | No (embedded zero-config key) |
 
 `/models list` shows configured models; `/model` or Ctrl+T opens the selector.
 The turn stays on its selected model during an outage; no automatic provider
@@ -349,8 +348,8 @@ registering it in the `PROMPTS` map (or call `register()` at runtime).
 ## Output budget — 200k tokens
 
 Every effort level requests **200,000 output tokens** (`config.MAX_TOKENS`).
-The client clamps requests to Union Alpha's **131,072-token** completion
-ceiling and the remaining context window before sending them to Kilo.
+The client clamps requests to the Kios backend's **131,072-token** completion
+ceiling and the remaining context window before sending them to Kios.
 
 ## Mastermind — coherence, not coercion
 

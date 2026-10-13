@@ -82,11 +82,6 @@ def _session_dir(session_id: Optional[str]) -> Path:
     return d
 
 
-def _snapshot_glob_prefix(rel: str) -> str:
-    # Matches "<rel>.<timestamp>.bak"; the timestamp never contains a "/".
-    return rel + ".*.bak"
-
-
 def _parse_ts(name: str, rel: str) -> str:
     """Extract the timestamp from a snapshot file name."""
     stem = name[len(rel) + 1:]  # strip "<rel>."

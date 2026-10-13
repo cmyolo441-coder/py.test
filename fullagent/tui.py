@@ -83,7 +83,6 @@ from .config import (
     model_by_id,
 )
 from .tools import Tool
-from .typeguards import ensure_dict, ensure_str  # central panel-ingest guards
 
 
 class SafeFileHistory(FileHistory):
@@ -1206,6 +1205,24 @@ class UI:
             except Exception:
                 pass
         # Agent and provider requests share the same cancellation flag.
+        # Esc must also stop running subagents: before the rewrite this
+        # called agent.crew.force_stop(); the rewrite dropped it, so
+        # workers silently kept running (and billing) after the user
+        # cancelled the turn. Non-destructive stop — the manager stays
+        # usable for later turns (shutdown(wait=False) would retire the
+        # pool instead). Never let this raise into the key handler.
+        try:
+            manager = self.agent.__dict__.get("subagents")
+            if manager is not None:
+                rows = (manager.snapshot() or {}).get("workers", [])
+                for row in rows:
+                    if row.get("state") in ("queued", "running", "cancelling"):
+                        try:
+                            manager.stop(row["id"])
+                        except Exception:
+                            pass
+        except Exception:
+            pass
         # Watchdog: if the turn thread is stuck (e.g. blocked in input()
         # or a hung subprocess), force-clear the busy state after 10s so
         # the UI never shows "cancelling…" forever.
@@ -1909,7 +1926,7 @@ class UI:
             self.print_error(f"subagents unavailable: {exc}")
             return
         text = (arg or "").strip()
-        if not text or text.lower() in ("list", "status"):
+        if not text or text.lower() in ("list", "status", "ls"):
             self._print_agents_dashboard(manager)
             return
         parts = text.split(None, 2)
@@ -1946,8 +1963,8 @@ class UI:
             if rest:
                 first, _, tail = rest.partition(" ")
                 from .roles import ROLES
-                if first in ROLES:
-                    role, task_text = first, tail.strip()
+                if first.lower() in ROLES:
+                    role, task_text = first.lower(), tail.strip()
             if not task_text:
                 self.print_error(
                     "usage: /agents spawn [role] <read-only investigation task>")
@@ -1973,6 +1990,36 @@ class UI:
             except Exception as exc:
                 self.print_error(str(exc))
             return
+        if action in ("errors", "failures"):
+            # legacy agentscmd parity: full error messages for failed subagents
+            failed = [w for w in manager.list() if w.state == "error"]
+            from rich.text import Text
+            if not failed:
+                self.print_info("no failed subagents", C["green"])
+                return
+            lines = [f"failed subagents ({len(failed)}):", ""]
+            for w in failed:
+                lines.append(f"  {w.id} ({w.name}):")
+                lines.append(f"    {w.error or '(no error message)'}")
+                lines.append("")
+            self.console.print(Panel(
+                Text("\n".join(lines)),
+                title=f"[bold {C['accent']}]Subagent errors[/]",
+                border_style=C["border"], expand=True))
+            return
+        if action in ("stop-all", "stopall"):
+            # legacy agentscmd parity: /agents stop-all → stop every subagent
+            active = [w for w in manager.list()
+                      if w.state in {"queued", "running", "cancelling"}]
+            try:
+                for w in active:
+                    manager.stop(w.id)
+                self.print_info(
+                    f"✓ stopped {len(active)} active subagent"
+                    f"{'s' if len(active) != 1 else ''}", C["yellow"])
+            except Exception as exc:
+                self.print_error(str(exc))
+            return
         if action == "stop":
             if len(parts) < 2:
                 self.print_error("usage: /agents stop <id|all>")
@@ -1994,8 +2041,8 @@ class UI:
             return
         self.print_error(
             "usage: /agents [list | roles | spawn [role] <read-only task> | "
-            "detail <id> | results [batch-id] | wait [id|all] | "
-            "stop <id|all>] — scoped coding delegation is approval-gated")
+            "detail <id> | results [batch-id] | wait [id|all] | errors | "
+            "stop <id|all|stop-all>] — scoped coding delegation is approval-gated")
 
     # -- event-log commands ------------------------------------------------------
 

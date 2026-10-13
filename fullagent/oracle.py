@@ -16,7 +16,6 @@ accumulated experience mined from the event log corpus.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from .kernel import EventLog, fold

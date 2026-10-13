@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import subprocess
 import sys
-import time
 
 REPO = __file__.rsplit("/fullagent/", 1)[0]
 BUDGET_S = 2.0

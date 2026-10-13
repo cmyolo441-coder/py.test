@@ -4,36 +4,30 @@ from fullagent import client, config
 from fullagent.config import Model, Provider
 
 
-def _keyless_provider():
-    return Provider(
-        key="kilo", name="Kilo Code",
-        base_url="https://api.kilo.ai/api/gateway",
-        api_key="", color="",
-    )
+def test_kios_is_the_only_configured_provider():
+    assert list(config.PROVIDERS) == ["kios"]
+    assert {m.id for m in config.MODELS} == {
+        "atria-dawn-preview", "step-5-preview-free",
+        "ling-3.1-flash", "glyph-cluster"}
+    assert all(m.provider == "kios" for m in config.MODELS)
+    assert config.DEFAULT_MODEL_ID == "step-5-preview-free"
 
 
-def test_kilo_is_the_only_configured_provider_and_model():
-    assert list(config.PROVIDERS) == ["kilo"]
-    assert [model.id for model in config.MODELS] == ["kilo-auto/free"]
-    assert config.DEFAULT_MODEL_ID == "kilo-auto/free"
-    assert config.MODELS[0].provider == "kilo"
+def test_kios_ships_embedded_api_key():
+    provider = config.PROVIDERS["kios"]
+    assert provider.api_key, "kios must have embedded zero-config key"
+    headers = client._base_headers(provider, stream=False)
+    assert headers["Authorization"].startswith("Bearer ")
+    assert headers["Content-Type"] == "application/json"
 
 
-def test_kilo_free_route_works_without_an_api_key():
-    provider = _keyless_provider()
-    model = config.MODELS[0]
-
-    client._check_api_key(provider, model)
-
-    assert "Authorization" not in client._base_headers(provider, stream=False)
-    assert client._base_headers(provider, stream=False)["Content-Type"] == "application/json"
-
-
-def test_other_keyless_kilo_model_still_requires_credentials():
+def test_keyless_provider_still_requires_credentials():
     with pytest.raises(client.APIError, match="no API key configured"):
         client._check_api_key(
-            _keyless_provider(),
-            Model("some-paid-model", "kilo", "Some Paid Model"),
+            Provider(key="kios", name="Kios API",
+                     base_url="https://kiosapi.com/v1", api_key="",
+                     color="#8be9fd"),
+            Model("step-5-preview-free", "kios", "Step 5 Preview Free"),
         )
 
 

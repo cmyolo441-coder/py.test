@@ -50,7 +50,11 @@ def list_models(filter_text: str = "") -> list[dict]:
             out.append(_as_dict(m))
     for match in difflib.get_close_matches(
         q, [m.id for m in MODELS] + [m.label for m in MODELS],
-        n=10, cutoff=0.45,
+        # 0.6: high-confidence fuzzy only. Below this, near-strings of
+        # REMOVED models (e.g. "space-bunny-free" -> "step-5-preview-free"
+        # at 0.457) would silently resolve to the wrong model instead of
+        # surfacing the clean "unknown model" error.
+        n=10, cutoff=0.6,
     ):
         m = resolve_model(match)
         if m is not None and m.id not in seen:
@@ -113,10 +117,10 @@ def resolve_model(query: str) -> Model | None:
                 difflib.SequenceMatcher(None, ql, m.label.lower()).ratio(),
             ),
         )
-    # 4. fuzzy best over id + label
+    # 4. fuzzy best over id + label (see cutoff note in list_models)
     cand = difflib.get_close_matches(
         q, [m.id for m in MODELS] + [m.label for m in MODELS],
-        n=1, cutoff=0.45,
+        n=1, cutoff=0.6,
     )
     if cand:
         return resolve_model(cand[0])
@@ -165,8 +169,8 @@ def _selftest() -> None:
 
     # 2. exact id, label and fuzzy free-route name
     checks.append(("exact id", (resolve_model(DEFAULT_MODEL_ID) or Model("", "", "")).id == DEFAULT_MODEL_ID))
-    checks.append(("label match", (resolve_model("Kilo Auto Free") or Model("", "", "")).id == DEFAULT_MODEL_ID))
-    checks.append(("fuzzy 'kilo auto'", (resolve_model("kilo auto") or Model("", "", "")).id == DEFAULT_MODEL_ID))
+    checks.append(("label match", (resolve_model("Step 5 Preview Free") or Model("", "", "")).id == DEFAULT_MODEL_ID))
+    checks.append(("fuzzy 'step 5'", (resolve_model("step 5") or Model("", "", "")).id == DEFAULT_MODEL_ID))
     checks.append(("unknown -> None", resolve_model("no-such-model-zzz") is None))
     # filter finds the configured free route
     filt = list_models("free")

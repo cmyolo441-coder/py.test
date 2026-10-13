@@ -412,7 +412,6 @@ def _os_realpath(p):
 # ---------------------------------------------------------------------------
 
 def _rand_history(rng, n, big_tool=False):
-    import random as _r
     msgs = [{"role": "system", "content": "sys"}]
     roles = ["user", "assistant", "tool"]
     for i in range(n):

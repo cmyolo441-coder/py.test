@@ -27,7 +27,7 @@ import os
 import re
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 USAGE = (
     "usage:\n"

@@ -41,7 +41,10 @@ _FILENAME_RE = re.compile(r"[^A-Za-z0-9_.-]")
 # pricing — "pricing unknown" is reported in that case (see
 # :func:`cost_of`).
 PRICING: Dict[str, tuple[float, float]] = {
-    "kilo-auto/free": (0.0, 0.0),          # Kilo free-model route
+    "atria-dawn-preview": (0.0, 0.0),
+    "step-5-preview-free": (0.0, 0.0),
+    "ling-3.1-flash": (0.0, 0.0),
+    "glyph-cluster": (0.0, 0.0),
 }
 
 USAGE = "usage:\n  /cost        show session token usage and estimated cost\n  /cost reset  clear this session's counters"
@@ -123,12 +126,13 @@ class CostTracker:
         """Record one completed turn (or completion). Never raises."""
         try:
             mid = str(model_id or "unknown")
-            row = self._by_model.get(mid)
-            if row is None:
-                row = self._by_model[mid] = {"turns": 0, "in": 0, "out": 0}
-            row["turns"] += 1
-            row["in"] += max(0, int(in_tokens or 0))
-            row["out"] += max(0, int(out_tokens or 0))
+            with self._lock:
+                row = self._by_model.get(mid)
+                if row is None:
+                    row = self._by_model[mid] = {"turns": 0, "in": 0, "out": 0}
+                row["turns"] += 1
+                row["in"] += max(0, int(in_tokens or 0))
+                row["out"] += max(0, int(out_tokens or 0))
             self.save()
         except Exception:
             pass
@@ -238,8 +242,8 @@ def register(agent: Any) -> None:
     """Attach a per-session CostTracker as ``agent.cost_tracker``.
 
     WIRE-IN HOOK POINT for the coordinator — in ``agent.py``:
-        method ``_emit_cost(self, usage)`` at agent.py:1046 (called from the
-        turn loop at agent.py:699, right after each ``_complete`` returns).
+        method ``_emit_cost(self, usage)`` at agent.py:1559 (called from the
+        turn loop at agent.py:1065, right after each ``_complete`` returns).
         That is the single place where per-turn ``usage`` (prompt_tokens /
         completion_tokens) and the current model (``self.model.id``) are both
         known. Add one line there, e.g.::
@@ -284,9 +288,9 @@ def _selftest() -> int:
 
     # 1. known free-route pricing
     check("known pricing math",
-          cost_of("kilo-auto/free", 500_000, 250_000) == 0.0)
-    check("pricing_for known", pricing_for("kilo-auto/free") == (0.0, 0.0))
-    check("is_pricing_known true", is_pricing_known("kilo-auto/free"))
+          cost_of("step-5-preview-free", 500_000, 250_000) == 0.0)
+    check("pricing_for known", pricing_for("step-5-preview-free") == (0.0, 0.0))
+    check("is_pricing_known true", is_pricing_known("step-5-preview-free"))
 
     # 2. unknown model handling
     check("unknown -> (0,0)", pricing_for("nope/mystery-9") == (0.0, 0.0))
@@ -299,8 +303,8 @@ def _selftest() -> int:
     check("register attaches tracker",
           isinstance(getattr(agent, "cost_tracker", None), CostTracker))
     t = agent.cost_tracker
-    t.add_turn("kilo-auto/free", 500_000, 250_000)
-    t.add_turn("kilo-auto/free", 500_000, 250_000)
+    t.add_turn("step-5-preview-free", 500_000, 250_000)
+    t.add_turn("step-5-preview-free", 500_000, 250_000)
     t.add_turn("nope/mystery-9", 1_000_000, 0)        # $0.00, unknown pricing
     tot = t.totals()
     check("totals turns", tot["turns"] == 3)
@@ -311,7 +315,7 @@ def _selftest() -> int:
     check("breakdown flags unknown",
           not tot["by_model"]["nope/mystery-9"]["pricing_known"])
     check("breakdown flags known",
-          tot["by_model"]["kilo-auto/free"]["pricing_known"])
+          tot["by_model"]["step-5-preview-free"]["pricing_known"])
 
     # 4. persistence round-trip with the temp dir
     path = os.path.join(tmp, "cost-selftest.json")
@@ -345,7 +349,7 @@ def _selftest() -> int:
         def print_error(self, s):
             self.errs.append(s)
 
-    t.add_turn("kilo-auto/free", 1_000_000, 0)
+    t.add_turn("step-5-preview-free", 1_000_000, 0)
     t.add_turn("nope/mystery-9", 100, 200)
     ui = FakeUI(agent)
     handle_cost(ui, "")

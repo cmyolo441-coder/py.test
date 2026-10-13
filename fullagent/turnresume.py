@@ -38,7 +38,6 @@ from __future__ import annotations
 import functools
 import json
 import os
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any

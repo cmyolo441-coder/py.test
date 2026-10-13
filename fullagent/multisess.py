@@ -480,7 +480,6 @@ def register(agent: Any) -> None:
 # -------------------------------------------------------------- self-test --
 
 if __name__ == "__main__":
-    import sys
     import tempfile
     from types import SimpleNamespace
 

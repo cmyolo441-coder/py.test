@@ -362,7 +362,7 @@ def live_probe() -> dict | None:
     try:
         from fullagent.config import (PROVIDERS, effort_by_key, model_by_id)
         from fullagent.client import chat_stream
-        model = model_by_id("kilo-auto/free")
+        model = model_by_id("step-5-preview-free")
         if model is None:
             return None
         provider = PROVIDERS[model.provider]
