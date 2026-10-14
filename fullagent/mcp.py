@@ -39,7 +39,7 @@ from typing import Any, Dict, List, Optional
 
 from .tools import Tool
 
-CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".fullagent", "mcp.json")
+CONFIG_PATH = os.path.join(os.environ.get("FULLAGENT_HOME") or os.path.join(os.path.expanduser("~"), ".fullagent"), "mcp.json")
 DEFAULT_TIMEOUT = 30.0          # seconds, for connect + tool calls
 DISCOVERY_TIMEOUT = 5.0         # seconds, for register-time tool discovery
 MAX_LINE_BYTES = 16 * 1024 * 1024

@@ -53,6 +53,20 @@ def _serve(handler):
                 if not chunk:
                     break
                 data += chunk
+            if b"\r\n\r\n" in data:
+                head, rest = data.split(b"\r\n\r\n", 1)
+                cl = 0
+                for line in head.split(b"\r\n")[1:]:
+                    if line.lower().startswith(b"content-length:"):
+                        try:
+                            cl = int(line.split(b":", 1)[1].strip())
+                        except ValueError:
+                            cl = 0
+                while len(rest) < cl:
+                    chunk = conn.recv(min(65536, cl - len(rest)))
+                    if not chunk:
+                        break
+                    rest += chunk
         except OSError:
             pass
 

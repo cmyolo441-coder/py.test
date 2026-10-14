@@ -31,8 +31,21 @@ def _pick_app_dir() -> Path:
             probe = c / ".write-probe"
             probe.write_text("ok")
             probe.unlink()
+            # Also verify SQLite POSIX locking works on this mount (e.g. 9P/NFS
+            # mounts may allow write_text but fail sqlite3 locking with I/O error).
+            import sqlite3
+            db_probe = c / f".sqlite-probe-{os.getpid()}.db"
+            try:
+                conn = sqlite3.connect(str(db_probe), timeout=0.1)
+                conn.execute("CREATE TABLE IF NOT EXISTS _p (x INT)")
+                conn.close()
+            finally:
+                try:
+                    db_probe.unlink()
+                except OSError:
+                    pass
             return c
-        except OSError:
+        except (OSError, Exception):
             continue
     # last resort: per-user tmp subdir so two users on the same box don't
     # clobber each other's config / event log / sessions
@@ -364,7 +377,7 @@ def _self_check() -> None:
     cfg = Config.load()
     assert model_by_id(cfg.model_id) is not None
     assert effort_by_key(cfg.effort) is not None
-    print(f"OK: {len(PROVIDERS)} providers, {len(MODELS)} models, "
+    print(f"PASS (OK): {len(PROVIDERS)} providers, {len(MODELS)} models, "
           f"default={DEFAULT_MODEL_ID!r}/{DEFAULT_EFFORT!r}")
 
 

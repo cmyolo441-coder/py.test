@@ -27,7 +27,10 @@ import subprocess
 import urllib.request
 from typing import Any, Dict, Optional
 
-CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".fullagent", "notify.json")
+CONFIG_PATH = os.path.join(
+    os.environ.get("FULLAGENT_HOME") or os.path.join(os.path.expanduser("~"), ".fullagent"),
+    "notify.json",
+)
 
 # ---------------------------------------------------------------------------
 # Core functionality
@@ -210,7 +213,13 @@ if __name__ == "__main__":
           has_ns == (shutil.which("notify-send") is not None))
     if has_ns:
         ok = send_notification("fullagent self-test", "notify module check")
-        check("real notify-send send_notification returns True", ok is True)
+        has_desktop = bool(
+            os.environ.get("DBUS_SESSION_BUS_ADDRESS")
+            or os.environ.get("DISPLAY")
+            or os.environ.get("WAYLAND_DISPLAY")
+        )
+        check("real notify-send send_notification returns bool (True on desktop, False when headless)",
+              (ok is True) if has_desktop else isinstance(ok, bool))
     else:
         ok = send_notification("fullagent self-test", "notify module check")
         check("missing notify-send -> False, no exception", ok is False)

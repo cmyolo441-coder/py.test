@@ -34,7 +34,7 @@ from typing import Any
 
 # ~/.fullagent/config.json — read/written directly, merging other keys, so
 # this module never depends on config.py (and never touches _EMBEDDED_KEYS).
-_APP_DIR = os.path.join(os.path.expanduser("~"), ".fullagent")
+_APP_DIR = os.environ.get("FULLAGENT_HOME") or os.path.join(os.path.expanduser("~"), ".fullagent")
 _CONFIG_KEY = "thinking_visible"
 _EXPANDED_KEY = "thinking_expanded"
 

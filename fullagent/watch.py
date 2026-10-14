@@ -51,7 +51,11 @@ _log = logging.getLogger(__name__)
 POLL_INTERVAL_S = 2.0
 _MIN_POLL_INTERVAL_S = 0.5  # hard floor: the poll loop can never spin faster
 DEBOUNCE_S = 5.0
-DEFAULT_CONFIG_PATH = Path("~/.fullagent/watches.json").expanduser()
+DEFAULT_CONFIG_PATH = (
+    Path(os.environ["FULLAGENT_HOME"]).expanduser() / "watches.json"
+    if os.environ.get("FULLAGENT_HOME")
+    else Path("~/.fullagent/watches.json").expanduser()
+)
 
 
 def _config_path() -> Path:
@@ -89,6 +93,7 @@ class WatchManager:
         # (watch_id, abs_file_path) -> (mtime_ns, size)
         self._state: dict[tuple[str, str], tuple[int, int]] = {}
         self._lock = threading.RLock()
+        self._poll_lock = threading.Lock()
         self._stop = threading.Event()
         self._wake = threading.Event()  # poke: instant wake when work arrives
         self._thread: threading.Thread | None = None
@@ -211,12 +216,13 @@ class WatchManager:
 
     def poll_once(self) -> int:
         """Run one poll cycle. Returns the number of actions fired."""
-        fired = 0
-        with self._lock:
-            watches = list(self.watches.values())
-        for w in watches:
-            fired += self._poll_watch(w)
-        return fired
+        with self._poll_lock:
+            fired = 0
+            with self._lock:
+                watches = list(self.watches.values())
+            for w in watches:
+                fired += self._poll_watch(w)
+            return fired
 
     def _poll_watch(self, w: Watch) -> int:
         root = Path(w.path)
@@ -245,9 +251,19 @@ class WatchManager:
             prev = {f: st for (wid, f), st in self._state.items()
                     if wid == w.id}
         seen: set[str] = set()
-        for f, st in current.items():
+        for f, st in list(current.items()):
             seen.add(f)
             if f not in prev:
+                # If a writer just opened the file (O_CREAT|O_TRUNC -> size 0)
+                # and is still flushing bytes, wait briefly and re-stat so the
+                # initial write settles into the single 'created' snapshot.
+                if st[1] == 0:
+                    time.sleep(0.015)
+                    try:
+                        st = self._stat(Path(f))
+                        current[f] = st
+                    except OSError:
+                        pass
                 fired += self._fire(w, "created", f, now)
             elif prev[f] != st:
                 fired += self._fire(w, "modified", f, now)

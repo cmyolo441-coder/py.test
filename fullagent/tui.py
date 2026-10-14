@@ -32,37 +32,148 @@ from html import escape as html_escape
 from pathlib import Path
 from typing import Callable
 
-from prompt_toolkit.patch_stdout import patch_stdout
-from prompt_toolkit.application import Application, get_app
-from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
-from prompt_toolkit.buffer import Buffer
-from prompt_toolkit.completion import Completer, Completion
-from prompt_toolkit.enums import DEFAULT_BUFFER
-from prompt_toolkit.filters import Condition, has_focus
-from prompt_toolkit.formatted_text import (
-    HTML,
-    fragment_list_to_text,
-    to_formatted_text,
-)
-from prompt_toolkit.history import FileHistory
-from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.keys import Keys
-from prompt_toolkit.layout import (
-    BufferControl,
-    CompletionsMenu,
-    ConditionalContainer,
-    Dimension,
-    Float,
-    FloatContainer,
-    FormattedTextControl,
-    HSplit,
-    Layout,
-    VSplit,
-    Window,
-)
-from prompt_toolkit.search import start_search
-from prompt_toolkit.styles import Style
-from prompt_toolkit.widgets import SearchToolbar
+try:
+    from prompt_toolkit.patch_stdout import patch_stdout
+    from prompt_toolkit.application import Application, get_app
+    from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+    from prompt_toolkit.buffer import Buffer
+    from prompt_toolkit.completion import Completer, Completion
+    from prompt_toolkit.enums import DEFAULT_BUFFER
+    from prompt_toolkit.filters import Condition, has_focus
+    from prompt_toolkit.formatted_text import (
+        HTML,
+        fragment_list_to_text,
+        to_formatted_text,
+    )
+    from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.keys import Keys
+    from prompt_toolkit.layout import (
+        BufferControl,
+        CompletionsMenu,
+        ConditionalContainer,
+        Dimension,
+        Float,
+        FloatContainer,
+        FormattedTextControl,
+        HSplit,
+        Layout,
+        VSplit,
+        Window,
+    )
+    from prompt_toolkit.search import start_search
+    from prompt_toolkit.styles import Style
+    from prompt_toolkit.widgets import SearchToolbar
+except ImportError:  # Headless / non-interactive fallback when prompt_toolkit is absent
+    import contextlib as _contextlib
+
+    @_contextlib.contextmanager
+    def patch_stdout(*_a, **_kw):
+        yield
+
+    class _DummyApp:
+        is_running = False
+        def invalidate(self): pass
+        def exit(self, *_a, **_kw): pass
+        def run(self, *_a, **_kw): pass
+
+    def get_app():
+        return _DummyApp()
+
+    class Application(_DummyApp):
+        def __init__(self, *_a, **_kw): pass
+
+    class AutoSuggestFromHistory:
+        pass
+
+    class Buffer:
+        def __init__(self, *_a, **_kw):
+            self.text = ""
+            self.cursor_position = 0
+        def reset(self, *_a, **_kw):
+            self.text = ""
+            self.cursor_position = 0
+
+    class Completer:
+        pass
+
+    class Completion:
+        def __init__(self, text="", start_position=0, display=None, display_meta=None, style=""):
+            self.text = text
+            self.start_position = start_position
+            self.display = display or text
+            self.display_meta = display_meta or ""
+            self.style = style
+
+    DEFAULT_BUFFER = "DEFAULT_BUFFER"
+
+    class Condition:
+        def __init__(self, fn=None): self.fn = fn or (lambda: False)
+        def __call__(self): return bool(self.fn())
+        def __and__(self, other): return Condition(lambda: self() and other())
+        def __or__(self, other): return Condition(lambda: self() or other())
+        def __invert__(self): return Condition(lambda: not self())
+
+    def has_focus(*_a, **_kw):
+        return Condition(lambda: False)
+
+    class HTML:
+        def __init__(self, value=""): self.value = str(value)
+        def __str__(self): return self.value
+
+    def to_formatted_text(val, *_a, **_kw):
+        if isinstance(val, list):
+            return val
+        text = getattr(val, "value", str(val))
+        text = re.sub(r"<[^>]+>", "", text)
+        return [("", text)]
+
+    def fragment_list_to_text(fragments):
+        return "".join(t for _, t in (fragments or []))
+
+    class FileHistory:
+        def __init__(self, filename=""): self.filename = filename
+        def get_strings(self): return []
+        def append_string(self, s): pass
+
+    class KeyBindings:
+        def add(self, *_a, **_kw):
+            def _dec(fn): return fn
+            return _dec
+
+    class Keys:
+        Escape = "escape"
+        ControlC = "c-c"
+        ControlD = "c-d"
+        ControlT = "c-t"
+        ControlE = "c-e"
+        ControlR = "c-r"
+        ControlL = "c-l"
+        Up = "up"
+        Down = "down"
+        PageUp = "pageup"
+        PageDown = "pagedown"
+        Home = "home"
+        End = "end"
+        Tab = "tab"
+        BackTab = "s-tab"
+        Enter = "enter"
+        Any = "<any>"
+
+    class _LayoutBox:
+        def __init__(self, *_a, **_kw): pass
+
+    BufferControl = CompletionsMenu = ConditionalContainer = Dimension = _LayoutBox
+    Float = FloatContainer = FormattedTextControl = HSplit = Layout = VSplit = Window = _LayoutBox
+
+    def start_search(*_a, **_kw): pass
+
+    class Style:
+        @classmethod
+        def from_dict(cls, d): return cls()
+
+    class SearchToolbar(_LayoutBox):
+        pass
 from rich.console import Console
 from rich.markdown import CodeBlock, Heading, Markdown
 from rich.panel import Panel
@@ -114,21 +225,61 @@ class SafeFileHistory(FileHistory):
             pass
 
 # ---------------------------------------------------------------------------
-# Palette (dracula-flavoured)
+# Next-Gen Multi-Theme Palette Engine (Neon Cyber-Dracula default)
 # ---------------------------------------------------------------------------
 
-C = {
-    "border": "#6272a4",
-    "accent": "#bd93f9",
-    "cyan": "#8be9fd",
-    "green": "#50fa7b",
-    "yellow": "#f1fa8c",
-    "orange": "#ffb86c",
-    "red": "#ff5555",
-    "pink": "#ff79c6",
-    "fg": "#f8f8f2",
-    "dim": "#6272a4",
+THEMES: dict[str, dict[str, str]] = {
+    "neon": {
+        "border": "#5b6eae",
+        "accent": "#c084fc",
+        "cyan": "#22d3ee",
+        "green": "#34d399",
+        "yellow": "#facc15",
+        "orange": "#fb923c",
+        "red": "#f87171",
+        "pink": "#f472b6",
+        "fg": "#f8fafc",
+        "dim": "#64748b",
+    },
+    "dracula": {
+        "border": "#6272a4",
+        "accent": "#bd93f9",
+        "cyan": "#8be9fd",
+        "green": "#50fa7b",
+        "yellow": "#f1fa8c",
+        "orange": "#ffb86c",
+        "red": "#ff5555",
+        "pink": "#ff79c6",
+        "fg": "#f8f8f2",
+        "dim": "#6272a4",
+    },
+    "nord": {
+        "border": "#4c566a",
+        "accent": "#b48ead",
+        "cyan": "#88c0d0",
+        "green": "#a3be8c",
+        "yellow": "#ebcb8b",
+        "orange": "#d08770",
+        "red": "#bf616a",
+        "pink": "#b48ead",
+        "fg": "#eceff4",
+        "dim": "#616e88",
+    },
+    "emerald": {
+        "border": "#059669",
+        "accent": "#10b981",
+        "cyan": "#06b6d4",
+        "green": "#4ade80",
+        "yellow": "#fde047",
+        "orange": "#fb923c",
+        "red": "#f43f5e",
+        "pink": "#ec4899",
+        "fg": "#f0fdf4",
+        "dim": "#6b7280",
+    },
 }
+
+C = dict(THEMES["neon"])
 
 STYLE = Style.from_dict({
     "box": C["border"],
@@ -617,6 +768,13 @@ class UI:
         self._ctx_cache: int | None = None
         self._ctx_cache_ts = 0.0
 
+        # Next-Gen TUI telemetry: live token velocity & session diff history
+        self._stream_tokens_count = 0
+        self._diff_history: list[dict] = []
+        self._theme_name = str(self.cfg.extra.get("theme", "neon"))
+        if self._theme_name in THEMES:
+            C.update(THEMES[self._theme_name])
+
         self._build()
 
         # vimmode: apply persisted vi/emacs editing preference
@@ -699,20 +857,29 @@ class UI:
         prov_color = (prov.color if prov is not None else C["accent"])
 
         segs: list[tuple[str, str]] = []
-        segs.append((f" {APP_NAME} ", "class:box.title"))
+        segs.append((f" ◆ {APP_NAME} ", "class:box.title"))
         segs.append((" ● ", f"bold {prov_color}"))
         segs.append((f" {model.label} ", "class:box.model"))
         if model.tag:
-            segs.append((f"◆ {model.tag} ", "class:box.tag"))
+            segs.append((f"★ {model.tag} ", "class:box.tag"))
         segs.append((f" ◈ {effort.label.lower()} ",
                      f"class:box.effort {effort_color}"))
-        # autonomy ladder — colour tells the risk at a glance:
-        # observer/advisor dim, assistant/collaborator green,
-        # pilot yellow, autonomous red
-        auto = self.agent.autonomy
+        auto = getattr(self.agent, "autonomy", 3)
         auto_color = (C["dim"] if auto <= 1 else C["green"] if auto <= 3
                       else C["yellow"] if auto == 4 else C["red"])
         segs.append((f" ⬢ L{auto} ", f"bold {auto_color}"))
+        # Live parallel subagent swarm indicator in the top HUD border
+        try:
+            mgr = self.agent.__dict__.get("subagents")
+            if mgr is not None:
+                snap = mgr.snapshot()
+                if snap.get("active", 0) > 0:
+                    segs.append((
+                        f" ⚡ Swarm {snap['active']}/{snap['max_active']} ",
+                        f"bold {C['pink']}",
+                    ))
+        except Exception:
+            pass
         # live goal distance — always on screen when a goal is active (§24).
         # cached for 1s: the border re-renders every frame, and status()
         # folds the whole log
@@ -805,21 +972,22 @@ class UI:
         if self._busy:
             frame = SPINNER_FRAMES[self._spinner_i]
             elapsed = ""
+            tok_rate = ""
             if self._turn_start_ts:
-                elapsed = f" · {max(0, int(time.time() - self._turn_start_ts))}s"
-            tail = " · Esc cancel "
-            # width-aware: the status preview may contain emoji/wide chars
-            # from the model; a codepoint slice could split one and the
-            # border would then be a column short
-            max_status = max(0, inner - _disp_width(f" ⠹ {elapsed} {tail}")
-                             - 4)
+                dt = max(0.001, time.time() - self._turn_start_ts)
+                elapsed = f" · {max(0, int(dt))}s"
+                n_tok = getattr(self, "_stream_tokens_count", 0)
+                if n_tok > 2 and dt >= 0.2:
+                    tok_rate = f" · ⚡{int(n_tok / dt)} tok/s"
+            tail = f"{tok_rate}{elapsed} · Esc cancel "
+            max_status = max(0, inner - _disp_width(f" ⠹ {tail}") - 4)
             status = _truncate_w(self._status_text, max_status)
             bar_len = (_disp_width(f" {frame} ") + _disp_width(status)
-                       + _disp_width(elapsed) + _disp_width(tail))
+                       + _disp_width(tail))
             return [("class:box", "╰"),
                     ("class:box.spinner", f" {frame} "),
                     ("class:box.status", status),
-                    ("class:box.hint", f"{elapsed}{tail}"),
+                    ("class:box.hint", tail),
                     ("class:box",
                      "─" * max(0, inner - bar_len) + "╯")]
 
@@ -835,9 +1003,10 @@ class UI:
         key = "class:box.key"
         dim = "class:box.hint"
         box = "class:box"
-        if inner >= len("⏎ send · ⇧⏎ newline · / cmds · ^T models · ^E effort ") + 1:
+        if inner >= len("⏎ send · ⇧⏎ newline · / cmds · /diff · ^T models · ^E effort ") + 1:
             segs = [(box, " ⏎ "), (key, "send"),
                     (dim, " · ⇧⏎ newline · "), (key, "/"), (dim, " cmds · "),
+                    (key, "/diff"), (dim, " live · "),
                     (key, "^T"), (dim, " models · "), (key, "^E"),
                     (dim, " effort ")]
         elif inner >= len("⏎ send · / cmds · ^T models ") + 1:
@@ -914,7 +1083,9 @@ class UI:
         def get_line_prefix(line: int, wrap_count: int):
             if line == 0 and wrap_count == 0:
                 return [("class:arrow", "❯ ")]
-            return [("class:cont", "│ ")]
+            if wrap_count > 0:
+                return [("class:cont", "↪ ")]
+            return [("class:cont", "┃ ")]
 
         self.input_control = BufferControl(
             buffer=self.buffer,
@@ -972,7 +1143,7 @@ class UI:
             style=STYLE,
             key_bindings=self._build_key_bindings(),
             full_screen=False,
-            min_redraw_interval=0.25,
+            min_redraw_interval=0.05,
             mouse_support=False,
         )
 
@@ -1486,6 +1657,10 @@ class UI:
             self.print_info(format_help(arg), C["fg"])
         elif cmd == "/agents":
             self._cmd_agents(arg)
+        elif cmd == "/diff":
+            self._cmd_diff(arg)
+        elif cmd == "/theme":
+            self._cmd_theme(arg)
         elif cmd == "/init":
             from .codeinit import run_init_command
             run_init_command(self, arg)
@@ -1848,16 +2023,28 @@ class UI:
             activity = " ".join(activity.split())
             if len(activity) > 180:
                 activity = activity[:177] + "..."
+            pct = 100 if state == "done" else (0 if state == "queued" else min(95, max(15, row["steps"] * 10)))
+            filled = int(round(pct / 20))
+            pbar = "▰" * filled + "▱" * (5 - filled)
             heading = Text()
             heading.append(state_icons.get(state, "·") + "  ",
                            style=f"bold {color}")
             heading.append(state.upper(), style=f"bold {color}")
-            heading.append(f"  {row['id']}  ·  {row['batch_id']}",
+            heading.append(f"  {pbar} {pct}%", style=color)
+            wave_badge = f"  ·  wave {row['wave']}" if row.get("wave", 0) > 0 else ""
+            prio_badge = f"  ·  prio {row['priority']:+d}" if row.get("priority", 0) else ""
+            diff_badge = (
+                f"  ·  Δ+{row['lines_added']}/-{row['lines_removed']}"
+                if (row.get("lines_added") or row.get("lines_removed"))
+                else ""
+            )
+            heading.append(f"  {row['id']}  ·  {row['batch_id']}{wave_badge}{prio_badge}{diff_badge}",
                            style=C["dim"])
+            tps = f" · {row['tokens_per_sec']} tok/s" if row.get("tokens_per_sec") else ""
             work = Text(
                 f"{role_label(row['role'])} · {row['name']}  |  "
                 f"{row['steps']} steps · {row['tool_calls']} tools  |  "
-                f"{row['tokens_in']}→{row['tokens_out']} tokens · {seconds:.1f}s",
+                f"{row['tokens_in']}→{row['tokens_out']} tokens{tps} · {seconds:.1f}s",
                 style=C["dim"])
             task_line = Text("Task  ", style=f"bold {C['cyan']}")
             task_line.append(task)
@@ -1956,6 +2143,63 @@ class UI:
             except Exception as exc:
                 self.print_error(str(exc))
             return
+        if action == "dag":
+            batch_id = parts[1] if len(parts) > 1 else ""
+            try:
+                from rich.text import Text
+                self.console.print(Panel(
+                    Text(manager.format_dag(batch_id=batch_id)),
+                    title=f"[bold {C['accent']}]Swarm DAG Topology[/]",
+                    border_style=C["border"], expand=True))
+            except Exception as exc:
+                self.print_error(str(exc))
+            return
+        if action in ("blackboard", "bb"):
+            from rich.text import Text
+            self.console.print(Panel(
+                Text(manager.blackboard.format_board()),
+                title=f"[bold {C['accent']}]Shared Subagent Blackboard[/]",
+                border_style=C["border"], expand=True))
+            return
+        if action == "diff":
+            target = parts[1] if len(parts) > 1 else ""
+            workers = [manager.get(target)] if target else manager.list()
+            workers = [w for w in workers if w is not None]
+            diffs = [d for w in workers for d in getattr(w, "diffs", [])]
+            if not diffs:
+                self.print_info("no subagent file diffs recorded yet", C["dim"])
+                return
+            for d in diffs[-10:]:
+                t = Text()
+                for ln in d.get("diff", "").splitlines()[:60]:
+                    st = (C["green"] if ln.startswith("+") else C["red"] if ln.startswith("-")
+                          else C["cyan"] if ln.startswith("@@") else C["fg"])
+                    t.append(ln + "\n", style=st)
+                self.console.print(Panel(
+                    t,
+                    title=(f"[bold {C['accent']}]{d['worker_id']} · {d['path']}[/] "
+                           f"[bold {C['green']}]+{d['added']}[/] [bold {C['red']}]-{d['removed']}[/]"),
+                    border_style=C["border"], expand=True))
+            return
+        if action in ("synth", "metrics"):
+            batch_id = parts[1] if len(parts) > 1 else ""
+            try:
+                from rich.text import Text
+                synth = manager.synthesize_batch(batch_id=batch_id)
+                lines = [
+                    f"Batch: {synth['batch_id'] or '(none)'}  ·  Workers: {synth['total_workers']}  ·  Waves: {synth['waves']}",
+                    f"Settled: {synth['all_settled']}  ·  Steps: {synth['total_steps']}  ·  Tool calls: {synth['total_tool_calls']}",
+                    f"Tokens: {synth['tokens_in']}→{synth['tokens_out']}  ·  Lines: +{synth.get('lines_added', 0)}/-{synth.get('lines_removed', 0)}  ·  Roles: {', '.join(synth['roles']) or 'none'}",
+                ]
+                if synth["files_touched"]:
+                    lines.append("Files touched: " + ", ".join(synth["files_touched"]))
+                self.console.print(Panel(
+                    Text("\n".join(lines)),
+                    title=f"[bold {C['accent']}]Batch synthesis & DAG metrics[/]",
+                    border_style=C["border"], expand=True))
+            except Exception as exc:
+                self.print_error(str(exc))
+            return
         if action == "spawn":
             rest = text[len(parts[0]):].strip()
             role = "researcher"
@@ -2040,9 +2284,65 @@ class UI:
                 self.print_error(str(exc))
             return
         self.print_error(
-            "usage: /agents [list | roles | spawn [role] <read-only task> | "
-            "detail <id> | results [batch-id] | wait [id|all] | errors | "
-            "stop <id|all|stop-all>] — scoped coding delegation is approval-gated")
+            "usage: /agents [list | roles | dag [batch] | diff [id] | blackboard | synth [batch] | "
+            "spawn [role] <read-only task> | detail <id> | results [batch-id] | wait [id|all] | "
+            "errors | stop <id|all|stop-all>] — scoped coding delegation is approval-gated")
+
+    def _cmd_theme(self, arg: str) -> None:
+        """Switch TUI color palette live: /theme [neon|dracula|nord|emerald]."""
+        name = (arg or "").strip().lower()
+        if not name:
+            self.print_info(
+                f"active theme: {getattr(self, '_theme_name', 'neon')}  ·  "
+                f"available: {', '.join(sorted(THEMES))}",
+                C["cyan"],
+            )
+            return
+        if name not in THEMES:
+            self.print_error(
+                f"unknown theme {name!r} — choose from: {', '.join(sorted(THEMES))}"
+            )
+            return
+        self._theme_name = name
+        C.update(THEMES[name])
+        self.cfg.extra["theme"] = name
+        self.cfg.save()
+        self._set_flash(f"✦ theme → {name}", C["green"])
+        self.print_info(f"✓ switched TUI palette to {name}", C["green"])
+
+    def _cmd_diff(self, arg: str) -> None:
+        """Inspect live/recorded file diffs from the session: /diff [last|all|clear|<path>]."""
+        from .diffpreview import render_rich_diff_panel
+        history = getattr(self, "_diff_history", None) or []
+        sub = (arg or "").strip()
+        if sub.lower() == "clear":
+            if hasattr(self, "_diff_history"):
+                self._diff_history.clear()
+            self.print_info("✓ cleared session diff history", C["green"])
+            return
+        if not history:
+            self.print_info(
+                "no file diffs recorded in this session yet — diffs stream live on every write/edit",
+                C["dim"],
+            )
+            return
+        if not sub or sub.lower() == "last":
+            selected = [history[-1]]
+        elif sub.lower() == "all":
+            selected = history[-10:]
+        else:
+            selected = [
+                h for h in history if sub.lower() in h.get("path", "").lower()
+            ]
+            if not selected:
+                self.print_error(f"no recorded diff matching {sub!r}")
+                return
+        for item in selected:
+            self.console.print(
+                render_rich_diff_panel(
+                    item["tool"], item["args"], max_lines=60, palette=C
+                )
+            )
 
     # -- event-log commands ------------------------------------------------------
 
@@ -3212,6 +3512,7 @@ class UI:
 
     def _run_turn(self, text: str) -> None:
         self._turn_start_ts = time.time()
+        self._stream_tokens_count = 0
         self._set_status("thinking…")
         self._start_spinner()
         # Only retain the unfinished line; emit complete lines immediately.
@@ -3243,6 +3544,7 @@ class UI:
 
         def on_token(piece: str):
             nonlocal md_preview
+            self._stream_tokens_count = getattr(self, "_stream_tokens_count", 0) + 1
             if render_md:
                 # Keep a bounded preview; the agent owns the complete reply.
                 maxw = max(1, self._width() - 26)
@@ -3344,18 +3646,20 @@ class UI:
             self.console.print(Text(" │ " + line, style=style),
                                soft_wrap=True)
 
-        # live file-change streaming — write_file / edit_file / apply_patch
-        # are shown happening WHILE the model generates them (true live, not
-        # a replay). on_tool_args feeds the growing JSON; a tracker pulls the
-        # relevant string field; on_tool_update closes the block.
-        live_f = {"kind": None, "tracker": None, "header": False,
-                  "count": 0, "held": [], "path": "", "old_emitted": False,
-                  "batch": []}
+        # Real-Time Streaming Live Diff Preview Engine (powered by LiveDiffStreamer)
+        from .diffpreview import LiveDiffStreamer, DiffStreamLine
+        live_f = {
+            "kind": None,
+            "streamer": None,
+            "header": False,
+            "count": 0,
+            "added": 0,
+            "removed": 0,
+            "path": "",
+            "batch": [],
+        }
 
-        # SPEED: one rich Console.print per streamed line meant thousands
-        # of render+write cycles for a big file. Lines are now batched
-        # (25 per print) — still looks live, ~25x fewer print calls.
-        _LF_BATCH = 25
+        _LF_BATCH = 16
 
         def _lf_flush():
             batch = live_f["batch"]
@@ -3369,124 +3673,72 @@ class UI:
                 t.append_text(ln)
             self.console.print(t, soft_wrap=True)
 
-        def _lf_write_line(ln: str):
+        def _lf_render_diff_line(dl: DiffStreamLine):
             live_f["count"] += 1
             t = Text()
             t.append(" │ ", style=C["dim"])
-            t.append(f"{live_f['count']:>4} ", style=C["dim"])
-            t.append("+  ", style=C["green"])
-            t.append(ln, style=C["fg"])
+            if dl.kind == "hunk":
+                t.append(f"     {dl.text}", style=f"bold {C['cyan']}")
+            elif dl.kind == "meta":
+                t.append(f"     {dl.text}", style=f"bold {C['dim']}")
+            elif dl.kind == "del":
+                live_f["removed"] += 1
+                lno = f"{dl.line_no:>4} " if dl.line_no else "     "
+                t.append(lno, style=C["dim"])
+                t.append("-  ", style=f"bold {C['red']}")
+                t.append(dl.text, style=C["red"])
+            elif dl.kind == "add":
+                live_f["added"] += 1
+                lno = f"{dl.line_no:>4} " if dl.line_no else f"{live_f['added']:>4} "
+                t.append(lno, style=C["dim"])
+                t.append("+  ", style=f"bold {C['green']}")
+                t.append(dl.text, style=C["fg"])
+            else:
+                t.append(f"     {dl.text}", style=C["dim"])
             live_f["batch"].append(t)
             if len(live_f["batch"]) >= _LF_BATCH:
                 _lf_flush()
-
-        def _lf_edit_line(ln: str, plus: bool):
-            live_f["count"] += 1
-            t = Text()
-            t.append(" │ ", style=C["dim"])
-            if plus:
-                t.append("+  ", style=C["green"])
-                t.append(ln, style=C["fg"])
-            else:
-                t.append("-  ", style=C["red"])
-                t.append(ln, style=C["red"])
-            live_f["batch"].append(t)
-            if len(live_f["batch"]) >= _LF_BATCH:
-                _lf_flush()
-
-        def _lf_patch_line(ln: str):
-            live_f["count"] += 1
-            t = Text()
-            t.append(" │ ", style=C["dim"])
-            if ln.startswith("@@"):
-                col = C["cyan"]
-            elif ln.startswith(("+++ ", "--- ")):
-                col = f"bold {C['dim']}"
-            elif ln.startswith("+"):
-                col = C["green"]
-            elif ln.startswith("-"):
-                col = C["red"]
-            else:
-                col = C["fg"]
-            t.append(ln, style=col)
-            live_f["batch"].append(t)
-            if len(live_f["batch"]) >= _LF_BATCH:
-                _lf_flush()
-
-        def _lf_emit(ln: str):
-            k = live_f["kind"]
-            if k == "write":
-                _lf_write_line(ln)
-            elif k == "edit":
-                _lf_edit_line(ln, plus=True)
-            else:
-                _lf_patch_line(ln)
 
         def on_tool_args(name: str, chunk: str):
-            if name not in ("write_file", "edit_file", "apply_patch"):
+            if name not in ("write_file", "edit_file", "MultiEdit", "multiedit", "apply_patch"):
                 return
             if not self.cfg.extra.get("live_stream_edits", True):
-                return  # animations disabled — fall back to instant render
-            kind = {"write_file": "write", "edit_file": "edit",
-                    "apply_patch": "patch"}[name]
-            if live_f["tracker"] is None:
-                key = {"write": "content", "edit": "new_string",
-                       "patch": "patch"}[kind]
-                live_f["tracker"] = _LiveWrite(key)
-                live_f["kind"] = kind
-            tr = live_f["tracker"]
-            try:
-                new_lines = tr.feed(chunk)
-            except Exception:  # noqa: BLE001 — never break the turn
                 return
-            # header once the path is known (patch has no single path)
+            if live_f["streamer"] is None or live_f["kind"] != name:
+                live_f["streamer"] = LiveDiffStreamer(name)
+                live_f["kind"] = name
+            streamer: LiveDiffStreamer = live_f["streamer"]
+            try:
+                diff_lines = streamer.feed(chunk)
+            except Exception:
+                return
             if not live_f["header"]:
-                if kind == "patch":
-                    p = True  # no path arg — header can go immediately
-                else:
-                    p = tr.path()
+                p = "patch" if name == "apply_patch" else streamer.detect_path()
                 if p:
-                    if kind != "patch":
+                    if name != "apply_patch":
                         live_f["path"] = p
-                    verb = {"write": "Wrote", "edit": "Edited",
-                            "patch": "Applied patch"}[kind]
-                    label = (verb if kind == "patch"
-                             else f"{verb} {self._rel_path(p)}")
+                    verb = {
+                        "write_file": "Wrote",
+                        "edit_file": "Edited",
+                        "MultiEdit": "Multi-Edited",
+                        "multiedit": "Multi-Edited",
+                        "apply_patch": "Applied patch",
+                    }[name]
+                    label = verb if name == "apply_patch" else f"{verb} {self._rel_path(p)}"
                     t = Text()
                     t.append(" ⏺ ", style=f"bold {C['accent']}")
                     t.append(label, style=f"bold {C['fg']}")
+                    t.append("  Δ LIVE DIFF", style=f"bold {C['cyan']}")
                     self.console.print(t, soft_wrap=True)
                     live_f["header"] = True
-            # edit: show the removed (old) lines once old_string is complete,
-            # before any added lines stream
-            if kind == "edit" and live_f["header"] \
-                    and not live_f["old_emitted"]:
-                old = tr._field(tr.buf, "old_string")
-                if old is not None:
-                    for ol in old.splitlines():
-                        _lf_edit_line(ol, plus=False)
-                    live_f["old_emitted"] = True
-                    for held in live_f["held"]:
-                        _lf_emit(held)
-                    live_f["held"] = []
-            # stream the new lines once header (and old lines) are done
-            ready = live_f["header"] and \
-                (kind != "edit" or live_f["old_emitted"])
-            if ready:
-                for ln in new_lines:
-                    _lf_emit(ln)
-                if new_lines:
-                    verb = {"write": "writing", "edit": "editing",
-                            "patch": "patching"}[kind]
-                    if kind != "patch":
-                        self._set_status(f"{verb} "
-                                         f"{self._rel_path(live_f['path'])} · "
-                                         f"{live_f['count']} lines…")
-                    else:
-                        self._set_status(f"{verb} · "
-                                         f"{live_f['count']} lines…")
-            else:
-                live_f["held"].extend(new_lines)
+            if live_f["header"]:
+                for dl in diff_lines:
+                    _lf_render_diff_line(dl)
+                if diff_lines:
+                    rel = self._rel_path(live_f["path"]) if live_f["path"] else "patch"
+                    self._set_status(
+                        f"Δ live diff {rel} · +{live_f['added']} -{live_f['removed']} lines…"
+                    )
 
         def on_tool_call(ev: ToolEvent):
             rem = "".join(stream_tail["parts"]).strip("\n")
@@ -3498,20 +3750,16 @@ class UI:
             shell_live["active"] = ev.name in ("run_command", "live_shell")
             shell_live["streamed"] = False
             shell_live["lines"] = 0
-            if ev.name not in ("write_file", "edit_file", "apply_patch"):
-                # a non file-change tool starting clears stale live state
+            if ev.name not in ("write_file", "edit_file", "MultiEdit", "multiedit", "apply_patch"):
                 live_f["kind"] = None
-                live_f["tracker"] = None
+                live_f["streamer"] = None
                 live_f["header"] = False
                 live_f["count"] = 0
-                live_f["held"] = []
-                live_f["old_emitted"] = False
+                live_f["added"] = 0
+                live_f["removed"] = 0
                 live_f["batch"] = []
             if ev.name in ("run_command", "live_shell", "apply_patch",
                            "write_file", "edit_file", "read_file"):
-                # live-action block header instead of the generic gear line.
-                # For file-change tools, skip the header if it was already
-                # printed during live streaming.
                 if ev.name in ("write_file", "edit_file", "apply_patch") \
                         and live_f["header"]:
                     pass
@@ -3522,27 +3770,31 @@ class UI:
             self._set_status(f"running {ev.name}…")
 
         def on_tool_update(ev: ToolEvent):
-            if ev.name in ("write_file", "edit_file", "apply_patch") \
+            if ev.name in ("write_file", "edit_file", "MultiEdit", "multiedit", "apply_patch") \
+                    and ev.status in ("done", "error"):
+                if hasattr(self, "_diff_history"):
+                    p = str(ev.args.get("path") or ev.args.get("file_path") or "patch")
+                    self._diff_history.append({
+                        "tool": ev.name,
+                        "path": p,
+                        "args": dict(ev.args),
+                        "status": ev.status,
+                    })
+            if ev.name in ("write_file", "edit_file", "MultiEdit", "multiedit", "apply_patch") \
                     and ev.status in ("done", "error") \
                     and live_f["count"] > 0:
-                # change already streamed live — flush the last partial line
-                # and the batched lines, then close the block; no replay
-                # cascade
-                tr = live_f["tracker"]
-                if tr is not None:
-                    last = tr.flush()
-                    if last is not None:
-                        _lf_emit(last)
+                streamer = live_f["streamer"]
+                if streamer is not None:
+                    for tail_dl in streamer.flush():
+                        _lf_render_diff_line(tail_dl)
                 _lf_flush()
                 self.console.print(self._write_footer(ev, live_f["count"]))
             elif ev.name in ("write_file", "edit_file", "apply_patch") \
                     and ev.status in ("done", "error"):
-                # Completed output must not delay the next model request.
                 self.console.print(self._live_block(ev))
             elif ev.name in ("run_command", "live_shell") \
                     and ev.status in ("done", "error"):
                 if shell_live["streamed"]:
-                    # output already streamed live — just close the block
                     self.console.print(self._shell_footer(ev))
                 else:
                     self.console.print(self._live_block(ev))
@@ -3552,11 +3804,11 @@ class UI:
                 self.console.print(self._tool_result_line(ev))
             shell_live["active"] = False
             live_f["kind"] = None
-            live_f["tracker"] = None
+            live_f["streamer"] = None
             live_f["header"] = False
             live_f["count"] = 0
-            live_f["held"] = []
-            live_f["old_emitted"] = False
+            live_f["added"] = 0
+            live_f["removed"] = 0
             live_f["batch"] = []
             self._set_status("thinking…")
 
@@ -3757,14 +4009,15 @@ class UI:
         self._approve_request[2].set()
 
     def _diff_preview(self, tool: Tool, args: dict):
-        """Real preview of what the mutation will do — unified diff for
-        edit_file, overwrite warning for write_file. None = no preview."""
+        """Rich unified diff preview for write_file, edit_file, MultiEdit, and apply_patch."""
+        if tool.name in ("MultiEdit", "multiedit", "apply_patch"):
+            from .diffpreview import render_rich_diff_panel
+            return render_rich_diff_panel(tool.name, args, max_lines=40, palette=C)
         if tool.name == "write_file":
             p = Path(str(args.get("path", ""))).expanduser()
             if p.exists() and p.is_file():
-                return Text(f"  ⚠ overwrites existing file "
-                            f"({p.stat().st_size:,} bytes)",
-                            style=C["yellow"])
+                from .diffpreview import render_rich_diff_panel
+                return render_rich_diff_panel(tool.name, args, max_lines=35, palette=C)
             return None
         if tool.name != "edit_file":
             return None
@@ -4526,7 +4779,8 @@ def _tui_selftest() -> None:
         return Turn(text, assistant_text=" ".join(words))
 
     ui.agent.run_turn = fake_run
-    with patch.object(tui_mod.time, "time", return_value=1000.0):
+    with patch.object(tui_mod.time, "time", return_value=1000.0), \
+         patch.object(tui_mod.time, "monotonic", return_value=1000.0):
         ui._run_turn_thread("hello")
 
     out = ui.output.getvalue()

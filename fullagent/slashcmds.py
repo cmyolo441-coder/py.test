@@ -53,7 +53,8 @@ _FRONTMATTER_RE = re.compile(r"^---[ \t]*\r?\n(.*?)\r?\n---[ \t]*\r?\n(.*)$",
 
 def default_commands_dir():
     """Path of the user commands directory: ~/.fullagent/commands."""
-    return os.path.expanduser(os.path.join("~", ".fullagent", "commands"))
+    base = os.environ.get("FULLAGENT_HOME") or os.path.expanduser(os.path.join("~", ".fullagent"))
+    return os.path.join(base, "commands")
 
 
 def _parse_file(path):

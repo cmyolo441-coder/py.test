@@ -37,7 +37,8 @@ def _store_path() -> Path:
     override = os.environ.get("FULLAGENT_OUTSTYLE_FILE")
     if override:
         return Path(override)
-    return Path.home() / ".fullagent" / "output_style"
+    base = Path(os.environ["FULLAGENT_HOME"]).expanduser() if os.environ.get("FULLAGENT_HOME") else (Path.home() / ".fullagent")
+    return base / "output_style"
 
 
 def load_style() -> str:

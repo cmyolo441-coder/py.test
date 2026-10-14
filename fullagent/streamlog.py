@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Optional
 
 from .tools import Tool
 
-LOG_DIR = os.path.join(os.path.expanduser("~"), ".fullagent", "logs")
+LOG_DIR = os.path.join(os.environ.get("FULLAGENT_HOME") or os.path.join(os.path.expanduser("~"), ".fullagent"), "logs")
 DEFAULT_MAX_BYTES = 50 * 1024 * 1024  # 50MB rotation threshold
 
 _SAFE_RE = re.compile(r"[^A-Za-z0-9_.-]")

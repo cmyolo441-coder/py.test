@@ -73,16 +73,21 @@ _LOG_KEEP_LINES = 2000   # per-process log trim on each (re)start
 # ---------------------------------------------------------------------------
 
 
+def _app_base_dir() -> Path:
+    from . import config
+    return config.APP_DIR
+
+
 def _db_path() -> Path:
     """SQLite path. FULLAGENT_SUPERVISE_DB overrides for tests."""
     env = os.environ.get("FULLAGENT_SUPERVISE_DB")
     if env:
         return Path(env).expanduser()
-    return Path.home() / ".fullagent" / "supervise.db"
+    return _app_base_dir() / "supervise.db"
 
 
 def _log_dir() -> Path:
-    return Path.home() / ".fullagent" / "supervise_logs"
+    return _app_base_dir() / "supervise_logs"
 
 
 def _shell_argv() -> list[str] | None:

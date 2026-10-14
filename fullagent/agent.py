@@ -656,9 +656,10 @@ class Agent:
 
     @property
     def model(self) -> Model:
-        _resolve_lazy("model_by_id")
-        m = model_by_id(self.cfg.model_id)
-        assert m is not None
+        _resolve_lazy("model_by_id", "config")
+        m = (model_by_id(self.cfg.model_id)
+             or model_by_id(config.DEFAULT_MODEL_ID)
+             or config.MODELS[0])
         return m
 
     @property
@@ -669,8 +670,9 @@ class Agent:
     @property
     def effort(self) -> Effort:
         _resolve_lazy("config")
-        e = config.effort_by_key(self.cfg.effort)
-        assert e is not None
+        e = (config.effort_by_key(self.cfg.effort)
+             or config.effort_by_key(config.DEFAULT_EFFORT)
+             or config.EFFORTS[0])
         return e
 
     def _base_prompt(self) -> str:
@@ -3089,6 +3091,12 @@ class Agent:
                 "name": {"type": "string"},
                 "context": {"type": "string"},
                 "model_id": {"type": "string"},
+                "priority": {"type": "integer", "minimum": -20, "maximum": 20},
+                "max_retries": {"type": "integer", "minimum": 0, "maximum": 5},
+                "depends_on": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Optional sibling task names or worker IDs that must finish before this task starts.",
+                },
             },
             "required": ["task"],
         }
@@ -3106,6 +3114,12 @@ class Agent:
                     "minItems": 1, "maxItems": 16,
                     "description": "Exact workspace files or directories "
                                    "this coder may change.",
+                },
+                "priority": {"type": "integer", "minimum": -20, "maximum": 20},
+                "max_retries": {"type": "integer", "minimum": 0, "maximum": 5},
+                "depends_on": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Optional sibling task names or worker IDs that must finish before this writer starts.",
                 },
             },
             "required": ["task", "write_scope"],

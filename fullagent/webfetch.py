@@ -182,7 +182,8 @@ def _is_html_content_type(content_type: str) -> bool:
 def _cache_dir(cache_dir: str | None) -> str:
     if cache_dir:
         return cache_dir
-    return os.path.join(os.path.expanduser("~"), ".fullagent", *CACHE_SUBDIR)
+    base = os.environ.get("FULLAGENT_HOME") or os.path.join(os.path.expanduser("~"), ".fullagent")
+    return os.path.join(base, *CACHE_SUBDIR)
 
 
 def _cache_path(url: str, cache_dir: str | None) -> str:

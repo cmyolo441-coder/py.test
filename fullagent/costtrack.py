@@ -25,7 +25,7 @@ import re
 import threading
 from typing import Any, Dict, Optional
 
-COST_DIR = os.path.join(os.path.expanduser("~"), ".fullagent", "cost")
+COST_DIR = os.path.join(os.environ.get("FULLAGENT_HOME") or os.path.join(os.path.expanduser("~"), ".fullagent"), "cost")
 
 _FILENAME_RE = re.compile(r"[^A-Za-z0-9_.-]")
 

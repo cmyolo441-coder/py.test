@@ -204,5 +204,57 @@ class StreamingTests(unittest.TestCase):
         self.assertEqual(observed, [True])
 
 
+
+    def test_live_diff_streaming_on_tool_args_and_diff_command(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            target = f"{td}/demo_live.py"
+            with open(target, "w", encoding="utf-8") as fh:
+                fh.write("def greet():\n    return 'old'\n")
+            ui = self.make_ui()
+            ui._diff_history = []
+            ui.cfg.save = lambda: None
+
+            def run(text, on_token, on_reasoning, on_tool_call, on_tool_update,
+                    on_status, approve, **kwargs):
+                on_tool_args = kwargs.get("on_tool_args")
+                chunks = [
+                    f'{{"path": "{target}", ',
+                    '"old_string": "    return \'old\'\\n", ',
+                    '"new_string": "    return \'new_live_diff\'\\n"}',
+                ]
+                for ch in chunks:
+                    on_tool_args("edit_file", ch)
+                ev = ToolEvent(
+                    "edit_file",
+                    {
+                        "path": target,
+                        "old_string": "    return 'old'\n",
+                        "new_string": "    return 'new_live_diff'\n",
+                    },
+                    result="OK: edited demo_live.py",
+                    status="done",
+                )
+                on_tool_call(ev)
+                on_tool_update(ev)
+                return Turn(text, assistant_text="updated")
+
+            ui.agent.run_turn = run
+            ui._run_turn_thread("edit demo_live.py")
+            out = ui.output.getvalue()
+            self.assertIn("LIVE DIFF", out)
+            self.assertIn("return 'old'", out)
+            self.assertIn("return 'new_live_diff'", out)
+            self.assertEqual(len(ui._diff_history), 1)
+
+            # Verify /diff command renders the recorded diff panel
+            ui._cmd_diff("last")
+            self.assertIn("Live Diff", ui.output.getvalue())
+
+            # Verify /theme command switches palette
+            ui._cmd_theme("dracula")
+            self.assertEqual(ui._theme_name, "dracula")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -64,7 +64,8 @@ _ARGS_CAP = 4000          # per tool-call args JSON cap
 
 def turns_dir() -> Path:
     """~/.fullagent/turns — created on demand."""
-    d = Path.home() / ".fullagent" / TURNS_DIRNAME
+    base = Path(os.environ["FULLAGENT_HOME"]).expanduser() if os.environ.get("FULLAGENT_HOME") else (Path.home() / ".fullagent")
+    d = base / TURNS_DIRNAME
     try:
         d.mkdir(parents=True, exist_ok=True)
     except OSError:

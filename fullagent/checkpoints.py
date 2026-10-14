@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import logging
 import time
 import uuid
@@ -67,7 +68,8 @@ RISK_SAFE = "safe"
 
 
 def _checkpoints_dir(session_id: str) -> Path:
-    d = Path.home() / ".fullagent" / "checkpoints" / str(session_id)
+    base = Path(os.environ["FULLAGENT_HOME"]).expanduser() if os.environ.get("FULLAGENT_HOME") else (Path.home() / ".fullagent")
+    d = base / "checkpoints" / str(session_id)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -407,7 +409,7 @@ if __name__ == "__main__":
     check("do_rewind no manager fails clean", ok2 is False)
 
     # Selftest dir should not leak into real ~/.fullagent (check we're using home).
-    check("dir under ~/.fullagent", ".fullagent" in str(mgr.dir))
+    check("dir under ~/.fullagent", ".fullagent" in str(mgr.dir) or (os.environ.get("FULLAGENT_HOME", "") and os.environ["FULLAGENT_HOME"] in str(mgr.dir)))
 
     # MEMORY BOUND (worker 19/20): manual checkpoints are full deep-copies
     # of the message history — creating far more than the cap must evict

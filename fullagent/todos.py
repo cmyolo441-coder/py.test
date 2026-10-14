@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional
 
 from .tools import Tool
 
-TODOS_DIR = os.path.join(os.path.expanduser("~"), ".fullagent", "todos")
+TODOS_DIR = os.path.join(os.environ.get("FULLAGENT_HOME") or os.path.join(os.path.expanduser("~"), ".fullagent"), "todos")
 
 STATUS_PENDING = "pending"
 STATUS_IN_PROGRESS = "in_progress"

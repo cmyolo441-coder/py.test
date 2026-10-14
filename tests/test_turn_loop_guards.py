@@ -31,7 +31,8 @@ import tempfile
 _tmp_home = tempfile.mkdtemp(prefix="turnloop_home_")
 os.environ["FULLAGENT_HOME"] = _tmp_home
 
-_REPO = "/home/hatch/workspace/pytest-repo"
+from pathlib import Path as _Path
+_REPO = str(_Path(__file__).resolve().parent.parent)
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 

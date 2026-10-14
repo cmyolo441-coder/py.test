@@ -29,7 +29,7 @@ from email.message import EmailMessage
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-CONFIG_PATH = Path(os.path.expanduser("~/.fullagent/smtp.json"))
+CONFIG_PATH = (Path(os.environ["FULLAGENT_HOME"]).expanduser() / "smtp.json") if os.environ.get("FULLAGENT_HOME") else Path(os.path.expanduser("~/.fullagent/smtp.json"))
 SMTP_TIMEOUT = 30.0
 
 MISSING_CONFIG_MSG = (

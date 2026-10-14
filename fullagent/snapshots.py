@@ -69,7 +69,8 @@ class SnapshotStore:
         p = self._obj_path(h)
         if not p.exists():
             p.parent.mkdir(parents=True, exist_ok=True)
-            tmp = p.with_suffix(".tmp")
+            import threading
+            tmp = p.with_name(f"{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")
             tmp.write_bytes(zlib.compress(data, 6))
             os.replace(tmp, p)  # atomic: a crash never leaves a torn blob
             # fsync the DIRECTORY entry: without it a crash can lose the
@@ -170,7 +171,8 @@ class SnapshotStore:
                 # extension (Makefile, LICENSE, ...) used to collide because
                 # with_suffix("") is a no-op, so tmp == p and the atomic
                 # write silently clobbered the destination before replace.
-                tmp = p.with_name(p.name + ".snap-tmp")
+                import threading
+                tmp = p.with_name(f"{p.name}.{os.getpid()}.{threading.get_ident()}.snap-tmp")
                 tmp.write_bytes(data)
                 os.replace(tmp, p)
                 restored += 1

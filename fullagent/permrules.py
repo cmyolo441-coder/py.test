@@ -78,7 +78,7 @@ READ_ONLY = frozenset({
     "WebSearch",
 })
 
-PERM_FILE = os.path.join(os.path.expanduser("~"), ".fullagent",
+PERM_FILE = os.path.join(os.environ.get("FULLAGENT_HOME") or os.path.join(os.path.expanduser("~"), ".fullagent"),
                          "permissions.json")
 
 

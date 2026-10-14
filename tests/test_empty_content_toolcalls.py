@@ -26,7 +26,8 @@ import copy
 import json
 import sys
 
-_REPO = "/home/hatch/workspace/pytest-repo"
+from pathlib import Path as _Path
+_REPO = str(_Path(__file__).resolve().parent.parent)
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 

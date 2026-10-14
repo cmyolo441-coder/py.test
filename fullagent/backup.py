@@ -255,9 +255,11 @@ def restore_backup(ref: str, confirm: bool = False,
                     return {"ok": False,
                             "message": "refusing to restore — manifest file "
                                        "list does not match archive contents"}
-                tar.extractall(tmp, members=members,
-                               filter="data")
-        except (tarfile.TarError, OSError, EOFError) as e:
+                if hasattr(tarfile, "data_filter"):
+                    tar.extractall(tmp, members=members, filter="data")
+                else:
+                    tar.extractall(tmp, members=members)
+        except (tarfile.TarError, OSError, EOFError, TypeError) as e:
             return {"ok": False,
                     "message": f"refusing to restore — cannot read archive: {e}"}
 

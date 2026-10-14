@@ -29,7 +29,8 @@ CFG_FILE = os.path.join(CFG_DIR, "config.json")
 def load_cfg() -> dict:
     try:
         with open(CFG_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
 
@@ -139,8 +140,8 @@ def cmd_chat(prompt: str) -> int:
     except KeyboardInterrupt:
         sys.stderr.write("\n[interrupted — server keeps running]\n")
         return 130
-    sys.stdout.write("\n")
-    return 0
+    sys.stderr.write("\n[error: stream closed before completion]\n")
+    return 1
 
 
 def main() -> int:

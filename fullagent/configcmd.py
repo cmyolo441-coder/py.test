@@ -33,7 +33,7 @@ import tempfile
 import threading
 
 # Path constant — the self-test monkeypatches this to a temp file.
-CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".fullagent", "config.json")
+CONFIG_PATH = os.path.join(os.environ.get("FULLAGENT_HOME") or os.path.join(os.path.expanduser("~"), ".fullagent"), "config.json")
 
 USAGE = (
     "usage:\n"

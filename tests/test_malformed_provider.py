@@ -27,7 +27,8 @@ import sys
 # Standalone entry (python3 /tmp/malformed_provider_test.py): make sure the
 # repo package is importable regardless of the script's own directory.
 # Harmless under pytest (python -m pytest already puts the root first).
-_REPO = "/home/hatch/workspace/pytest-repo"
+from pathlib import Path as _Path
+_REPO = str(_Path(__file__).resolve().parent.parent)
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 

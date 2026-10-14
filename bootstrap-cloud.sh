@@ -63,9 +63,13 @@ fi
 echo "    cloudflared ready."
 
 echo ">> [5/6] Starting server (port $PORT)..."
+: > "$DIR/server.log"
 nohup "$VENV/bin/python" "$DIR/cloudserve.py" --port "$PORT" \
   >"$DIR/server.log" 2>&1 < /dev/null &
-sleep 6
+for _i in $(seq 1 30); do
+  grep -q "agent ready" "$DIR/server.log" 2>/dev/null && break
+  sleep 1
+done
 if ! grep -q "agent ready" "$DIR/server.log" 2>/dev/null; then
   echo "!! server failed to start — tail of server.log:" >&2
   tail -20 "$DIR/server.log" >&2 || true

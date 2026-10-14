@@ -17,7 +17,8 @@ Run:  python3 -m pytest tests/test_history_validation.py -q
 import logging
 import sys
 
-_REPO = "/home/hatch/workspace/pytest-repo"
+from pathlib import Path as _Path
+_REPO = str(_Path(__file__).resolve().parent.parent)
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 

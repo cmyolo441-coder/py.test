@@ -44,7 +44,7 @@ from pathlib import Path
 _log = logging.getLogger(__name__)
 
 HOOK_TIMEOUT_S = 10
-DEFAULT_CONFIG_PATH = Path("~/.fullagent/hooks.json").expanduser()
+DEFAULT_CONFIG_PATH = (Path(os.environ["FULLAGENT_HOME"]).expanduser() / "hooks.json") if os.environ.get("FULLAGENT_HOME") else Path("~/.fullagent/hooks.json").expanduser()
 
 
 def _config_path(path: str | os.PathLike | None) -> Path:

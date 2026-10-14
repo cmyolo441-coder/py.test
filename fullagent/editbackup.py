@@ -40,7 +40,7 @@ try:  # pragma: no cover - exercised through the package path
 except ImportError:  # running the file directly (dev convenience)
     from fullagent.tools import Tool, _resolve
 
-SNAPSHOT_BASE = os.path.join(os.path.expanduser("~"), ".fullagent", "snapshots")
+SNAPSHOT_BASE = os.path.join(os.environ.get("FULLAGENT_HOME") or os.path.join(os.path.expanduser("~"), ".fullagent"), "snapshots")
 
 #: Bounded retention: how many snapshots to keep per file.
 KEEP_SNAPSHOTS = 20

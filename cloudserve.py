@@ -58,7 +58,8 @@ def get_token() -> str:
         if tok:
             return tok
     tok = secrets.token_urlsafe(32)
-    with open(TOKEN_FILE, "w", encoding="utf-8") as f:
+    fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(tok + "\n")
     os.chmod(TOKEN_FILE, 0o600)
     return tok
@@ -132,10 +133,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not tok:
             return False
         auth = self.headers.get("Authorization", "")
-        if auth == "Bearer " + tok:
+        expected = "Bearer " + tok
+        if len(auth) == len(expected) and secrets.compare_digest(auth, expected):
             return True
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-        return qs.get("token", [""])[0] == tok
+        cand = qs.get("token", [""])[0]
+        return len(cand) == len(tok) and secrets.compare_digest(cand, tok)
 
     # -- routes -------------------------------------------------------
     def do_GET(self):
@@ -153,12 +156,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except (TypeError, ValueError):
-            length = 0
+            return self._send_json(400, {"ok": False, "error": "invalid Content-Length"})
+        if length < 0 or length > 10 * 1024 * 1024:
+            return self._send_json(413, {"ok": False, "error": "payload too large or negative length"})
         try:
-            data = json.loads(self.rfile.read(length) or b"{}")
+            raw_body = self.rfile.read(length) if length > 0 else b"{}"
+            data = json.loads(raw_body or b"{}")
         except Exception:
             return self._send_json(400, {"ok": False, "error": "bad json"})
-        prompt = (data.get("prompt") or "").strip()
+        if not isinstance(data, dict):
+            return self._send_json(400, {"ok": False, "error": "json body must be an object"})
+        raw_prompt = data.get("prompt")
+        if raw_prompt is not None and not isinstance(raw_prompt, str):
+            return self._send_json(400, {"ok": False, "error": "prompt must be a string"})
+        prompt = (raw_prompt or "").strip()
         if not prompt:
             return self._send_json(400, {"ok": False, "error": "empty prompt"})
         if not _turn_lock.acquire(blocking=False):
@@ -173,6 +184,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _stream_chat(self, prompt: str) -> None:
         q: "queue.Queue[tuple]" = queue.Queue()
         DONE = object()
+        cancelled = threading.Event()
 
         def _run():
             try:
@@ -190,6 +202,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     on_tool_update=_noop,
                     on_status=lambda s: q.put(("status", s)),
                     approve=lambda tool, args: True,
+                    should_cancel=cancelled.is_set,
                 )
                 q.put(("done", json.dumps({
                     "error": turn.error or "",
@@ -233,6 +246,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if not _write(line.encode("utf-8")):
                     return
         finally:
+            cancelled.set()
+            worker.join(timeout=5.0)
             # SSE has no Content-Length: the client only sees EOF when we
             # close. Without this the connection stays open (keep-alive)
             # and the client hangs after DONE.

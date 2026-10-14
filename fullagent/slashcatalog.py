@@ -3,6 +3,8 @@ from __future__ import annotations
 
 SLASH_COMMANDS = [
     ("/model", "select model — PgUp/PgDn/Tab to navigate"),
+    ("/diff", "live diff viewer — /diff [last|all|clear|<path>]"),
+    ("/theme", "switch TUI color theme — /theme [neon|dracula|nord|emerald]"),
     ("/agents", "parallel crew dashboard — roles, detail, results, wait, errors, stop"),
     ("/models", "list all models and providers"),
     ("/effort", "low · medium · high · extrahigh · ultrahigh"),

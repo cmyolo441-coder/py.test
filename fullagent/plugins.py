@@ -35,7 +35,7 @@ from typing import Any, Dict, List, Optional, Set
 
 from .tools import Tool, RISK_CONFIRM
 
-BASE_DIR = os.path.join(os.path.expanduser("~"), ".fullagent")
+BASE_DIR = os.environ.get("FULLAGENT_HOME") or os.path.join(os.path.expanduser("~"), ".fullagent")
 PLUGINS_DIR = os.path.join(BASE_DIR, "plugins")
 ENABLED_FILE = os.path.join(BASE_DIR, "plugins.json")
 

@@ -118,7 +118,8 @@ def _check_connectivity() -> List[Dict[str, Any]]:
 
 
 def _check_app_dir() -> Dict[str, Any]:
-    app_dir = os.path.join(os.path.expanduser("~"), ".fullagent")
+    app_dir = os.environ.get("FULLAGENT_HOME") or os.path.join(
+        os.path.expanduser("~"), ".fullagent")
     exists = os.path.isdir(app_dir)
     writable = os.access(app_dir, os.W_OK) if exists else False
     ok = exists and writable
@@ -149,8 +150,9 @@ def _check_dependencies() -> Dict[str, Any]:
         except metadata.PackageNotFoundError:
             missing.append(pkg)
     if missing:
+        installed_str = f" (installed: {', '.join(versions)})" if versions else ""
         return _result("deps", False,
-                       "missing: " + ", ".join(missing))
+                       "missing: " + ", ".join(missing) + installed_str)
     return _result("deps", True, ", ".join(versions) + " installed")
 
 
