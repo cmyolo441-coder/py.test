@@ -120,7 +120,7 @@ class CoverageEngine:
             if r is None:
                 try:
                     r = str(Path(fn).resolve())
-                except OSError:
+                except Exception:
                     r = fn
                 resolved[fn] = r
             return r == target_str

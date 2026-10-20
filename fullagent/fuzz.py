@@ -117,8 +117,12 @@ def _simpler(variant: object, gen: Generator) -> list:
     elif isinstance(variant, int):
         if variant != 0:
             out.append(0)
-            out.append(1 if variant > 0 else -1)
-            out.append(variant // 2)
+            if variant > 0:
+                out.append(variant - 1)
+            elif variant < 0:
+                out.append(variant + 1)
+            if variant // 2 != variant:
+                out.append(variant // 2)
     elif isinstance(variant, list):
         if variant:
             out.append([])

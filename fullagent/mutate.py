@@ -261,7 +261,11 @@ class MutationTester:
         # module path, so the mutants were never exercised and every
         # mutant silently "survived" with a 0.0 score.)
         target = Path(self.mutant_path) if self.mutant_path else p
-        backup = target.read_text(errors="replace")
+        backup = None
+        try:
+            backup = target.read_text(errors="replace")
+        except OSError:
+            backup = None
         try:
             for m in mutants:
                 res = MutantResult(m["kind"], m["description"])
@@ -270,7 +274,10 @@ class MutationTester:
                     code, out = self._run_suite()
                 except OSError as e:
                     code, out = 127, str(e)
-                if code == 127:
+                if code == 124:
+                    res.status, res.detail = "error", out or "suite timed out"
+                    report.errors += 1
+                elif code == 127:
                     res.status, res.detail = "error", out
                     report.errors += 1
                 elif code != 0:
@@ -282,7 +289,11 @@ class MutationTester:
                     report.survived += 1
                 report.results.append(res)
         finally:
-            target.write_text(backup)  # always restore the target
+            if backup is not None:
+                try:
+                    target.write_text(backup)
+                except OSError:
+                    pass
 
         scored = report.killed + report.survived
         report.score = report.killed / scored if scored else 0.0

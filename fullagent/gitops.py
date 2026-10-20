@@ -46,9 +46,9 @@ def _run_git(args: list[str], cwd: str | None = None
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 
-def _check_repo() -> str | None:
+def _check_repo(cwd: str | None = None) -> str | None:
     """Return an ERROR string if cwd is not a git repo, else None."""
-    rc, _, err = _run_git(["rev-parse", "--git-dir"])
+    rc, _, err = _run_git(["rev-parse", "--git-dir"], cwd=cwd)
     if rc != 0:
         return ("ERROR: not a git repository (git rev-parse failed). "
                 f"{err[:200] if err else 'Run this from inside a git repo.'}")
@@ -76,12 +76,13 @@ _GIT_STATUS_PARAMS = {
 
 
 def git_status(cwd: str = "") -> str:
-    err = _check_repo()
+    cwdd = _cwd_or(cwd)
+    err = _check_repo(cwdd)
     if err:
         return err
-    rc, branch, _ = _run_git(["branch", "--show-current"])
+    rc, branch, _ = _run_git(["branch", "--show-current"], cwd=cwdd)
     branch = branch if rc == 0 and branch else "(detached HEAD)"
-    rc, porcelain, _ = _run_git(["status", "--porcelain"])
+    rc, porcelain, _ = _run_git(["status", "--porcelain"], cwd=cwdd)
     if rc != 0:
         return "ERROR: git status failed."
     if not porcelain:
@@ -114,13 +115,13 @@ _GIT_COMMIT_PARAMS = {
 
 
 def git_commit(message: str, cwd: str = "") -> str:
-    err = _check_repo()
+    cwdd = _cwd_or(cwd)
+    err = _check_repo(cwdd)
     if err:
         return err
     message = (message or "").strip()
     if not message:
         return "ERROR: commit message is required and cannot be empty."
-    cwdd = _cwd_or(cwd)
     # Refuse if nothing to commit — check porcelain before staging.
     rc, porcelain, _ = _run_git(["status", "--porcelain"], cwdd)
     if rc != 0:
@@ -165,10 +166,10 @@ _GIT_BRANCH_PARAMS = {
 
 
 def git_branch(name: str = "", cwd: str = "") -> str:
-    err = _check_repo()
+    cwdd = _cwd_or(cwd)
+    err = _check_repo(cwdd)
     if err:
         return err
-    cwdd = _cwd_or(cwd)
     name = (name or "").strip() if isinstance(name, str) else ""
     if not name:
         rc, out, err_out = _run_git(["branch"], cwdd)
@@ -203,10 +204,10 @@ _GIT_PUSH_PARAMS = {
 
 
 def git_push(cwd: str = "") -> str:
-    err = _check_repo()
+    cwdd = _cwd_or(cwd)
+    err = _check_repo(cwdd)
     if err:
         return err
-    cwdd = _cwd_or(cwd)
     rc, out, err_out = _run_git(["push"], cwdd)
     combined = "\n".join(p for p in (out, err_out) if p).strip()
     if rc != 0:
@@ -238,10 +239,10 @@ _GIT_DIFF_PARAMS = {
 
 
 def git_diff(file: str = "", cwd: str = "") -> str:
-    err = _check_repo()
+    cwdd = _cwd_or(cwd)
+    err = _check_repo(cwdd)
     if err:
         return err
-    cwdd = _cwd_or(cwd)
     f = (file or "").strip() if isinstance(file, str) else ""
     if f:
         rc, out, err_out = _run_git(["diff", "--", f], cwdd)
@@ -276,13 +277,13 @@ _GIT_LOG_PARAMS = {
 
 
 def git_log(n: int = 10, cwd: str = "") -> str:
-    err = _check_repo()
+    cwdd = _cwd_or(cwd)
+    err = _check_repo(cwdd)
     if err:
         return err
     n, coer = _coerce_int(n, "n", 10, 1, 50)
     if coer:
         return coer
-    cwdd = _cwd_or(cwd)
     rc, out, err_out = _run_git(["log", "--oneline", f"-{n}"], cwdd)
     if rc != 0:
         return f"ERROR: git log failed: {err_out[:300]}"

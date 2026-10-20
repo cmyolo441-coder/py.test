@@ -108,17 +108,24 @@ def reset_conversation(agent: Any) -> dict:
     # the goal contract, and todos are simply not touched.
     system = next((m for m in messages if _role(m) == "system"), None)
 
+    new_messages: list = []
+    if isinstance(system, dict):
+        new_messages.append(system)
     try:
         from . import compact
 
-        new_messages: list = []
-        if isinstance(system, dict):
-            new_messages.append(system)
         if stats["summary"]:
             new_messages.append({
                 "role": "user",
                 "content": compact.SUMMARY_MARKER + "\n" + stats["summary"],
             })
+    except Exception:  # noqa: BLE001
+        if stats["summary"]:
+            new_messages.append({
+                "role": "user",
+                "content": "SUMMARY: " + stats["summary"],
+            })
+    try:
         agent.messages = new_messages
     except Exception:  # noqa: BLE001
         pass

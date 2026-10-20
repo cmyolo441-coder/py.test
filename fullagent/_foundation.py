@@ -182,10 +182,14 @@ def validate_path(value: str, *, name: str = "path",
     p = Path(value).expanduser()
     if not allow_relative and not p.is_absolute():
         p = Path.cwd() / p
-    if must_exist and not p.exists():
+    try:
+        resolved = p.resolve(strict=False)
+    except (OSError, RuntimeError):
+        resolved = p
+    if must_exist and not resolved.exists():
         raise ValidationError(f"{name} does not exist: {p}",
                               hint="check the path and try again")
-    return p
+    return resolved
 
 
 def validate_non_empty(value: str, *, name: str = "value") -> str:

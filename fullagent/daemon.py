@@ -285,7 +285,7 @@ class Daemon:
         if base is None:
             return None
         mission_id = str(base.get("mission_id", ""))
-        steps = [Step(id=s["id"], task=s["task"], state=s.get("state"),
+        steps = [Step(id=s["id"], task=s["task"], state=s.get("state") or "PENDING",
                       attempts=int(s.get("attempts", 0)),
                       result=s.get("result", ""))
                  for s in base.get("steps") or []]
@@ -346,7 +346,7 @@ class Daemon:
         if running:
             reasons.append(f"{len(running)} mission(s) RUNNING with "
                            "pending steps")
-        failed_verdicts = sum(1 for v in st.verdicts if not v.get("passed"))
+        failed_verdicts = sum(1 for v in st.verdicts if v.get("passed") is False)
         if failed_verdicts:
             reasons.append(f"{failed_verdicts} failed verdict(s) to react to")
         if st.budget_events:

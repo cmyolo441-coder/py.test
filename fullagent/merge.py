@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 from dataclasses import dataclass, field
 
 from .kernel import EventLog, Event
@@ -102,7 +103,26 @@ class TimelineMerger:
         """The seq of the newest event common to both branches' chains
         (-1 if they share nothing). Exact via parent-chain sets."""
         def chain_ids(branch: str) -> list[str]:
-            return [e.id for e in self.log.events(branch)]
+            ids = [e.id for e in self.log.events(branch)]
+            # Fall back to the archive when the in-memory window truncated
+            # the branch chain, so common ancestry is not lost.
+            if self.log.archived_event_count > 0:
+                try:
+                    with self.log.archive_path.open("r", encoding="utf-8") as fh:
+                        for line in fh:
+                            if f'"branch": "{branch}"' not in line:
+                                continue
+                            try:
+                                d = json.loads(line)
+                            except ValueError:
+                                continue
+                            if isinstance(d, dict) and d.get("branch") == branch:
+                                eid = d.get("id")
+                                if isinstance(eid, str) and eid not in ids:
+                                    ids.append(eid)
+                except OSError:
+                    pass
+            return ids
         a_ids = set(chain_ids(a))
         best = -1
         for ev in self.log.events(b):
@@ -196,26 +216,38 @@ class TimelineMerger:
         merge_branch = result.branch
         # fork the merge branch from A at the ancestor, carrying A's base
         # (fork seeds the branch; the shared ancestor events are already
-        # on it through A's chain)
-        self.log._heads[merge_branch] = self.log._event_at(
-            a, fork_at).id if fork_at >= 0 else None
+        # on it through A's chain).
+        # The base event may be outside the in-memory retention window
+        # (_event_at -> None, .id -> AttributeError); materialise it from
+        # the archive exactly like kernel.fork() does.
+        base = None
         replay = []
         for ev in result.only_a + result.only_b + result.shared:
             # every classified copy replays — duplicates are REAL history
             if ev.type in _CONTENT_TYPES:
                 replay.append(ev)
-        cur = self.log.branch
-        self.log.branch = merge_branch
-        try:
-            for ev in replay:
-                # deep-copy the payload: the original event and the
-                # replayed one must never share a mutable dict — mutating
-                # either side would corrupt the other's content hash and
-                # break verify()
-                self.log.append(ev.type, copy.deepcopy(ev.data),
-                                actor="merge", provenance=ev.provenance)
-        finally:
-            self.log.branch = cur
+        # the head seed + branch swap + replay must be one critical
+        # section: self.log.branch is shared turn state, so a concurrent
+        # append between the swap and the restore lands on the wrong
+        # branch. EventLog._lock is an RLock, so append() re-enters.
+        with self.log._lock:
+            base = self.log._event_at(a, fork_at) if fork_at >= 0 else None
+            if (base is None and fork_at >= 0
+                    and self.log.archived_event_count):
+                base = self.log._load_archived_base(a, fork_at)
+            self.log._heads[merge_branch] = base.id if base else None
+            cur = self.log.branch
+            self.log.branch = merge_branch
+            try:
+                for ev in replay:
+                    # deep-copy the payload: the original event and the
+                    # replayed one must never share a mutable dict — mutating
+                    # either side would corrupt the other's content hash and
+                    # break verify()
+                    self.log.append(ev.type, copy.deepcopy(ev.data),
+                                    actor="merge", provenance=ev.provenance)
+            finally:
+                self.log.branch = cur
         self.log.checkout(merge_branch)
 
         self.log.append("merge.merged", result.to_dict(), actor="kernel")

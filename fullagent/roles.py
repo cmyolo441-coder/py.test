@@ -124,4 +124,4 @@ def role_label(role: str) -> str:
 
 def role_guidance(role: str) -> str:
     """Return focused instructions without changing the role's capabilities."""
-    return ROLE_GUIDANCE.get(role, ROLE_GUIDANCE["researcher"])
+    return ROLE_GUIDANCE.get(role, ROLE_GUIDANCE[DEFAULT_ROLE])

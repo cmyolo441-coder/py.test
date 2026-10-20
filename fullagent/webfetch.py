@@ -197,8 +197,11 @@ def _cache_get(url: str, cache_dir: str | None):
         path = _cache_path(url, cache_dir)
         with open(path, "r", encoding="utf-8") as f:
             entry = json.load(f)
-        if time.time() - float(entry.get("fetched_at", 0)) <= CACHE_TTL:
-            return entry["result"]
+        result = entry.get("result")
+        if (isinstance(result, dict)
+                and time.time() - float(entry.get("fetched_at", 0))
+                <= CACHE_TTL):
+            return result
     except Exception:
         pass
     return None
@@ -301,7 +304,7 @@ def fetch_text(url: str, timeout: int = DEFAULT_TIMEOUT,
                 return {"error": f"HTTP {status}"}
             final_url = resp.geturl()
             content_type = resp.headers.get("Content-Type", "")
-            raw = resp.read(MAX_HTML_BYTES + 1)
+            raw = resp.read(MAX_HTML_BYTES)
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
 
@@ -359,7 +362,11 @@ def register(agent) -> None:
     """
     from .tools import Tool  # local import: avoids any import-time cycles
 
-    existing = getattr(agent, "tools", {}).get("web_fetch")
+    tools = getattr(agent, "tools", None)
+    if not isinstance(tools, dict):
+        tools = {}
+        setattr(agent, "tools", tools)
+    existing = tools.get("web_fetch")
     if existing is not None:
         agent.tools["web_fetch"] = Tool(
             existing.name, existing.description, existing.parameters,

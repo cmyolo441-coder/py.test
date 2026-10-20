@@ -79,7 +79,7 @@ def _droppable_groups(msgs: list) -> list[list[int]]:
     n = len(msgs)
     groups: list[list[int]] = []
     i = 1
-    first_user_seen = False
+    first_user_seen = (n > 0 and msgs[0].get("role") == "user")
     while i < n:
         role = msgs[i].get("role")
         if role == "user" and not first_user_seen:

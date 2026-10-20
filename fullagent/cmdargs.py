@@ -60,7 +60,7 @@ def expand_arguments(template, args):
     def _repl(match):
         token = match.group(0)
         if token == "$ARGUMENTS" or token == "$@":
-            return " ".join(args)
+            return " ".join(str(a) for a in args)
         # Positional $1, $2, ...
         idx = int(token[1:]) - 1
         if 0 <= idx < len(args):

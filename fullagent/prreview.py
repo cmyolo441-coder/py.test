@@ -263,7 +263,9 @@ def parse_diff(diff: str) -> List[Dict[str, Any]]:
 def _is_test_file(path: str) -> bool:
     base = path.rsplit("/", 1)[-1].lower()
     p = path.lower()
-    return ("test" in base or "spec" in base
+    stem = base.rsplit(".", 1)[0]
+    return (bool(re.search(r"(^|[_\-\.])tests?([_\-\.]|$)", stem))
+            or bool(re.search(r"(^|[_\-\.])specs?([_\-\.]|$)", stem))
             or "/test/" in p or p.startswith("test/")
             or "/tests/" in p or p.startswith("tests/")
             or "/spec/" in p or "/__tests__/" in p)

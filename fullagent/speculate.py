@@ -51,7 +51,10 @@ class Prediction:
     why: str = ""
 
     def key(self) -> str:
-        return f"{self.tool}:{sorted(self.args.items())}"
+        try:
+            return f"{self.tool}:{sorted(self.args.items())}"
+        except TypeError:
+            return f"{self.tool}:{sorted(self.args.items(), key=lambda kv: str(kv))}"
 
 
 def predict(user_text: str, recent_tools: list[dict],
@@ -223,7 +226,10 @@ class Speculator:
         result (a hit). Otherwise None — the caller runs it for real."""
         if tool not in SPECULATIVE_TOOLS:
             return None
-        key = f"{tool}:{sorted(args.items())}"
+        try:
+            key = f"{tool}:{sorted(args.items())}"
+        except TypeError:
+            key = f"{tool}:{sorted(args.items(), key=lambda kv: str(kv))}"
         # Counter increment AND the spec.hit event log BOTH live inside
         # the lock now. The previous code released the lock between
         # `del self._cache[key]` and `self.hits += 1`, so two threads

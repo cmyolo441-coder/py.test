@@ -289,7 +289,7 @@ class KnowledgeGraph:
             e = self._entities.get(eid)
             if e is not None and (kind is None or e.kind == kind):
                 out.append(e)
-        return out
+        return sorted(out, key=lambda e: e.id)
 
     def out_edges(self, entity_id: str, rel: str | None = None
                   ) -> list[Relation]:

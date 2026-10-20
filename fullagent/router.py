@@ -146,7 +146,11 @@ class Router:
     def __init__(self, log: EventLog,
                  table: dict[str, dict] | None = None) -> None:
         self.log = log
-        self.table = table or MODEL_TABLE
+        # `table or MODEL_TABLE` treated an explicitly EMPTY table as
+        # "use the production catalog": the empty-table degradation below
+        # (`if not self.table`) was dead code and an empty custom table
+        # silently routed to real models. Only None means "default".
+        self.table = table if table is not None else MODEL_TABLE
         # BUGFIX: the escalation ceiling belongs to THIS router's table.
         # The old module-global _STRONGEST leaked across Router instances
         # with custom tables — the `escalated` flag and savings() both
@@ -233,7 +237,7 @@ class Router:
         reason = (f"difficulty {diff.score:.2f} -> cheapest capable "
                   f"'{best}' (cap {spec['capability']:.2f})")
         choice = RouteChoice(best, diff.score, reason,
-                             escalated=escalated or best == self._strongest,
+                             escalated=escalated,
                              est_cost=self._cost(best, est_tokens),
                              est_tokens=est_tokens)
         self._seal(task, diff, choice)

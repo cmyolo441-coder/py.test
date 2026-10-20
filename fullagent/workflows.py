@@ -94,6 +94,8 @@ class Workflow:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Workflow":
+        if not isinstance(d, dict):
+            raise WorkflowError("workflow definition must be a JSON object")
         name = str(d.get("name", "")).strip()
         if not _NAME_RE.match(name):
             raise WorkflowError(
@@ -179,7 +181,7 @@ class WorkflowEngine:
             known = ", ".join(self.list()) or "none"
             raise WorkflowError(f"unknown workflow {name!r} (saved: {known})")
         try:
-            return Workflow.from_dict(json.loads(path.read_text()))
+            return Workflow.from_dict(json.loads(path.read_text(encoding="utf-8")))
         except (ValueError, KeyError, TypeError) as e:
             raise WorkflowError(f"workflow {name!r} is malformed: {e}")
 

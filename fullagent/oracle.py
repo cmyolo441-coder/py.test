@@ -31,7 +31,10 @@ class Oracle:
         self.log = log
         self.memory_dir = Path(memory_dir) if memory_dir else None
         if self.memory_dir:
-            self.memory_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                self.memory_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                self.memory_dir = None
 
     # -- post-run analysis (§24.1) --------------------------------------------
 

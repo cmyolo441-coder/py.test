@@ -16,6 +16,7 @@ Use:
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import sys
@@ -37,7 +38,8 @@ def load_cfg() -> dict:
 
 def save_cfg(cfg: dict) -> None:
     os.makedirs(CFG_DIR, exist_ok=True)
-    with open(CFG_FILE, "w", encoding="utf-8") as f:
+    fd = os.open(CFG_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(cfg, f)
     os.chmod(CFG_FILE, 0o600)
 
@@ -111,8 +113,11 @@ def cmd_chat(prompt: str) -> int:
                     ev = json.loads(line[5:].strip())
                 except ValueError:
                     continue
+                if not isinstance(ev, dict):
+                    continue
                 et = ev.get("type")
-                tx = ev.get("text", "")
+                tx = ev.get("text")
+                tx = "" if tx is None else str(tx)
                 if et == "token":
                     sys.stdout.write(tx)
                     sys.stdout.flush()
@@ -131,15 +136,20 @@ def cmd_chat(prompt: str) -> int:
                         info = json.loads(tx)
                     except ValueError:
                         info = {}
+                    if not isinstance(info, dict):
+                        info = {}
                     if info.get("error"):
                         sys.stderr.write(
-                            f"\n[done with error: {info['error']}]\n")
+                            f"\n[done with error: {info.get('error')}]\n")
                         return 1
                     sys.stdout.write("\n")
                     return 0
     except KeyboardInterrupt:
         sys.stderr.write("\n[interrupted — server keeps running]\n")
         return 130
+    except (OSError, http.client.HTTPException) as e:
+        sys.stderr.write(f"\n[error: connection lost: {e}]\n")
+        return 1
     sys.stderr.write("\n[error: stream closed before completion]\n")
     return 1
 

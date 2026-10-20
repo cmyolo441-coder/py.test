@@ -188,11 +188,14 @@ class _BrowserSession:
         """Real page load. Returns title + final url."""
         if not isinstance(url, str) or not url.strip():
             return "ERROR: url must be a non-empty string"
+        url = url.strip()
+        if not url.lower().startswith(("http://", "https://")):
+            return "ERROR: url must start with http:// or https://"
         err, page = self._ensure()
         if err:
             return err
         try:
-            page.goto(url.strip(), timeout=self._timeout,
+            page.goto(url, timeout=self._timeout,
                       wait_until="domcontentloaded")
             return f"title: {page.title()}\nurl: {page.url}"
         except Exception as e:  # noqa: BLE001 — real nav failure
@@ -238,20 +241,22 @@ class _BrowserSession:
             text = " ".join(text.split())
             return text[:SNAPSHOT_CAP] or "(empty page)"
         lines: list[str] = []
-
-        def _walk(node: dict, depth: int) -> None:
-            role = str(node.get("role", "?"))
-            name = str(node.get("name", "") or "").strip()
-            value = str(node.get("value", "") or "").strip()
-            detail = " ".join(p for p in (name, value) if p)
-            line = f"{'  ' * depth}[{role}]" + (f" {detail}" if detail else "")
-            lines.append(line)
-            for child in node.get("children") or []:
-                if isinstance(child, dict):
-                    _walk(child, depth + 1)
-
+        stack: list[tuple[dict, int]] = [(tree, 0)]
         try:
-            _walk(tree, 0)
+            while stack:
+                node, depth = stack.pop()
+                if not isinstance(node, dict):
+                    continue
+                role = str(node.get("role", "?"))
+                name = str(node.get("name", "") or "").strip()
+                value = str(node.get("value", "") or "").strip()
+                detail = " ".join(p for p in (name, value) if p)
+                line = f"{'  ' * depth}[{role}]" + (f" {detail}" if detail else "")
+                lines.append(line)
+                children = node.get("children") or []
+                for child in reversed(children):
+                    if isinstance(child, dict):
+                        stack.append((child, depth + 1))
         except Exception:
             pass
         out = "\n".join(lines).strip()
@@ -390,8 +395,12 @@ def _selftest() -> None:
         for t in ("BrowserOpen", "BrowserSnapshot", "BrowserClick"):
             h = agent.tools[t].handler
             try:
-                tool_outs.append(h("x") if t != "BrowserSnapshot"
-                                else h())
+                if t == "BrowserSnapshot":
+                    tool_outs.append(h())
+                elif t == "BrowserOpen":
+                    tool_outs.append(h("https://example.com"))
+                else:
+                    tool_outs.append(h("button"))
             except Exception as e:  # noqa: BLE001
                 tool_outs.append(f"RAISED {e}")
         check("tool handlers return actionable unavailable message",
@@ -414,11 +423,29 @@ def _selftest() -> None:
               {"BrowserOpen", "BrowserSnapshot", "BrowserClick",
                "BrowserClose"} <= set(agent.tools))
 
-        from urllib.parse import quote
-        page_url = "data:text/html;charset=utf-8," + quote(
-            "<html><head><title>Example</title></head><body>"
-            "<main><h1>Example page</h1><a href='#more'>More information</a>"
-            "<p id='more'>Browser automation works.</p></main></body></html>")
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        _page = ("<html><head><title>Example</title></head><body>"
+                 "<main><h1>Example page</h1>"
+                 "<a href='#more'>More information</a>"
+                 "<p id='more'>Browser automation works.</p></main></body></html>")
+
+        class _PageHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = _page.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _PageHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        page_url = f"http://127.0.0.1:{server.server_port}/"
         out = agent.tools["BrowserOpen"].handler(page_url)
         check("BrowserOpen returns output (no exception)", bool(out))
         print("   open:", out.replace("\n", " | ")[:120])
@@ -446,6 +473,8 @@ def _selftest() -> None:
         check("re-open after close works", "Example" in out2)
         final = agent.tools["BrowserClose"].handler()
         check("final close clean", final == "browser closed")
+        server.shutdown()
+        server.server_close()
 
         # invalid inputs return errors, never raise
         check("empty url -> error",

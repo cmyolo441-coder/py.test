@@ -106,7 +106,8 @@ def _fresh_pct(agent: Any) -> float:
     model_id = getattr(model, "id", "") if model is not None else ""
     window = getattr(model, "context_window", 0) if model is not None else 0
     used = estimate_tokens(messages, model_id)
-    window = max(1, window)
+    if not window or window <= 0:
+        return 0.0
     return min(100.0, used * 100.0 / window)
 
 

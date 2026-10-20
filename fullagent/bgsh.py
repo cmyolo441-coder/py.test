@@ -310,7 +310,16 @@ def _handle_bash_output(**kwargs: Any) -> str:
             return (f"ERROR: tail_lines must be an integer, "
                     f"got {tail_lines!r}")
         n = max(0, min(n, 2000))
-        lines = full_out.splitlines(keepends=True)
+        with task._lock:
+            err_text = "".join(task._stderr)
+            spawn_err = task.spawn_error
+        combined = ""
+        if spawn_err:
+            combined += spawn_err + "\n"
+        combined += full_out
+        if err_text:
+            combined += ("\n" if not combined.endswith("\n") else "") + err_text
+        lines = combined.splitlines(keepends=True)
         body = "".join(lines[-n:]) if n else ""
     else:
         body = _render(new_out, new_err)

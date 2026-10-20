@@ -426,7 +426,13 @@ class GoalContract:
         st = self.status()
         if not st.active:
             return {"distance": 1.0, "velocity": 0.0}
-        measures = fold(self.log).distance_measures
+        last_set_seq = -1
+        for ev in self.log.events():
+            if ev.type == "goal.set":
+                last_set_seq = ev.seq
+        measures = [m for m in fold(self.log).distance_measures
+                    if (m.get("seq", 0) if isinstance(m, dict) else 0)
+                    > last_set_seq]
         velocity = 0.0
         if measures:
             last = measures[-1]
@@ -445,8 +451,20 @@ class GoalContract:
         clause becomes the focus; everything re-aims at it."""
         st = self.status()
         # SPEED: the fold ran once per clause (inside the loop) — hoisted.
-        regressed_ids = {r.get("clause")
-                         for r in fold(self.log).clause_regressed}
+        last_set_seq = -1
+        for ev in self.log.events():
+            if ev.type == "goal.set":
+                last_set_seq = ev.seq
+        regressed_ids = set()
+        for ev in self.log.events():
+            if ev.type != "clause.regressed":
+                continue
+            if ev.seq <= last_set_seq:
+                continue
+            d = ev.data or {}
+            if d.get("anti") or d.get("invariant"):
+                continue
+            regressed_ids.add(d.get("clause"))
         scores: dict[str, float] = {}
         for c in st.clauses:
             if c.state in ("PROVEN", "WAIVED"):

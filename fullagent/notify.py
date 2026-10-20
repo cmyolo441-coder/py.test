@@ -75,7 +75,7 @@ def load_config(path: str = CONFIG_PATH) -> Dict[str, Any]:
 def save_config(config: Dict[str, Any], path: str = CONFIG_PATH) -> bool:
     """Save the notify config. Returns True on success, False on error."""
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(config, fh, indent=2)
         return True

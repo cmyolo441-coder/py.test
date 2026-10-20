@@ -308,10 +308,10 @@ def review_files(paths: list[str]) -> str:
             findings.append(_finding(p, 0, "low", f"Could not read file: {e}",
                                      "Check permissions and retry."))
             continue
+        lines = text.splitlines()
         fake_diff = (f"--- /dev/null\n+++ b/{p}\n"
-                     + "".join(f"@@ -0,0 +{i},1 @@\n+{ln}\n"
-                               for i, ln in
-                               enumerate(text.splitlines(), start=1)))
+                     + f"@@ -0,0 +1,{len(lines)} @@\n"
+                     + "".join(f"+{ln}\n" for ln in lines))
         findings.extend(review_diff(fake_diff))
     return format_report(findings, "Code review")
 

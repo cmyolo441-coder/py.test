@@ -101,13 +101,18 @@ def observations_from_log(log: EventLog) -> list[Observation]:
             if ev.data.get("status") == "error":
                 current["errors"] += 1
         elif t == "turn.scorecard":
-            current["outcome"] = float(ev.data.get("score", 0)) / 100.0
+            raw = ev.data.get("score", 0)
+            try:
+                score = float(raw)
+            except (TypeError, ValueError):
+                score = 0.0
+            current["outcome"] = min(1.0, max(0.0, score / 100.0 if score > 1 else score))
     if current is not None:
         turns.append(current)
     out = []
     for tn in turns:
         if tn["outcome"] is None:
-            tn["outcome"] = 1.0 if tn["errors"] == 0 and tn["tools"] \
+            tn["outcome"] = 1.0 if tn["errors"] == 0 and tn["tools"] > 0 \
                 else (0.4 if tn["errors"] == 0 else 0.0)
         out.append(Observation(
             features={"web": tn["web"],

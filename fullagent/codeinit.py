@@ -82,7 +82,7 @@ def _iter_source_files(root: Path):
     """Yield relative paths of files under root, skipping junk dirs."""
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames
-                       if d not in _SKIP_DIRS and not d.startswith(".git")]
+                       if d not in _SKIP_DIRS and not d.startswith(".")]
         for fn in filenames:
             yield Path(dirpath, fn).relative_to(root)
 
@@ -115,8 +115,10 @@ def analyze_project(root: str | Path = ".") -> dict:
         label = _KEY_FILES.get(low)
         if label:
             key_files.append(rel.as_posix())
-        if low in ("main.py", "main.go", "main.rs", "index.js", "index.ts",
-                   "app.py", "cli.py", "__main__.py"):
+        name_stem = rel.stem.lower()
+        if (low in ("main.py", "main.go", "main.rs", "index.js", "index.ts",
+                    "app.py", "cli.py", "__main__.py", "server.py")
+                or name_stem in ("main", "app", "cli", "index", "server")):
             entry_points.append(rel.as_posix())
 
         ext = rel.suffix.lower()

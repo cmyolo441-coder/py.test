@@ -111,19 +111,35 @@ def run_cancellable(fn: Callable[[], Any],
     def _run() -> None:
         try:
             result = fn()
+        # BaseException too: a SystemExit/KeyboardInterrupt raised by fn()
+        # killed the worker without ever enqueueing an outcome, leaving the
+        # caller polling forever (a silent hang — no cancel will arrive).
         except BaseException as e:  # noqa: BLE001 — re-raised on caller
-            box.put((e, None))
+            try:
+                box.put((e, None))
+            except Exception:
+                pass
             return
+        # If cancelled, close any closable resource regardless of timing.
         if abandoned.is_set():
-            # Cancelled while we were blocked: nobody will consume this.
-            # Close it if it is a closable resource (HTTP response).
             close = getattr(result, "close", None)
             if callable(close):
                 try:
                     close()
                 except Exception:
                     pass
-        box.put((_DONE, result))
+        try:
+            box.put((_DONE, result))
+        except Exception:
+            pass
+        # Race: cancellation may land after enqueue — close then.
+        if abandoned.is_set():
+            close = getattr(result, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
 
     worker = threading.Thread(target=_run, daemon=True,
                               name=f"cancelguard:{name}")

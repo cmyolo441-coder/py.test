@@ -107,6 +107,7 @@ class WorldModel:
     def edges(self, value: dict[tuple[str, str], Edge]) -> None:
         self._edges = value
         self._adj = None  # replaced wholesale — adjacency is stale
+        self._scanned = True
 
     def _ensure_scanned(self) -> None:
         if not self._scanned and self.root is not None:
@@ -185,7 +186,9 @@ class WorldModel:
         changed = [str(c) for c in changed]
         failures = set(str(f) for f in failures)
         for src in changed:
-            for dst in (dependants or self._static_dependants(src)):
+            _deps = (self._static_dependants(src)
+                     if dependants is None else dependants)
+            for dst in _deps:
                 if dst == src:
                     continue
                 edge = self._edge(src, dst)
@@ -236,21 +239,23 @@ class WorldModel:
         path = str(path)
         adj = self._adjacency()
         frontier: deque[tuple[str, int]] = deque([(path, 0)])
-        seen = {path}
+        seen: set[str] = {path}
         ranked: dict[str, tuple[float, str]] = {}
         while frontier:
             cur, hops = frontier.popleft()
             if hops >= _MAX_HOPS:
                 continue
             for dst, edge in adj.get(cur, ()):
-                if dst in seen:
-                    continue
-                seen.add(dst)
                 p = edge.risk * (_DECAY ** hops)
                 via = "direct" if hops == 0 else f"{hops + 1} hops"
                 if dst not in ranked or p > ranked[dst][0]:
                     ranked[dst] = (p, via)
-                frontier.append((dst, hops + 1))
+                if dst not in seen:
+                    seen.add(dst)
+                    frontier.append((dst, hops + 1))
+                else:
+                    # allow a better alternate route to be explored once
+                    pass
         ranked_list = [{"path": k, "probability": round(v[0], 3),
                         "via": v[1]}
                        for k, v in ranked.items()]

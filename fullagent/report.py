@@ -282,7 +282,7 @@ def format_forecast(f: dict) -> str:
         lines.append(f"  per turn          : ~{f['tokens_in_per_turn']:,} "
                      f"in / ~{f['tokens_out_per_turn']:,} out"
                      + (f" · ${f['cost_per_turn_usd']:.4f}"
-                        if f.get("cost_per_turn_usd") else ""))
+                        if f.get("cost_per_turn_usd") is not None else ""))
     if "goal_distance" in f and f["goal_distance"] is not None:
         done = (1 - f["goal_distance"]) * 100
         lines.append(f"  goal progress     : {done:.0f}% "

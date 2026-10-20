@@ -142,6 +142,7 @@ class DualProcess:
         key = self._cache_key(question)
         cached = self.cache.get(key)
         if cached is not None:
+            self.cache.move_to_end(key)
             answer, sealed_at, from_slow = cached
             age = time.time() - sealed_at
             conf = self._confidence(question, answer, age)

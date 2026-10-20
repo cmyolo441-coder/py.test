@@ -116,7 +116,7 @@ class CIPilot:
         # prune the text cache: entries for test files that no longer
         # exist would otherwise pin their contents forever on a
         # long-running watch
-        for stale in set(self._test_text_cache) - tests:
+        for stale in list(set(self._test_text_cache) - tests):
             del self._test_text_cache[stale]
         if not tests:
             return []
@@ -135,7 +135,7 @@ class CIPilot:
             for t, text in test_text.items():
                 if mod and mod in text:
                     picked.add(t)       # imports/mentions the module
-            dirn = str(path.parent)
+            dirn = path.parent.as_posix()
             for t in tests:
                 if str(Path(t).parent).replace("\\", "/") == dirn:
                     picked.add(t)       # same directory
@@ -151,7 +151,7 @@ class CIPilot:
                 p for p, sig in current.items()
                 if self._snapshot.get(p) != sig)
             disappeared = [p for p in self._snapshot if p not in current]
-            changed += disappeared
+            changed = sorted(set(changed))
             if changed:
                 tests = self.impacted_tests(changed)
                 record = RunRecord(changed=changed[:50], tests=tests[:30],

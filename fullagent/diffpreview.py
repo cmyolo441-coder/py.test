@@ -545,11 +545,11 @@ def _ask_yes_no(prompt: str, ui: Any) -> bool:
             except (EOFError, KeyboardInterrupt):
                 return False
         else:
-            return True
+            return False
     except Exception:
-        return True
+        return False
     if answer is None:
-        return True
+        return False
     a = str(answer).strip().lower()
     return a in ("", "y", "yes")
 

@@ -114,7 +114,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "FullAgentCloud/1.0"
 
     def log_message(self, fmt, *args):  # quieter logs
-        sys.stderr.write("[cloud] " + fmt % args + "\n")
+        msg = fmt % args
+        # redact query-string tokens (e.g. ?token=...) from request logs
+        if "token=" in msg:
+            import re
+            msg = re.sub(r"token=[^ &]+", "token=***", msg)
+        sys.stderr.write("[cloud] " + msg + "\n")
 
     # -- helpers ------------------------------------------------------
     def _send_json(self, code: int, obj: dict) -> None:
@@ -132,13 +137,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         tok = get_token()
         if not tok:
             return False
+
+        def _eq(candidate: str, expected: str) -> bool:
+            try:
+                return (len(candidate) == len(expected)
+                        and secrets.compare_digest(candidate, expected))
+            except TypeError:  # non-ASCII header/query value
+                return False
+
         auth = self.headers.get("Authorization", "")
-        expected = "Bearer " + tok
-        if len(auth) == len(expected) and secrets.compare_digest(auth, expected):
+        if _eq(auth, "Bearer " + tok):
             return True
         qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         cand = qs.get("token", [""])[0]
-        return len(cand) == len(tok) and secrets.compare_digest(cand, tok)
+        return _eq(cand, tok)
 
     # -- routes -------------------------------------------------------
     def do_GET(self):

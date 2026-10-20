@@ -200,6 +200,8 @@ def build_command(command: str,
     if chosen == BACKEND_BWRAP and detect_backends()[BACKEND_BWRAP]:
         return _build_bwrap_command(command, network), BACKEND_BWRAP
     if chosen == BACKEND_UNSHARE and detect_backends()[BACKEND_UNSHARE]:
+        if network:
+            return _build_unshare_command(command, network), BACKEND_RLIMIT
         return _build_unshare_command(command, network), BACKEND_UNSHARE
     return ["sh", "-c", command], BACKEND_RLIMIT
 
@@ -238,7 +240,15 @@ def run_sandboxed(command: str,
         result["error"] = "empty command"
         return result
 
-    timeout = max(MIN_TIMEOUT, min(float(timeout), MAX_TIMEOUT))
+    try:
+        timeout = float(timeout)
+    except (TypeError, ValueError):
+        result["error"] = f"invalid timeout: {timeout!r}"
+        return result
+    if timeout != timeout:  # NaN would make the clamp/timeout meaningless
+        result["error"] = "invalid timeout: NaN"
+        return result
+    timeout = max(MIN_TIMEOUT, min(timeout, MAX_TIMEOUT))
     argv, used = build_command(command, network=network, backend=backend)
     result["sandbox"] = used
 
@@ -297,6 +307,9 @@ def _format_result(res: dict[str, Any]) -> str:
 def _handle_sandboxed_run(command: str = "",
                           network: bool = False,
                           timeout: float = DEFAULT_TIMEOUT) -> str:
+    if isinstance(network, str):
+        # bool("false") is True; models often send stringified booleans
+        network = network.strip().lower() in ("1", "true", "yes", "y", "on")
     res = run_sandboxed(command, network=bool(network), timeout=timeout)
     return _format_result(res)
 

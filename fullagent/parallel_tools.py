@@ -96,13 +96,16 @@ def _run_batch(
     def _run(indexed_item: tuple[int, tuple[dict, Any]]) -> None:
         idx, (_, ev) = indexed_item
         t0 = time.perf_counter()
-        execute(
-            ev,
-            approve,
-            on_status,
-            causation_id=causation_id,
-            on_tool_output=on_tool_output,
-        )
+        try:
+            execute(
+                ev,
+                approve,
+                on_status,
+                causation_id=causation_id,
+                on_tool_output=on_tool_output,
+            )
+        except Exception:
+            pass
         durations[idx] = time.perf_counter() - t0
 
     t_start = time.perf_counter()

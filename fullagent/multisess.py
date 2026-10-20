@@ -230,7 +230,9 @@ def _snapshot_current(agent: Any) -> None:
         msgs = getattr(agent, "messages", None) or []
         with _meta_lock:
             meta = load_meta()
-            _record(meta, sid, msg_count=len(msgs))
+            _record(meta, sid, msg_count=sum(
+                1 for m in msgs if isinstance(m, dict)
+                and m.get("role") in ("user", "assistant")))
             save_meta(meta)
     except Exception:
         pass

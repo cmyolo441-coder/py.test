@@ -119,13 +119,14 @@ class PermissionRulesManager:
 
     def save(self) -> None:
         """Persist current rules to the JSON file (best-effort)."""
-        data = {v: sorted(self._rules[v]) for v in VERDICTS}
-        try:
-            os.makedirs(os.path.dirname(self._path), exist_ok=True)
-            with open(self._path, "w", encoding="utf-8") as fh:
-                json.dump(data, fh, ensure_ascii=False, indent=2)
-        except OSError:
-            pass  # persistence is best-effort; never break the flow
+        with self._lock:
+            data = {v: sorted(self._rules[v]) for v in VERDICTS}
+            try:
+                os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
+                with open(self._path, "w", encoding="utf-8") as fh:
+                    json.dump(data, fh, ensure_ascii=False, indent=2)
+            except OSError:
+                pass  # persistence is best-effort; never break the flow
 
     # -- mutation ---------------------------------------------------------
     def set_rule(self, tool_name: str, verdict: str) -> None:
@@ -160,7 +161,7 @@ class PermissionRulesManager:
     def _persist_locked(self) -> None:
         data = {v: sorted(self._rules[v]) for v in VERDICTS}
         try:
-            os.makedirs(os.path.dirname(self._path), exist_ok=True)
+            os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
             with open(self._path, "w", encoding="utf-8") as fh:
                 json.dump(data, fh, ensure_ascii=False, indent=2)
         except OSError:

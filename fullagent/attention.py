@@ -159,9 +159,22 @@ class AttentionEconomy:
         # floors may have pushed the total over budget — shave the
         # largest allocations back down toward their floor
         over = sum(limits.values()) - budget
+        # shave non-pinned sections first; pinned (ceiling) sections are
+        # only shaved as a last resort (floors still respected).
         for s in sorted(limits, key=lambda k: -limits[k]):
             if over <= 0:
                 break
+            if s in fixed:
+                continue
+            shave = min(over, limits[s] - floor)
+            if shave > 0:
+                limits[s] -= shave
+                over -= shave
+        for s in sorted(limits, key=lambda k: -limits[k]):
+            if over <= 0:
+                break
+            if s not in fixed:
+                continue
             shave = min(over, limits[s] - floor)
             if shave > 0:
                 limits[s] -= shave

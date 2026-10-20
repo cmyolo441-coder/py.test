@@ -132,8 +132,9 @@ def _wrap_editor(agent: Any, tool, orig_reader: Callable | None):
     def edit_guarded(*args, **kwargs):
         path = _extract_path(args, kwargs)
         normed = _norm(path) if isinstance(path, str) and path else None
+        existed_before = (normed is not None and os.path.exists(normed))
         grounded = False
-        if normed is not None and os.path.exists(normed):
+        if existed_before:
             # Existing file: must be grounded in a fresh read first.
             if not _is_fresh(agent, normed):
                 # Auto-read (bounded) so the *model* sees fresh content
@@ -144,7 +145,7 @@ def _wrap_editor(agent: Any, tool, orig_reader: Callable | None):
         result = orig(*args, **kwargs)
         # Our own successful write keeps the file fresh, so consecutive
         # edits by the agent don't trigger a redundant re-read.
-        if (normed is not None and grounded
+        if (normed is not None and existed_before
                 and isinstance(result, str)
                 and not result.startswith("ERROR")):
             _record(agent, normed)

@@ -415,6 +415,19 @@ class EventLog:
                 # from pruning while it remains a branch head.
                 self._by_id[ev.id] = ev
                 self._extra.add(ev.id)
+        # Pin archived immediate parents so deep-rewind chains survive reload.
+        pending = [ev for ev in list(self._by_id.values())
+                   if ev.parent and ev.parent not in self._by_id]
+        seen_parents: set[str] = set()
+        for ev in pending:
+            if ev.parent in seen_parents:
+                continue
+            seen_parents.add(ev.parent)
+            parent = self._find_in_archive(ev.parent)
+            if parent is not None and parent.id not in self._by_id:
+                self._by_id[parent.id] = parent
+                self._extra.add(parent.id)
+
         self._pruned_total = max(0, self._next_seq - len(self._by_id))
 
     def _slow_load(self, max_e: int | None) -> None:
@@ -700,9 +713,11 @@ class EventLog:
         if max_e is None:
             return
         protected = {h for h in self._heads.values() if h}
+        referenced = {ev.parent for ev in self._events if ev.parent}
         # reap window-external events that are no longer a branch head
-        # (e.g. a deep-rewind base superseded by its marker). O(#branches).
-        stale = [eid for eid in self._extra if eid not in protected]
+        # nor referenced as a parent by any retained event.
+        stale = [eid for eid in self._extra
+                 if eid not in protected and eid not in referenced]
         for eid in stale:
             self._by_id.pop(eid, None)
             self._extra.discard(eid)

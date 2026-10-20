@@ -80,9 +80,9 @@ class ProgressTracker:
         cur = self._clamp_int(current)
         with self._lock:
             t = self._trackers[pid]  # KeyError: unknown id
-            t.current = cur
+            t.current = max(0, cur)
             if t.total > 0:
-                t.current = min(max(cur, 0), t.total)
+                t.current = min(t.current, t.total)
             if message is not None:
                 t.message = str(message)[:200]
 
@@ -95,9 +95,9 @@ class ProgressTracker:
             delta = 0
         with self._lock:
             t = self._trackers[pid]  # KeyError: unknown id
-            t.current += delta
+            t.current = max(0, t.current + delta)
             if t.total > 0:
-                t.current = min(max(t.current, 0), t.total)
+                t.current = min(t.current, t.total)
             return t.current
 
     def mark_done(self, pid: str) -> None:

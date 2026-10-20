@@ -240,7 +240,7 @@ def main() -> int:
                     default="text",
                     help="headless turn output format (text|json)")
     _ns, argv = _p.parse_known_args(argv)
-    if _ns.print_:
+    if _ns.print_ is not None:
         return _headless_print(_ns.print_, _ns)
     if argv:
         return _headless(argv)

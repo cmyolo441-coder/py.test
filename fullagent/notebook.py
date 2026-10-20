@@ -222,7 +222,7 @@ def register(agent) -> None:
 def _safe(fn) -> str:
     try:
         return fn()
-    except (FileNotFoundError, ValueError, IndexError, TypeError) as e:
+    except (OSError, ValueError, IndexError, TypeError) as e:
         return f"ERROR: {e}"
 
 

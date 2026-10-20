@@ -61,7 +61,7 @@ def _registry_path() -> Path:
     if override:
         return Path(os.path.expandvars(override)).expanduser()
     if os.environ.get("FULLAGENT_HOME"):
-        return Path(os.environ["FULLAGENT_HOME"]).expanduser() / "webhooks.json"
+        return Path(os.path.expandvars(os.environ["FULLAGENT_HOME"])).expanduser() / "webhooks.json"
     return Path("~/.fullagent/webhooks.json").expanduser()
 
 

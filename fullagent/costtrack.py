@@ -133,7 +133,7 @@ class CostTracker:
                 row["turns"] += 1
                 row["in"] += max(0, int(in_tokens or 0))
                 row["out"] += max(0, int(out_tokens or 0))
-            self.save()
+                self.save()
         except Exception:
             pass
 

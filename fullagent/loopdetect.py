@@ -43,12 +43,18 @@ def normalize_args(args) -> str:
     normalise to the same string — they are the same approach.
     """
     if not isinstance(args, dict):
-        return json.dumps(args, sort_keys=True, ensure_ascii=False,
-                          default=str)
+        try:
+            return json.dumps(args, sort_keys=True, ensure_ascii=False,
+                              default=str)
+        except (TypeError, ValueError):
+            return json.dumps(args, ensure_ascii=False, default=str)
     clean = {k: v for k, v in args.items()
              if str(k).lower() not in _VOLATILE_ARG_KEYS}
-    return json.dumps(clean, sort_keys=True, ensure_ascii=False,
-                      default=str)
+    try:
+        return json.dumps(clean, sort_keys=True, ensure_ascii=False,
+                          default=str)
+    except (TypeError, ValueError):
+        return json.dumps(clean, ensure_ascii=False, default=str)
 
 
 def normalize_error(error_text) -> str:

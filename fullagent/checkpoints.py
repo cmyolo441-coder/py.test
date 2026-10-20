@@ -68,7 +68,7 @@ RISK_SAFE = "safe"
 
 
 def _checkpoints_dir(session_id: str) -> Path:
-    base = Path(os.environ["FULLAGENT_HOME"]).expanduser() if os.environ.get("FULLAGENT_HOME") else (Path.home() / ".fullagent")
+    base = Path(os.path.expandvars(os.environ["FULLAGENT_HOME"])).expanduser().resolve() if os.environ.get("FULLAGENT_HOME") else (Path.home() / ".fullagent").resolve()
     d = base / "checkpoints" / str(session_id)
     d.mkdir(parents=True, exist_ok=True)
     return d

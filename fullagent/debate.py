@@ -99,6 +99,7 @@ class DebateTournament:
         self.models = models or []
         self.trust: dict[str, float] = {}
         self._champion_cluster: set[str] = set()
+        self._clusters: list[list[str]] = []
         self._load_trust()
 
     # -- calibration persistence (from the event log — the only source) ----
@@ -210,6 +211,7 @@ class DebateTournament:
         self._champion_cluster = (
             set(result.clusters[0]) if result.clusters
             else {result.champion_model})
+        self._clusters = list(result.clusters or [])
         self.log.append("debate.verdict", result.to_dict(),
                         actor="kernel")
         return result
@@ -308,8 +310,18 @@ class DebateTournament:
 
     def refute(self, dissent_model: str) -> dict:
         """The dissent was right instead: flip the flow of trust."""
+        winners: set[str] = {dissent_model}
+        # credit the whole dissenting cluster, not just the named model.
+        # _clusters holds model-id lists (the same shape _fuse returns in
+        # DebateResult.clusters) — indexing self.models with them raised
+        # TypeError: '<' not supported between 'str' and 'int'.
+        for cluster in self._clusters:
+            ids = set(cluster)
+            if dissent_model in ids:
+                winners = ids
+                break
         for m in self.models:
-            self._update(m, won=(m == dissent_model))
+            self._update(m, won=(m in winners))
         return dict(self.trust)
 
     # -- reporting --------------------------------------------------------------------------

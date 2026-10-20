@@ -175,7 +175,7 @@ def smart_edit_retry(path: str, old_string: str, new_string: str,
         sleep_fn(wait)
         try:
             fresh_text = Path(path).read_text(encoding="utf-8")
-        except OSError as e:
+        except (OSError, UnicodeError) as e:
             fresh_text = None
             note = f"re-read failed ({e}); retrying with original old_string"
             use_old = old_string

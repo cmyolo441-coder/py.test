@@ -25,6 +25,7 @@ import shutil
 import sys
 import time
 import urllib.request
+import urllib.error
 from importlib import metadata
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -53,6 +54,9 @@ def _fetch_url(url: str, timeout: float = CONNECT_TIMEOUT
             url, headers={"User-Agent": "fullagent-doctor/1.0"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             status = f"HTTP {resp.status}"
+        reachable = True
+    except urllib.error.HTTPError as exc:
+        status = f"HTTP {exc.code}"
         reachable = True
     except Exception as exc:  # connection refused, timeout, DNS, TLS…
         status = f"{type(exc).__name__}: {exc}"
@@ -92,8 +96,9 @@ def _check_provider_keys() -> List[Dict[str, Any]]:
         try:
             present = bool(_provider_api_key(key))
         except Exception as exc:
-            return [_result(f"api-key:{key}", False,
-                            f"lookup failed: {type(exc).__name__}")]
+            results.append(_result(f"api-key:{key}", False,
+                                  f"lookup failed: {type(exc).__name__}"))
+            continue
         results.append(_result(f"api-key:{key}", present,
                                "set" if present else "missing"))
     return results

@@ -207,7 +207,13 @@ def _wrap_edit_tool(tool: Any, session_id: Optional[str]) -> Any:
     orig: Callable[..., str] = tool.handler
 
     def handler(*args: Any, **kwargs: Any) -> str:
-        path = args[0] if args else kwargs.get("path")
+        path = args[0] if args else None
+        if not isinstance(path, str):
+            for key in ("path", "file_path", "filepath", "file", "target"):
+                v = kwargs.get(key)
+                if isinstance(v, str):
+                    path = v
+                    break
         if isinstance(path, str) and path:
             snapshot_file(path, session_id)
         return orig(*args, **kwargs)

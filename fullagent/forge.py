@@ -141,7 +141,7 @@ class Forge:
         # changed while the digests differ
         changed = {k for k in ("os", "arch", "kernel", "python",
                                "implementation", "locale", "encoding",
-                               "lockfile_hash", "cwd")
+                               "lockfile_hash", "cwd", "case_sensitive")
                    if prev.get(k) != cur.get(k)}
         env_changed = {k for k in set(prev.get("env", {})) |
                        set(cur.get("env", {}))

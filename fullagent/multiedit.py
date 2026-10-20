@@ -209,12 +209,22 @@ def _apply_edits(p: Path, edits: list[dict[str, Any]], text: str,
                     i, None)
         resolved.append(res)
 
+    # Validate that resolved spans do not overlap in the original text.
+    spans = sorted((resolved[i]["start"], resolved[i]["end"]) for i in range(len(edits)))
+    for a in range(1, len(spans)):
+        if spans[a][0] < spans[a - 1][1]:
+            return (False,
+                    "ERROR: edits overlap in the original text "
+                    "(no changes were made)", None, None)
     new_text = text
     detail_lines = []
     shift = 0  # cumulative offset delta from earlier edits in this batch
     strategies: list[str] = []  # [worker 9] winning chain strategy per edit
     fuzzy_indices: list[int] = []  # [worker 1] fuzzy-applied edit indices
-    for i, (edit, res) in enumerate(zip(edits, resolved)):
+    order = sorted(range(len(edits)), key=lambda i: resolved[i]["start"])
+    for i in order:
+        edit = edits[i]
+        res = resolved[i]
         # Each old_string resolved to one confident span in `text`
         # (offsets into the ORIGINAL text, adjusted by `shift` from
         # earlier edits in this batch).

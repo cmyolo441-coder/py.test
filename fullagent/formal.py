@@ -61,11 +61,11 @@ class Before:
     def check(self, trace: list[set[str]]) -> str | None:
         seen_b = False
         for i, s in enumerate(trace):
-            if self.b in s:
-                seen_b = True
             if self.a in s and not seen_b:
                 return f"{self.a} at position {i} without prior " \
                        f"{self.b}"
+            if self.b in s:
+                seen_b = True
         return None
 
 

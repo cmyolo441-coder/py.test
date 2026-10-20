@@ -139,11 +139,12 @@ class Council:
     def convene(self, question: str) -> Verdict:
         """Run one full debate: thesis, then antithesis (serial), then the
         blind synthesis. Never raises — failures land in Verdict.error."""
-        council_id = f"council-{self.log.head() + 1}"
-        self.log.append("council.convened",
-                        {"council_id": council_id,
-                         "question": question[:300]},
-                        actor="council")
+        with self.log._lock:
+            council_id = f"council-{self.log.head() + 1}"
+            self.log.append("council.convened",
+                            {"council_id": council_id,
+                             "question": question[:300]},
+                            actor="council")
         verdict = Verdict(question=question)
         if self.speaker is None:
             verdict.ok = False

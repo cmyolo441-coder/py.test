@@ -282,7 +282,7 @@ class IntentCompiler:
         path collision inside the wave budget are returned as dropped so
         the plan reports them — the old code only sealed a log event and
         left plan.dropped / format() under-reporting the loss."""
-        out: list[list[dict]] = [[] for _ in waves]
+        out: list[list[dict]] = [[] for _ in waves] if waves else [[]]
         locked: list[set[str]] = [set() for _ in waves]
         dropped: list[dict] = []
         for wi, wave in enumerate(waves):

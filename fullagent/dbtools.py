@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import sqlite3
 from pathlib import Path
+from urllib.parse import quote
 
 from .tools import (
     RISK_CONFIRM,
@@ -49,7 +50,7 @@ def _connect_readonly(p: Path) -> sqlite3.Connection:
     above anyway) and refuses any write statement — a guard so SELECT
     tools can never accidentally modify data.
     """
-    uri = "file:" + p.as_posix().replace("?", "%3F") + "?mode=ro"
+    uri = "file:" + quote(p.as_posix(), safe="/") + "?mode=ro"
     return sqlite3.connect(uri, uri=True, timeout=5.0)
 
 
@@ -98,7 +99,7 @@ def db_tables(db_path: str) -> str:
             if kind == "table":
                 try:
                     count = conn.execute(
-                        f'SELECT COUNT(*) FROM "{name}"'
+                        f'SELECT COUNT(*) FROM "{name.replace(chr(34), chr(34)*2)}"'
                     ).fetchone()[0]
                 except sqlite3.Error:
                     count = "?"
@@ -143,7 +144,7 @@ def db_schema(db_path: str, table: str) -> str:
                         "(no CREATE TABLE statement)")
             return f"ERROR: table {name!r} not found in {p}"
         ddl = row[0]
-        cols = conn.execute(f'PRAGMA table_info("{name}")').fetchall()
+        cols = conn.execute(f'PRAGMA table_info("{name.replace(chr(34), chr(34)*2)}")').fetchall()
         col_rows = []
         for _cid, col, ctype, notnull, dflt, pk in cols:
             col_rows.append((
@@ -156,7 +157,7 @@ def db_schema(db_path: str, table: str) -> str:
         out = f"Table: {name} (in {p})\n\n{ddl};\n\nColumns:\n"
         out += _format_table(["column", "type", "nullable", "pk",
                               "default"], col_rows)
-        fks = conn.execute(f'PRAGMA foreign_key_list("{name}")').fetchall()
+        fks = conn.execute(f'PRAGMA foreign_key_list("{name.replace(chr(34), chr(34)*2)}")').fetchall()
         if fks:
             fk_rows = [(str(r[2]), str(r[3]), str(r[4])) for r in fks]
             out += "\n\nForeign keys:\n"

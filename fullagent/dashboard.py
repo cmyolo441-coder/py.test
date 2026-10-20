@@ -102,9 +102,8 @@ class Dashboard:
                              for e in st.analysis_events
                              if e.get("type") == "analysis.taint")
         graph_entities = 0
-        for e in st.graph_events:
-            graph_entities = max(graph_entities,
-                                 _safe_int(e.get("entities", 0)))
+        if st.graph_events:
+            graph_entities = _safe_int(st.graph_events[-1].get("entities", 0))
         cov_runs = [e for e in st.coverage_events
                     if e.get("type") == "coverage.result"]
         cov_last = (_safe_float(cov_runs[-1].get("percent", 0.0))

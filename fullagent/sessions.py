@@ -73,6 +73,7 @@ def save(agent: Any, session_id: Optional[str] = None,
     """
     try:
         sid = session_id or getattr(agent, "session_id", None) or "session"
+        sid = Path(str(sid)).name or "session"
         cfg = getattr(agent, "cfg", None)
         model_id = getattr(cfg, "model_id", "") if cfg is not None else ""
         messages = list(getattr(agent, "messages", []) or [])[-MAX_MESSAGES:]
@@ -148,6 +149,7 @@ def load(session_id: str) -> Optional[dict[str, Any]]:
         if entry is None:
             return None
         session_id = entry["id"]
+    session_id = Path(str(session_id)).name
     fp = store_dir() / f"{session_id}.json"
     if not fp.is_file():
         return None

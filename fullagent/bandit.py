@@ -169,7 +169,13 @@ class BanditRouter:
             _log.warning("bandit.update: unknown arm %r ignored "
                          "(not in configured arms)", arm)
             return
-        reward = max(0.0, min(1.0, float(reward)))
+        try:
+            r = float(reward)
+        except (TypeError, ValueError):
+            r = 0.0
+        if not math.isfinite(r):
+            r = 0.0
+        reward = max(0.0, min(1.0, r))
         context = context or "chat"
         a, b = self._posterior(context, arm)
         # fractional update: α += reward, β += (1 − reward)

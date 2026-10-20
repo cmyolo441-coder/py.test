@@ -97,13 +97,13 @@ class Nexus:
         if p.name == "__init__.py":
             # the export heuristic caches this file's contents
             self._init_cache.pop(str(p.parent), None)
-        self.idx.file_hashes[str(p)] = h
         try:
             tree = ast.parse(text)
         except SyntaxError as e:
             self.idx.errors[str(p)] = f"syntax error line {e.lineno}"
             return True
         self._extract(p, tree)
+        self.idx.file_hashes[str(p)] = h
         return True
 
     def _drop_file(self, path: str) -> None:
@@ -248,7 +248,11 @@ class Nexus:
             except OSError:
                 self._init_cache[pkg_dir] = None
         text = self._init_cache[pkg_dir]
-        return text is not None and sym.name in text
+        if text is None:
+            return False
+        # match the symbol name as a whole identifier, not a substring
+        import re
+        return bool(re.search(r"\b" + re.escape(sym.name) + r"\b", text))
 
     @staticmethod
     def _risk_score(public: bool, n_transitive: int, coverage: float,

@@ -289,6 +289,7 @@ def _make_handler(plugin: Dict[str, Any], tool: Dict[str, Any]):
                 input=payload,
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=timeout,
                 cwd=plugin["dir"],
             )
@@ -372,7 +373,9 @@ def handle_plugin(ui, arg: str) -> None:
     ``/plugin enable|disable <name>`` persists the enabled set and notes
     that a restart is needed for the change to take effect.
     """
-    mgr = _get_manager()
+    mgr = getattr(getattr(ui, "agent", None), "plugins", None)
+    if not isinstance(mgr, PluginManager):
+        mgr = _get_manager()
     text = (arg or "").strip()
     if not text or text.lower() in ("list", "ls"):
         ui.print_info(_list_text(mgr))

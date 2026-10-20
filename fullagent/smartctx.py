@@ -39,7 +39,9 @@ def _candidate_path(token: str, cwd: str) -> str | None:
     token = token.strip().strip(_QUOTES)
     if not token:
         return None
+    token = os.path.expanduser(token)
     full = token if os.path.isabs(token) else os.path.join(cwd, token)
+    full = os.path.expanduser(full)
     if os.path.isfile(full):
         return token
     return None
@@ -88,7 +90,9 @@ def read_attachments(paths: List[str], cwd: str = ".") -> str:
 
     for path in paths:
         header = f"--- {path} ---\n"
+        path = os.path.expanduser(path)
         full = path if os.path.isabs(path) else os.path.join(cwd, path)
+        full = os.path.expanduser(full)
         try:
             size = os.path.getsize(full)
         except OSError:

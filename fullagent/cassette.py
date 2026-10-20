@@ -148,7 +148,7 @@ class Cassette:
 
     def _store_put(self, key: str, response: dict) -> None:
         """Insert into the hot LRU, evicting the coldest entry past cap."""
-        self._store[key] = response
+        self._store[key] = copy.deepcopy(response)
         self._store.move_to_end(key)
         while len(self._store) > _MAX_HOT:
             self._store.popitem(last=False)

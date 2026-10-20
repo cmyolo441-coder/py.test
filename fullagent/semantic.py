@@ -172,7 +172,8 @@ class SemanticMemory:
         new = self._collect_new(st)
         if new:
             self._items.extend(new)
-            self._indexed = len(self._items)
+        self._indexed = len(self._items)
+        if new:
             self.log.append("semantic.indexed",
                             {"items": len(self._items), "new": len(new)},
                             actor="librarian")

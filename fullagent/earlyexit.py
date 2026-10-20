@@ -112,7 +112,7 @@ def novelty_score(result: str, seen_hashes: set[str],
     digest = hashlib.sha256(norm.encode("utf-8", "replace")).hexdigest()
     if digest in seen_hashes:
         return 0.0  # byte-identical result seen before
-    if tool_name in _READ_TOOLS and args is not None:
+    if tool_name in _READ_TOOLS and isinstance(args, dict):
         arg_key = (tool_name, _normalise_args(args))
         if arg_key in seen_arg_keys:
             return 0.0  # same read, same arguments: a re-read

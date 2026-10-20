@@ -295,9 +295,10 @@ def check_ast_assert(path: str, symbol: str, kind: str = "def",
                            f"has_parameter is not supported for kind="
                            f"'class' ({symbol!r} is a class)")
         args = match.args
-        names = ([a.arg for a in args.args] + [a.arg for a in args.kwonlyargs]
-                 + ([args.vararg.arg] if args.vararg else [])
-                 + ([args.kwarg.arg] if args.kwarg else []))
+        names = ([a.arg for a in getattr(args, "posonlyargs", [])]
+                  + [a.arg for a in args.args] + [a.arg for a in args.kwonlyargs]
+                  + ([args.vararg.arg] if args.vararg else [])
+                  + ([args.kwarg.arg] if args.kwarg else []))
         if has_parameter not in names:
             return Verdict(False, "ast_assert",
                            f"{symbol}() has no parameter {has_parameter!r} "
@@ -545,7 +546,7 @@ class Judge:
                 if not symbol:
                     return Verdict(False, ptype, "predicate missing 'symbol'")
                 return check_ast_assert(str(path), str(symbol),
-                                        str(predicate.get("kind", "def")),
+                                        str(predicate.get("kind") or "def"),
                                         predicate.get("has_parameter"))
             if ptype == "diff_assert":
                 path = predicate.get("path")

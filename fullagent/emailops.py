@@ -29,7 +29,10 @@ from email.message import EmailMessage
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-CONFIG_PATH = (Path(os.environ["FULLAGENT_HOME"]).expanduser() / "smtp.json") if os.environ.get("FULLAGENT_HOME") else Path(os.path.expanduser("~/.fullagent/smtp.json"))
+def _base_config_path() -> Path:
+    if os.environ.get("FULLAGENT_HOME"):
+        return Path(os.path.expandvars(os.environ["FULLAGENT_HOME"])).expanduser() / "smtp.json"
+    return Path(os.path.expanduser("~/.fullagent/smtp.json"))
 SMTP_TIMEOUT = 30.0
 
 MISSING_CONFIG_MSG = (
@@ -38,38 +41,51 @@ MISSING_CONFIG_MSG = (
 )
 
 _CONFIG_CACHE: Optional[Dict[str, Any]] = None
+_CONFIG_CACHE_KEY: Optional[tuple[str, float]] = None
 
 
 def _config_path() -> Path:
     """Honour FULLAGENT_SMTP_CONFIG for tests; default ~/.fullagent/smtp.json."""
     override = os.environ.get("FULLAGENT_SMTP_CONFIG")
-    return Path(override) if override else CONFIG_PATH
+    return Path(override) if override else _base_config_path()
 
 
 def _load_config() -> Optional[Dict[str, Any]]:
-    global _CONFIG_CACHE
-    if _CONFIG_CACHE is not None:
+    global _CONFIG_CACHE, _CONFIG_CACHE_KEY
+    path = _config_path()
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = -1.0
+    key = (str(path), mtime)
+    if _CONFIG_CACHE_KEY == key:
         return _CONFIG_CACHE
     try:
-        data = json.loads(_config_path().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError):
         _CONFIG_CACHE = None
+        _CONFIG_CACHE_KEY = key
         return None
     if not isinstance(data, dict):
         _CONFIG_CACHE = None
+        _CONFIG_CACHE_KEY = key
         return None
     _CONFIG_CACHE = data
+    _CONFIG_CACHE_KEY = key
     return data
 
 
 def _clear_config_cache() -> None:
-    global _CONFIG_CACHE
+    global _CONFIG_CACHE, _CONFIG_CACHE_KEY
     _CONFIG_CACHE = None
+    _CONFIG_CACHE_KEY = None
 
 
 def _valid_email(addr: str) -> bool:
     """Minimal validation: non-empty and contains @ with something on both sides."""
     if not isinstance(addr, str):
+        return False
+    if "\r" in addr or "\n" in addr:  # header injection / EmailMessage ValueError
         return False
     parts = addr.strip().split("@")
     return len(parts) == 2 and bool(parts[0]) and bool(parts[1])
@@ -105,6 +121,8 @@ def send_email(to: Any, subject: str, body: str,
     if not _valid_email(from_addr):
         return "ERROR: smtp.json 'from_addr' (or 'username') is not a valid email address"
     use_tls = bool(cfg.get("use_tls", True))
+    if isinstance(subject, str) and ("\r" in subject or "\n" in subject):
+        return "ERROR: subject must not contain newline characters"
 
     msg = EmailMessage()
     msg["From"] = from_addr
