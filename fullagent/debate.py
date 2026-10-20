@@ -106,9 +106,19 @@ class DebateTournament:
 
     def _load_trust(self) -> None:
         for ev in self.log.events():
-            if ev.type == "debate.calibration":
-                self.trust[ev.data.get("model", "")] = float(
-                    ev.data.get("trust", 0.5))
+            if ev.type != "debate.calibration":
+                continue
+            # calibration events are data, not trusted code: a hand-edited
+            # or third-party-written log may carry None/NaN and must not
+            # take down the tournament on startup
+            try:
+                value = float(ev.data.get("trust", 0.5))
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(value):
+                continue
+            self.trust[str(ev.data.get("model", ""))] = max(
+                _TRUST_MIN, min(_TRUST_MAX, value))
 
     def calibration(self, model_id: str) -> float:
         return self.trust.get(model_id, 0.5)

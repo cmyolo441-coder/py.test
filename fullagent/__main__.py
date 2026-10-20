@@ -217,6 +217,58 @@ def _headless_print(prompt: str, ns) -> int:
     return 0
 
 
+def _self_check() -> int:
+    """Smoke-test a frozen build: import every subsystem, build an Agent.
+
+    PyInstaller only sees static imports, so a bundled binary can pass
+    --version and still die the moment a lazily-imported subsystem is
+    touched (the v3.2.0 build shipped without fullagent.mastermind).
+    This resolves the whole lazy table and constructs the real agent
+    against a throwaway home directory — no network, no user state.
+    """
+    import importlib
+    import os
+    import pkgutil
+    import tempfile
+    import traceback
+
+    os.environ["FULLAGENT_HOME"] = tempfile.mkdtemp(prefix="selfcheck-")
+
+    import fullagent
+
+    failures: list[str] = []
+    imported = 0
+    for info in pkgutil.iter_modules(fullagent.__path__):
+        name = f"{fullagent.__name__}.{info.name}"
+        try:
+            importlib.import_module(name)
+            imported += 1
+        except BaseException as exc:
+            failures.append(f"import {name}: {exc!r}")
+
+    try:
+        from . import config
+        from .agent import Agent, _ensure_submodules
+        from .config import Config
+
+        _ensure_submodules()
+        config.ensure_dirs()
+        cfg = Config.load()
+        Agent(cfg)
+    except BaseException as exc:
+        traceback.print_exc()
+        failures.append(f"startup: {exc!r}")
+
+    if failures:
+        for line in failures:
+            print(f"SELF-CHECK FAIL: {line}", file=sys.stderr)
+        return 1
+    from . import __version__
+    print(f"SELF-CHECK OK: fullagent v{__version__}, "
+          f"{imported} submodules imported, agent constructed")
+    return 0
+
+
 def main() -> int:
     _force_utf8()
 
@@ -225,6 +277,8 @@ def main() -> int:
         from . import __version__
         print(f"fullagent v{__version__}")
         return 0
+    if argv and argv[0] == "--self-check":
+        return _self_check()
     # Feature: --resume/--continue flags (peeled before headless dispatch)
     import argparse as _ap
     _p = _ap.ArgumentParser()

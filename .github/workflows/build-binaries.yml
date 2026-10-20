@@ -55,6 +55,9 @@ jobs:
           BIN="fullagent"
           if [[ "${{ matrix.os }}" == windows-* ]]; then BIN="fullagent.exe"; fi
           ./$BIN --version
+          # --version alone proves nothing: resolve every lazily-imported
+          # subsystem and construct the agent, or fail the build.
+          ./$BIN --self-check
       - name: Rename asset
         shell: bash
         run: |

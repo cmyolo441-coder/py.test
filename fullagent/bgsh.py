@@ -35,6 +35,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections import deque
 from typing import Any
 
 from .tools import RISK_CONFIRM, RISK_SAFE, Tool
@@ -50,6 +51,11 @@ STATUS_KILLED = "killed"
 
 DEFAULT_TIMEOUT = 600.0   # 10 minutes, same as run_command's hard cap
 MAX_TIMEOUT = 3600.0      # hard cap: 1 hour
+
+# A chatty background task must never exhaust memory: keep at most this
+# much text per stream (the tail) and this many finished tasks.
+MAX_OUTPUT_CHARS = 262_144
+MAX_FINISHED_TASKS = 32
 
 # ---------------------------------------------------------------------------
 # Task engine
@@ -74,11 +80,44 @@ class _BgTask:
         self.proc: subprocess.Popen | None = None
         self.spawn_error: str | None = None
         self._lock = threading.Lock()
-        self._stdout: list[str] = []
-        self._stderr: list[str] = []
+        self._stdout: deque[str] = deque()
+        self._stderr: deque[str] = deque()
+        self._stdout_chars = 0
+        self._stderr_chars = 0
+        self._stdout_dropped = 0
+        self._stderr_dropped = 0
         self._stdout_seen = 0
         self._stderr_seen = 0
         self._kill_requested = False
+
+
+def _append_capped(task: _BgTask, stream: str, text: str) -> None:
+    """Append output, discarding the oldest text past MAX_OUTPUT_CHARS.
+
+    Caller must hold ``task._lock``. ``_stdout_dropped``/``_stderr_dropped``
+    count chars evicted from the front so poll offsets stay absolute.
+    """
+    chunks = task._stdout if stream == "out" else task._stderr
+    total = (task._stdout_chars if stream == "out"
+             else task._stderr_chars) + len(text)
+    chunks.append(text)
+    dropped = 0
+    while total > MAX_OUTPUT_CHARS and chunks:
+        if len(chunks) == 1:
+            extra = total - MAX_OUTPUT_CHARS
+            chunks[0] = chunks[0][extra:]
+            total -= extra
+            dropped += extra
+            break
+        old = chunks.popleft()
+        total -= len(old)
+        dropped += len(old)
+    if stream == "out":
+        task._stdout_chars = total
+        task._stdout_dropped += dropped
+    else:
+        task._stderr_chars = total
+        task._stderr_dropped += dropped
 
 
 _TASKS: dict[str, _BgTask] = {}
@@ -101,12 +140,12 @@ def _get(task_id: Any) -> _BgTask | None:
         return _TASKS.get(task_id)
 
 
-def _pump_pipe(task: _BgTask, pipe, chunks: list[str]) -> None:
-    """Drain one pipe line-by-line into the task's chunk list."""
+def _pump_pipe(task: _BgTask, pipe, stream: str) -> None:
+    """Drain one pipe line-by-line into the task's capped buffer."""
     try:
         for line in iter(pipe.readline, ""):
             with task._lock:
-                chunks.append(line)
+                _append_capped(task, stream, line)
     finally:
         try:
             pipe.close()
@@ -144,7 +183,8 @@ def _watch(task: _BgTask) -> None:
         rc = task.returncode
         if timed_out:
             task.status = STATUS_KILLED
-            task._stderr.append(
+            _append_capped(
+                task, "err",
                 f"\n[timeout after {task.timeout:g}s — process killed]\n")
         elif task._kill_requested and rc is not None and rc < 0:
             # negative rc => died by signal (our kill); a natural exit that
@@ -193,16 +233,26 @@ def launch(command: str, description: str = "",
             task.spawn_error = f"failed to start process: {e}"
         else:
             threading.Thread(target=_pump_pipe,
-                             args=(task, task.proc.stdout, task._stdout),
+                             args=(task, task.proc.stdout, "out"),
                              daemon=True, name=f"bgsh-out-{task.id}").start()
             threading.Thread(target=_pump_pipe,
-                             args=(task, task.proc.stderr, task._stderr),
+                             args=(task, task.proc.stderr, "err"),
                              daemon=True, name=f"bgsh-err-{task.id}").start()
             threading.Thread(target=_watch, args=(task,),
                              daemon=True, name=f"bgsh-watch-{task.id}").start()
     with _TASKS_LOCK:
         _TASKS[task.id] = task
+        _evict_finished_locked()
     return task.id
+
+
+def _evict_finished_locked() -> None:
+    """Cap retained finished tasks so a long session cannot leak them."""
+    finished = sorted(
+        (t for t in _TASKS.values() if t.status != STATUS_RUNNING),
+        key=lambda t: t.started_at)
+    for old in finished[:max(0, len(finished) - MAX_FINISHED_TASKS)]:
+        _TASKS.pop(old.id, None)
 
 
 def _render(out: str, err: str) -> str:
@@ -224,6 +274,12 @@ def poll(task_id: str) -> dict:
     with task._lock:
         out = "".join(task._stdout)
         err = "".join(task._stderr)
+        if task._stdout_dropped:
+            out = (f"[... {task._stdout_dropped} earlier chars "
+                   f"truncated ...]\n" + out)
+        if task._stderr_dropped:
+            err = (f"[... {task._stderr_dropped} earlier chars "
+                   f"truncated ...]\n" + err)
         if task.spawn_error:
             err = task.spawn_error + "\n" + err
         return {"id": task.id, "description": task.description,
@@ -237,10 +293,14 @@ def _read_new(task: _BgTask) -> tuple[str, str]:
     with task._lock:
         out_full = "".join(task._stdout)
         err_full = "".join(task._stderr)
-        new_out = out_full[task._stdout_seen:]
-        new_err = err_full[task._stderr_seen:]
-        task._stdout_seen = len(out_full)
-        task._stderr_seen = len(err_full)
+        # offsets are absolute stream positions; the retained tail starts
+        # at _stdout_dropped/_stderr_dropped
+        out_start = max(task._stdout_seen, task._stdout_dropped)
+        err_start = max(task._stderr_seen, task._stderr_dropped)
+        new_out = out_full[out_start - task._stdout_dropped:]
+        new_err = err_full[err_start - task._stderr_dropped:]
+        task._stdout_seen = task._stdout_dropped + len(out_full)
+        task._stderr_seen = task._stderr_dropped + len(err_full)
     return new_out, new_err
 
 

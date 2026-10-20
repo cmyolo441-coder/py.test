@@ -389,3 +389,80 @@ def test_workflow_cancel_seals_abandoned_state(tmp_path):
         assert done and done[-1].data["state"] == "ABANDONED"
     finally:
         log.close()
+
+
+def test_bgsh_output_buffer_is_capped_and_offsets_stay_correct(monkeypatch):
+    from fullagent import bgsh
+
+    monkeypatch.setattr(bgsh, "MAX_OUTPUT_CHARS", 10)
+    task = bgsh._BgTask("t1", "cap", 30.0)
+    for chunk in ("aaaa", "bbbb", "cccc"):
+        with task._lock:
+            bgsh._append_capped(task, "out", chunk)
+    assert "".join(task._stdout) == "bbbbcccc"
+    assert task._stdout_dropped == 4
+    got, _ = bgsh._read_new(task)
+    assert got == "bbbbcccc"
+    with task._lock:
+        bgsh._append_capped(task, "out", "dddd")
+    got, _ = bgsh._read_new(task)
+    assert got == "dddd"
+    with bgsh._TASKS_LOCK:
+        bgsh._TASKS["t1"] = task
+    try:
+        snap = bgsh.poll("t1")
+    finally:
+        with bgsh._TASKS_LOCK:
+            bgsh._TASKS.pop("t1", None)
+    assert "truncated" in snap["output_so_far"]
+
+
+def test_bgsh_finished_task_registry_is_bounded(monkeypatch):
+    from fullagent import bgsh
+
+    monkeypatch.setattr(bgsh, "MAX_FINISHED_TASKS", 2)
+    with bgsh._TASKS_LOCK:
+        bgsh._TASKS.clear()
+        for i in range(6):
+            t = bgsh._BgTask(f"done{i}", "d", 30.0)
+            t.started_at = float(i)
+            t.status = bgsh.STATUS_DONE
+            bgsh._TASKS[t.id] = t
+        running = bgsh._BgTask("run", "r", 30.0)
+        running.started_at = 0.5
+        bgsh._TASKS[running.id] = running
+        bgsh._evict_finished_locked()
+        ids = set(bgsh._TASKS)
+        bgsh._TASKS.clear()
+    assert "run" in ids
+    assert {"done4", "done5"} <= ids
+    assert "done0" not in ids and "done1" not in ids
+
+
+def test_debate_malformed_trust_does_not_crash(tmp_path):
+    log = EventLog(tmp_path / "trust.jsonl")
+    try:
+        log.append("debate.calibration", {"model": "a", "trust": "bogus"})
+        log.append("debate.calibration", {"model": "b", "trust": None})
+        log.append("debate.calibration", {"model": "c", "trust": float("nan")})
+        log.append("debate.calibration", {"model": "d", "trust": 2.5})
+        tour = DebateTournament(log, lambda m, p: "", ["a", "b", "c", "d"])
+        assert tour.calibration("a") == 0.5
+        assert tour.calibration("b") == 0.5
+        assert tour.calibration("c") == 0.5
+        assert tour.calibration("d") == 0.95
+    finally:
+        log.close()
+
+
+def test_watch_debounce_map_is_pruned():
+    from fullagent.watch import Watch, WatchManager
+
+    w = Watch(id="w", path="/tmp", pattern="*", action="true",
+              added_at=0.0)
+    now = 1000.0
+    for i in range(1100):
+        w._fired[f"w|modified|/tmp/f{i}"] = now
+    WatchManager._prune_fired(w, now, "w|modified|/tmp/f1099")
+    assert len(w._fired) <= 1024
+    assert "w|modified|/tmp/f1099" in w._fired

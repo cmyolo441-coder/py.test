@@ -38,6 +38,7 @@ import json
 import logging
 import os
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -137,9 +138,21 @@ class WatchManager:
                       "action": w.action, "added_at": w.added_at,
                       "events_fired": w.events_fired}
                 for wid, w in self.watches.items()}}
-            tmp = self.config_path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-            os.replace(tmp, self.config_path)
+            # unique tmp per writer: two concurrent saves must not race on
+            # the same scratch file and clobber each other's os.replace
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(self.config_path.parent),
+                prefix=self.config_path.name + ".", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(json.dumps(payload, indent=2))
+                os.replace(tmp_name, self.config_path)
+            except BaseException:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
         except OSError as e:
             _log.warning("watch: failed to persist watches: %s", e)
 
@@ -283,6 +296,21 @@ class WatchManager:
         return st.st_mtime_ns, st.st_size
 
     @staticmethod
+    def _prune_fired(w: Watch, now: float, keep_key: str) -> None:
+        """Bound the debounce map; one entry per (event, path) otherwise."""
+        if len(w._fired) <= 1024:
+            return
+        cutoff = now - DEBOUNCE_S * 4
+        w._fired = {k: ts for k, ts in w._fired.items()
+                    if ts >= cutoff or k == keep_key}
+        if len(w._fired) > 1024:
+            newest = sorted(((k, ts) for k, ts in w._fired.items()
+                             if k != keep_key),
+                            key=lambda kv: kv[1], reverse=True)[:511]
+            newest.append((keep_key, w._fired[keep_key]))
+            w._fired = dict(newest)
+
+    @staticmethod
     def _matches(w: Watch, f: Path, root: Path) -> bool:
         if not w.pattern:
             return True
@@ -300,6 +328,7 @@ class WatchManager:
         if now - last < DEBOUNCE_S:
             return 0  # debounced: same event re-triggered too soon
         w._fired[key] = now
+        self._prune_fired(w, now, key)
         env = dict(os.environ)
         env["WATCH_EVENT"] = event
         env["WATCH_PATH"] = f
