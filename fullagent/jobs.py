@@ -53,7 +53,8 @@ STATUS_CANCELLED = "cancelled"
 
 KILL_GRACE_SECONDS = 5.0
 KILL_SIGNAL = signal.SIGTERM
-ESCALATE_SIGNAL = signal.SIGKILL
+# Windows has no SIGKILL; importing this module must not depend on it.
+ESCALATE_SIGNAL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 # ---------------------------------------------------------------------------
 # Store location (parameterized for tests)

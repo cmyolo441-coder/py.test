@@ -25,6 +25,7 @@ from __future__ import annotations
 import shlex
 import shutil
 import subprocess
+import time
 from typing import Optional
 
 DOCKER_TIMEOUT_S = 30
@@ -321,7 +322,16 @@ if __name__ == "__main__":
         started = _docker_run(image="alpine", command="echo selftest-ok",
                               name=cname, detach=True)
         if started.startswith("container started"):
-            logs = _docker_logs(container=cname, tail=20)
+            # docker logs can be empty for a moment while the container
+            # starts writing on a busy runner — poll briefly instead of
+            # failing the whole gate on a scheduling race
+            logs = ""
+            deadline = time.time() + 10.0
+            while time.time() < deadline:
+                logs = _docker_logs(container=cname, tail=20)
+                if "selftest-ok" in logs:
+                    break
+                time.sleep(0.25)
             check("docker_logs detached container", "selftest-ok" in logs,
                   repr(logs[:80]))
             stopped = _docker_stop(container=cname)
