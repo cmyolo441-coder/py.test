@@ -634,6 +634,9 @@ if __name__ == "__main__":
 
     sched = a.cron_scheduler
     assert sched.db_path == DB_PATH
+    # Stop the background loop before driving run_due() by hand: a pending
+    # wake can otherwise consume the forced-due row first, making n == 0.
+    sched.stop()
 
     # --- CronAdd: every minute, next_run computed correctly ------------------
     out = a.tools["CronAdd"].handler(cron_expr="* * * * *",
@@ -706,7 +709,6 @@ if __name__ == "__main__":
     out = a.tools["CronRemove"].handler(id=1)
     assert out.startswith("error:"), out
 
-    sched.stop()
     print("PASS cronsched self-test: real sqlite + real subprocess + "
           "restart survival verified")
 

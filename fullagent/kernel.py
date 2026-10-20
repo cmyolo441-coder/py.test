@@ -415,9 +415,12 @@ class EventLog:
                 # from pruning while it remains a branch head.
                 self._by_id[ev.id] = ev
                 self._extra.add(ev.id)
-        # Pin archived immediate parents so deep-rewind chains survive reload.
+        # Deep-rewind/fork markers point at an archived base; pin that one
+        # immediate parent so the marker's chain survives reload. Ordinary
+        # window events are not pinned — the window stays exactly max_events.
         pending = [ev for ev in list(self._by_id.values())
-                   if ev.parent and ev.parent not in self._by_id]
+                   if ev.type in ("kernel.rewind", "kernel.branch")
+                   and ev.parent and ev.parent not in self._by_id]
         seen_parents: set[str] = set()
         for ev in pending:
             if ev.parent in seen_parents:
@@ -713,7 +716,7 @@ class EventLog:
         if max_e is None:
             return
         protected = {h for h in self._heads.values() if h}
-        referenced = {ev.parent for ev in self._events if ev.parent}
+        referenced = {ev.parent for ev in self._by_id.values() if ev.parent}
         # reap window-external events that are no longer a branch head
         # nor referenced as a parent by any retained event.
         stale = [eid for eid in self._extra
@@ -1602,6 +1605,21 @@ if __name__ == "__main__":
             log4.checkout("dormant")
             log4.append("user.message", {"text": "dormant wakes"})
             ok, msg = log4.verify(branch="dormant")
+            assert ok, msg
+
+        # deep rewind past the window must survive reload: the marker's
+        # archived base stays reachable, so replay keeps real history.
+        with tempfile.TemporaryDirectory() as td4:
+            p4 = Path(td4) / "rewind.jsonl"
+            log5 = EventLog(p4, max_events=20)
+            for i in range(150):
+                log5.append("user.message", {"text": f"m{i}"})
+            marker_seq = log5.rewind(5)
+            assert marker_seq == 150, marker_seq
+            log6 = EventLog(p4, max_events=20)
+            seqs = [e.seq for e in replay(log6)]
+            assert 5 in seqs and marker_seq in seqs, seqs
+            ok, msg = log6.verify()
             assert ok, msg
 
     print("KERNEL SELF-TEST PASS (incl. memory window)")

@@ -743,7 +743,7 @@ if __name__ == "__main__":
             ok = preview_and_confirm("run_command", {"command": "x"}, None)
         finally:
             sys.stdin = real_stdin
-        check("non-tty fallback proceeds", ok is True)
+        check("non-tty fallback denies (fail closed)", ok is False)
 
         agent = FakeAgent("bypassPermissions")
         register(agent)
