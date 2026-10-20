@@ -378,6 +378,13 @@ def check_tool_delta(command: str, delta: int = 0,
     # count error-ish lines: "file:line: error" or "file:line:col: E501"
     errors = [ln for ln in output.splitlines()
               if re.search(r":\d+(:\d+)?:\s*(error|E\d{3}|F\d{3})", ln)]
+    if not errors and rc != 0:
+        # A checker that failed to launch (127) or crashed (traceback) emits
+        # no "file:line: error" lines; treating that as zero errors would
+        # pass a check that never actually ran.
+        return Verdict(False, "tool_delta",
+                       f"'{command}' exited {rc} without a parseable "
+                       "error line", _clip(output))
     try:
         allowed = int(delta)
     except (TypeError, ValueError):

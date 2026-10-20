@@ -99,36 +99,83 @@ class TimelineMerger:
 
     # -- ancestor ---------------------------------------------------------------
 
+    def _archived_rows(self) -> dict[str, dict]:
+        """id -> archived event dict for every readable archived event.
+
+        Needed when the retention window truncates a chain: the missing
+        ancestors can belong to OTHER branches (a fork point lives on the
+        source branch), so matching on the branch field loses them.
+        """
+        rows: dict[str, dict] = {}
+        try:
+            with self.log.archive_path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        d = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(d, dict) and isinstance(d.get("id"), str):
+                        rows[d["id"]] = d
+        except OSError:
+            pass
+        return rows
+
     def ancestor(self, a: str, b: str) -> int:
         """The seq of the newest event common to both branches' chains
         (-1 if they share nothing). Exact via parent-chain sets."""
-        def chain_ids(branch: str) -> list[str]:
-            ids = [e.id for e in self.log.events(branch)]
-            # Fall back to the archive when the in-memory window truncated
-            # the branch chain, so common ancestry is not lost.
-            if self.log.archived_event_count > 0:
-                try:
-                    with self.log.archive_path.open("r", encoding="utf-8") as fh:
-                        for line in fh:
-                            if f'"branch": "{branch}"' not in line:
-                                continue
-                            try:
-                                d = json.loads(line)
-                            except ValueError:
-                                continue
-                            if isinstance(d, dict) and d.get("branch") == branch:
-                                eid = d.get("id")
-                                if isinstance(eid, str) and eid not in ids:
-                                    ids.append(eid)
-                except OSError:
-                    pass
-            return ids
-        a_ids = set(chain_ids(a))
-        best = -1
-        for ev in self.log.events(b):
-            if ev.id in a_ids:
-                best = max(best, ev.seq)
-        return best
+        archived: dict[str, dict] | None = None
+
+        def chain_seqs(branch: str) -> dict[str, int]:
+            nonlocal archived
+            evs = self.log.events(branch)
+            seqs = {e.id: e.seq for e in evs}
+            if not evs or self.log.archived_event_count <= 0:
+                return seqs
+            # Close the truncated tail by following parent links through
+            # the archive — not by branch tag (ancestors may be tagged
+            # with a different branch after a fork).
+            cur = evs[0].parent
+            while cur and cur not in seqs:
+                ev = self.log.get(cur)
+                if ev is not None:
+                    seqs[cur] = ev.seq
+                    cur = ev.parent
+                    continue
+                if archived is None:
+                    archived = self._archived_rows()
+                d = archived.get(cur)
+                seq = d.get("seq") if isinstance(d, dict) else None
+                if not isinstance(seq, int):
+                    break
+                seqs[cur] = seq
+                cur = d.get("parent")
+            return seqs
+
+        a_seqs = chain_seqs(a)
+        b_seqs = chain_seqs(b)
+        common = a_seqs.keys() & b_seqs.keys()
+        return max((a_seqs[eid] for eid in common), default=-1)
+
+    def _archived_event_at(self, seq: int) -> Event | None:
+        """The archived event with this exact seq (seqs are global and
+        unique). Used for a fork point older than the memory window: the
+        branch-tag lookup in EventLog._load_archived_base() cannot find
+        an ancestor that is tagged with a different branch."""
+        try:
+            with self.log.archive_path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        d = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(d, dict) and d.get("seq") == seq:
+                        try:
+                            return Event.from_dict(d)
+                        except (ValueError, KeyError, TypeError):
+                            return None
+        except OSError:
+            return None
+        return None
 
     # -- merge -------------------------------------------------------------------
 
@@ -234,7 +281,13 @@ class TimelineMerger:
             base = self.log._event_at(a, fork_at) if fork_at >= 0 else None
             if (base is None and fork_at >= 0
                     and self.log.archived_event_count):
-                base = self.log._load_archived_base(a, fork_at)
+                # the ancestor seq identifies the exact event; a branch-tag
+                # lookup would miss a fork point inherited from another
+                # branch (and could pick an abandoned, rewound event)
+                base = self._archived_event_at(fork_at)
+                if base is not None and base.id not in self.log._by_id:
+                    self.log._by_id[base.id] = base
+                    self.log._extra.add(base.id)
             self.log._heads[merge_branch] = base.id if base else None
             cur = self.log.branch
             self.log.branch = merge_branch

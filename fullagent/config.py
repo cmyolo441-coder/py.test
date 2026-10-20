@@ -22,7 +22,13 @@ def _pick_app_dir() -> Path:
     env = os.environ.get("FULLAGENT_HOME")
     if env:
         candidates.append(Path(env))
-    candidates.append(Path.home() / ".fullagent")
+    try:
+        candidates.append(Path.home() / ".fullagent")
+    except (OSError, RuntimeError):
+        # containers running as a uid with no passwd entry and no $HOME:
+        # Path.home() raises RuntimeError. Skip the candidate — the tmp
+        # fallback below still gives the app a writable home.
+        pass
     uid = str(os.getuid()) if hasattr(os, "getuid") else "user"
     candidates.append(Path(tempfile.gettempdir()) / f"fullagent-{uid}")
     for c in candidates:

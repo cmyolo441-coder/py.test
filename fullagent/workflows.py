@@ -36,6 +36,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .cancelguard import TurnCancelled
 from .kernel import EventLog
 from ._foundation import get_logger
 
@@ -219,6 +220,7 @@ class WorkflowEngine:
                         actor="sovereign")
         results: list[StepResult] = []
         state = "RUNNING"
+        aborted: BaseException | None = None
         t0 = time.monotonic()
 
         try:
@@ -276,6 +278,11 @@ class WorkflowEngine:
                     if r.status in ("blocked", "error"):
                         state = "BLOCKED"
                         break
+        except BaseException as exc:
+            # Esc/Ctrl+C or a bug must still seal workflow.done: without
+            # it the run looked RUNNING forever to dashboards/notifiers.
+            state = "ABANDONED"
+            aborted = exc
         finally:
             # reap step-executor threads: finished ones are untracked, and
             # any thread that outlived its timeout is sealed as
@@ -294,6 +301,8 @@ class WorkflowEngine:
                          "steps_total": len(wf.steps),
                          "elapsed_ms": report["elapsed_ms"]},
                         actor="kernel")
+        if aborted is not None:
+            raise aborted
         return report
 
     def _run_step(self, item: dict, timeout: float) -> dict:
@@ -302,12 +311,20 @@ class WorkflowEngine:
         at the step's timeout budget instead of stalling the workflow."""
         started = time.monotonic()
         out: dict = {}
+        aborted: BaseException | None = None
 
         def runner():
+            nonlocal aborted
             try:
                 rep = self.executor(item) or {}
                 if not isinstance(rep, dict):
                     rep = {"status": "error", "summary": str(rep)}
+            except TurnCancelled as e:
+                # Esc during a step is a turn abort, not a step failure —
+                # swallowing it here left the run "done/error" and kept
+                # executing later phases.
+                aborted = e
+                rep = {"status": "error", "summary": "cancelled"}
             except Exception as e:  # noqa: BLE001 — a step never kills the engine
                 rep = {"status": "error",
                        "summary": f"{type(e).__name__}: {e}"}
@@ -327,6 +344,8 @@ class WorkflowEngine:
             # audited abandon is the honest outcome).
             with self._step_lock:
                 self._step_threads.discard(th)
+        if aborted is not None:
+            raise aborted
         if not out and th.is_alive():
             rep = {"status": "error",
                    "summary": f"step timed out after {timeout:g}s"}

@@ -81,7 +81,8 @@ LONG_HUNK_LINES = 80
 # Unified-diff parsing (stdlib only)
 # ---------------------------------------------------------------------------
 
-_HUNK_RX = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+_HUNK_RX = re.compile(
+    r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _NEWFILE_RX = re.compile(r"^\+\+\+ b/(.+)$")
 
 
@@ -103,30 +104,54 @@ def _parse_diff(diff_text: str) -> tuple[list[_AddedLine], list[tuple[str, int]]
     new_line = 0
     hunk_added = 0
     hunk_file = ""
+    in_hunk = False
+    old_left = new_left = 0
 
     for raw in (diff_text or "").splitlines():
-        if raw.startswith("+++ "):
+        if raw.startswith("diff --git "):
+            in_hunk = False
+            continue
+        # ---/+++ are file headers only BETWEEN hunks; inside a hunk a
+        # data line whose text starts with "++ " / "-- " produces the
+        # same prefix and must not be mistaken for a header.
+        if not in_hunk and raw.startswith("+++ "):
             m = _NEWFILE_RX.match(raw)
             cur_file = m.group(1).strip() if m else raw[4:].strip()
+            continue
+        if not in_hunk and raw.startswith("--- "):
             continue
         m = _HUNK_RX.match(raw)
         if m:
             if hunk_file:
                 hunks.append((hunk_file, hunk_added))
-            new_line = int(m.group(1))
+            new_line = int(m.group(3))
+            old_left = int(m.group(2)) if m.group(2) is not None else 1
+            new_left = int(m.group(4)) if m.group(4) is not None else 1
+            in_hunk = old_left > 0 or new_left > 0
             hunk_added = 0
             hunk_file = cur_file
             continue
         if not cur_file:
             continue
-        if raw.startswith("+") and not raw.startswith("+++"):
+        if raw.startswith("+"):
             added.append(_AddedLine(cur_file, new_line, raw[1:]))
             new_line += 1
             hunk_added += 1
-        elif raw.startswith("-") and not raw.startswith("---"):
-            pass  # removed line: new-file line numbers don't advance
+            if in_hunk and new_left > 0:
+                new_left -= 1
+        elif raw.startswith("-"):
+            # removed line: new-file line numbers don't advance
+            if in_hunk and old_left > 0:
+                old_left -= 1
+        elif raw.startswith("\\"):
+            pass  # "\ No newline at end of file" is not a context line
         else:
             new_line += 1  # context line
+            if in_hunk:
+                old_left = max(0, old_left - 1)
+                new_left = max(0, new_left - 1)
+        if in_hunk and old_left <= 0 and new_left <= 0:
+            in_hunk = False
     if hunk_file:
         hunks.append((hunk_file, hunk_added))
     return added, hunks

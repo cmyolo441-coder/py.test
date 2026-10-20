@@ -122,6 +122,11 @@ def list_sessions(limit: int = 50) -> list[dict[str, Any]]:
             data = json.loads(fp.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
+        if not isinstance(data, dict):
+            # valid JSON but not a session object ("[]", "42", ...):
+            # data.get() below would raise AttributeError and kill the
+            # whole listing for one stray file
+            continue
         messages = data.get("messages") or []
         entries.append({
             "id": data.get("session_id") or fp.stem,
@@ -154,9 +159,11 @@ def load(session_id: str) -> Optional[dict[str, Any]]:
     if not fp.is_file():
         return None
     try:
-        return json.loads(fp.read_text(encoding="utf-8"))
+        data = json.loads(fp.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+    # a valid-JSON non-object file is not a session; callers expect a dict
+    return data if isinstance(data, dict) else None
 
 
 # --------------------------------------------------------------- resume -----

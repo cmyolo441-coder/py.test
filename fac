@@ -31,9 +31,17 @@ def load_cfg() -> dict:
     try:
         with open(CFG_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
+    if not isinstance(data, dict):
+        return {}
+    # a hand-edited config can hold non-string url/token values; those used
+    # to crash cmd_chat with TypeError before any network error handling
+    for key in ("url", "token"):
+        if key in data:
+            val = data[key]
+            data[key] = val.strip() if isinstance(val, str) else ""
+    return data
 
 
 def save_cfg(cfg: dict) -> None:
@@ -83,11 +91,11 @@ def cmd_chat(prompt: str) -> int:
               file=sys.stderr)
         return 2
     body = json.dumps({"prompt": prompt}).encode("utf-8")
-    req = urllib.request.Request(
-        cfg["url"] + "/chat", data=body,
-        headers={"Content-Type": "application/json",
-                 "Authorization": "Bearer " + cfg["token"]})
     try:
+        req = urllib.request.Request(
+            cfg["url"] + "/chat", data=body,
+            headers={"Content-Type": "application/json",
+                     "Authorization": "Bearer " + cfg["token"]})
         resp = urllib.request.urlopen(req)  # no timeout: turns take minutes
     except urllib.error.HTTPError as e:
         try:

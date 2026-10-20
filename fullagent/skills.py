@@ -118,21 +118,59 @@ def _validate_shape(tree: ast.Module, skill: Skill) -> str | None:
     return None
 
 
-def _attr_root_is_dangerous(node: ast.Attribute) -> bool:
+def _dangerous_bindings(tree: ast.Module) -> set[str]:
+    """Names bound to a dangerous module/class by import statements.
+
+    ``from pathlib import Path`` binds ``Path``; ``import os as o`` binds
+    ``o``. Without tracking these aliases the receiver-root check below
+    only knew the literal module names, so ``Path(x).write_text(...)``
+    slipped through the mutation gate.
+    """
+    names = set(_DANGEROUS_MODULES)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                root = a.name.split(".")[0]
+                if root in _DANGEROUS_MODULES:
+                    names.add(a.asname or root)
+        elif isinstance(node, ast.ImportFrom):
+            root = (node.module or "").split(".")[0]
+            if root in _DANGEROUS_MODULES:
+                names.add(root)
+                for a in node.names:
+                    names.add(a.asname or a.name)
+    return names
+
+
+def _attr_root_is_dangerous(node: ast.Attribute,
+                            dangerous: set[str] | None = None) -> bool:
     """Walk the receiver chain of `a.b.c.d` and return True iff the
-    leftmost name is a known dangerous module (os, shutil, ...). A method
-    call on a locally-defined object (e.g. `door.open()`) returns False
-    even when the attribute name itself is in the forbidden list."""
+    leftmost binding is a known dangerous module/class (os, shutil,
+    pathlib.Path, ...). A method call on a locally-defined object (e.g.
+    `door.open()`) returns False even when the attribute name itself is
+    in the forbidden list."""
+    names = _DANGEROUS_MODULES if dangerous is None else dangerous
     cur: ast.AST = node
-    while isinstance(cur, ast.Attribute):
-        cur = cur.value
-    if isinstance(cur, ast.Name):
-        return cur.id in _DANGEROUS_MODULES
-    return False
+    while True:
+        if isinstance(cur, (ast.Attribute, ast.Subscript)):
+            cur = cur.value
+        elif isinstance(cur, ast.Call):
+            # Receiver is a constructor call, e.g. Path(x).write_text()
+            # or pathlib.Path(x).write_text(); inspect its function.
+            fn = cur.func
+            if isinstance(fn, ast.Name):
+                return fn.id in names
+            if isinstance(fn, ast.Attribute) and fn.attr in names:
+                return True
+            cur = fn
+        else:
+            break
+    return isinstance(cur, ast.Name) and cur.id in names
 
 
 def _validate_safety(tree: ast.Module) -> str | None:
     """AST scan: no forbidden imports, calls, attributes, or writes."""
+    dangerous = _dangerous_bindings(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for a in node.names:
@@ -149,7 +187,7 @@ def _validate_safety(tree: ast.Module) -> str | None:
                 return f"forbidden call: {fn.id}()"
             if isinstance(fn, ast.Attribute) \
                     and fn.attr in _FORBIDDEN_ATTRS \
-                    and _attr_root_is_dangerous(fn):
+                    and _attr_root_is_dangerous(fn, dangerous):
                 # only reject when the receiver chain is a known dangerous
                 # module — a user-defined `Door.open()` is fine
                 return (f"forbidden attribute on dangerous module: "

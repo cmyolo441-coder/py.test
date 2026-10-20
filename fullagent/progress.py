@@ -64,7 +64,7 @@ class ProgressTracker:
         label = (label or "").strip() or "task"
         try:
             total = int(total)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             total = 0
         total = max(total, 0)
         pid = uuid.uuid4().hex[:8]
@@ -91,7 +91,7 @@ class ProgressTracker:
         value.  Built for racing background threads — no lost updates."""
         try:
             delta = int(delta)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             delta = 0
         with self._lock:
             t = self._trackers[pid]  # KeyError: unknown id
@@ -143,7 +143,7 @@ class ProgressTracker:
     def _clamp_int(value: Any) -> int:
         try:
             return int(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return 0
 
     @staticmethod

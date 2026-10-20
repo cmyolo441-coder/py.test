@@ -159,15 +159,13 @@ def _shell_argv() -> list[str] | None:
     return None
 
 
-def _pump(job_id: str, proc: subprocess.Popen) -> None:
+def _pump(job_id: str, proc: subprocess.Popen, entry: dict) -> None:
     """Stream stdout/stderr to the log file in real time (one thread)."""
-    entry = _LIVE.get(job_id)
-    if entry is None:
-        return
     try:
         fh = open(entry["log_path"], "a", encoding="utf-8",
                   errors="replace")
     except OSError:
+        entry["pump_done"].set()
         return
     try:
         threads = [
@@ -192,6 +190,7 @@ def _pump(job_id: str, proc: subprocess.Popen) -> None:
                 pipe.close()
             except Exception:  # noqa: BLE001 — never break the pump
                 pass
+        entry["pump_done"].set()
 
 
 def _drain(pipe, fh, lock: threading.Lock) -> None:
@@ -204,16 +203,19 @@ def _drain(pipe, fh, lock: threading.Lock) -> None:
         pass
 
 
-def _watch(job_id: str, proc: subprocess.Popen) -> None:
+def _watch(job_id: str, proc: subprocess.Popen, entry: dict) -> None:
     """Wait for the job's process; settle the final DB status."""
     try:
         proc.wait()
     except Exception:  # noqa: BLE001 — still record what we know
         pass
+    # Drain the tail of stdout/stderr before settling (bounded: a runaway
+    # grandchild holding the pipe open must not wedge the watcher).
+    entry["pump_done"].wait(10.0)
     with _LOCK:
-        entry = _LIVE.pop(job_id, None)
+        _LIVE.pop(job_id, None)
     rc = proc.returncode
-    cancelled = bool(entry and entry.get("cancelled"))
+    cancelled = bool(entry.get("cancelled"))
     now = time.time()
     if cancelled:
         _update(job_id, status=STATUS_CANCELLED, finished_at=now,
@@ -275,6 +277,7 @@ def start_job(command: str) -> str:
     log_path.touch(exist_ok=True)
     entry: dict[str, Any] = {"proc": None, "cancelled": False,
                              "log_lock": threading.Lock(),
+                             "pump_done": threading.Event(),
                              "log_path": log_path}
     with _LOCK:
         _LIVE[job_id] = entry
@@ -303,9 +306,9 @@ def start_job(command: str) -> str:
 
     entry["proc"] = proc
     _update(job_id, status=STATUS_RUNNING, pid=proc.pid, started_at=time.time())
-    threading.Thread(target=_pump, args=(job_id, proc), daemon=True,
+    threading.Thread(target=_pump, args=(job_id, proc, entry), daemon=True,
                      name=f"jobs-pump-{job_id}").start()
-    threading.Thread(target=_watch, args=(job_id, proc), daemon=True,
+    threading.Thread(target=_watch, args=(job_id, proc, entry), daemon=True,
                      name=f"jobs-watch-{job_id}").start()
     return job_id
 
@@ -393,9 +396,12 @@ def _recover() -> None:
     "process died"; jobs left ``pending`` are started for real.
     """
     global _RECOVERED
-    if _RECOVERED:
-        return
-    _RECOVERED = True
+    with _LOCK:
+        if _RECOVERED:
+            return
+        # Claim the one-shot before releasing: concurrent register() calls
+        # race here otherwise and respawn every pending job twice.
+        _RECOVERED = True
     with _DB_LOCK:
         conn = _connect()
         try:
@@ -431,6 +437,7 @@ def _respawn(job_id: str, command: str) -> None:
         raise RuntimeError("no POSIX shell available")
     entry: dict[str, Any] = {"proc": None, "cancelled": False,
                              "log_lock": threading.Lock(),
+                             "pump_done": threading.Event(),
                              "log_path": Path(_get_row(job_id)["log_path"])}
     with _LOCK:
         _LIVE[job_id] = entry
@@ -443,9 +450,9 @@ def _respawn(job_id: str, command: str) -> None:
     entry["proc"] = proc
     _update(job_id, status=STATUS_RUNNING, pid=proc.pid,
             started_at=time.time())
-    threading.Thread(target=_pump, args=(job_id, proc), daemon=True,
+    threading.Thread(target=_pump, args=(job_id, proc, entry), daemon=True,
                      name=f"jobs-pump-{job_id}").start()
-    threading.Thread(target=_watch, args=(job_id, proc), daemon=True,
+    threading.Thread(target=_watch, args=(job_id, proc, entry), daemon=True,
                      name=f"jobs-watch-{job_id}").start()
 
 

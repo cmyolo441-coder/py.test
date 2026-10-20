@@ -84,6 +84,13 @@ def _iter_matching(hooks: dict, kind: str, tool_name: str) -> list[dict]:
         command = entry.get("command")
         if not isinstance(command, str) or not command.strip():
             continue
+        # A non-string "match" (null, number, list) must skip only this
+        # entry. Previously re.search() raised TypeError, aborting the
+        # whole loop and silently disabling every later safety hook.
+        if not isinstance(pattern, str):
+            _log.warning("hooks: non-string match %r — skipping hook",
+                         pattern)
+            continue
         try:
             if re.search(pattern, tool_name or ""):
                 out.append(entry)

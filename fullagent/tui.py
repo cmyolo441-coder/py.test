@@ -176,6 +176,7 @@ except ImportError:  # Headless / non-interactive fallback when prompt_toolkit i
         pass
 from rich.console import Console
 from rich.markdown import CodeBlock, Heading, Markdown
+from rich.markup import escape
 from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.text import Text
@@ -2162,6 +2163,7 @@ class UI:
                 border_style=C["border"], expand=True))
             return
         if action == "diff":
+            from rich.text import Text
             target = parts[1] if len(parts) > 1 else ""
             workers = [manager.get(target)] if target else manager.list()
             workers = [w for w in workers if w is not None]
@@ -2177,7 +2179,8 @@ class UI:
                     t.append(ln + "\n", style=st)
                 self.console.print(Panel(
                     t,
-                    title=(f"[bold {C['accent']}]{d['worker_id']} · {d['path']}[/] "
+                    title=(f"[bold {C['accent']}]{escape(str(d['worker_id']))} · "
+                           f"{escape(str(d['path']))}[/] "
                            f"[bold {C['green']}]+{d['added']}[/] [bold {C['red']}]-{d['removed']}[/]"),
                     border_style=C["border"], expand=True))
             return

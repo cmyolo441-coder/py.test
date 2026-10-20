@@ -172,7 +172,9 @@ def turn_to_json(turn: Any, session_id: Optional[str],
         merged = dict(extra)
         merged.pop("agent", None)  # internal-only, never emitted
         obj.update({k: _json_safe(v) for k, v in merged.items()})
-    return obj
+    # Top-level fields come straight from the turn; coerce them too so the
+    # documented "all values JSON-safe" contract holds for fakes/older Turns.
+    return _json_safe(obj)
 
 
 def emit_json(obj: Dict[str, Any]) -> None:

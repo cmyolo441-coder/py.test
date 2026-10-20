@@ -102,21 +102,38 @@ class CostTracker:
                 for mid, row in data.items():
                     if not isinstance(mid, str) or not isinstance(row, dict):
                         continue
-                    cleaned[mid] = {
-                        "turns": max(0, int(row.get("turns", 0) or 0)),
-                        "in": max(0, int(row.get("in", 0) or 0)),
-                        "out": max(0, int(row.get("out", 0) or 0)),
-                    }
+                    try:
+                        cleaned[mid] = {
+                            "turns": max(0, int(row.get("turns", 0) or 0)),
+                            "in": max(0, int(row.get("in", 0) or 0)),
+                            "out": max(0, int(row.get("out", 0) or 0)),
+                        }
+                    except (TypeError, ValueError):
+                        # one hand-edited/corrupt row must not discard the
+                        # whole session (int(list) raised TypeError here)
+                        continue
                 self._by_model = cleaned
-        except (OSError, ValueError):
+        except (OSError, ValueError, TypeError):
             self._by_model = {}
 
     def save(self) -> None:
         try:
             os.makedirs(COST_DIR, exist_ok=True)
-            with open(_persist_path(self.session_id), "w",
-                      encoding="utf-8") as fh:
-                json.dump(self._by_model, fh, ensure_ascii=False, indent=2)
+            path = _persist_path(self.session_id)
+            # atomic write: a crash mid-dump (or two writers racing) must
+            # never leave truncated JSON that load() silently resets to $0
+            tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+            try:
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(self._by_model, fh, ensure_ascii=False,
+                              indent=2)
+                os.replace(tmp, path)
+            except OSError:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
         except OSError:
             pass  # persistence is best-effort; never break a turn
 

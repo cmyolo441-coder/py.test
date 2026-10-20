@@ -129,16 +129,17 @@ def _webp_dims(data: bytes) -> Optional[Tuple[int, int]]:
     if chunk == b"VP8X":
         w = int.from_bytes(data[24:27], "little") + 1
         h = int.from_bytes(data[27:30], "little") + 1
-        return (w, h) if w > 1 and h > 1 else None
+        return (w, h) if w > 0 and h > 0 else None
     if chunk == b"VP8 " and len(data) >= 30 and data[23:26] == b"\x9d\x01\x2a":
         w = int.from_bytes(data[26:28], "little") & 0x3FFF
         h = int.from_bytes(data[28:30], "little") & 0x3FFF
         return (w, h) if w > 0 and h > 0 else None
     if chunk == b"VP8L" and len(data) >= 25 and data[20] == 0x2F:
+        # VP8L: 14-bit width-1, then 14-bit height-1 (LSB-first).
         word = int.from_bytes(data[21:25], "little")
-        w = ((word >> 8) & 0x3FFF) + 1
-        h = ((word >> 22) & 0x3FFF) + 1
-        return (w, h) if w > 1 and h > 1 else None
+        w = (word & 0x3FFF) + 1
+        h = ((word >> 14) & 0x3FFF) + 1
+        return (w, h) if w > 0 and h > 0 else None
     return None
 
 

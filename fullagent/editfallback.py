@@ -214,24 +214,36 @@ def check_python_syntax(text: str) -> str | None:
                                      encoding="utf-8") as tf:
         tf.write(text)
         tmp = tf.name
+    # An explicit cfile keeps py_compile from creating a __pycache__
+    # directory next to the temp copy (i.e. littering /tmp forever).
+    pyc = tmp + ".pyc"
     try:
-        py_compile.compile(tmp, doraise=True)
+        py_compile.compile(tmp, cfile=pyc, doraise=True)
     except py_compile.PyCompileError as exc:
         return str(exc)
     finally:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        for leftover in (tmp, pyc):
+            try:
+                os.unlink(leftover)
+            except OSError:
+                pass
     return None
 
 
 def _atomic_write(p: Path, text: str) -> None:
+    try:
+        # mkstemp creates 0600; os.replace would then silently downgrade
+        # an existing 0644/0755 source file. Keep the target's mode bits.
+        mode = p.stat().st_mode & 0o777
+    except OSError:
+        mode = None
     fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=".editfb-",
                                suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
+        if mode is not None:
+            os.chmod(tmp, mode)
         os.replace(tmp, p)
     except BaseException:
         try:

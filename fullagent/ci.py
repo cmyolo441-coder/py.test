@@ -151,7 +151,8 @@ class CIPilot:
                 p for p, sig in current.items()
                 if self._snapshot.get(p) != sig)
             disappeared = [p for p in self._snapshot if p not in current]
-            changed = sorted(set(changed))
+            # a deleted source file is still a change: its tests must run
+            changed = sorted(set(changed) | set(disappeared))
             if changed:
                 tests = self.impacted_tests(changed)
                 record = RunRecord(changed=changed[:50], tests=tests[:30],

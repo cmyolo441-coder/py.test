@@ -101,14 +101,14 @@ def notify_event(event_type: str, data: Any = None,
     target = url or webhook_url()
     if not target:
         return False
-    payload = json.dumps({"type": str(event_type), "data": data}).encode("utf-8")
-    req = urllib.request.Request(
-        target,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
     try:
+        payload = json.dumps({"type": str(event_type), "data": data}).encode("utf-8")
+        req = urllib.request.Request(
+            target,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return 200 <= resp.status < 300
     except Exception:

@@ -629,7 +629,22 @@ class EventLog:
 
     def _write_event(self, ev: Event) -> None:
         if self._fh is None:
+            # A crash can leave a torn final line (no trailing newline).
+            # Opening in append mode would glue the next event onto it,
+            # destroying BOTH lines. Terminate the torn line first so only
+            # it is lost; the loader already skips corrupt lines.
+            torn = False
+            try:
+                with self.path.open("rb") as probe:
+                    probe.seek(0, os.SEEK_END)
+                    if probe.tell() > 0:
+                        probe.seek(-1, os.SEEK_END)
+                        torn = probe.read(1) != b"\n"
+            except OSError:
+                torn = False
             self._fh = self.path.open("a", encoding="utf-8")
+            if torn:
+                self._fh.write("\n")
         # default=str must match Event.compute_id's canonicalization —
         # otherwise a value that hashed fine fails to serialize AFTER the
         # in-memory state already advanced past it

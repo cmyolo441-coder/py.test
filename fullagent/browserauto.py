@@ -228,8 +228,9 @@ class _BrowserSession:
                 except Exception:
                     out = ""
             if len(out) > SNAPSHOT_CAP:
-                out = out[:SNAPSHOT_CAP].rsplit("\n", 1)[0] + \
-                    f"\n… [{len(out) - SNAPSHOT_CAP} chars truncated]"
+                kept = len(out)
+                out = out[:SNAPSHOT_CAP].rsplit("\n", 1)[0]
+                out += f"\n… [{kept - len(out)} chars truncated]"
             return out or "(empty page)"
         if not tree:
             # Empty AX tree (e.g. canvas-only page): fall back to raw text.
@@ -261,8 +262,9 @@ class _BrowserSession:
             pass
         out = "\n".join(lines).strip()
         if len(out) > SNAPSHOT_CAP:
-            out = out[:SNAPSHOT_CAP].rsplit("\n", 1)[0] + \
-                f"\n… [{len(out) - SNAPSHOT_CAP} chars truncated]"
+            kept = len(out)
+            out = out[:SNAPSHOT_CAP].rsplit("\n", 1)[0]
+            out += f"\n… [{kept - len(out)} chars truncated]"
         return out or "(empty accessibility tree)"
 
     def click(self, selector: str) -> str:

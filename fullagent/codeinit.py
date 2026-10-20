@@ -176,7 +176,9 @@ def _detect_name(root: Path, key_files: list[str]) -> str:
             try:
                 data = json.loads((root / kf).read_text(encoding="utf-8",
                                                         errors="ignore"))
-                if data.get("name"):
+                # valid JSON need not be a package object ("[]", "null"):
+                # data.get() used to crash project analysis on such repos
+                if isinstance(data, dict) and data.get("name"):
                     return str(data["name"])
             except (OSError, ValueError):
                 pass
@@ -222,13 +224,14 @@ def _detect_commands(root: Path, key_files: list[str]) -> tuple[list[str], list[
             try:
                 data = json.loads(p.read_text(encoding="utf-8",
                                               errors="ignore"))
-                scripts = data.get("scripts", {}) or {}
+                scripts = data.get("scripts", {}) if isinstance(
+                    data, dict) else {}
+                if not isinstance(scripts, dict):
+                    scripts = {}
                 if scripts.get("build"):
                     _add(build, "npm run build")
                 if scripts.get("test"):
                     _add(test, "npm test")
-                elif scripts.get("scripts") is None:
-                    pass
             except (OSError, ValueError):
                 pass
             _add(build, "npm run build")

@@ -18,6 +18,8 @@ for every enabled cron relative to now.
 
 from __future__ import annotations
 
+import os
+import signal
 import sqlite3
 import subprocess
 import threading
@@ -309,16 +311,44 @@ class CronScheduler:
         """Run one cron command as a real subprocess; record the result."""
         started_at = time.time()
         try:
-            proc = subprocess.run(
-                cron["command"], shell=True, capture_output=True,
-                text=True, timeout=RUN_TIMEOUT)
-            exit_code = proc.returncode
-            out = (proc.stdout or "") + (proc.stderr or "")
-        except subprocess.TimeoutExpired as e:
-            exit_code = 124
-            out = ((e.stdout or "") if isinstance(e.stdout, str) else "")
-            out += ((e.stderr or "") if isinstance(e.stderr, str) else "")
-            out += f"\n[TIMED OUT after {RUN_TIMEOUT}s]"
+            # Own process group: on timeout subprocess.run() killed only
+            # the shell, leaving backgrounded children running forever.
+            proc = subprocess.Popen(
+                cron["command"], shell=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace",
+                **({"start_new_session": True} if os.name == "posix" else {}))
+            try:
+                stdout, stderr = proc.communicate(timeout=RUN_TIMEOUT)
+                exit_code = proc.returncode
+                out = (stdout or "") + (stderr or "")
+            except subprocess.TimeoutExpired:
+                try:
+                    if os.name == "posix":
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    else:
+                        proc.kill()
+                except OSError:
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                try:
+                    stdout, stderr = proc.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    for stream in (proc.stdout, proc.stderr):
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
+                    try:
+                        proc.wait(timeout=1)
+                    except Exception:
+                        pass
+                    stdout, stderr = "", ""
+                exit_code = 124
+                out = ((stdout or "") + (stderr or "")
+                       + f"\n[TIMED OUT after {RUN_TIMEOUT}s]")
         except Exception as e:  # noqa: BLE001 — never let cron die silently
             exit_code = 125
             out = f"[failed to launch: {e}]"

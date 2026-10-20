@@ -273,11 +273,21 @@ class ThreadedServer(socketserver.ThreadingMixIn,
 
 
 def main() -> int:
+    try:
+        default_port = int(os.environ.get("FULLAGENT_CLOUD_PORT", "18791"))
+    except (TypeError, ValueError):
+        # a typo'd env var must not crash startup (argparse would also
+        # raise before --help could even run)
+        default_port = 18791
+    if not 0 <= default_port <= 65535:
+        default_port = 18791
+    # an empty $FULLAGENT_CLOUD_HOST made the server bind 0.0.0.0 (all
+    # interfaces); empty/malformed means "use the safe loopback default"
+    default_host = (
+        os.environ.get("FULLAGENT_CLOUD_HOST", "").strip() or "127.0.0.1")
     ap = argparse.ArgumentParser(description="FullAgent Cloud Server")
-    ap.add_argument("--port", type=int,
-                    default=int(os.environ.get("FULLAGENT_CLOUD_PORT", "18791")))
-    ap.add_argument("--host", default=os.environ.get(
-        "FULLAGENT_CLOUD_HOST", "127.0.0.1"))
+    ap.add_argument("--port", type=int, default=default_port)
+    ap.add_argument("--host", default=default_host)
     args = ap.parse_args()
 
     tok = get_token()

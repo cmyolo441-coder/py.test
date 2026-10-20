@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import subprocess
 import time
 from typing import Any
@@ -257,24 +258,54 @@ def run_sandboxed(command: str,
         preexec = _make_preexec(cpu_limit, mem_limit_mb, fsize_limit_mb)
 
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             argv,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=timeout,
             preexec_fn=preexec,
+            # Own process group, so a timeout can kill the whole tree.
+            **({"start_new_session": True} if os.name == "posix" else {}),
         )
-        result["returncode"] = proc.returncode
-        result["stdout"] = proc.stdout or ""
-        result["stderr"] = proc.stderr or ""
-    except subprocess.TimeoutExpired as e:
-        result["timed_out"] = True
-        result["stdout"] = (e.stdout or "") if isinstance(e.stdout, str) else ""
-        result["stderr"] = (e.stderr or "") if isinstance(e.stderr, str) else ""
-        result["error"] = (f"timed out after {timeout:g}s "
-                           f"(process killed)")
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # subprocess.run() only kills the direct child; backgrounded
+            # grandchildren (`cmd &`, shell wrappers) kept running.
+            try:
+                if os.name == "posix":
+                    os.killpg(proc.pid, signal.SIGKILL)
+                else:
+                    proc.kill()
+            except OSError:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            try:
+                out, err = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                for stream in (proc.stdout, proc.stderr):
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+                try:
+                    proc.wait(timeout=1)
+                except Exception:
+                    pass
+                out, err = "", ""
+            result["timed_out"] = True
+            result["stdout"] = out or ""
+            result["stderr"] = err or ""
+            result["error"] = (f"timed out after {timeout:g}s "
+                               f"(process killed)")
+        else:
+            result["returncode"] = proc.returncode
+            result["stdout"] = out or ""
+            result["stderr"] = err or ""
     except OSError as e:
         result["error"] = f"failed to start sandboxed process: {e}"
     finally:

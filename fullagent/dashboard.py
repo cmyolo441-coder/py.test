@@ -74,9 +74,14 @@ class Dashboard:
 
     def _snapshot_uncached(self) -> dict:
         st = fold(self.log)
-        goal = st.goal
+        goal = st.goal if isinstance(st.goal, dict) else {}
         proven = len(st.goal_done)
-        clauses = len(goal.get("clauses") or []) if goal else 0
+        raw_statement = goal.get("statement")
+        statement = (raw_statement if isinstance(raw_statement, str)
+                     else str(raw_statement) if raw_statement else "")
+        raw_clauses = goal.get("clauses")
+        clauses = len(raw_clauses) if isinstance(
+            raw_clauses, (list, tuple, dict)) else 0
 
         # routing + speculation dividends
         routed = len(st.router_decisions)
@@ -125,8 +130,8 @@ class Dashboard:
             "tool_errors": st.tool_errors,
             "commands_run": st.commands_run,
             "files_touched": len(st.files_touched),
-            "goal_active": bool(goal and goal.get("statement")),
-            "goal_statement": (goal or {}).get("statement", ""),
+            "goal_active": bool(statement),
+            "goal_statement": statement,
             "clauses_proven": proven,
             "clauses_total": clauses,
             "routed": routed,

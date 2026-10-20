@@ -120,13 +120,29 @@ class PermissionRulesManager:
     def save(self) -> None:
         """Persist current rules to the JSON file (best-effort)."""
         with self._lock:
-            data = {v: sorted(self._rules[v]) for v in VERDICTS}
+            self._write_locked(
+                {v: sorted(self._rules[v]) for v in VERDICTS})
+
+    def _write_locked(self, data: dict) -> None:
+        # Atomic replace: a crash mid-write used to truncate the file,
+        # which reload() treats as "no rules" — silently dropping DENY
+        # entries and reopening tools the user had blocked.
+        try:
+            os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
+            tmp = (f"{self._path}.{os.getpid()}."
+                   f"{threading.get_ident()}.tmp")
             try:
-                os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
-                with open(self._path, "w", encoding="utf-8") as fh:
+                with open(tmp, "w", encoding="utf-8") as fh:
                     json.dump(data, fh, ensure_ascii=False, indent=2)
+                os.replace(tmp, self._path)
             except OSError:
-                pass  # persistence is best-effort; never break the flow
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+        except OSError:
+            pass  # persistence is best-effort; never break the flow
 
     # -- mutation ---------------------------------------------------------
     def set_rule(self, tool_name: str, verdict: str) -> None:
@@ -159,13 +175,7 @@ class PermissionRulesManager:
             return found
 
     def _persist_locked(self) -> None:
-        data = {v: sorted(self._rules[v]) for v in VERDICTS}
-        try:
-            os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
-            with open(self._path, "w", encoding="utf-8") as fh:
-                json.dump(data, fh, ensure_ascii=False, indent=2)
-        except OSError:
-            pass
+        self._write_locked({v: sorted(self._rules[v]) for v in VERDICTS})
 
     # -- verdicts ---------------------------------------------------------
     def check(self, tool_name: str) -> str:

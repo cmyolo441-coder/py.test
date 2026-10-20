@@ -200,7 +200,10 @@ def fetch_pr_diff(pr_ref: str, repo: str = "") -> str:
 # ---------------------------------------------------------------------------
 
 _DIFF_FILE_RE = re.compile(r"^diff --git a/(.*) b/(.*)$")
-_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+# both line ranges are captured so the parser knows exactly where a hunk
+# ends (header-looking content inside a hunk is data, not a header)
+_HUNK_RE = re.compile(
+    r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 _SECRET_PATTERNS = [
     (re.compile(r"(?i)\b(api[_-]?key|secret[_-]?key|client[_-]?secret|"
@@ -232,31 +235,45 @@ def parse_diff(diff: str) -> List[Dict[str, Any]]:
     files: List[Dict[str, Any]] = []
     cur: Optional[Dict[str, Any]] = None
     new_lineno = 0
+    in_hunk = False
+    old_left = new_left = 0
     for line in (diff or "").splitlines():
         m = _DIFF_FILE_RE.match(line)
         if m:
             cur = {"file": m.group(2), "added": [],
                    "added_count": 0, "removed_count": 0}
             files.append(cur)
+            in_hunk = False
             continue
         if cur is None:
             continue
         m = _HUNK_RE.match(line)
         if m:
-            new_lineno = int(m.group(1))
+            new_lineno = int(m.group(3))
+            old_left = int(m.group(2) if m.group(2) is not None else 1)
+            new_left = int(m.group(4) if m.group(4) is not None else 1)
+            in_hunk = old_left > 0 or new_left > 0
             continue
-        if line.startswith(("+++ ", "--- ")):
+        if not in_hunk and line.startswith(("+++ ", "--- ")):
             continue
         if line.startswith("+"):
             cur["added"].append((new_lineno, line[1:]))
             cur["added_count"] += 1
             new_lineno += 1
+            if in_hunk and new_left > 0:
+                new_left -= 1
         elif line.startswith("-"):
             cur["removed_count"] += 1
-        elif line.startswith(" ") or line.startswith("\\"):
-            if line.startswith(" "):
-                new_lineno += 1
+            if in_hunk and old_left > 0:
+                old_left -= 1
+        elif line.startswith(" "):
+            new_lineno += 1
+            if in_hunk:
+                old_left = max(0, old_left - 1)
+                new_left = max(0, new_left - 1)
         # "\ No newline at end of file" and anything else: ignored
+        if in_hunk and old_left <= 0 and new_left <= 0:
+            in_hunk = False
     return files
 
 

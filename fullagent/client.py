@@ -2362,6 +2362,13 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
                     f"provider returned invalid JSON "
                     f"(status {resp.status_code}): {str(e)[:200]}",
                     status=resp.status_code) from e
+            except BaseException:
+                # CANCEL/read timeout: the abandoned worker may still be
+                # blocked in recv() holding the socket read lock — shut the
+                # socket down first, or the finally's resp.close() blocks
+                # until the read timeout (same hazard as the SSE path).
+                _abort_response(resp)
+                raise
             # NB: the isinstance check must happen BEFORE data.get — a
             # provider returning a JSON array/string here used to escape
             # as a raw AttributeError instead of a clean APIError.

@@ -292,10 +292,18 @@ def _atomic_write_text(p: Path, text: str) -> None:
     truncated/corrupt file behind. The temp name carries pid+thread so two
     concurrent writes to the same path can't clobber each other's temp."""
     p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        # os.replace(tmp, p) installs a fresh inode: preserve the target's
+        # permission bits instead of resetting 0600/0755 files to 0644.
+        mode = stat.S_IMODE(p.stat().st_mode) & 0o777
+    except OSError:
+        mode = None
     tmp = p.with_name(
         f"{p.name}.tmp-{os.getpid()}-{threading.get_ident()}")
     try:
         tmp.write_text(text, encoding="utf-8")
+        if mode is not None:
+            os.chmod(tmp, mode)
     except BaseException:
         # don't litter a half-written temp file next to the target
         try:
@@ -1237,13 +1245,34 @@ def web_fetch(url: str,
         # Pooled keep-alive session: repeated fetches to the same host
         # skip the TCP+TLS handshake instead of paying it every call.
         from .client import shared_session
+        # Same SSRF policy as webfetch.py: loopback, private, link-local
+        # (169.254.169.254) and cloud-metadata hosts are refused. Requests
+        # follows redirects itself, so walk them manually and validate
+        # every hop BEFORE its body can be read.
+        from .webfetch import _validate_url
+        from urllib.parse import urljoin
 
         def _get():
-            r = shared_session().get(url, timeout=30, headers={
-                "User-Agent":
-                    "Mozilla/5.0 (X11; Linux x86_64) FullAgent/1.0"})
-            r.raise_for_status()
-            return r
+            current = url.strip()
+            for _ in range(6):
+                blocked = _validate_url(current)
+                if blocked:
+                    raise ValueError(f"blocked URL: {blocked}")
+                r = shared_session().get(current, timeout=30, allow_redirects=False,
+                                         headers={
+                    "User-Agent":
+                        "Mozilla/5.0 (X11; Linux x86_64) FullAgent/1.0"})
+                if r.status_code in (301, 302, 303, 307, 308):
+                    location = r.headers.get("location")
+                    r.close()
+                    if not location:
+                        raise ValueError(
+                            f"HTTP {r.status_code} redirect without Location")
+                    current = urljoin(current, location)
+                    continue
+                r.raise_for_status()
+                return r
+            raise ValueError("too many redirects")
         resp = run_cancellable(_get, should_cancel, name="web fetch")
     except TurnCancelled:
         # Never swallow a cancel into an ERROR string — _execute_tool

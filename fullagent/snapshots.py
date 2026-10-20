@@ -149,10 +149,12 @@ class SnapshotStore:
         for key, blob in manifest.items():
             p = Path(key)
             if blob is None:
-                # file did not exist at snapshot time
-                if p.exists():
+                # file did not exist at snapshot time. is_symlink() is
+                # required: a DANGLING symlink created after the snapshot
+                # makes exists() false, so it used to survive the restore.
+                if p.exists() or p.is_symlink():
                     try:
-                        if p.is_dir():
+                        if p.is_dir() and not p.is_symlink():
                             import shutil
                             shutil.rmtree(p, ignore_errors=True)
                         else:
@@ -200,8 +202,31 @@ class SnapshotStore:
     def reachable_hashes(self, log: EventLog) -> set[str]:
         """Every blob/tree hash referenced by any snapshot event (I9)."""
         from .kernel import fold
+        snaps = [s for s in fold(log).snapshots if isinstance(s, dict)]
+        # fold() only sees the in-RAM retention window of the checked-out
+        # branch. Snapshot events deeper in the archive (or taken on
+        # another branch) are still reachable: collecting their blobs
+        # would make those snapshots unrestorable. The JSONL archive is
+        # append-only and complete, so scan it and merge the references.
+        try:
+            with log.path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    if '"snapshot.taken"' not in line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except (ValueError, TypeError):
+                        continue
+                    if not isinstance(rec, dict) or \
+                            rec.get("type") != "snapshot.taken":
+                        continue
+                    data = rec.get("data")
+                    if isinstance(data, dict):
+                        snaps.append(data)
+        except (OSError, UnicodeDecodeError):
+            pass
         keep: set[str] = set()
-        for snap in fold(log).snapshots:
+        for snap in snaps:
             tree = snap.get("tree")
             if tree:
                 keep.add(tree)
@@ -220,10 +245,12 @@ class SnapshotStore:
         ran.
         """
         import time
-        keep = self.reachable_hashes(log)
-        # nanosecond clock: a blob born after this instant is concurrent
-        # with the sweep and must survive it (see docstring)
+        # nanosecond clock BEFORE the keep-set is computed: a blob born
+        # after this instant is concurrent with the sweep and must survive
+        # (see docstring). Starting the clock after reachable_hashes()
+        # left a take() sealed in that gap deletable.
         started_ns = time.time_ns()
+        keep = self.reachable_hashes(log)
         deleted = 0
         if not self.objects.exists():
             return 0
@@ -234,8 +261,13 @@ class SnapshotStore:
                 h = sub.name + f.name
                 if f.name.endswith(".tmp"):
                     # abandoned atomic-write leftovers — sweep them too,
-                    # otherwise they accumulate forever
+                    # otherwise they accumulate forever. A NEW tmp file is
+                    # a concurrent put_blob() mid-write: unlinking it makes
+                    # that os.replace fail and take() silently records the
+                    # file as absent, so only sweep old ones.
                     try:
+                        if f.stat().st_mtime_ns >= started_ns:
+                            continue
                         f.unlink()
                         deleted += 1
                     except OSError:

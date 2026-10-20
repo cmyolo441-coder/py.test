@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from .cancelguard import TurnCancelled
 from .speculate import SPECULATIVE_TOOLS
 
 #: Tools that may run concurrently — the Speculator's read-only whitelist.
@@ -104,9 +105,14 @@ def _run_batch(
                 causation_id=causation_id,
                 on_tool_output=on_tool_output,
             )
+        except TurnCancelled:
+            # Esc/Ctrl+C during a parallel read batch must abort the turn.
+            # Swallowing it left ev.status "running" and the turn continuing.
+            raise
         except Exception:
             pass
-        durations[idx] = time.perf_counter() - t0
+        finally:
+            durations[idx] = time.perf_counter() - t0
 
     t_start = time.perf_counter()
     with ThreadPoolExecutor(

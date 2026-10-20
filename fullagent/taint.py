@@ -121,6 +121,22 @@ def _call_name(node: ast.Call) -> str:
     return ""
 
 
+def _expr_name(node: ast.expr) -> str:
+    """Dotted name of a plain expression: os.environ / sys.argv / req.json."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parts = []
+        cur = node
+        while isinstance(cur, ast.Attribute):
+            parts.append(cur.attr)
+            cur = cur.value
+        if isinstance(cur, ast.Name):
+            parts.append(cur.id)
+            return ".".join(reversed(parts))
+    return ""
+
+
 class TaintAnalyzer:
     """Intra-procedural taint dataflow over one module's AST."""
 
@@ -194,6 +210,14 @@ def _analyze_impl(source: str, sources: frozenset, sinks: frozenset,
             if isinstance(sub, ast.Call):
                 name = _call_name(sub)
                 if is_source_name(name):
+                    return True, name, getattr(sub, "lineno", 0)
+        # Bare attribute/subscript reads of a declared source: the common
+        # os.environ["X"], sys.argv[1], request.args[...] forms contain no
+        # Call, so the loop above missed them entirely.
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Attribute):
+                name = _expr_name(sub)
+                if name and is_source_name(name):
                     return True, name, getattr(sub, "lineno", 0)
         return False, "", 0
 

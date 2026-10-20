@@ -1727,6 +1727,17 @@ class Agent:
         else:
             model_msgs = self._prune_for_model(
                 reserved_tokens=_reserved)
+
+        def _shrink_view() -> bool:
+            # The client retries with the exact `messages` list it was
+            # given; self._overflow_shrink() only shrinks self.messages,
+            # so the detached, budget-capped view must be rebuilt IN
+            # PLACE or layer-3 recovery resends the oversized payload.
+            if not self._overflow_shrink():
+                return False
+            model_msgs[:] = self._prune_for_model(reserved_tokens=_reserved)
+            return True
+
         # cassette replay: zero API cost, fully deterministic (§20.2)
         if self.cassette is not None and self.cassette.mode == "replay":
             from .client import StreamResult
@@ -1766,7 +1777,7 @@ class Agent:
                                on_tool_start=lambda n: on_status(f"tool:{n}"),
                                on_tool_args=on_tool_args,
                                should_cancel=should_cancel,
-                               on_overflow=self._overflow_shrink,
+                               on_overflow=_shrink_view,
                                on_status=on_status)
 
         try:
@@ -1781,6 +1792,11 @@ class Agent:
                 # context-length error.
                 on_status("compacting context")
                 self._emergency_compact()
+                # CORRECTNESS: model_msgs is a detached, budget-capped view
+                # of self.messages — _emergency_compact() shrank the latter,
+                # so recompute the view or the retry resends the same
+                # oversized prompt that just overflowed.
+                model_msgs = self._prune_for_model(reserved_tokens=_reserved)
                 result = chat_stream(self.provider, self.model, self.effort,
                                      model_msgs, schemas,
                                      on_token=on_token,
@@ -1788,7 +1804,7 @@ class Agent:
                                      on_tool_start=lambda n: on_status(f"tool:{n}"),
                                      on_tool_args=on_tool_args,
                                      should_cancel=should_cancel,
-                                     on_overflow=self._overflow_shrink,
+                                     on_overflow=_shrink_view,
                                      on_status=on_status)
             elif e.status == 400 and "tool" in msg and schemas:
                 on_status("retrying (no tools)")
@@ -1800,13 +1816,13 @@ class Agent:
                                      on_token=on_token,
                                      on_reasoning=on_reasoning,
                                      should_cancel=should_cancel,
-                                     on_overflow=self._overflow_shrink,
+                                     on_overflow=_shrink_view,
                                      on_status=on_status)
             elif e.status == 400 and "stream" in msg:
                 on_status("retrying (non-stream)")
                 result = chat_blocking(self.provider, self.model,
                                        self.effort, model_msgs, schemas,
-                                       on_overflow=self._overflow_shrink,
+                                       on_overflow=_shrink_view,
                                        should_cancel=should_cancel,
                                        on_status=on_status)
             else:

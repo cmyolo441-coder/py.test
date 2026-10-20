@@ -37,7 +37,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
-from .tools import Tool
+from .tools import Tool, RISK_CONFIRM
 
 CONFIG_PATH = os.path.join(os.environ.get("FULLAGENT_HOME") or os.path.join(os.path.expanduser("~"), ".fullagent"), "mcp.json")
 DEFAULT_TIMEOUT = 30.0          # seconds, for connect + tool calls
@@ -408,6 +408,9 @@ def _make_tool(manager: MCPManager, server: str,
         description=description,
         parameters=_translate_schema(spec.get("inputSchema")),
         handler=_handler,
+        # Remote MCP tools can have arbitrary side effects; they must go
+        # through the approval gate like shell/edit tools.
+        risk=RISK_CONFIRM,
     )
 
 

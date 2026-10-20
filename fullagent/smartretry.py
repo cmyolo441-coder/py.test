@@ -66,7 +66,11 @@ def backoff_delay(attempt_index: int, base_delay: float,
     ``base_delay * 2**attempt_index``, plus 0-20% random jitter, capped
     at ``max_delay``.
     """
-    delay = base_delay * (2.0 ** attempt_index)
+    try:
+        delay = base_delay * (2.0 ** attempt_index)
+    except OverflowError:
+        # large max_attempts + tiny max_delay reaches 2**1024 (OverflowError)
+        return max_delay
     delay *= 1.0 + random.uniform(0.0, JITTER_MAX_PCT)
     return min(delay, max_delay)
 
@@ -98,7 +102,10 @@ def _run_once(command: Any, shell: bool,
         if not ok:
             return 2, "", "invalid command", "invalid command"
         if isinstance(argv, str):  # string without shell: shlex-split
-            argv = shlex.split(argv)
+            try:
+                argv = shlex.split(argv)
+            except ValueError as e:  # e.g. unbalanced quote from the model
+                return (2, "", f"invalid command: {e}", "invalid command")
         popen_args = argv
         popen_kwargs = {"shell": False}
     try:

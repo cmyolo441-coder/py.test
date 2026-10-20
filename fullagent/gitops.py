@@ -35,20 +35,35 @@ _GIT_TIMEOUT = 30.0
 
 def _run_git(args: list[str], cwd: str | None = None
              ) -> tuple[int, str, str]:
-    """Run git and return (returncode, stdout, stderr), stripped."""
-    proc = subprocess.run(
-        ["git", *args],
-        capture_output=True,
-        text=True,
-        timeout=_GIT_TIMEOUT,
-        cwd=cwd or None,
-    )
+    """Run git and return (returncode, stdout, stderr), stripped.
+
+    Never raises: a missing git binary or an invalid/inaccessible ``cwd``
+    used to propagate FileNotFoundError/NotADirectoryError through every
+    git tool; a hung git used to raise TimeoutExpired after the tool layer
+    had already reported progress. Both now surface as ordinary errors.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT,
+            cwd=cwd or None,
+        )
+    except subprocess.TimeoutExpired:
+        return 124, "", f"git timed out after {_GIT_TIMEOUT:g}s"
+    except (OSError, ValueError) as e:
+        return 127, "", f"could not run git: {e}"
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 
 def _check_repo(cwd: str | None = None) -> str | None:
     """Return an ERROR string if cwd is not a git repo, else None."""
     rc, _, err = _run_git(["rev-parse", "--git-dir"], cwd=cwd)
+    if rc == 124:
+        return f"ERROR: {err[:200]}"
+    if rc == 127:
+        return f"ERROR: {err[:200]}"
     if rc != 0:
         return ("ERROR: not a git repository (git rev-parse failed). "
                 f"{err[:200] if err else 'Run this from inside a git repo.'}")

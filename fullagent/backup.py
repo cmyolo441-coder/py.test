@@ -120,18 +120,33 @@ def create_backup(app_dir: Optional[Path] = None) -> Dict[str, Any]:
     }
     manifest_bytes = json.dumps(manifest, indent=2).encode("utf-8")
 
-    with tarfile.open(dest, "w:gz") as tar:
-        # MANIFEST.json first, so it can be read without scanning the
-        # whole archive on restore.
-        info = tarfile.TarInfo(MANIFEST_NAME)
-        info.size = len(manifest_bytes)
-        info.mtime = int(time.time())
-        with tempfile.SpooledTemporaryFile() as buf:
-            buf.write(manifest_bytes)
-            buf.seek(0)
-            tar.addfile(info, buf)  # type: ignore[arg-type]
-        for full, arcname in files:
-            tar.add(full, arcname=arcname, recursive=False)
+    # Write to a temp file and rename on success: a crash or full disk
+    # mid-archive used to leave a truncated backup-*.tar.gz that
+    # list_backups() then advertised as a real backup.
+    fd, tmp_name = tempfile.mkstemp(dir=str(bdir),
+                                    prefix=dest.name + ".", suffix=".tmp")
+    os.close(fd)
+    tmp_dest = Path(tmp_name)
+    try:
+        with tarfile.open(tmp_dest, "w:gz") as tar:
+            # MANIFEST.json first, so it can be read without scanning the
+            # whole archive on restore.
+            info = tarfile.TarInfo(MANIFEST_NAME)
+            info.size = len(manifest_bytes)
+            info.mtime = int(time.time())
+            with tempfile.SpooledTemporaryFile() as buf:
+                buf.write(manifest_bytes)
+                buf.seek(0)
+                tar.addfile(info, buf)  # type: ignore[arg-type]
+            for full, arcname in files:
+                tar.add(full, arcname=arcname, recursive=False)
+        os.replace(tmp_dest, dest)
+    except BaseException:
+        try:
+            tmp_dest.unlink()
+        except OSError:
+            pass
+        raise
 
     return {
         "name": dest.name,

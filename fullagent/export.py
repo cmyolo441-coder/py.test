@@ -40,9 +40,11 @@ MD_ARGS_LIMIT = 2000   # max chars for pretty-printed tool-call args
 MD_RESULT_LIMIT = 4000  # max chars for a tool result
 
 # Redact API-key-shaped strings before anything hits disk.
+# NOTE: no leading \b — Python's \b uses Unicode word chars, so a key glued
+# to CJK text ("密钥sk-...") had no word boundary and leaked unredacted.
 _KEY_PATTERNS = (
-    re.compile(r"\boc_sk_[A-Za-z0-9_.\-]{8,}\b"),
-    re.compile(r"\bsk-[A-Za-z0-9_.\-]{8,}\b"),
+    re.compile(r"(?<![A-Za-z0-9])oc_sk_[A-Za-z0-9_.\-]{8,}"),
+    re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_.\-]{8,}"),
 )
 REDACTED = "[REDACTED]"
 

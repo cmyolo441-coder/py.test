@@ -22,9 +22,11 @@ from __future__ import annotations
 
 import hashlib
 import html
+import ipaddress
 import json
 import os
 import re
+import socket
 import time
 import urllib.parse
 import urllib.request
@@ -258,12 +260,46 @@ _JS_NOTE = ("note: page may require JavaScript; content may be incomplete")
 # Main fetch
 # ---------------------------------------------------------------------------
 
+_METADATA_HOSTS = frozenset({
+    "metadata.google.internal",
+    "metadata.goog",
+    "instance-data",
+    "instance-data.ec2.internal",
+})
+
+
+def _host_error(host: str | None) -> str:
+    """Return a reason if *host* is not a public internet address."""
+    if not host:
+        return "URL has no host"
+    h = host.strip().strip("[]").rstrip(".").lower()
+    if not h:
+        return "URL has no host"
+    if h in _METADATA_HOSTS:
+        return f"blocked cloud-metadata host: {host}"
+    try:
+        infos = socket.getaddrinfo(h, None, proto=socket.IPPROTO_TCP)
+    except OSError:
+        return ""  # unresolvable: let urlopen report the network error
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
+        except ValueError:
+            continue
+        if not ip.is_global:
+            # loopback / private / link-local (169.254.169.254) / CGNAT
+            return f"blocked non-public address for {host}: {ip}"
+    return ""
+
+
 def _validate_url(url: object) -> str:
     """Return an error message, or '' if the URL is fetchable."""
     if not isinstance(url, str) or not url.strip():
         return "url must be a non-empty string"
     try:
-        scheme = urllib.parse.urlparse(url.strip()).scheme.lower()
+        parsed = urllib.parse.urlparse(url.strip())
+        scheme = parsed.scheme.lower()
+        host = parsed.hostname
     except ValueError:
         return f"malformed URL: {url[:80]}"
     if scheme not in ("http", "https"):
@@ -271,6 +307,9 @@ def _validate_url(url: object) -> str:
         # reached through exotic schemes.
         return (f"only http(s) URLs are allowed, "
                 f"got {scheme or 'no'} scheme")
+    blocked = _host_error(host)
+    if blocked:
+        return f"blocked URL: {blocked}"
     return ""
 
 
@@ -303,6 +342,12 @@ def fetch_text(url: str, timeout: int = DEFAULT_TIMEOUT,
             if status >= 400:
                 return {"error": f"HTTP {status}"}
             final_url = resp.geturl()
+            # urllib follows redirects on its own: validate the final hop
+            # before reading any body, so an attacker page cannot redirect
+            # us to 169.254.169.254 / localhost and leak the response.
+            final_err = _validate_url(final_url)
+            if final_err:
+                return {"error": f"redirect blocked: {final_err}"}
             content_type = resp.headers.get("Content-Type", "")
             raw = resp.read(MAX_HTML_BYTES)
     except Exception as e:

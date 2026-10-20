@@ -458,16 +458,19 @@ def add(command: str, restart_policy: str = "on-failure",
     ensure_started()
     sid = uuid.uuid4().hex[:12]
     now = time.time()
-    _db_insert(id=sid, command=command.strip(), restart_policy=policy,
-               max_restarts=mr, restarts=0, status=STATUS_RUNNING,
-               pid=None, exit_code=None, created_at=now, started_at=now,
-               next_restart_at=None, backoff_s=None, note=None)
-    try:
-        proc = _spawn(sid, command.strip())
-    except OSError as e:
-        _db_update(sid, status=STATUS_FAILED, note=f"spawn failed: {e}")
-        raise RuntimeError(f"could not start process (id {sid}): {e}")
+    # Hold the supervisor lock across insert+spawn+registration: otherwise
+    # a poll can see a RUNNING row with no live handle and treat the spawn
+    # as a crash (scheduling a restart, or marking it stopped).
     with _SUP._lock:
+        _db_insert(id=sid, command=command.strip(), restart_policy=policy,
+                   max_restarts=mr, restarts=0, status=STATUS_RUNNING,
+                   pid=None, exit_code=None, created_at=now, started_at=now,
+                   next_restart_at=None, backoff_s=None, note=None)
+        try:
+            proc = _spawn(sid, command.strip())
+        except OSError as e:
+            _db_update(sid, status=STATUS_FAILED, note=f"spawn failed: {e}")
+            raise RuntimeError(f"could not start process (id {sid}): {e}")
         _SUP._procs[sid] = proc
         _SUP._pid_history.setdefault(sid, []).append(proc.pid)
         _SUP._first_start[sid] = now
@@ -482,6 +485,12 @@ def stop_supervised(sid: str) -> tuple[bool, str]:
     row = _row(sid)
     if row is None:
         return False, f"ERROR: unknown supervised id: {sid!r}"
+    was_stopped = row["status"] == STATUS_STOPPED
+    # Write STOPPED *before* killing: the kill can take seconds, and the
+    # poller must not see a missing handle for a still-RUNNING row and
+    # schedule a restart that would outlive this stop.
+    _db_update(sid, status=STATUS_STOPPED, pid=None,
+               next_restart_at=None, backoff_s=None)
     with _SUP._lock:
         proc = _SUP._procs.pop(sid, None)
     killed = False
@@ -495,11 +504,9 @@ def stop_supervised(sid: str) -> tuple[bool, str]:
             killed = True
         except (ProcessLookupError, PermissionError, OSError):
             pass
-    _db_update(sid, status=STATUS_STOPPED, pid=None,
-               next_restart_at=None, backoff_s=None)
     if killed:
         return True, f"stopped {sid} (process terminated)"
-    if row["status"] == STATUS_STOPPED:
+    if was_stopped:
         return True, f"{sid} was already stopped"
     return True, f"stopped {sid}"
 

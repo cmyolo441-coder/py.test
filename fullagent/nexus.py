@@ -101,6 +101,11 @@ class Nexus:
             tree = ast.parse(text)
         except SyntaxError as e:
             self.idx.errors[str(p)] = f"syntax error line {e.lineno}"
+            # record the BROKEN content hash: _drop_file already removed
+            # this file's symbols, so keeping the previous hash made a
+            # revert to the old (still-hashed as indexed) content skip the
+            # reparse and leave the file missing from the index forever
+            self.idx.file_hashes[str(p)] = h
             return True
         self._extract(p, tree)
         self.idx.file_hashes[str(p)] = h
