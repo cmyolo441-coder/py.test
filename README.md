@@ -9,7 +9,7 @@
 ╚═╝      ╚═════╝ ╚═════╝╚════╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝  ╚═╝
 ```
 
-<h1>FullAgent <sup><code>v3.2.0</code></sup></h1>
+<h1>FullAgent <sup><code>v3.2.1</code></sup></h1>
 
 **Advanced Terminal AI Agent — Pure Python, Real Code, World-Class TUI**
 
@@ -48,7 +48,7 @@
  ██╔══╝  ██╔══██║                   │ 3. Ask coding questions, edit code… │
  ██║     ██║  ██║                   │ 4. Be specific for the best results │
  ╚═╝     ╚═╝  ╚═╝                   ╰─────────────────────────────────────╯
-  FullAgent CLI v3.2.0
+  FullAgent CLI v3.2.1
 ```
 
 While a swarm is running the frame shows the Qoder-style board and footer:
@@ -59,10 +59,10 @@ While a swarm is running the frame shows the Qoder-style board and footer:
  ◉ Code    · Edit fullagent/tui.py
    … +6 more · ↓ to manage
  COLLAB  ⇧Tab pilot · ◎ 8 running · 0 queued ── 0 skills
-╭─ FullAgent ── ● Step 5 Preview Free ── ◈ extra high ── ◉ ctx 3% ─╮
+╭─ FullAgent ── ● DeepSeek V4.1 Flash Free ── ◈ extra high ── ◉ ctx 3% ─╮
 │ ❯ type anything… the agent reads, writes, edits files, runs commands │
 ╰ ⏎ send · ⇧⏎ newline · / cmds · /diff live · ^T models · ^E effort ──╯
- ● Step 5 Preview Free · extra high · 262k context · ctx ░░░░░░░░░░ 3% · ~/Desktop
+ ● DeepSeek V4.1 Flash Free · extra high · 1m context · ctx ░░░░░░░░░░ 3% · ~/Desktop
                            ◎ feat/tui-chrome · ◎ 8 agents | 8 running
 ```
 
@@ -84,7 +84,7 @@ batches is never counted as live. The footer branch is the real
 autonomy level from `AUTONOMY_LEVELS` (L0 Observe … L5 Autonomous), the
 skills counter is the real `SKILL.md` + forge registry (0 until you install
 or author one), and the context meter is the live token estimate against
-the model's real window (262k here). `<repo>/AGENTS.md` (plus ancestors and
+the model's real window (1m here). `<repo>/AGENTS.md` (plus ancestors and
 `~/.fullagent/AGENTS.md`) is genuinely loaded into the system prompt as the
 `PROJECT INSTRUCTIONS` context section — edit it and the next model call
 sees the change.
@@ -116,11 +116,11 @@ without artificial animation delays.
  ██╔══╝  ██╔══██║                   │ 3. Ask coding questions, edit code, run… │
  ██║     ██║  ██║                   │ 4. Be specific for the best results      │
  ╚═╝     ╚═╝  ╚═╝                   ╰──────────────────────────────────────────╯
-  FullAgent CLI v3.2.0
+  FullAgent CLI v3.2.1
   API key · built-in (Kios API)
-  Step 5 Preview Free  ·  high
+  DeepSeek V4.1 Flash Free  ·  high
   ~/Desktop  ·  session a1b2c3d4
- ❯ model  Step 5 Preview Free   effort  high   autonomy  L3   session  a1b2c3d4
+ ❯ model  DeepSeek V4.1 Flash Free   effort  high   autonomy  L3   session  a1b2c3d4
    / commands · Ctrl+T models · Ctrl+E effort · Shift+Tab pilot · Ctrl+O expand output
 ```
 
@@ -155,7 +155,7 @@ python main.py
 
 ## Provider and rate limits
 
-`Step 5 Preview Free` (Kios API) is the default configured model and works without
+`DeepSeek V4.1 Flash Free` (Kios API) is the default configured model and works without
 manually setting an API key. The app does not impose a five-requests-per-minute
 client cap; when Kios returns a rate-limit response, it honors `Retry-After`
 or waits with backoff and retries until the request succeeds or you cancel
@@ -280,7 +280,7 @@ Event-log commands:
   composed context, lineage)
 - `/dashboard` — live observability: cost, goal, councils, router, spec,
   memory, health in one screen
-- `/router` — task classification and routing history; model: Step 5 Preview Free
+- `/router` — task classification and routing history; model: DeepSeek V4.1 Flash Free
 - `/spec` — speculative execution: prefetch stats + hit-rate
 - `/recall <question>` — semantic (meaning-based) memory recall
 - `/mission [start|tick|list|abandon]` — daemon mission control
@@ -302,14 +302,18 @@ tokens, temperature, and reasoning effort.
 
 ## Models & providers
 
-**Kios API is the only configured provider.** Four models ship, all on Kios:
+**Kios API is the only configured provider.** Two models ship, all on Kios:
 
 | Model | Tag | Context |
 |---|---|---|
-| `step-5-preview-free` (default) | free | 262k |
-| `atria-dawn-preview` | preview | 262k |
-| `ling-3.1-flash` | — | 262k |
-| `glyph-cluster` | — | 262k |
+| `deepseek-v4.1-flash-free` (default) | free | 1.0m |
+| `minimax-m3.1-flash-free` | free | 1.0m |
+
+`deepseek-v4.1-flash-free` is the fastest Kios free route we measured
+(~1s to first token); it is the default and runs with reasoning disabled so
+answers stream immediately. MiniMax keeps its provider-default reasoning.
+Unknown or retired model ids now fail immediately instead of retrying the
+provider's 503 for ~14s.
 
 Zero-config: a Kios API key is embedded in the build, so it works right after
 installation with no setup. Override anytime via the `KIOS_API_KEY` environment

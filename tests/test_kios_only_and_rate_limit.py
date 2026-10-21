@@ -7,10 +7,9 @@ from fullagent.config import Model, Provider
 def test_kios_is_the_only_configured_provider():
     assert list(config.PROVIDERS) == ["kios"]
     assert {m.id for m in config.MODELS} == {
-        "atria-dawn-preview", "step-5-preview-free",
-        "ling-3.1-flash", "glyph-cluster"}
+        "deepseek-v4.1-flash-free", "minimax-m3.1-flash-free"}
     assert all(m.provider == "kios" for m in config.MODELS)
-    assert config.DEFAULT_MODEL_ID == "step-5-preview-free"
+    assert config.DEFAULT_MODEL_ID == "deepseek-v4.1-flash-free"
 
 
 def test_kios_ships_embedded_api_key():
@@ -27,8 +26,29 @@ def test_keyless_provider_still_requires_credentials():
             Provider(key="kios", name="Kios API",
                      base_url="https://kiosapi.com/v1", api_key="",
                      color="#8be9fd"),
-            Model("step-5-preview-free", "kios", "Step 5 Preview Free"),
+            Model("deepseek-v4.1-flash-free", "kios",
+                  "DeepSeek V4.1 Flash Free"),
         )
+
+
+def test_dead_model_error_is_not_retried(monkeypatch):
+    """A retired model id must fail immediately, not burn 2+4+8s of backoff.
+
+    Kios answers unknown/retired model ids with 503 model_not_found. That
+    is permanent: retrying only made the UI feel frozen for ~14s."""
+    attempts = []
+
+    def fake_once(*_args, **_kwargs):
+        attempts.append(True)
+        raise client.APIError(
+            "model_not_found: No available channel for model", status=503)
+
+    monkeypatch.setattr(client, "_chat_stream_once", fake_once)
+    with pytest.raises(client.APIError, match="model_not_found"):
+        client._chat_stream_with_retries(
+            "https://example.test", {}, {}, None, None, None, None, None, 5,
+        )
+    assert len(attempts) == 1
 
 
 def test_retry_after_parses_seconds_and_ignores_invalid_values():

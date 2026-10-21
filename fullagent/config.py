@@ -97,17 +97,16 @@ MAX_TOKENS = 200_000
 # Backends reject a request when input + max_tokens exceeds the model's
 # context window. Every request's max_tokens is clamped to fit (client.py).
 #
-# Per-model context windows, researched 2026-10-10 (worker 17/20).
-# Free-tier gateways sometimes serve LESS than the lab's headline number
-# (e.g. Ling 3.1 Flash targets 1M but the free trial is capped at 256K),
+# Per-model context windows, researched 2026-10-21.
+# Free-tier gateways sometimes serve LESS than the lab's headline number,
 # so values below are the SERVED window where documented, conservative
 # otherwise. The backend can still teach a smaller window at runtime
 # (client.learn_context_window) — that only ever shrinks these.
 MODEL_CONTEXT_WINDOWS: dict[str, int] = {
-    "atria-dawn-preview": 262_144,
-    "step-5-preview-free": 262_144,
-    "ling-3.1-flash": 262_144,
-    "glyph-cluster": 262_144,
+    # upstream: deepseek/deepseek-v4.1-flash (1,048,576-token window)
+    "deepseek-v4.1-flash-free": 1_048_576,
+    # upstream: minimax/minimax-m3.1-flash:free (1,000,000-token window)
+    "minimax-m3.1-flash-free": 1_000_000,
 }
 # Default for models NOT in the table above: assume a small window rather
 # than risk a ~44s doomed request against an unknown cap. A request we can
@@ -212,20 +211,21 @@ PROVIDERS: dict[str, Provider] = {
 }
 
 MODELS: list[Model] = [
-    Model("atria-dawn-preview", "kios", "Atria Dawn Preview",
-          tag="preview", supports_tools=True,
-          context_window=model_context_window("atria-dawn-preview")),
-    Model("step-5-preview-free", "kios", "Step 5 Preview Free",
+    # Fast default: DeepSeek accepts reasoning_effort="none" (sent by
+    # client.build_payload when supports_reasoning=True), so it answers
+    # immediately instead of after a long hidden chain-of-thought.
+    # MiniMax rejects that parameter ("Reasoning is mandatory for this
+    # endpoint"), so it keeps the provider default.
+    Model("deepseek-v4.1-flash-free", "kios", "DeepSeek V4.1 Flash Free",
+          tag="free", supports_tools=True, supports_reasoning=True,
+          context_window=model_context_window("deepseek-v4.1-flash-free")),
+    Model("minimax-m3.1-flash-free", "kios", "MiniMax M3.1 Flash Free",
           tag="free", supports_tools=True,
-          context_window=model_context_window("step-5-preview-free")),
-    Model("ling-3.1-flash", "kios", "Ling 3.1 Flash",
-          supports_tools=True,
-          context_window=model_context_window("ling-3.1-flash")),
-    Model("glyph-cluster", "kios", "Glyph Cluster",
-          supports_tools=True,
-          context_window=model_context_window("glyph-cluster")),
+          context_window=model_context_window("minimax-m3.1-flash-free")),
 ]
-DEFAULT_MODEL_ID = "step-5-preview-free"
+# Fastest Kios free route measured 2026-10-21 (~1s first token vs ~3s for
+# MiniMax and ~40s for qwen3.8-flash-free): default to it.
+DEFAULT_MODEL_ID = "deepseek-v4.1-flash-free"
 
 
 @dataclass(frozen=True)

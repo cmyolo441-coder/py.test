@@ -166,6 +166,27 @@ def _is_rate_limited(error: APIError) -> bool:
             or "throttl" in message)
 
 
+# Errors that can NEVER heal by retrying: an unknown model id, bad auth, a
+# malformed request. Retrying those burned ~14s of backoff (2+4+8) before
+# the UI showed the real error — indistinguishable from "the app is slow".
+_PERMANENT_STATUSES = {400, 401, 403, 404, 405, 422}
+
+
+def _is_permanent_error(error: APIError) -> bool:
+    """True when retrying is pointless: the request itself is wrong.
+
+    Gateways answer a retired/dead model id with 503 ``model_not_found``
+    or "No available channel for model ...", which is permanent even
+    though 503 is normally transient."""
+    if error.status in _PERMANENT_STATUSES:
+        return True
+    message = str(error).lower()
+    return ("model_not_found" in message
+            or "no available channel" in message
+            or "invalid api key" in message
+            or "unauthorized" in message)
+
+
 def _wait_for_rate_limit(error: APIError, attempt: int,
                          should_cancel: Callable[[], bool] | None,
                          on_status: Callable[[str], None] | None = None) -> None:
@@ -2231,8 +2252,9 @@ def _chat_stream_with_retries(
                 attempt = 0
                 deadline = time.monotonic() + timeout
                 continue
-            if (e.status in RETRY_STATUSES and attempt < MAX_RETRIES - 1
-                    and not emitted["out"]):
+            if (e.status in RETRY_STATUSES and not emitted["out"]
+                    and not _is_permanent_error(e)
+                    and attempt < MAX_RETRIES - 1):
                 _sleep_capped_cancellable(_backoff(attempt), deadline,
                                           should_cancel)
                 attempt += 1
@@ -2857,7 +2879,8 @@ def _post_blocking(url: str, headers: dict, payload: dict,
                 attempt = 0
                 deadline = time.monotonic() + timeout
                 continue
-            if e.status in RETRY_STATUSES and attempt < MAX_RETRIES - 1:
+            if (e.status in RETRY_STATUSES and not _is_permanent_error(e)
+                    and attempt < MAX_RETRIES - 1):
                 _sleep_capped_cancellable(_backoff(attempt), deadline,
                                           should_cancel)
                 attempt += 1
@@ -3288,8 +3311,8 @@ if __name__ == "__main__":
             check(f"weird {weird!r} no crash ({e})", False)
 
     # -- 9. per-model window table ----------------------------------------------
-    check("Step 5 Preview Free window is 262144",
-          config.model_context_window("step-5-preview-free") == 262_144)
+    check("DeepSeek V4.1 Flash Free window is 1048576",
+          config.model_context_window("deepseek-v4.1-flash-free") == 1_048_576)
     check("unknown model defaults to 128k",
           config.model_context_window("nope-xyz") == 128_000)
     check("every shipped model has a sane window",

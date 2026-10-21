@@ -85,8 +85,7 @@ def _ensure_working_model(cfg) -> str:
     current = getattr(cfg, "model_id", "")
     if has_key(current):
         return current
-    for mid in ("step-5-preview-free", "ling-3.1-flash",
-                "glyph-cluster", "atria-dawn-preview", "space-bunny-free"):
+    for mid in ("deepseek-v4.1-flash-free", "minimax-m3.1-flash-free"):
         if has_key(mid):
             cfg.model_id = mid
             return mid

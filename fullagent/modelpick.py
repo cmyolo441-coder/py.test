@@ -51,7 +51,7 @@ def list_models(filter_text: str = "") -> list[dict]:
     for match in difflib.get_close_matches(
         q, [m.id for m in MODELS] + [m.label for m in MODELS],
         # 0.6: high-confidence fuzzy only. Below this, near-strings of
-        # REMOVED models (e.g. "space-bunny-free" -> "step-5-preview-free"
+        # REMOVED models (e.g. "space-bunny-free" -> "deepseek-v4.1-flash-free"
         # at 0.457) would silently resolve to the wrong model instead of
         # surfacing the clean "unknown model" error.
         n=10, cutoff=0.6,
@@ -169,19 +169,20 @@ def _selftest() -> None:
 
     # 2. exact id, label and fuzzy free-route name
     checks.append(("exact id", (resolve_model(DEFAULT_MODEL_ID) or Model("", "", "")).id == DEFAULT_MODEL_ID))
-    checks.append(("label match", (resolve_model("Step 5 Preview Free") or Model("", "", "")).id == DEFAULT_MODEL_ID))
-    checks.append(("fuzzy 'step 5'", (resolve_model("step 5") or Model("", "", "")).id == DEFAULT_MODEL_ID))
+    checks.append(("label match", (resolve_model("DeepSeek V4.1 Flash Free") or Model("", "", "")).id == DEFAULT_MODEL_ID))
+    checks.append(("fuzzy 'deepseek'", (resolve_model("deepseek") or Model("", "", "")).id == DEFAULT_MODEL_ID))
     checks.append(("unknown -> None", resolve_model("no-such-model-zzz") is None))
-    # filter finds the configured free route
+    # filter finds every configured free route
     filt = list_models("free")
-    checks.append(("substring filter finds free model",
-                   len(filt) == 1 and filt[0]["id"] == DEFAULT_MODEL_ID))
+    checks.append(("substring filter finds free models",
+                   len(filt) == len(MODELS)
+                   and all(m["id"].endswith("-free") for m in filt)))
 
     # 3. format contains columns
     txt = format_model_list(all_models)
     cols_ok = all(h in txt for h in ("LABEL", "ID", "PROVIDER", "TAG", "CTX", "TOOLS"))
     checks.append(("format columns", cols_ok))
-    checks.append(("format shows 262k", "262k" in txt))
+    checks.append(("format shows 1.0m", "1.0m" in txt))
     checks.append(("format tools tick", "✓" in txt))
 
     # 4. override set / get / clear

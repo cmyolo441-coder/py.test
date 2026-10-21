@@ -211,7 +211,7 @@ if __name__ == "__main__":
     turn = SimpleNamespace(
         user_text="sum these",
         assistant_text="done",
-        model_id="step-5-preview-free",
+        model_id="deepseek-v4.1-flash-free",
         tools=calls,
         usage={"prompt_tokens": 120, "completion_tokens": 45},
         error="",
@@ -222,7 +222,7 @@ if __name__ == "__main__":
     for key in _SCHEMA_KEYS:
         assert key in obj, f"missing schema key: {key}"
     assert obj["session_id"] == "sess-1"
-    assert obj["model"] == "step-5-preview-free"
+    assert obj["model"] == "deepseek-v4.1-flash-free"
     assert obj["user"] == "sum these"
     assert obj["assistant"] == "done"
     assert obj["usage"] == {"input_tokens": 120, "output_tokens": 45}

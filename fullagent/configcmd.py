@@ -350,7 +350,7 @@ def _selftest() -> None:
         assert cfg.set("thinking_visible", "no") is False
         assert cfg.set("output_style", "detailed") == "detailed"
         assert cfg.set("theme", "solarized") == "solarized"
-        assert cfg.set("default_model", "step-5-preview-free") == "step-5-preview-free"
+        assert cfg.set("default_model", "deepseek-v4.1-flash-free") == "deepseek-v4.1-flash-free"
 
         # validation: bad bool
         try:

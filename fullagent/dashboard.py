@@ -323,7 +323,7 @@ if __name__ == "__main__":
         log.append("goal.set", {"statement": "fix parser",
                                 "clauses": [{"id": "C1"}, {"id": "C2"}]})
         log.append("goal.clause.done", {"clause": "C1"})
-        log.append("router.decision", {"model": "step-5-preview-free",
+        log.append("router.decision", {"model": "deepseek-v4.1-flash-free",
                                        "est_cost": 0.0})
         log.append("spec.prefetch", {"tool": "read_file"})
         log.append("spec.hit", {"tool": "read_file"})
