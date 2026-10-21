@@ -36,14 +36,42 @@
 
 ---
 
-> **Banner Updated ✨ — naya FullAgent banner fir se banaya gaya hai!**  
-> Terminal `python main.py` chalate hi ab naya gradient ASCII banner + session info dikhega — aur GitHub README pe yahi banner sabse upar.
+> **Qoder-style chrome ✨ — naya welcome card, live agent board aur status HUD!**  
+> `python main.py` chalate hi block logo + "Tips for getting started" card dikhta hai,
+> aur kaam ke dauraan neeche ek permanent HUD rehta hai: mode chip, skills counter,
+> live parallel-subagent board, model/effort/context footer aur agent count.
 
 ```
-╭─ FullAgent ── model: Step 5 Preview Free ── effort: HIGH ── session a1b2c3d4 ──╮
-│ ❯ type anything… the agent reads, writes, edits files, runs commands     │
-╰─ Enter send · Esc+Enter newline · / commands · Ctrl+T models ────────────╯
+ ███████╗ █████╗                    ╭───── Tips for getting started ─────╮
+ ██╔════╝██╔══██╗                   │ 1. Use AGENTS.md files to customize │
+ █████╗  ███████║                   │ 2. /help for more information       │
+ ██╔══╝  ██╔══██║                   │ 3. Ask coding questions, edit code… │
+ ██║     ██║  ██║                   │ 4. Be specific for the best results │
+ ╚═╝     ╚═╝  ╚═╝                   ╰─────────────────────────────────────╯
+  FullAgent CLI v3.2.0
 ```
+
+While a swarm is running the frame shows the Qoder-style board and footer:
+
+```
+ ≡ 8 Agents (8 running) ───────────────────────────── ↓ to manage
+ ◉ Explore · Read fullagent/autopilot.py
+ ◉ Code    · Edit fullagent/tui.py
+   … +6 more · ↓ to manage
+ YOLO  ⇧Tab auto mode · ◎ 8 agents ─────────────── 21 skills
+╭─ FullAgent ── ● Step 5 Preview Free ── ◈ extra high ── ◉ ctx 3% ─╮
+│ ❯ type anything… the agent reads, writes, edits files, runs commands │
+╰ ⏎ send · ⇧⏎ newline · / cmds · /diff live · ^T models · ^E effort ──╯
+ ● Step 5 Preview Free · extra high · 1M context · ctx ░░░░░░░░░░ 3% · ~/Desktop
+                                    ◎ main · ◎ 8 agents | 8 running
+```
+
+| Key | Action |
+|---|---|
+| `Shift+Tab` | Toggle auto mode (Pilot — safe tools run without asking; deletes still ask) |
+| `Ctrl+O` | Expand / collapse tool output (`… +N more` rows) |
+| `↓` on an empty prompt | Open the live agent dashboard (`/agents`) |
+| `Ctrl+T` / `Ctrl+E` | Model / effort picker |
 
 The prompt is a **double-line box** (not full-screen). One application runs
 for the whole session, so the box **never disappears** — while the model
@@ -66,14 +94,22 @@ without artificial animation delays.
 <summary><b>🖼️ Terminal Banner Preview (after <code>python main.py</code>)</b></summary>
 
 ```
- ◆ FullAgent v3.2.0  ·  advanced terminal AI agent
- event-sourced kernel · goal contracts · self-healing
- ──────────────────────────────────────────────────────────────────
- ❯ model  Step 5 Preview Free   effort  high   autonomy  L4   session  a1b2c3d4
-   / commands · Ctrl+T models · Ctrl+E effort · shell jobs
+ ███████╗ █████╗                    ╭───── Tips for getting started ──────────╮
+ ██╔════╝██╔══██╗                   │ 1. Use AGENTS.md files to customize beh… │
+ █████╗  ███████║                   │ 2. /help for more information            │
+ ██╔══╝  ██╔══██║                   │ 3. Ask coding questions, edit code, run… │
+ ██║     ██║  ██║                   │ 4. Be specific for the best results      │
+ ╚═╝     ╚═╝  ╚═╝                   ╰──────────────────────────────────────────╯
+  FullAgent CLI v3.2.0
+  Signed in · Kios API
+  Step 5 Preview Free  ·  high
+  ~/Desktop  ·  session a1b2c3d4
+ ❯ model  Step 5 Preview Free   effort  high   autonomy  L3   session  a1b2c3d4
+   / commands · Ctrl+T models · Ctrl+E effort · Shift+Tab auto mode · Ctrl+O expand output
 ```
 
-*Full ASCII (6-line) gradient banner dikhega jab terminal ≥80 cols wide ho, warna compact fallback.*
+*Wide terminals get the side-by-side card; under 78 columns the tips card
+stacks under the logo so nothing wraps or clips.*
 
 </details>
 

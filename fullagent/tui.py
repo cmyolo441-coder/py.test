@@ -182,6 +182,7 @@ from rich.syntax import Syntax
 from rich.text import Text
 
 from . import config
+from . import cliui
 from .agent import Agent, ToolEvent
 from .config import (
     APP_NAME,
@@ -772,6 +773,12 @@ class UI:
         # Next-Gen TUI telemetry: live token velocity & session diff history
         self._stream_tokens_count = 0
         self._diff_history: list[dict] = []
+        # Qoder-style chrome: live agent board + expandable tool detail
+        self._agents_cache: dict | None = None
+        self._agents_cache_ts = 0.0
+        self._auto_prev = 3
+        self._detail_expanded = False
+        self._last_detail_event: ToolEvent | None = None
         self._theme_name = str(self.cfg.extra.get("theme", "neon"))
         if self._theme_name in THEMES:
             C.update(THEMES[self._theme_name])
@@ -1030,7 +1037,133 @@ class UI:
             return self.overlay.fragments(self._width())
         return []
 
+    # -- Qoder-style chrome: HUD, footer, live agent board ---------------------
+
+    def _skills_count(self) -> int:
+        """Number of forged skills registered as live tools (0 on any error)."""
+        try:
+            return len(getattr(self.agent.skill_forge, "registry", {}) or {})
+        except Exception:
+            return 0
+
+    def _agents_snapshot(self) -> dict:
+        """Live subagent snapshot, cached for a quarter second.
+
+        The board re-renders on every frame; ``snapshot()`` copies one dict
+        per worker under the manager lock, so polling it 20x/second for a
+        16-worker swarm is wasted work.
+        """
+        now = time.time()
+        cached = getattr(self, "_agents_cache", None)
+        if cached is None or now - getattr(self, "_agents_cache_ts", 0.0) > 0.25:
+            try:
+                mgr = self.agent.__dict__.get("subagents")
+                cached = mgr.snapshot() if mgr is not None else {}
+            except Exception:
+                cached = {}
+            self._agents_cache = cached
+            self._agents_cache_ts = now
+        return cached or {}
+
+    def _agents_visible(self) -> bool:
+        """True while at least one subagent is queued or running."""
+        try:
+            snap = self._agents_snapshot()
+            return any(row.get("state") in cliui.ACTIVE_STATES
+                       for row in snap.get("workers") or [])
+        except Exception:
+            return False
+
+    def _agents_fragments(self) -> list:
+        """The live swarm board, one prompt_toolkit fragment row per line."""
+        try:
+            rows = cliui.agent_board(self._agents_snapshot(),
+                                     width=self._width(), colors=C)
+        except Exception:
+            return []
+        frags: list = []
+        for idx, row in enumerate(rows):
+            frags.extend(row)
+            if idx < len(rows) - 1:
+                frags.append(("", "\n"))
+        return frags
+
+    def _hud_fragments(self) -> list:
+        """Mode chip + key hint on the left, skills counter on the right."""
+        try:
+            active = int((self._agents_snapshot() or {}).get("active") or 0)
+        except Exception:
+            active = 0
+        try:
+            return cliui.hud_fragments(
+                width=self._width(), colors=C,
+                autonomy=getattr(self.agent, "autonomy", 3),
+                skills=self._skills_count(), agents_active=active)
+        except Exception:
+            return []
+
+    def _cwd_label(self) -> str:
+        try:
+            cwd = os.getcwd()
+            home = str(Path.home())
+            if home and (cwd == home or cwd.startswith(home + os.sep)):
+                cwd = "~" + cwd[len(home):]
+            return cwd
+        except Exception:
+            return "."
+
+    def _signed_in_label(self) -> str:
+        """Honest sign-in line for the welcome card (never claims a login)."""
+        try:
+            model = self._model()
+            prov = PROVIDERS.get(model.provider)
+            if prov is not None and getattr(prov, "api_key", ""):
+                return f"Signed in · {prov.name}"
+        except Exception:
+            pass
+        return "Local session · no provider key"
+
+    def _context_percent(self) -> int:
+        """Live context usage %, cached 1s (the border redraws every frame)."""
+        now = time.time()
+        cached = getattr(self, "_ctx_cache", None)
+        if cached is None or now - getattr(self, "_ctx_cache_ts", 0.0) > 1.0:
+            try:
+                from .client import estimate_tokens
+                used = estimate_tokens(self.agent.messages,
+                                       self.agent.model.id)
+                window = max(1, self.agent.model.context_window)
+                cached = min(100, int(used * 100 / window))
+            except Exception:
+                if cached is None:
+                    cached = 0
+            self._ctx_cache = cached
+            self._ctx_cache_ts = now
+        return int(cached or 0)
+
+    def _meta_fragments(self) -> list:
+        """Footer under the prompt: model · effort · context · cwd · agents."""
+        try:
+            snap = self._agents_snapshot() or {}
+            workers = snap.get("workers") or []
+            total = len(workers)
+            active = int(snap.get("active") or 0)
+        except Exception:
+            total = active = 0
+        try:
+            model = self._model()
+            effort = self._effort()
+            return cliui.status_fragments(
+                width=self._width(), colors=C,
+                model_label=model.label, effort_label=effort.label.lower(),
+                context_window=model.context_window,
+                used_pct=self._context_percent(), cwd=self._cwd_label(),
+                agents_total=total, agents_active=active)
+        except Exception:
+            return []
+
     # -- background shell/progress panel ---------------------------------------
+
 
     def _background_visible(self) -> bool:
         try:
@@ -1103,6 +1236,13 @@ class UI:
 
         top_window = Window(FormattedTextControl(self._top_fragments),
                             height=1, dont_extend_height=True)
+        hud_window = Window(FormattedTextControl(self._hud_fragments),
+                            height=1, dont_extend_height=True)
+        meta_window = Window(FormattedTextControl(self._meta_fragments),
+                             height=1, dont_extend_height=True)
+        agents_window = Window(
+            FormattedTextControl(self._agents_fragments),
+            dont_extend_height=True)
         bottom_window = Window(FormattedTextControl(self._bottom_fragments),
                                height=1, dont_extend_height=True)
         left_window = Window(FormattedTextControl(
@@ -1122,12 +1262,17 @@ class UI:
                 ConditionalContainer(
                     overlay_window,
                     filter=Condition(self._overlay_open)),
+                ConditionalContainer(
+                    agents_window,
+                    filter=Condition(self._agents_visible)),
+                hud_window,
                 top_window,
                 ConditionalContainer(
                     background_window,
                     filter=Condition(self._background_visible)),
                 VSplit([left_window, input_window, right_window], padding=0),
                 bottom_window,
+                meta_window,
                 ConditionalContainer(self.search_toolbar,
                                      filter=Condition(self._search_visible)),
             ]),
@@ -1313,6 +1458,25 @@ class UI:
         def _hist_next(event):
             self.buffer.history_forward()
 
+        # Qoder-style board: ↓ on an empty prompt opens /agents instead of
+        # doing nothing (registered after _hist_next so it wins).
+        @kb.add(Keys.Down, filter=focused & ~ov & idle &
+                Condition(self._on_last_line) &
+                Condition(self._buffer_empty) &
+                Condition(lambda: not self._busy) &
+                ~Condition(self._completion_active))
+        def _manage_agents(event):
+            if self._agents_visible():
+                self._cmd_agents("")
+
+        @kb.add("s-tab", filter=focused & ~ov & idle)
+        def _toggle_auto(event):
+            self._toggle_auto_mode()
+
+        @kb.add("c-o", filter=focused & ~ov)
+        def _toggle_detail(event):
+            self._toggle_detail_view()
+
         @kb.add("c-c", filter=focused & ~ov & idle)
         def _ctrl_c(event):
             if self._busy:
@@ -1422,6 +1586,93 @@ class UI:
             except Exception as e:  # noqa: BLE001 — report, never crash
                 self.print_error(f"{type(e).__name__}: {e}")
         threading.Thread(target=guarded, daemon=True).start()
+
+    # -- Qoder-style chrome: mode toggle + expandable tool detail --------------
+
+    def _toggle_auto_mode(self) -> None:
+        """⇧Tab: flip between the normal level and Pilot (YOLO) autonomy.
+
+        Pilot keeps the one destructive guard (deletes still ask), so this
+        is a mode switch, not a blanket approval bypass. The previous level
+        is remembered so ⇧Tab toggles cleanly in both directions.
+        """
+        try:
+            current = int(getattr(self.agent, "autonomy", 3))
+        except Exception:
+            current = 3
+        if current >= 4:
+            target = int(getattr(self, "_auto_prev", 3) or 3)
+            if target >= 4:
+                target = 3
+            label = "auto mode OFF"
+        else:
+            self._auto_prev = current
+            target = 4
+            label = "auto mode ON — safe actions run without asking"
+        try:
+            self.agent.set_autonomy(target)
+            actual = int(getattr(self.agent, "autonomy", target))
+        except Exception as exc:  # noqa: BLE001 — never break the key handler
+            self._set_flash(f"⚠ cannot switch mode: {exc}", C["red"])
+            return
+        self._set_flash(f"✦ {label} · L{actual}", C["green"]
+                        if actual >= 4 else C["cyan"])
+        self._invalidate()
+
+    def _cap(self, compact: int, full: int | None = None) -> int:
+        """Row cap for tool bodies — Ctrl+O swaps compact for full output."""
+        if getattr(self, "_detail_expanded", False):
+            return full if full is not None else max(compact, 2000)
+        return compact
+
+    def _remember_detail(self, ev: ToolEvent, kind: str = "live") -> None:
+        """Keep the last finished tool block so Ctrl+O can re-print it."""
+        try:
+            if ev is not None and ev.status in ("done", "error"):
+                self._last_detail_event = (ev, kind)
+        except Exception:
+            pass
+
+    def _toggle_detail_view(self) -> None:
+        """Ctrl+O: expand/collapse tool output (Qoder's "+N rows" control).
+
+        Expanding re-prints the last finished block with every row instead
+        of the compact cap; collapsing restores the compact default for the
+        next block. Print failures can never take the UI down.
+        """
+        expanded = not getattr(self, "_detail_expanded", False)
+        self._detail_expanded = expanded
+        stored = getattr(self, "_last_detail_event", None)
+        if expanded and stored is not None:
+            try:
+                ev, kind = stored
+                w = max(20, self._width() - 8)
+                if kind == "live":
+                    rows = self._live_rows(ev, w)
+                    title = self._devin_title(ev)
+                else:
+                    rows = self._generic_rows(ev)
+                    title = self._devin_title(ev)
+                head = Text()
+                head.append(" ⏺ ", style=f"bold {C['accent']}")
+                head.append(f"detail · {title}", style=f"bold {C['fg']}")
+                head.append(f"  {len(rows)} rows", style=C["dim"])
+                self.console.print(head)
+                n = len(rows)
+                for idx, row in enumerate(rows):
+                    line = Text()
+                    line.append(" └ " if idx == n - 1 else " │ ", style=C["dim"])
+                    for seg, style in row:
+                        line.append(seg, style=style)
+                    self.console.print(line)
+                self._set_flash("✦ detail expanded (Ctrl+O to collapse)",
+                                C["cyan"])
+                return
+            except Exception:
+                pass
+        self._set_flash(
+            "✦ full output: on (next tool block)" if expanded
+            else "✦ full output: off", C["cyan"] if expanded else C["dim"])
 
     # -- dispatch: slash commands + turns ----------------------------------------------------
 
@@ -4200,49 +4451,23 @@ class UI:
         model = self._model()
         effort = self._effort()
 
-        # ── FullAgent ASCII banner (6-line block, dracula gradient) ──
-        # Compact width ~69-72 fits safely in 80-col consoles (inner 76).
-        # On narrow terminals (<78) fall back to single-line logo to avoid wrap.
-        ascii_lines = [
-            "███████╗██╗   ██╗██╗    ██╗    █████╗  ██████╗ ███████╗███╗ ██╗████████╗",
-            "██╔════╝██║   ██║██║    ██║   ██╔══██╗██╔════╝ ██╔════╝████╗██║╚══██╔══╝",
-            "█████╗  ██║   ██║██║    ██║   ███████║██║  ███╗█████╗  ██╔██╗██║  ██║   ",
-            "██╔══╝  ██║   ██║██║    ██║   ██╔══██║██║   ██║██╔══╝  ██║╚██╗██║  ██║   ",
-            "██║     ╚██████╔╝██████╗█████╗██║  ██║╚██████╔╝███████╗██║ ╚████║  ██║   ",
-            "╚═╝      ╚═════╝ ╚═════╝╚════╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝  ╚═╝   ",
-        ]
-        accent_styles = [C["accent"], C["accent"], C["pink"], C["cyan"], C["cyan"], C["pink"]]
-
-        # effective console width may be smaller than term_w (Panel caps to console width)
-        # so be conservative: need inner width >= max ascii length + 4
-        max_ascii = max(len(s) for s in ascii_lines)
-        need_width = max_ascii + 4 + 2  # borders + padding
-        if width >= max(78, need_width):
-            banner = Text()
-            for i, line in enumerate(ascii_lines):
-                banner.append(line.rstrip(), style=f"bold {accent_styles[i % len(accent_styles)]}")
-                banner.append("\n")
-            # tagline + feature stripe under the ascii (kept ≤74 chars to avoid Panel wrap)
-            banner.append("  ◆ FullAgent ", style=f"bold {C['accent']}")
-            banner.append(f"v{__version__}", style=f"bold {C['pink']}")
-            banner.append("  ·  Event-Sourced Kernel  ·  Goal Contracts  ·  Self-Healing", style=C["dim"])
-            banner.append("\n")
-            n_prov = len(PROVIDERS)
-            banner.append(f"  ⚡ 40+ Commands · 16 Tools · {n_prov} Providers · Real-time Web · Daemon", style=C["dim"])
-            self.console.print(Panel(banner, width=width,
-                                     border_style=C["border"], padding=(0, 1),
-                                     title=f"[bold {C['accent']}]FullAgent[/]",
-                                     subtitle=f"[dim]session {self.agent.session_id}[/]"))
-        else:
-            # narrow fallback — original compact logo (never wraps)
+        # ── Qoder-style welcome: block logo + identity on the left, tips card
+        # on the right. `cliui` owns the layout so it stays headless-testable;
+        # any failure falls back to the compact logo (chrome must never take
+        # the session down).
+        try:
+            self.console.print(cliui.welcome(
+                width=width, version=__version__, model_label=model.label,
+                effort_label=effort.label.lower(),
+                signed_in=self._signed_in_label(),
+                session=self.agent.session_id, cwd=self._cwd_label(),
+                colors=C))
+        except Exception:
             logo = Text()
             logo.append("◆ ", style=f"bold {C['accent']}")
             logo.append(APP_NAME, style=f"bold {C['accent']}")
             logo.append(f" v{__version__}", style=f"bold {C['pink']}")
             logo.append("  ·  advanced terminal AI agent", style=C["dim"])
-            logo.append("\n")
-            logo.append("event-sourced kernel · goal contracts · "
-                        "self-healing", style=C["dim"])
             self.console.print(Panel(logo, width=width,
                                      border_style=C["border"], padding=(0, 1)))
 
@@ -4267,7 +4492,11 @@ class UI:
         hints.append("Ctrl+T", style=f"bold {C['cyan']}")
         hints.append(" models · ", style=C["dim"])
         hints.append("Ctrl+E", style=f"bold {C['cyan']}")
-        hints.append(" effort", style=C["dim"])
+        hints.append(" effort · ", style=C["dim"])
+        hints.append("Shift+Tab", style=f"bold {C['cyan']}")
+        hints.append(" auto mode · ", style=C["dim"])
+        hints.append("Ctrl+O", style=f"bold {C['cyan']}")
+        hints.append(" expand output", style=C["dim"])
         self.console.print(hints)
         self.console.print()
         # Feature: turnresume — offer /resume-turn when a previous session
@@ -4352,9 +4581,10 @@ class UI:
         lines = res.splitlines()
 
         def capped(items, cap):
+            cap = self._cap(cap)
             rows = [[(it, C["fg"])] for it in items[:cap]]
             if len(items) > cap:
-                rows.append([(f"… +{len(items) - cap} more", C["dim"])])
+                rows.append([(f"… +{len(items) - cap} more (Ctrl+O)", C["dim"])])
             return rows
 
         if name == "glob_files":
@@ -4399,6 +4629,7 @@ class UI:
         return [[(first[:200], C["green"])]]
 
     def _tool_result_line(self, ev: ToolEvent) -> Text:
+        self._remember_detail(ev, "generic")
         rows = self._generic_rows(ev)
         t = Text()
         n = len(rows)
@@ -4534,10 +4765,11 @@ class UI:
                 return rows
             code, out, err = self._parse_shell_result(ev.result)
             lines = out.splitlines()
-            for ln in lines[:30]:
+            cap = self._cap(30)
+            for ln in lines[:cap]:
                 add(ln if ln else " ", C["fg"])
-            if len(lines) > 30:
-                add(f"… +{len(lines) - 30} more lines", C["dim"])
+            if len(lines) > cap:
+                add(f"… +{len(lines) - cap} more lines (Ctrl+O)", C["dim"])
             for ln in err.splitlines()[:10]:
                 add(ln, C["orange"])
             if code is not None:
@@ -4550,12 +4782,13 @@ class UI:
             content = str(ev.args.get("content", ""))
             lines = content.splitlines()
             width = len(str(max(len(lines), 1)))
-            for n, ln in enumerate(lines[:300], 1):
+            cap = self._cap(300)
+            for n, ln in enumerate(lines[:cap], 1):
                 rows.append([(f"{n:>{width}} ", C["dim"]),
                              ("+  ", C["green"]),
                              (ln[:w], C["fg"])])
-            if len(lines) > 300:
-                add(f"… +{len(lines) - 300} more lines", C["dim"])
+            if len(lines) > cap:
+                add(f"… +{len(lines) - cap} more lines (Ctrl+O)", C["dim"])
         elif ev.name == "edit_file":
             if failed:
                 add(ev.result.strip() or ev.status, C["red"])
@@ -4565,12 +4798,13 @@ class UI:
             start = self._find_hunk_line(str(ev.args.get("path", "")), new)
             drows = self._diff_rows(old, new, start)
             width = len(str(max((r[0] for r in drows), default=1)))
-            for num, mark, color, text in drows[:100]:
+            cap = self._cap(100)
+            for num, mark, color, text in drows[:cap]:
                 rows.append([(f"{num:>{width}} ", C["dim"]),
                              (mark, C["dim"] if mark == "   " else color),
                              (text[:w], color)])
-            if len(drows) > 100:
-                add(f"… +{len(drows) - 100} more lines", C["dim"])
+            if len(drows) > cap:
+                add(f"… +{len(drows) - cap} more lines (Ctrl+O)", C["dim"])
         elif ev.name == "read_file":
             m = re.search(r"(\d+) lines total, showing (\d+)\.\.(\d+)",
                           ev.result)
@@ -4583,7 +4817,8 @@ class UI:
                 add((ev.result.splitlines() or [""])[0], C["dim"])
         else:  # apply_patch
             lines = str(ev.args.get("patch", "")).splitlines()
-            for ln in lines[:60]:
+            cap = self._cap(60)
+            for ln in lines[:cap]:
                 if ln.startswith("@@"):
                     add(ln, C["cyan"])
                 elif ln.startswith(("+++ ", "--- ")):
@@ -4594,8 +4829,8 @@ class UI:
                     add(ln, C["red"])
                 else:
                     add(ln, C["fg"])
-            if len(lines) > 60:
-                add(f"… +{len(lines) - 60} more lines", C["dim"])
+            if len(lines) > cap:
+                add(f"… +{len(lines) - cap} more lines (Ctrl+O)", C["dim"])
             if failed:
                 add(ev.result.strip() or ev.status, C["red"])
         if not rows:
@@ -4637,6 +4872,7 @@ class UI:
             else:
                 t.append("Applied patch", style=f"bold {C['fg']}")
             return t
+        self._remember_detail(ev)
         body = self._live_body_lines(ev)
         for idx, line in enumerate(body):
             t.append_text(line)
@@ -4649,6 +4885,7 @@ class UI:
         the error), printed once the command finishes."""
         t = Text()
         t.append(" └ ", style=C["dim"])
+        self._remember_detail(ev)
         if ev.status != "done" or ev.result.startswith("ERROR"):
             msg = ev.result.splitlines()[0] if ev.result else ev.status
             t.append(msg[:200], style=C["red"])
@@ -4666,6 +4903,7 @@ class UI:
         (e.g. 'OK: created … 286 line(s)'), printed once writing finishes."""
         t = Text()
         t.append(" └ ", style=C["dim"])
+        self._remember_detail(ev)
         if ev.status != "done" or ev.result.startswith("ERROR"):
             msg = ev.result.splitlines()[0] if ev.result else ev.status
             t.append(msg[:200], style=C["red"])
