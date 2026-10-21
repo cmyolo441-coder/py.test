@@ -210,5 +210,22 @@ class DetailToggleTests(unittest.TestCase):
         self.assertTrue(ui.flashes)
 
 
+class ThinkingBlockTests(unittest.TestCase):
+    def test_thinking_block_collapses_and_ctrl_o_expands(self):
+        ui = _make_ui([])
+        text = "\n".join(f"thought {i}" for i in range(15))
+        ui._print_thinking_block(text)
+        out = ui.output.getvalue()
+        self.assertIn("Thinking", out)
+        self.assertIn("thought 0", out)
+        self.assertNotIn("thought 12", out)
+        self.assertIn("+7 rows (Ctrl+O to expand)", out)
+
+        ui._toggle_detail_view()
+        out2 = ui.output.getvalue()
+        self.assertIn("thought 14", out2)
+        self.assertTrue(any("thinking expanded" in f for f in ui.flashes))
+
+
 if __name__ == "__main__":
     unittest.main()

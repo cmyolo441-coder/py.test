@@ -1633,6 +1633,37 @@ class UI:
         except Exception:
             pass
 
+    def _print_thinking_block(self, text: str, expanded: bool = False) -> None:
+        """Qoder-style ``Thinking`` panel: a few rows, Ctrl+O for the rest.
+
+        The full reasoning is kept in ``_last_detail_event`` so Ctrl+O can
+        re-print every row instead of just the collapsed preview.
+        """
+        lines = [ln.rstrip() for ln in str(text or "").splitlines()
+                 if ln.strip()]
+        if not lines:
+            return
+        width = max(20, self._width() - 6)
+        limit = len(lines) if expanded else self._cap(8)
+        head = Text()
+        head.append("  Thinking", style=f"bold {C['pink']}")
+        if len(lines) > limit:
+            head.append(f"  ({len(lines)} rows)", style=C["dim"])
+        self.console.print(head)
+        for ln in lines[:limit]:
+            row = Text()
+            row.append("  │ ", style=C["dim"])
+            row.append(_truncate_w(ln, width), style=f"italic {C['dim']}")
+            self.console.print(row)
+        if len(lines) > limit:
+            self.console.print(Text(
+                f"  │ … +{len(lines) - limit} rows (Ctrl+O to expand)",
+                style=C["dim"]))
+            # only a truncated block needs the Ctrl+O affordance; an
+            # already-complete block must not steal expansion from the
+            # last tool output
+            self._last_detail_event = (str(text), "thinking")
+
     def _toggle_detail_view(self) -> None:
         """Ctrl+O: expand/collapse tool output (Qoder's "+N rows" control).
 
@@ -1646,6 +1677,11 @@ class UI:
         if expanded and stored is not None:
             try:
                 ev, kind = stored
+                if kind == "thinking":
+                    self._print_thinking_block(ev, expanded=True)
+                    self._set_flash("✦ thinking expanded (Ctrl+O to collapse)",
+                                    C["cyan"])
+                    return
                 w = max(20, self._width() - 8)
                 if kind == "live":
                     rows = self._live_rows(ev, w)
@@ -4147,14 +4183,9 @@ class UI:
                 pass
             if turn.reasoning and _think_visible:
                 try:
-                    _fmt = getattr(self.agent, "format_thinking", None)
                     _exp = bool(getattr(self.agent, "thinking_expanded",
                                         False))
-                    if callable(_fmt):
-                        self.print_info(_fmt(turn.reasoning,
-                                            collapsed=not _exp), C["dim"])
-                    else:
-                        self.print_reasoning(turn.reasoning)
+                    self._print_thinking_block(turn.reasoning, expanded=_exp)
                 except Exception:
                     self.print_reasoning(turn.reasoning)
             if turn.error:
