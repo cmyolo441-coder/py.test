@@ -724,8 +724,9 @@ class Agent:
                           query: str = ""
                           ) -> dict[str, str]:
         """Live context sections composed beneath the sealed prompt by the
-        Mastermind gate (constitution, goal, web, memory). The framing is
-        the composer's job — bodies here are plain content only.
+        Mastermind gate (constitution, project, goal, web, memory,
+        compacted). The framing is the composer's job — bodies here are
+        plain content only.
 
         SPEED: each section is cached with a head-seq watermark — the section
         is only recomputed when the log has grown past the cached head. This
@@ -740,6 +741,18 @@ class Agent:
             self._const_cache_head = head
         if self._const_cache:
             sections["constitution"] = self._const_cache
+
+        # project instructions — real AGENTS.md files (global → cwd).
+        # instructions.py caches by mtime/size, so a multi-call turn does
+        # not re-read disk pages it already has; a live edit is still seen
+        # on the next call.
+        try:
+            from . import instructions as _instructions
+            _project = _instructions.collect()
+        except Exception:
+            _project = ""
+        if _project:
+            sections["project"] = _project
 
         # goal — cached until a goal event is sealed
         if not hasattr(self, "_goal_cache") or self._goal_cache_head != head:

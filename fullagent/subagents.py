@@ -46,6 +46,12 @@ from .roles import ROLES, role_label
 from .tools import RISK_SAFE, Tool, parse_tool_arguments
 
 MAX_GROUP_SIZE = 8
+# Real concurrency limit. MAX_GROUP_SIZE is the largest batch the tools
+# accept, so the pool must be able to run that whole batch at once —
+# otherwise "8 parallel specialists" would silently be 4 running + 4
+# queued (the TUI shows the exact split, but the capability should be real).
+DEFAULT_WORKERS = 8
+DEFAULT_ACTIVE_LIMIT = 8
 MAX_RETAINED = 40
 MAX_TASK_CHARS = 12_000
 MAX_CONTEXT_CHARS = 24_000
@@ -53,7 +59,6 @@ MAX_TOOL_OUTPUT_CHARS = 12_000
 MAX_CALLS_PER_STEP = 12
 MAX_TOTAL_TOOL_CALLS = 80
 MAX_STEPS = 20
-DEFAULT_WORKERS = 4
 DEFAULT_ACTIVE_LIMIT = 8
 CALL_TIMEOUT = 120.0
 DRAIN_TIMEOUT = 5.0

@@ -16,6 +16,23 @@ Bottom border: live spinner + elapsed seconds while busy, ✦ flash
 messages, coloured [y]es/[n]o/[a]lways approval bar, styled key hints
 when idle. Overlays (model / effort / help / history) render directly
 above the box and are navigated with ↑↓, PgUp/PgDn, Tab, Home/End.
+
+Qoder-style chrome (``fullagent.cliui``) wraps the box:
+
+    ≡ 4 Agents (4 running) ───────────────────────── ↓ to manage
+     ◉ Explore · Read fullagent/autopilot.py
+    COLLAB  ⇧Tab pilot · ◎ 4 running · 0 queued ───── 0 skills
+    ╭─ FullAgent ──●── Union Alpha ── ◈ high ──⬢ L3──◉ ctx 12%──╮
+    │ ❯ user types here…                                        │
+    ╰ ⏎ send · ⇧⏎ newline · / cmds · ^T models · ^E effort ─────╯
+     ● Union Alpha · high · 262k context · ctx ░░░░░░░░░░ 12% · ~/repo
+                              ◎ feature/x · ◎ 4 agents | 4 running
+
+The board only appears while a swarm is queued/running; the HUD carries
+the autonomy mode (Shift+Tab toggles Pilot) and the skills counter; the
+footer carries model/effort/context/cwd plus the agent count. Ctrl+O
+expands the last tool block or Thinking panel instead of its "+N rows"
+preview.
 """
 
 from __future__ import annotations
@@ -182,6 +199,7 @@ from rich.syntax import Syntax
 from rich.text import Text
 
 from . import config
+from . import cliui
 from .agent import Agent, ToolEvent
 from .config import (
     APP_NAME,
@@ -772,6 +790,16 @@ class UI:
         # Next-Gen TUI telemetry: live token velocity & session diff history
         self._stream_tokens_count = 0
         self._diff_history: list[dict] = []
+        # Qoder-style chrome: live agent board + expandable tool detail
+        self._agents_cache: dict | None = None
+        self._agents_cache_ts = 0.0
+        self._agents_hooked = False
+        self._branch_cache: str | None = None
+        self._branch_cache_ts = 0.0
+        self._auto_prev = 3
+        self._detail_expanded = False
+        # (payload, kind) — kind is "live" | "generic" | "thinking"
+        self._last_detail_event: tuple | None = None
         self._theme_name = str(self.cfg.extra.get("theme", "neon"))
         if self._theme_name in THEMES:
             C.update(THEMES[self._theme_name])
@@ -1030,7 +1058,275 @@ class UI:
             return self.overlay.fragments(self._width())
         return []
 
+    # -- Qoder-style chrome: HUD, footer, live agent board ---------------------
+
+    def _skills_count(self) -> int:
+        """Real installed skills: SKILL.md skills + forged tools.
+
+        Scans the same sources ``/skills`` shows (``~/.fullagent/skills``
+        SKILL.md directories plus the forge registry), cached for 5s — the
+        footer re-renders every frame and both sources touch disk.
+        """
+        now = time.time()
+        cached = getattr(self, "_skills_cache", None)
+        if (cached is not None
+                and now - getattr(self, "_skills_cache_ts", 0.0) < 5.0):
+            return cached
+        names: set[str] = set()
+        try:
+            mgr = getattr(self.agent, "skill_manager", None)
+            if mgr is None:
+                from .skills import SkillMDManager
+                mgr = SkillMDManager()
+            for item in mgr.list_skills() or []:
+                if isinstance(item, dict) and item.get("name"):
+                    names.add(str(item["name"]).strip().lower())
+        except Exception:
+            pass
+        try:
+            names.update(str(k).strip().lower() for k in
+                         (getattr(self.agent.skill_forge, "registry", {})
+                          or {}))
+        except Exception:
+            pass
+        self._skills_cache = len(names)
+        self._skills_cache_ts = now
+        return self._skills_cache
+
+    def _log_chrome_error(self, where: str, exc: Exception) -> None:
+        """Record a chrome wiring failure once (never spam, never crash).
+
+        Render callbacks run inside prompt_toolkit's draw pass, so printing
+        there could corrupt the frame — the failure goes to a log file the
+        user can inspect instead of vanishing into a bare ``except``.
+        """
+        try:
+            key = f"{where}:{type(exc).__name__}:{exc}"
+            seen = getattr(self, "_chrome_errors", None)
+            if seen is None:
+                seen = self._chrome_errors = set()
+            if key in seen:
+                return
+            seen.add(key)
+            path = config.APP_DIR / "chrome_errors.log"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {key}\n")
+        except Exception:
+            pass
+
+    def _agents_snapshot(self) -> dict:
+        """Live subagent snapshot, cached for a quarter second.
+
+        The board re-renders on every frame; ``snapshot()`` copies one dict
+        per worker under the manager lock, so polling it 20x/second for a
+        16-worker swarm is wasted work. Tool calls and turn boundaries drop
+        the cache, so a spawn/finish shows up immediately instead of after
+        the TTL.
+        """
+        now = time.time()
+        cached = getattr(self, "_agents_cache", None)
+        if cached is None or now - getattr(self, "_agents_cache_ts", 0.0) > 0.25:
+            try:
+                mgr = self.agent.__dict__.get("subagents")
+                if mgr is not None:
+                    self._hook_agents(mgr)
+                cached = mgr.snapshot() if mgr is not None else {}
+            except Exception:
+                cached = {}
+            self._agents_cache = cached
+            self._agents_cache_ts = now
+        return cached or {}
+
+    def _hook_agents(self, mgr) -> None:
+        """Subscribe to the real manager's progress events (once).
+
+        Worker threads call this on every state/tool transition, so the
+        board updates the instant a worker starts, calls a tool or finishes
+        — even while the main turn is blocked waiting on TaskCollect.
+        """
+        if getattr(self, "_agents_hooked", False):
+            return
+        self._agents_hooked = True
+        try:
+            mgr.on_progress(self._on_subagent_event)
+        except Exception:
+            pass
+
+    def _on_subagent_event(self, _worker=None, _kind=None) -> None:
+        """Manager callback (worker thread): drop the cache and redraw."""
+        self._invalidate_agents()
+        try:
+            self._invalidate()
+        except Exception:
+            pass
+
+    def _invalidate_agents(self) -> None:
+        """Force the next frame to read the real subagent state."""
+        self._agents_cache = None
+        self._agents_cache_ts = 0.0
+
+    def _agents_visible(self) -> bool:
+        """True while at least one subagent is queued or running."""
+        try:
+            snap = self._agents_snapshot()
+            return any(row.get("state") in cliui.ACTIVE_STATES
+                       for row in snap.get("workers") or [])
+        except Exception:
+            return False
+
+    def _agents_fragments(self) -> list:
+        """The live swarm board, one prompt_toolkit fragment row per line."""
+        try:
+            rows = cliui.agent_board(self._agents_snapshot(),
+                                     width=self._width(), colors=C)
+        except Exception as exc:  # noqa: BLE001 — chrome must never crash
+            self._log_chrome_error("agent_board", exc)
+            return []
+        frags: list = []
+        for idx, row in enumerate(rows):
+            frags.extend(row)
+            if idx < len(rows) - 1:
+                frags.append(("", "\n"))
+        return frags
+
+    def _agent_counts(self) -> tuple:
+        """(running, queued, live) from the real snapshot — live only.
+
+        Retained workers from earlier batches are deliberately excluded;
+        they are history, not running agents.
+        """
+        counts = (self._agents_snapshot() or {}).get("counts") or {}
+        running = int(counts.get("running") or 0)
+        queued = int(counts.get("queued") or 0)
+        cancelling = int(counts.get("cancelling") or 0)
+        return running, queued, running + queued + cancelling
+
+    def _hud_fragments(self) -> list:
+        """Mode chip + key hint on the left, skills counter on the right."""
+        try:
+            running, queued, _ = self._agent_counts()
+        except Exception:
+            running = queued = 0
+        try:
+            return cliui.hud_fragments(
+                width=self._width(), colors=C,
+                autonomy=getattr(self.agent, "autonomy", 3),
+                skills=self._skills_count(),
+                agents_running=running, agents_queued=queued)
+        except Exception as exc:  # noqa: BLE001
+            self._log_chrome_error("hud", exc)
+            return []
+
+    def _cwd_label(self) -> str:
+        try:
+            cwd = os.getcwd()
+            home = str(Path.home())
+            if home and (cwd == home or cwd.startswith(home + os.sep)):
+                cwd = "~" + cwd[len(home):]
+            return cwd
+        except Exception:
+            return "."
+
+    def _signed_in_label(self) -> str:
+        """Honest provider-credential line for the welcome card.
+
+        FullAgent has no browser auth. The default build also ships an
+        embedded fallback key, so "Signed in" (or even a bare "API key
+        loaded") would overstate what is happening. This reports the real
+        origin of the key that will be used: environment, user key file,
+        or the built-in fallback — and says so plainly when there is none.
+        """
+        try:
+            model = self._model()
+            prov = PROVIDERS.get(model.provider)
+            if prov is None:
+                return "No provider configured"
+            env_name = f"{model.provider.upper()}_API_KEY"
+            if (os.environ.get(env_name) or "").strip():
+                return f"API key · env ({prov.name})"
+            try:
+                key_file = config.APP_DIR / f"{model.provider}_api_key"
+                if key_file.read_text(encoding="utf-8").strip():
+                    return f"API key · key file ({prov.name})"
+            except (OSError, UnicodeDecodeError):
+                pass
+            if getattr(prov, "api_key", ""):
+                return f"API key · built-in ({prov.name})"
+        except Exception:
+            pass
+        return "No API key · local session"
+
+    def _branch_label(self) -> str:
+        """The real git branch of the working directory (or a clear fallback).
+
+        ``git rev-parse --abbrev-ref HEAD`` is cheap and cached for 5s; a
+        non-repo / detached HEAD shows the session id instead of inventing
+        a branch name.
+        """
+        now = time.time()
+        if (getattr(self, "_branch_cache", None) is not None
+                and now - getattr(self, "_branch_cache_ts", 0.0) < 5.0):
+            return self._branch_cache
+        name = ""
+        try:
+            import subprocess
+            if shutil.which("git"):
+                proc = subprocess.run(
+                    ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                    cwd=os.getcwd(), capture_output=True, text=True,
+                    timeout=2.0)
+                if proc.returncode == 0:
+                    name = (proc.stdout or "").strip()
+        except Exception:
+            name = ""
+        if not name or name == "HEAD":
+            sid = str(getattr(self.agent, "session_id", "") or "")
+            name = f"session {sid[:8]}" if sid else "no git"
+        self._branch_cache = name
+        self._branch_cache_ts = now
+        return name
+
+    def _context_percent(self) -> int:
+        """Live context usage %, cached 1s (the border redraws every frame)."""
+        now = time.time()
+        cached = getattr(self, "_ctx_cache", None)
+        if cached is None or now - getattr(self, "_ctx_cache_ts", 0.0) > 1.0:
+            try:
+                from .client import estimate_tokens
+                used = estimate_tokens(self.agent.messages,
+                                       self.agent.model.id)
+                window = max(1, self.agent.model.context_window)
+                cached = min(100, int(used * 100 / window))
+            except Exception:
+                if cached is None:
+                    cached = 0
+            self._ctx_cache = cached
+            self._ctx_cache_ts = now
+        return int(cached or 0)
+
+    def _meta_fragments(self) -> list:
+        """Footer under the prompt: model · effort · context · cwd · agents."""
+        try:
+            running, queued, _ = self._agent_counts()
+        except Exception:
+            running = queued = 0
+        try:
+            model = self._model()
+            effort = self._effort()
+            return cliui.status_fragments(
+                width=self._width(), colors=C,
+                model_label=model.label, effort_label=effort.label.lower(),
+                context_window=model.context_window,
+                used_pct=self._context_percent(), cwd=self._cwd_label(),
+                branch=self._branch_label(),
+                agents_running=running, agents_queued=queued)
+        except Exception as exc:  # noqa: BLE001
+            self._log_chrome_error("footer", exc)
+            return []
+
     # -- background shell/progress panel ---------------------------------------
+
 
     def _background_visible(self) -> bool:
         try:
@@ -1103,6 +1399,13 @@ class UI:
 
         top_window = Window(FormattedTextControl(self._top_fragments),
                             height=1, dont_extend_height=True)
+        hud_window = Window(FormattedTextControl(self._hud_fragments),
+                            height=1, dont_extend_height=True)
+        meta_window = Window(FormattedTextControl(self._meta_fragments),
+                             height=1, dont_extend_height=True)
+        agents_window = Window(
+            FormattedTextControl(self._agents_fragments),
+            dont_extend_height=True)
         bottom_window = Window(FormattedTextControl(self._bottom_fragments),
                                height=1, dont_extend_height=True)
         left_window = Window(FormattedTextControl(
@@ -1122,12 +1425,17 @@ class UI:
                 ConditionalContainer(
                     overlay_window,
                     filter=Condition(self._overlay_open)),
+                ConditionalContainer(
+                    agents_window,
+                    filter=Condition(self._agents_visible)),
+                hud_window,
                 top_window,
                 ConditionalContainer(
                     background_window,
                     filter=Condition(self._background_visible)),
                 VSplit([left_window, input_window, right_window], padding=0),
                 bottom_window,
+                meta_window,
                 ConditionalContainer(self.search_toolbar,
                                      filter=Condition(self._search_visible)),
             ]),
@@ -1313,6 +1621,25 @@ class UI:
         def _hist_next(event):
             self.buffer.history_forward()
 
+        # Qoder-style board: ↓ on an empty prompt opens /agents instead of
+        # doing nothing (registered after _hist_next so it wins).
+        @kb.add(Keys.Down, filter=focused & ~ov & idle &
+                Condition(self._on_last_line) &
+                Condition(self._buffer_empty) &
+                Condition(lambda: not self._busy) &
+                ~Condition(self._completion_active))
+        def _manage_agents(event):
+            if self._agents_visible():
+                self._cmd_agents("")
+
+        @kb.add("s-tab", filter=focused & ~ov & idle)
+        def _toggle_auto(event):
+            self._toggle_auto_mode()
+
+        @kb.add("c-o", filter=focused & ~ov)
+        def _toggle_detail(event):
+            self._toggle_detail_view()
+
         @kb.add("c-c", filter=focused & ~ov & idle)
         def _ctrl_c(event):
             if self._busy:
@@ -1395,6 +1722,7 @@ class UI:
                             pass
         except Exception:
             pass
+        self._invalidate_agents()  # cancelled workers must leave the board now
         # Watchdog: if the turn thread is stuck (e.g. blocked in input()
         # or a hung subprocess), force-clear the busy state after 10s so
         # the UI never shows "cancelling…" forever.
@@ -1422,6 +1750,134 @@ class UI:
             except Exception as e:  # noqa: BLE001 — report, never crash
                 self.print_error(f"{type(e).__name__}: {e}")
         threading.Thread(target=guarded, daemon=True).start()
+
+    # -- Qoder-style chrome: mode toggle + expandable tool detail --------------
+
+    def _toggle_auto_mode(self) -> None:
+        """⇧Tab: flip between the current autonomy level and Pilot (L4).
+
+        Pilot keeps the one destructive guard (deletes still ask), so this
+        is a mode switch, not a blanket approval bypass. The previous level
+        is remembered so ⇧Tab toggles cleanly in both directions.
+        """
+        try:
+            current = int(getattr(self.agent, "autonomy", 3))
+        except Exception:
+            current = 3
+        if current >= 4:
+            target = int(getattr(self, "_auto_prev", 3) or 3)
+            if target >= 4:
+                target = 3
+            label = "Pilot mode OFF"
+        else:
+            self._auto_prev = current
+            target = 4
+            label = "Pilot mode ON — safe actions run without asking (L4)"
+        try:
+            self.agent.set_autonomy(target)
+            actual = int(getattr(self.agent, "autonomy", target))
+        except Exception as exc:  # noqa: BLE001 — never break the key handler
+            self._set_flash(f"⚠ cannot switch mode: {exc}", C["red"])
+            return
+        self._set_flash(f"✦ {label} · L{actual}", C["green"]
+                        if actual >= 4 else C["cyan"])
+        self._invalidate()
+
+    def _cap(self, compact: int, full: int | None = None) -> int:
+        """Row cap for tool bodies — Ctrl+O swaps compact for full output."""
+        if getattr(self, "_detail_expanded", False):
+            return full if full is not None else max(compact, 2000)
+        return compact
+
+    def _remember_detail(self, ev: ToolEvent, kind: str = "live") -> None:
+        """Keep the last finished tool block so Ctrl+O can re-print it."""
+        try:
+            if ev is not None and ev.status in ("done", "error"):
+                self._last_detail_event = (ev, kind)
+        except Exception:
+            pass
+
+    def _print_thinking_block(self, text: str, expanded: bool = False) -> None:
+        """Qoder-style ``Thinking`` panel: a few rows, Ctrl+O for the rest.
+
+        The full reasoning is kept in ``_last_detail_event`` so Ctrl+O can
+        re-print every row instead of just the collapsed preview.
+        """
+        lines = [ln.rstrip() for ln in str(text or "").splitlines()
+                 if ln.strip()]
+        if not lines:
+            return
+        width = max(20, self._width() - 6)
+        preview = 8
+        limit = len(lines) if expanded else preview
+        head = Text()
+        head.append("  Thinking", style=f"bold {C['pink']}")
+        if len(lines) > limit:
+            head.append(f"  ({len(lines)} rows)", style=C["dim"])
+        self.console.print(head)
+        for ln in lines[:limit]:
+            row = Text()
+            row.append("  │ ", style=C["dim"])
+            row.append(_truncate_w(ln, width), style=f"italic {C['dim']}")
+            self.console.print(row)
+        if len(lines) > limit:
+            self.console.print(Text(
+                f"  │ … +{len(lines) - limit} rows (Ctrl+O to expand)",
+                style=C["dim"]))
+        # Only a truncated, still-collapsed block needs the Ctrl+O target;
+        # an already-complete or already-expanded block must not steal
+        # expansion from the previous block.
+        if len(lines) > preview and not expanded:
+            self._last_detail_event = (str(text), "thinking")
+
+    def _toggle_detail_view(self) -> None:
+        """Ctrl+O: expand the last block, then return to the compact view.
+
+        Expanding re-prints the last finished block with every row instead
+        of the compact cap. Collapsing switches back to compact output for
+        the NEXT block — output already in the scrollback cannot be
+        un-printed, and the flash says so instead of pretending otherwise.
+        Print failures can never take the UI down.
+        """
+        expanded = not getattr(self, "_detail_expanded", False)
+        self._detail_expanded = expanded
+        stored = getattr(self, "_last_detail_event", None)
+        if expanded and stored is not None:
+            try:
+                ev, kind = stored
+                if kind == "thinking":
+                    self._print_thinking_block(ev, expanded=True)
+                    self._set_flash(
+                        "✦ thinking expanded · Ctrl+O compact view", C["cyan"])
+                    return
+                w = max(20, self._width() - 8)
+                if kind == "live":
+                    rows = self._live_rows(ev, w)
+                    title = self._devin_title(ev)
+                else:
+                    rows = self._generic_rows(ev)
+                    title = self._devin_title(ev)
+                head = Text()
+                head.append(" ⏺ ", style=f"bold {C['accent']}")
+                head.append(f"detail · {title}", style=f"bold {C['fg']}")
+                head.append(f"  {len(rows)} rows", style=C["dim"])
+                self.console.print(head)
+                n = len(rows)
+                for idx, row in enumerate(rows):
+                    line = Text()
+                    line.append(" └ " if idx == n - 1 else " │ ", style=C["dim"])
+                    for seg, style in row:
+                        line.append(seg, style=style)
+                    self.console.print(line)
+                self._set_flash("✦ expanded · Ctrl+O compact view", C["cyan"])
+                return
+            except Exception:
+                pass
+        self._set_flash(
+            "✦ full output: on (next tool block)" if expanded
+            else "✦ compact view for the next block "
+                 "(expanded output stays in scrollback)",
+            C["cyan"] if expanded else C["dim"])
 
     # -- dispatch: slash commands + turns ----------------------------------------------------
 
@@ -3511,11 +3967,13 @@ class UI:
             self._stop_spinner()
             self._busy = False
             self._set_status("")
+            self._invalidate_agents()  # board/roster reflect the finished turn
             self._invalidate()
 
     def _run_turn(self, text: str) -> None:
         self._turn_start_ts = time.time()
         self._stream_tokens_count = 0
+        self._invalidate_agents()
         self._set_status("thinking…")
         self._start_spinner()
         # Only retain the unfinished line; emit complete lines immediately.
@@ -3744,6 +4202,7 @@ class UI:
                     )
 
         def on_tool_call(ev: ToolEvent):
+            self._invalidate_agents()  # TaskGroup spawns must show immediately
             rem = "".join(stream_tail["parts"]).strip("\n")
             stream_tail["parts"].clear()
             stream_tail["pv"] = ""
@@ -3773,6 +4232,7 @@ class UI:
             self._set_status(f"running {ev.name}…")
 
         def on_tool_update(ev: ToolEvent):
+            self._invalidate_agents()  # worker progress/finish is real state
             if ev.name in ("write_file", "edit_file", "MultiEdit", "multiedit", "apply_patch") \
                     and ev.status in ("done", "error"):
                 if hasattr(self, "_diff_history"):
@@ -3896,14 +4356,9 @@ class UI:
                 pass
             if turn.reasoning and _think_visible:
                 try:
-                    _fmt = getattr(self.agent, "format_thinking", None)
                     _exp = bool(getattr(self.agent, "thinking_expanded",
                                         False))
-                    if callable(_fmt):
-                        self.print_info(_fmt(turn.reasoning,
-                                            collapsed=not _exp), C["dim"])
-                    else:
-                        self.print_reasoning(turn.reasoning)
+                    self._print_thinking_block(turn.reasoning, expanded=_exp)
                 except Exception:
                     self.print_reasoning(turn.reasoning)
             if turn.error:
@@ -4200,49 +4655,23 @@ class UI:
         model = self._model()
         effort = self._effort()
 
-        # ── FullAgent ASCII banner (6-line block, dracula gradient) ──
-        # Compact width ~69-72 fits safely in 80-col consoles (inner 76).
-        # On narrow terminals (<78) fall back to single-line logo to avoid wrap.
-        ascii_lines = [
-            "███████╗██╗   ██╗██╗    ██╗    █████╗  ██████╗ ███████╗███╗ ██╗████████╗",
-            "██╔════╝██║   ██║██║    ██║   ██╔══██╗██╔════╝ ██╔════╝████╗██║╚══██╔══╝",
-            "█████╗  ██║   ██║██║    ██║   ███████║██║  ███╗█████╗  ██╔██╗██║  ██║   ",
-            "██╔══╝  ██║   ██║██║    ██║   ██╔══██║██║   ██║██╔══╝  ██║╚██╗██║  ██║   ",
-            "██║     ╚██████╔╝██████╗█████╗██║  ██║╚██████╔╝███████╗██║ ╚████║  ██║   ",
-            "╚═╝      ╚═════╝ ╚═════╝╚════╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝  ╚═╝   ",
-        ]
-        accent_styles = [C["accent"], C["accent"], C["pink"], C["cyan"], C["cyan"], C["pink"]]
-
-        # effective console width may be smaller than term_w (Panel caps to console width)
-        # so be conservative: need inner width >= max ascii length + 4
-        max_ascii = max(len(s) for s in ascii_lines)
-        need_width = max_ascii + 4 + 2  # borders + padding
-        if width >= max(78, need_width):
-            banner = Text()
-            for i, line in enumerate(ascii_lines):
-                banner.append(line.rstrip(), style=f"bold {accent_styles[i % len(accent_styles)]}")
-                banner.append("\n")
-            # tagline + feature stripe under the ascii (kept ≤74 chars to avoid Panel wrap)
-            banner.append("  ◆ FullAgent ", style=f"bold {C['accent']}")
-            banner.append(f"v{__version__}", style=f"bold {C['pink']}")
-            banner.append("  ·  Event-Sourced Kernel  ·  Goal Contracts  ·  Self-Healing", style=C["dim"])
-            banner.append("\n")
-            n_prov = len(PROVIDERS)
-            banner.append(f"  ⚡ 40+ Commands · 16 Tools · {n_prov} Providers · Real-time Web · Daemon", style=C["dim"])
-            self.console.print(Panel(banner, width=width,
-                                     border_style=C["border"], padding=(0, 1),
-                                     title=f"[bold {C['accent']}]FullAgent[/]",
-                                     subtitle=f"[dim]session {self.agent.session_id}[/]"))
-        else:
-            # narrow fallback — original compact logo (never wraps)
+        # ── Qoder-style welcome: block logo + identity on the left, tips card
+        # on the right. `cliui` owns the layout so it stays headless-testable;
+        # any failure falls back to the compact logo (chrome must never take
+        # the session down).
+        try:
+            self.console.print(cliui.welcome(
+                width=width, version=__version__, model_label=model.label,
+                effort_label=effort.label.lower(),
+                signed_in=self._signed_in_label(),
+                session=self.agent.session_id, cwd=self._cwd_label(),
+                colors=C, app_name=APP_NAME))
+        except Exception:
             logo = Text()
             logo.append("◆ ", style=f"bold {C['accent']}")
             logo.append(APP_NAME, style=f"bold {C['accent']}")
             logo.append(f" v{__version__}", style=f"bold {C['pink']}")
             logo.append("  ·  advanced terminal AI agent", style=C["dim"])
-            logo.append("\n")
-            logo.append("event-sourced kernel · goal contracts · "
-                        "self-healing", style=C["dim"])
             self.console.print(Panel(logo, width=width,
                                      border_style=C["border"], padding=(0, 1)))
 
@@ -4267,7 +4696,11 @@ class UI:
         hints.append("Ctrl+T", style=f"bold {C['cyan']}")
         hints.append(" models · ", style=C["dim"])
         hints.append("Ctrl+E", style=f"bold {C['cyan']}")
-        hints.append(" effort", style=C["dim"])
+        hints.append(" effort · ", style=C["dim"])
+        hints.append("Shift+Tab", style=f"bold {C['cyan']}")
+        hints.append(" pilot · ", style=C["dim"])
+        hints.append("Ctrl+O", style=f"bold {C['cyan']}")
+        hints.append(" expand output", style=C["dim"])
         self.console.print(hints)
         self.console.print()
         # Feature: turnresume — offer /resume-turn when a previous session
@@ -4352,9 +4785,10 @@ class UI:
         lines = res.splitlines()
 
         def capped(items, cap):
+            cap = self._cap(cap)
             rows = [[(it, C["fg"])] for it in items[:cap]]
             if len(items) > cap:
-                rows.append([(f"… +{len(items) - cap} more", C["dim"])])
+                rows.append([(f"… +{len(items) - cap} more (Ctrl+O)", C["dim"])])
             return rows
 
         if name == "glob_files":
@@ -4399,6 +4833,7 @@ class UI:
         return [[(first[:200], C["green"])]]
 
     def _tool_result_line(self, ev: ToolEvent) -> Text:
+        self._remember_detail(ev, "generic")
         rows = self._generic_rows(ev)
         t = Text()
         n = len(rows)
@@ -4534,10 +4969,11 @@ class UI:
                 return rows
             code, out, err = self._parse_shell_result(ev.result)
             lines = out.splitlines()
-            for ln in lines[:30]:
+            cap = self._cap(30)
+            for ln in lines[:cap]:
                 add(ln if ln else " ", C["fg"])
-            if len(lines) > 30:
-                add(f"… +{len(lines) - 30} more lines", C["dim"])
+            if len(lines) > cap:
+                add(f"… +{len(lines) - cap} more lines (Ctrl+O)", C["dim"])
             for ln in err.splitlines()[:10]:
                 add(ln, C["orange"])
             if code is not None:
@@ -4550,12 +4986,13 @@ class UI:
             content = str(ev.args.get("content", ""))
             lines = content.splitlines()
             width = len(str(max(len(lines), 1)))
-            for n, ln in enumerate(lines[:300], 1):
+            cap = self._cap(300)
+            for n, ln in enumerate(lines[:cap], 1):
                 rows.append([(f"{n:>{width}} ", C["dim"]),
                              ("+  ", C["green"]),
                              (ln[:w], C["fg"])])
-            if len(lines) > 300:
-                add(f"… +{len(lines) - 300} more lines", C["dim"])
+            if len(lines) > cap:
+                add(f"… +{len(lines) - cap} more lines (Ctrl+O)", C["dim"])
         elif ev.name == "edit_file":
             if failed:
                 add(ev.result.strip() or ev.status, C["red"])
@@ -4565,12 +5002,13 @@ class UI:
             start = self._find_hunk_line(str(ev.args.get("path", "")), new)
             drows = self._diff_rows(old, new, start)
             width = len(str(max((r[0] for r in drows), default=1)))
-            for num, mark, color, text in drows[:100]:
+            cap = self._cap(100)
+            for num, mark, color, text in drows[:cap]:
                 rows.append([(f"{num:>{width}} ", C["dim"]),
                              (mark, C["dim"] if mark == "   " else color),
                              (text[:w], color)])
-            if len(drows) > 100:
-                add(f"… +{len(drows) - 100} more lines", C["dim"])
+            if len(drows) > cap:
+                add(f"… +{len(drows) - cap} more lines (Ctrl+O)", C["dim"])
         elif ev.name == "read_file":
             m = re.search(r"(\d+) lines total, showing (\d+)\.\.(\d+)",
                           ev.result)
@@ -4583,7 +5021,8 @@ class UI:
                 add((ev.result.splitlines() or [""])[0], C["dim"])
         else:  # apply_patch
             lines = str(ev.args.get("patch", "")).splitlines()
-            for ln in lines[:60]:
+            cap = self._cap(60)
+            for ln in lines[:cap]:
                 if ln.startswith("@@"):
                     add(ln, C["cyan"])
                 elif ln.startswith(("+++ ", "--- ")):
@@ -4594,8 +5033,8 @@ class UI:
                     add(ln, C["red"])
                 else:
                     add(ln, C["fg"])
-            if len(lines) > 60:
-                add(f"… +{len(lines) - 60} more lines", C["dim"])
+            if len(lines) > cap:
+                add(f"… +{len(lines) - cap} more lines (Ctrl+O)", C["dim"])
             if failed:
                 add(ev.result.strip() or ev.status, C["red"])
         if not rows:
@@ -4637,6 +5076,7 @@ class UI:
             else:
                 t.append("Applied patch", style=f"bold {C['fg']}")
             return t
+        self._remember_detail(ev)
         body = self._live_body_lines(ev)
         for idx, line in enumerate(body):
             t.append_text(line)
@@ -4649,6 +5089,7 @@ class UI:
         the error), printed once the command finishes."""
         t = Text()
         t.append(" └ ", style=C["dim"])
+        self._remember_detail(ev)
         if ev.status != "done" or ev.result.startswith("ERROR"):
             msg = ev.result.splitlines()[0] if ev.result else ev.status
             t.append(msg[:200], style=C["red"])
@@ -4666,6 +5107,7 @@ class UI:
         (e.g. 'OK: created … 286 line(s)'), printed once writing finishes."""
         t = Text()
         t.append(" └ ", style=C["dim"])
+        self._remember_detail(ev)
         if ev.status != "done" or ev.result.startswith("ERROR"):
             msg = ev.result.splitlines()[0] if ev.result else ev.status
             t.append(msg[:200], style=C["red"])
