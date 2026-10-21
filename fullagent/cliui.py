@@ -148,6 +148,23 @@ def align(
     left = list(left)
     right = list(right)
     width = max(1, int(width))
+    if _pad(right) + 1 > width:
+        # extreme narrow terminal: the badge itself must shrink, otherwise
+        # prompt_toolkit wraps the row and the pinned frame corrupts
+        room = max(0, width - 1)
+        fitted_right: List[Fragment] = []
+        used = 0
+        for style, text in right:
+            tw = display_width(text)
+            if used + tw <= room:
+                fitted_right.append((style, text))
+                used += tw
+                continue
+            rest = room - used
+            if rest > 0:
+                fitted_right.append((style, truncate(text, rest)))
+            break
+        right = fitted_right
     if _pad(left) + _pad(right) + 1 > width:
         room = max(0, width - _pad(right) - 1)
         fitted: List[Fragment] = []

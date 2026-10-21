@@ -97,6 +97,11 @@ class CliuiLayoutTests(unittest.TestCase):
         self.assertEqual(_width(line), 30)
         self.assertIn("tail", "".join(t for _, t in line))
 
+    def test_align_survives_oversized_right_badge(self):
+        line = cliui.align([("", "left")], [("", "x" * 80)], 20)
+        self.assertLessEqual(_width(line), 20)
+        self.assertGreaterEqual(_width(line), 19)
+
     def test_agent_chip_names(self):
         self.assertEqual(cliui.short_role("researcher"), "Explore")
         self.assertEqual(cliui.short_role("coder"), "Code")
