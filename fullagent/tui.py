@@ -16,6 +16,23 @@ Bottom border: live spinner + elapsed seconds while busy, ✦ flash
 messages, coloured [y]es/[n]o/[a]lways approval bar, styled key hints
 when idle. Overlays (model / effort / help / history) render directly
 above the box and are navigated with ↑↓, PgUp/PgDn, Tab, Home/End.
+
+Qoder-style chrome (``fullagent.cliui``) wraps the box:
+
+    ≡ 4 Agents (4 running) ───────────────────────── ↓ to manage
+     ◉ Explore · Read fullagent/autopilot.py
+    YOLO  ⇧Tab auto mode · ◎ 4 agents ─────────────── 21 skills
+    ╭─ FullAgent ──●── Union Alpha ── ◈ high ──⬢ L3──◉ ctx 12%──╮
+    │ ❯ user types here…                                        │
+    ╰ ⏎ send · ⇧⏎ newline · / cmds · ^T models · ^E effort ─────╯
+     ● Union Alpha · high · 1M context · ctx ░░░░░░░░░░ 12% · ~/repo
+                                     ◎ main · ◎ 4 agents | 4 running
+
+The board only appears while a swarm is queued/running; the HUD carries
+the autonomy mode (Shift+Tab toggles Pilot) and the skills counter; the
+footer carries model/effort/context/cwd plus the agent count. Ctrl+O
+expands the last tool block or Thinking panel instead of its "+N rows"
+preview.
 """
 
 from __future__ import annotations
@@ -778,7 +795,8 @@ class UI:
         self._agents_cache_ts = 0.0
         self._auto_prev = 3
         self._detail_expanded = False
-        self._last_detail_event: ToolEvent | None = None
+        # (payload, kind) — kind is "live" | "generic" | "thinking"
+        self._last_detail_event: tuple | None = None
         self._theme_name = str(self.cfg.extra.get("theme", "neon"))
         if self._theme_name in THEMES:
             C.update(THEMES[self._theme_name])
