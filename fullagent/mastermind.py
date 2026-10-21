@@ -129,11 +129,17 @@ class PromptVault:
 # the sealed prompt — never as a peer instruction. That framing is the
 # whole trick: the prompt stays the only voice giving direction, and the
 # model follows it because everything else defers to it.
-_SECTION_ORDER = ("constitution", "goal", "web", "memory", "compacted")
+_SECTION_ORDER = ("constitution", "project", "output_style", "goal", "web",
+                  "memory", "compacted")
 
 _SECTION_FRAMES = {
     "constitution": ("STANDING CONTEXT — standing rules that apply within "
                      "the directives above:"),
+    "project": ("PROJECT INSTRUCTIONS — repository rules written by the "
+                "user for this workspace, to follow within the directives "
+                "above:"),
+    "output_style": ("OUTPUT STYLE — the answer register the directives "
+                     "above request for this session:"),
     "goal": ("LIVE CONTEXT — the active goal contract the directives above "
              "are currently serving:"),
     "web": ("LIVE CONTEXT — this turn needs real-time data; per the "

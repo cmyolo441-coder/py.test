@@ -58,20 +58,36 @@ While a swarm is running the frame shows the Qoder-style board and footer:
  ◉ Explore · Read fullagent/autopilot.py
  ◉ Code    · Edit fullagent/tui.py
    … +6 more · ↓ to manage
- YOLO  ⇧Tab auto mode · ◎ 8 agents ─────────────── 21 skills
+ COLLAB  ⇧Tab pilot · ◎ 8 running · 0 queued ── 0 skills
 ╭─ FullAgent ── ● Step 5 Preview Free ── ◈ extra high ── ◉ ctx 3% ─╮
 │ ❯ type anything… the agent reads, writes, edits files, runs commands │
 ╰ ⏎ send · ⇧⏎ newline · / cmds · /diff live · ^T models · ^E effort ──╯
- ● Step 5 Preview Free · extra high · 1M context · ctx ░░░░░░░░░░ 3% · ~/Desktop
-                                    ◎ main · ◎ 8 agents | 8 running
+ ● Step 5 Preview Free · extra high · 262k context · ctx ░░░░░░░░░░ 3% · ~/Desktop
+                           ◎ feat/tui-chrome · ◎ 8 agents | 8 running
 ```
 
 | Key | Action |
 |---|---|
-| `Shift+Tab` | Toggle auto mode (Pilot — safe tools run without asking; deletes still ask) |
+| `Shift+Tab` | Toggle Pilot (L4 — safe tools run without asking; deletes still ask) |
 | `Ctrl+O` | Expand / collapse tool output (`… +N more` rows) |
 | `↓` on an empty prompt | Open the live agent dashboard (`/agents`) |
 | `Ctrl+T` / `Ctrl+E` | Model / effort picker |
+
+Every value in that frame is live state, not decoration. The board and both
+agent counters read `ParallelSubagents.snapshot()`: only workers that are
+running or queued right now are counted, `8 running` appears only when eight
+workers are genuinely executing (the pool is 8-wide, matching the largest
+`TaskGroup` batch), queued workers are shown separately, and the badge
+disappears the moment the swarm finishes. Retained history from earlier
+batches is never counted as live. The footer branch is the real
+`git rev-parse --abbrev-ref HEAD` of the cwd, the mode chip names the real
+autonomy level from `AUTONOMY_LEVELS` (L0 Observe … L5 Autonomous), the
+skills counter is the real `SKILL.md` + forge registry (0 until you install
+or author one), and the context meter is the live token estimate against
+the model's real window (262k here). `<repo>/AGENTS.md` (plus ancestors and
+`~/.fullagent/AGENTS.md`) is genuinely loaded into the system prompt as the
+`PROJECT INSTRUCTIONS` context section — edit it and the next model call
+sees the change.
 
 The prompt is a **double-line box** (not full-screen). One application runs
 for the whole session, so the box **never disappears** — while the model
@@ -101,11 +117,11 @@ without artificial animation delays.
  ██║     ██║  ██║                   │ 4. Be specific for the best results      │
  ╚═╝     ╚═╝  ╚═╝                   ╰──────────────────────────────────────────╯
   FullAgent CLI v3.2.0
-  Signed in · Kios API
+  API key · built-in (Kios API)
   Step 5 Preview Free  ·  high
   ~/Desktop  ·  session a1b2c3d4
  ❯ model  Step 5 Preview Free   effort  high   autonomy  L3   session  a1b2c3d4
-   / commands · Ctrl+T models · Ctrl+E effort · Shift+Tab auto mode · Ctrl+O expand output
+   / commands · Ctrl+T models · Ctrl+E effort · Shift+Tab pilot · Ctrl+O expand output
 ```
 
 *Wide terminals get the side-by-side card; under 78 columns the tips card

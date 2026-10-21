@@ -203,6 +203,7 @@ def welcome(
     session: str,
     cwd: str,
     colors: dict,
+    app_name: str = "FullAgent",
     tips: Sequence[str] = TIPS,
 ):
     """Build the startup card: block logo + identity on the left, tips right.
@@ -224,7 +225,7 @@ def welcome(
         logo.append(line + "\n", style=f"bold {colors.get(key, '')}")
 
     identity = Text()
-    identity.append("  FullAgent CLI ", style=f"bold {colors.get('fg', '')}")
+    identity.append(f"  {app_name} CLI ", style=f"bold {colors.get('fg', '')}")
     identity.append(f"v{version}", style=f"bold {colors.get('pink', '')}")
     identity.append("\n")
     identity.append(f"  {signed_in}", style=colors.get("green", ""))
@@ -273,19 +274,32 @@ def welcome(
 # Mode / skills HUD and status footer
 # ---------------------------------------------------------------------------
 
-def mode_badge(autonomy: int, colors: dict) -> List[Fragment]:
-    """Mode chip: YOLO at full autonomy, AUTO mid, SAFE low."""
+# Short aliases for the REAL autonomy ladder in agent.AUTONOMY_LEVELS.
+# No invented "YOLO": level 4 is Pilot (deletes still ask), level 5 is
+# Autonomous, level 3 the default Collaborator.
+_MODE_NAMES = {
+    0: "OBSERVE",
+    1: "ADVISOR",
+    2: "ASSIST",
+    3: "COLLAB",
+    4: "PILOT",
+    5: "AUTONOMOUS",
+}
+
+
+def _mode_level(autonomy: int) -> int:
     try:
-        level = int(autonomy)
+        return max(0, min(5, int(autonomy)))
     except (TypeError, ValueError):
-        level = 3
-    if level >= 4:
-        name, key = "YOLO", "yellow"
-    elif level >= 3:
-        name, key = "AUTO", "green"
-    else:
-        name, key = "SAFE", "cyan"
-    return [(f"bold {colors.get(key, '')}", f" {name} ")]
+        return 3
+
+
+def mode_badge(autonomy: int, colors: dict) -> List[Fragment]:
+    """Mode chip naming the real autonomy level (L0–L5)."""
+    level = _mode_level(autonomy)
+    key = ("dim" if level <= 1 else "cyan" if level == 2
+           else "green" if level == 3 else "yellow" if level == 4 else "red")
+    return [(f"bold {colors.get(key, '')}", f" {_MODE_NAMES[level]} ")]
 
 
 def hud_fragments(
@@ -294,14 +308,18 @@ def hud_fragments(
     colors: dict,
     autonomy: int,
     skills: int,
-    agents_active: int = 0,
+    agents_running: int = 0,
+    agents_queued: int = 0,
 ) -> List[Fragment]:
     """The row above the prompt: mode chip, ⇧Tab hint, skills counter."""
-    left: List[Fragment] = mode_badge(autonomy, colors)
-    left.append((colors.get("dim", ""), " ⇧Tab auto mode "))
-    if agents_active:
+    level = _mode_level(autonomy)
+    left: List[Fragment] = mode_badge(level, colors)
+    hint = " ⇧Tab pilot " if level < 4 else " ⇧Tab exit pilot "
+    left.append((colors.get("dim", ""), hint))
+    if agents_running or agents_queued:
         left.append((f"bold {colors.get('pink', '')}",
-                     f"· ◎ {agents_active} agents "))
+                     f"· ◎ {int(agents_running)} running "
+                     f"· {int(agents_queued)} queued "))
     right: List[Fragment] = [
         (f"bold {colors.get('cyan', '')}", f" {max(0, int(skills))} skills "),
     ]
@@ -314,7 +332,8 @@ def _compact_number(value: int) -> str:
     except (TypeError, ValueError):
         return "?"
     if n >= 1_000_000:
-        return f"{n / 1_000_000:.0f}M"
+        # %g keeps 1M as "1M", 1.5M as "1.5M" — no rounding up to 2M
+        return f"{n / 1_000_000:g}M"
     if n >= 1000:
         return f"{n // 1000}k"
     return str(n)
@@ -345,16 +364,30 @@ def status_fragments(
     context_window: int,
     used_pct: int,
     cwd: str,
-    agents_total: int = 0,
-    agents_active: int = 0,
+    branch: str = "",
+    agents_running: int = 0,
+    agents_queued: int = 0,
 ) -> List[Fragment]:
     """The footer under the prompt: identity, context meter, agent badge."""
-    right: List[Fragment] = [(f"bold {colors.get('accent', '')}", " ◎ main ")]
-    if agents_total:
-        right.append((colors.get("dim", ""), "· "))
+    right: List[Fragment] = []
+    if branch:
+        right.append((f"bold {colors.get('accent', '')}",
+                      f" ◎ {truncate(branch, 24)} "))
+    # Agent badge is live state only: it counts the workers that are
+    # running or queued right now — never retained history from an earlier
+    # batch — and it disappears the moment nothing is live.
+    running = max(0, int(agents_running))
+    queued = max(0, int(agents_queued))
+    live = running + queued
+    if live:
+        if right:
+            right.append((colors.get("dim", ""), "· "))
+        noun = "agent" if live == 1 else "agents"
         right.append((f"bold {colors.get('pink', '')}",
-                      f"◎ {agents_total} agents"))
-        right.append((colors.get("dim", ""), f" | {agents_active} running "))
+                      f"◎ {live} {noun}"))
+        right.append((colors.get("dim", ""), f" | {running} running "))
+        if queued:
+            right.append((colors.get("dim", ""), f"· {queued} queued "))
     right_pad = _pad(right)
 
     # Left side is assembled by priority: identity + context meter are
@@ -403,26 +436,40 @@ def agent_board(
     """
     if not isinstance(snapshot, dict):
         return []
+    # Only LIVE workers belong on the live board: retained history from
+    # earlier batches must never inflate the header or the hidden count.
     workers = [w for w in (snapshot.get("workers") or [])
-               if isinstance(w, dict)]
+               if isinstance(w, dict)
+               and w.get("state") in ACTIVE_STATES]
     if not workers:
-        return []
-    active = sum(1 for w in workers if w.get("state") in ACTIVE_STATES)
-    if active <= 0:
         return []
 
     width = max(24, int(width))
     total = len(workers)
     noun = "Agent" if total == 1 else "Agents"
+    counts: dict[str, int] = {}
+    for w in workers:
+        state = str(w.get("state") or "queued")
+        counts[state] = counts.get(state, 0) + 1
+    running = counts.get("running", 0)
+    queued = counts.get("queued", 0)
+    cancelling = counts.get("cancelling", 0)
+    # Exact live breakdown — "8 running" only when 8 are genuinely running.
+    parts = []
+    if running:
+        parts.append(f"{running} running")
+    if queued:
+        parts.append(f"{queued} queued")
+    if cancelling:
+        parts.append(f"{cancelling} cancelling")
     head: List[Fragment] = [
         (f"bold {colors.get('accent', '')}", f" ≡ {total} {noun} "),
-        (colors.get("green", ""), f"({active} running) "),
+        (colors.get("green", ""), "(" + " · ".join(parts) + ") "),
     ]
     tail: List[Fragment] = [(colors.get("dim", ""), " ↓ to manage ")]
     rows: List[List[Fragment]] = [align(head, tail, width, fill="─")]
 
-    # Running first, then cancelling/queued, then whatever finished while
-    # this frame was rendered.
+    # Running first, then cancelling, then queued.
     order = {"running": 0, "cancelling": 1, "queued": 2}
     ranked = sorted(workers,
                     key=lambda w: (order.get(w.get("state"), 3),
@@ -432,10 +479,13 @@ def agent_board(
         color = colors.get(STATE_COLOR_KEYS.get(state, "fg"), "")
         icon = STATE_ICONS.get(state, "·")
         chip = short_role(str(row.get("role") or ""))
-        raw = (row.get("current_action")
-               if state in ACTIVE_STATES or not row.get("summary")
-               else row.get("summary"))
-        action = " ".join(str(raw or state).split())
+        action = " ".join(str(row.get("current_action") or state).split())
+        # While a worker is waiting on the model, current_action is the
+        # generic "model step N/20"; the real assigned task says more.
+        if (not action or action == "starting"
+                or action.startswith("model step")):
+            task = " ".join(str(row.get("task") or "").split())
+            action = task or action or state
         prefix = f" {icon} "
         room = max(8, width - display_width(prefix) - len(chip) - 4)
         rows.append([
@@ -479,18 +529,24 @@ def _cliui_selftest() -> None:
 
     # hud + footer stay on one terminal line
     hud = hud_fragments(width=80, colors=colors, autonomy=5, skills=21,
-                        agents_active=8)
-    assert "YOLO" in "".join(t for _, t in hud)
+                        agents_running=8, agents_queued=0)
+    assert "AUTONOMOUS" in "".join(t for _, t in hud)
     assert "21 skills" in "".join(t for _, t in hud)
+    assert "8 running" in "".join(t for _, t in hud)
     assert width_of(hud) == 80
     foot = status_fragments(width=90, colors=colors, model_label="Test",
                             effort_label="max", context_window=1_000_000,
-                            used_pct=3, cwd="/tmp", agents_total=8,
-                            agents_active=8)
+                            used_pct=3, cwd="/tmp", branch="main",
+                            agents_running=8, agents_queued=0)
     foot_text = "".join(t for _, t in foot)
     assert "1M context" in foot_text, foot_text
     assert "8 agents | 8 running" in foot_text, foot_text
     assert width_of(foot) == 90
+    idle_foot = "".join(t for _, t in status_fragments(
+        width=90, colors=colors, model_label="Test", effort_label="max",
+        context_window=1_000_000, used_pct=3, cwd="/tmp", branch="main",
+        agents_running=0, agents_queued=0))
+    assert "agents" not in idle_foot, idle_foot
 
     # board: hidden when idle, bounded when a swarm is live
     assert agent_board({"workers": []}, width=80, colors=colors) == []

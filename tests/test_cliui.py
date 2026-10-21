@@ -22,13 +22,18 @@ def _width(frags):
 
 
 def _snapshot(states, role="researcher"):
+    counts = {}
+    for state in states:
+        counts[state] = counts.get(state, 0) + 1
     return {"workers": [
         {"id": f"ag-{i}", "state": state, "role": role,
+         "task": f"Inspect src/file{i}.py and report",
          "current_action": f"Read src/file{i}.py",
          "summary": "done" if state == "done" else "",
          "elapsed_ms": i * 1000}
         for i, state in enumerate(states)
-    ], "active": sum(1 for s in states if s in cliui.ACTIVE_STATES)}
+    ], "counts": counts,
+        "active": sum(1 for s in states if s in cliui.ACTIVE_STATES)}
 
 
 class _Mgr:
@@ -102,6 +107,85 @@ class CliuiLayoutTests(unittest.TestCase):
         self.assertLessEqual(_width(line), 20)
         self.assertGreaterEqual(_width(line), 19)
 
+    def test_board_and_footer_split_queued_from_running(self):
+        snap = _snapshot(["running"] * 4 + ["queued"] * 4)
+        board = cliui.agent_board(snap, width=100, colors={})
+        head = "".join(t for _, t in board[0])
+        self.assertIn("8 Agents", head)
+        self.assertIn("4 running", head)
+        self.assertIn("4 queued", head)
+        self.assertNotIn("8 running", head)
+
+        foot = "".join(t for _, t in cliui.status_fragments(
+            width=140, colors={}, model_label="M", effort_label="high",
+            context_window=1000, used_pct=1, cwd="~", branch="main",
+            agents_running=4, agents_queued=4))
+        self.assertIn("8 agents | 4 running", foot)
+        self.assertIn("4 queued", foot)
+
+    def test_footer_without_live_workers_has_no_agent_badge(self):
+        foot = "".join(t for _, t in cliui.status_fragments(
+            width=140, colors={}, model_label="M", effort_label="high",
+            context_window=1000, used_pct=1, cwd="~", branch="main",
+            agents_running=0, agents_queued=0))
+        self.assertNotIn("agents", foot)
+        self.assertIn("main", foot)
+
+    def test_manager_progress_events_refresh_the_board_immediately(self):
+        class Mgr:
+            def __init__(self):
+                self.cb = None
+
+            def on_progress(self, cb):
+                self.cb = cb
+
+            def snapshot(self):
+                return _snapshot(["running"])
+
+        ui = _make_ui([])
+        mgr = Mgr()
+        ui.agent.subagents = mgr
+        ui._agents_cache = None
+        ui._agents_snapshot()  # first read wires the real progress hook
+        self.assertIsNotNone(mgr.cb, "progress hook not registered")
+
+        ui._agents_cache = _snapshot(["running"])
+        ui._agents_cache_ts = 1e18  # pretend a fresh cache
+        redraws = []
+        ui._invalidate = lambda: redraws.append(1)
+        mgr.cb(None, "subagent.running")
+        self.assertIsNone(ui._agents_cache,
+                          "worker event must drop the stale snapshot")
+        self.assertTrue(redraws, "worker event must request a redraw")
+
+    def test_board_shows_task_while_worker_waits_on_model(self):
+        snap = {"workers": [{
+            "id": "ag-1", "state": "running", "role": "researcher",
+            "current_action": "model step 2/20",
+            "task": "Read fullagent/tui.py and report the layout",
+            "summary": "", "elapsed_ms": 1200,
+        }], "counts": {"running": 1}, "active": 1}
+        board = "".join(t for _, t in cliui.agent_board(
+            snap, width=100, colors={})[1])
+        self.assertIn("Read fullagent/tui.py", board)
+        self.assertNotIn("model step", board)
+
+    def test_retained_workers_never_inflate_live_counts(self):
+        # 9 finished workers from older batches + 1 genuinely running
+        snap = _snapshot(["done"] * 9 + ["running"])
+        board = cliui.agent_board(snap, width=100, colors={})
+        head = "".join(t for _, t in board[0])
+        self.assertIn("1 Agent", head)
+        self.assertNotIn("10", head)
+        self.assertIn("1 running", head)
+
+        foot = "".join(t for _, t in cliui.status_fragments(
+            width=140, colors={}, model_label="M", effort_label="high",
+            context_window=262144, used_pct=1, cwd="~", branch="main",
+            agents_running=1, agents_queued=0))
+        self.assertIn("1 agent | 1 running", foot)
+        self.assertNotIn("10", foot)
+
     def test_agent_chip_names(self):
         self.assertEqual(cliui.short_role("researcher"), "Explore")
         self.assertEqual(cliui.short_role("coder"), "Code")
@@ -137,13 +221,17 @@ class UiChromeTests(unittest.TestCase):
     def test_hud_shows_mode_and_skill_count(self):
         auto = _make_ui(["running"], skills=21, autonomy=3)
         text = "".join(t for _, t in auto._hud_fragments())
-        self.assertIn("AUTO", text)
+        self.assertIn("COLLAB", text)
         self.assertIn("21 skills", text)
         self.assertIn("⇧Tab", text)
+        self.assertIn("1 running", text)
 
-        yolo = _make_ui([], skills=0, autonomy=5)
-        self.assertIn("YOLO",
-                      "".join(t for _, t in yolo._hud_fragments()))
+        pilot = _make_ui([], skills=0, autonomy=4)
+        self.assertIn("PILOT",
+                      "".join(t for _, t in pilot._hud_fragments()))
+        top = _make_ui([], skills=0, autonomy=5)
+        self.assertIn("AUTONOMOUS",
+                      "".join(t for _, t in top._hud_fragments()))
 
     def test_footer_shows_model_context_cwd_and_agents(self):
         ui = _make_ui(["running"] * 8)
@@ -153,6 +241,43 @@ class UiChromeTests(unittest.TestCase):
         self.assertIn("context", text)
         self.assertIn("8 agents | 8 running", text)
         self.assertEqual(_width(ui._meta_fragments()), 120)
+
+    def test_agent_badge_disappears_when_nothing_is_running(self):
+        # retained (finished) workers must never leave a fake "8 running"
+        ui = _make_ui(["done"] * 8)
+        text = "".join(t for _, t in ui._meta_fragments())
+        self.assertNotIn("agents", text)
+        self.assertNotIn("running", text)
+        self.assertIn(ui._model().label, text)
+
+    def test_footer_branch_is_the_real_git_branch(self):
+        ui = _make_ui([])
+        branch = ui._branch_label()
+        self.assertTrue(branch)
+        self.assertNotIn("\n", branch)
+        # cached value is stable and identical on the next frame
+        self.assertEqual(branch, ui._branch_label())
+
+        import subprocess
+        try:
+            expected = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True, text=True, timeout=5).stdout.strip()
+        except Exception:
+            expected = ""
+        if expected and expected != "HEAD":
+            self.assertEqual(branch, expected)
+        else:
+            self.assertTrue(branch.startswith("session ") or
+                            branch == "no git")
+
+    def test_signed_in_label_is_honest(self):
+        ui = _make_ui([])
+        label = ui._signed_in_label()
+        self.assertNotIn("Signed in", label)
+        self.assertTrue(label.startswith("API key ·") or
+                        label.startswith("No API key") or
+                        label.startswith("No provider"), label)
 
     def test_shift_tab_toggles_auto_mode_both_ways(self):
         ui = _make_ui([], autonomy=3)

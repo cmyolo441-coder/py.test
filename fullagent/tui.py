@@ -21,12 +21,12 @@ Qoder-style chrome (``fullagent.cliui``) wraps the box:
 
     ≡ 4 Agents (4 running) ───────────────────────── ↓ to manage
      ◉ Explore · Read fullagent/autopilot.py
-    YOLO  ⇧Tab auto mode · ◎ 4 agents ─────────────── 21 skills
+    COLLAB  ⇧Tab pilot · ◎ 4 running · 0 queued ───── 0 skills
     ╭─ FullAgent ──●── Union Alpha ── ◈ high ──⬢ L3──◉ ctx 12%──╮
     │ ❯ user types here…                                        │
     ╰ ⏎ send · ⇧⏎ newline · / cmds · ^T models · ^E effort ─────╯
-     ● Union Alpha · high · 1M context · ctx ░░░░░░░░░░ 12% · ~/repo
-                                     ◎ main · ◎ 4 agents | 4 running
+     ● Union Alpha · high · 262k context · ctx ░░░░░░░░░░ 12% · ~/repo
+                              ◎ feature/x · ◎ 4 agents | 4 running
 
 The board only appears while a swarm is queued/running; the HUD carries
 the autonomy mode (Shift+Tab toggles Pilot) and the skills counter; the
@@ -793,6 +793,9 @@ class UI:
         # Qoder-style chrome: live agent board + expandable tool detail
         self._agents_cache: dict | None = None
         self._agents_cache_ts = 0.0
+        self._agents_hooked = False
+        self._branch_cache: str | None = None
+        self._branch_cache_ts = 0.0
         self._auto_prev = 3
         self._detail_expanded = False
         # (payload, kind) — kind is "live" | "generic" | "thinking"
@@ -1058,30 +1061,110 @@ class UI:
     # -- Qoder-style chrome: HUD, footer, live agent board ---------------------
 
     def _skills_count(self) -> int:
-        """Number of forged skills registered as live tools (0 on any error)."""
+        """Real installed skills: SKILL.md skills + forged tools.
+
+        Scans the same sources ``/skills`` shows (``~/.fullagent/skills``
+        SKILL.md directories plus the forge registry), cached for 5s — the
+        footer re-renders every frame and both sources touch disk.
+        """
+        now = time.time()
+        cached = getattr(self, "_skills_cache", None)
+        if (cached is not None
+                and now - getattr(self, "_skills_cache_ts", 0.0) < 5.0):
+            return cached
+        names: set[str] = set()
         try:
-            return len(getattr(self.agent.skill_forge, "registry", {}) or {})
+            mgr = getattr(self.agent, "skill_manager", None)
+            if mgr is None:
+                from .skills import SkillMDManager
+                mgr = SkillMDManager()
+            for item in mgr.list_skills() or []:
+                if isinstance(item, dict) and item.get("name"):
+                    names.add(str(item["name"]).strip().lower())
         except Exception:
-            return 0
+            pass
+        try:
+            names.update(str(k).strip().lower() for k in
+                         (getattr(self.agent.skill_forge, "registry", {})
+                          or {}))
+        except Exception:
+            pass
+        self._skills_cache = len(names)
+        self._skills_cache_ts = now
+        return self._skills_cache
+
+    def _log_chrome_error(self, where: str, exc: Exception) -> None:
+        """Record a chrome wiring failure once (never spam, never crash).
+
+        Render callbacks run inside prompt_toolkit's draw pass, so printing
+        there could corrupt the frame — the failure goes to a log file the
+        user can inspect instead of vanishing into a bare ``except``.
+        """
+        try:
+            key = f"{where}:{type(exc).__name__}:{exc}"
+            seen = getattr(self, "_chrome_errors", None)
+            if seen is None:
+                seen = self._chrome_errors = set()
+            if key in seen:
+                return
+            seen.add(key)
+            path = config.APP_DIR / "chrome_errors.log"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {key}\n")
+        except Exception:
+            pass
 
     def _agents_snapshot(self) -> dict:
         """Live subagent snapshot, cached for a quarter second.
 
         The board re-renders on every frame; ``snapshot()`` copies one dict
         per worker under the manager lock, so polling it 20x/second for a
-        16-worker swarm is wasted work.
+        16-worker swarm is wasted work. Tool calls and turn boundaries drop
+        the cache, so a spawn/finish shows up immediately instead of after
+        the TTL.
         """
         now = time.time()
         cached = getattr(self, "_agents_cache", None)
         if cached is None or now - getattr(self, "_agents_cache_ts", 0.0) > 0.25:
             try:
                 mgr = self.agent.__dict__.get("subagents")
+                if mgr is not None:
+                    self._hook_agents(mgr)
                 cached = mgr.snapshot() if mgr is not None else {}
             except Exception:
                 cached = {}
             self._agents_cache = cached
             self._agents_cache_ts = now
         return cached or {}
+
+    def _hook_agents(self, mgr) -> None:
+        """Subscribe to the real manager's progress events (once).
+
+        Worker threads call this on every state/tool transition, so the
+        board updates the instant a worker starts, calls a tool or finishes
+        — even while the main turn is blocked waiting on TaskCollect.
+        """
+        if getattr(self, "_agents_hooked", False):
+            return
+        self._agents_hooked = True
+        try:
+            mgr.on_progress(self._on_subagent_event)
+        except Exception:
+            pass
+
+    def _on_subagent_event(self, _worker=None, _kind=None) -> None:
+        """Manager callback (worker thread): drop the cache and redraw."""
+        self._invalidate_agents()
+        try:
+            self._invalidate()
+        except Exception:
+            pass
+
+    def _invalidate_agents(self) -> None:
+        """Force the next frame to read the real subagent state."""
+        self._agents_cache = None
+        self._agents_cache_ts = 0.0
 
     def _agents_visible(self) -> bool:
         """True while at least one subagent is queued or running."""
@@ -1097,7 +1180,8 @@ class UI:
         try:
             rows = cliui.agent_board(self._agents_snapshot(),
                                      width=self._width(), colors=C)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 — chrome must never crash
+            self._log_chrome_error("agent_board", exc)
             return []
         frags: list = []
         for idx, row in enumerate(rows):
@@ -1106,18 +1190,32 @@ class UI:
                 frags.append(("", "\n"))
         return frags
 
+    def _agent_counts(self) -> tuple:
+        """(running, queued, live) from the real snapshot — live only.
+
+        Retained workers from earlier batches are deliberately excluded;
+        they are history, not running agents.
+        """
+        counts = (self._agents_snapshot() or {}).get("counts") or {}
+        running = int(counts.get("running") or 0)
+        queued = int(counts.get("queued") or 0)
+        cancelling = int(counts.get("cancelling") or 0)
+        return running, queued, running + queued + cancelling
+
     def _hud_fragments(self) -> list:
         """Mode chip + key hint on the left, skills counter on the right."""
         try:
-            active = int((self._agents_snapshot() or {}).get("active") or 0)
+            running, queued, _ = self._agent_counts()
         except Exception:
-            active = 0
+            running = queued = 0
         try:
             return cliui.hud_fragments(
                 width=self._width(), colors=C,
                 autonomy=getattr(self.agent, "autonomy", 3),
-                skills=self._skills_count(), agents_active=active)
-        except Exception:
+                skills=self._skills_count(),
+                agents_running=running, agents_queued=queued)
+        except Exception as exc:  # noqa: BLE001
+            self._log_chrome_error("hud", exc)
             return []
 
     def _cwd_label(self) -> str:
@@ -1131,15 +1229,63 @@ class UI:
             return "."
 
     def _signed_in_label(self) -> str:
-        """Honest sign-in line for the welcome card (never claims a login)."""
+        """Honest provider-credential line for the welcome card.
+
+        FullAgent has no browser auth. The default build also ships an
+        embedded fallback key, so "Signed in" (or even a bare "API key
+        loaded") would overstate what is happening. This reports the real
+        origin of the key that will be used: environment, user key file,
+        or the built-in fallback — and says so plainly when there is none.
+        """
         try:
             model = self._model()
             prov = PROVIDERS.get(model.provider)
-            if prov is not None and getattr(prov, "api_key", ""):
-                return f"Signed in · {prov.name}"
+            if prov is None:
+                return "No provider configured"
+            env_name = f"{model.provider.upper()}_API_KEY"
+            if (os.environ.get(env_name) or "").strip():
+                return f"API key · env ({prov.name})"
+            try:
+                key_file = config.APP_DIR / f"{model.provider}_api_key"
+                if key_file.read_text(encoding="utf-8").strip():
+                    return f"API key · key file ({prov.name})"
+            except (OSError, UnicodeDecodeError):
+                pass
+            if getattr(prov, "api_key", ""):
+                return f"API key · built-in ({prov.name})"
         except Exception:
             pass
-        return "Local session · no provider key"
+        return "No API key · local session"
+
+    def _branch_label(self) -> str:
+        """The real git branch of the working directory (or a clear fallback).
+
+        ``git rev-parse --abbrev-ref HEAD`` is cheap and cached for 5s; a
+        non-repo / detached HEAD shows the session id instead of inventing
+        a branch name.
+        """
+        now = time.time()
+        if (getattr(self, "_branch_cache", None) is not None
+                and now - getattr(self, "_branch_cache_ts", 0.0) < 5.0):
+            return self._branch_cache
+        name = ""
+        try:
+            import subprocess
+            if shutil.which("git"):
+                proc = subprocess.run(
+                    ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                    cwd=os.getcwd(), capture_output=True, text=True,
+                    timeout=2.0)
+                if proc.returncode == 0:
+                    name = (proc.stdout or "").strip()
+        except Exception:
+            name = ""
+        if not name or name == "HEAD":
+            sid = str(getattr(self.agent, "session_id", "") or "")
+            name = f"session {sid[:8]}" if sid else "no git"
+        self._branch_cache = name
+        self._branch_cache_ts = now
+        return name
 
     def _context_percent(self) -> int:
         """Live context usage %, cached 1s (the border redraws every frame)."""
@@ -1162,12 +1308,9 @@ class UI:
     def _meta_fragments(self) -> list:
         """Footer under the prompt: model · effort · context · cwd · agents."""
         try:
-            snap = self._agents_snapshot() or {}
-            workers = snap.get("workers") or []
-            total = len(workers)
-            active = int(snap.get("active") or 0)
+            running, queued, _ = self._agent_counts()
         except Exception:
-            total = active = 0
+            running = queued = 0
         try:
             model = self._model()
             effort = self._effort()
@@ -1176,8 +1319,10 @@ class UI:
                 model_label=model.label, effort_label=effort.label.lower(),
                 context_window=model.context_window,
                 used_pct=self._context_percent(), cwd=self._cwd_label(),
-                agents_total=total, agents_active=active)
-        except Exception:
+                branch=self._branch_label(),
+                agents_running=running, agents_queued=queued)
+        except Exception as exc:  # noqa: BLE001
+            self._log_chrome_error("footer", exc)
             return []
 
     # -- background shell/progress panel ---------------------------------------
@@ -1577,6 +1722,7 @@ class UI:
                             pass
         except Exception:
             pass
+        self._invalidate_agents()  # cancelled workers must leave the board now
         # Watchdog: if the turn thread is stuck (e.g. blocked in input()
         # or a hung subprocess), force-clear the busy state after 10s so
         # the UI never shows "cancelling…" forever.
@@ -1608,7 +1754,7 @@ class UI:
     # -- Qoder-style chrome: mode toggle + expandable tool detail --------------
 
     def _toggle_auto_mode(self) -> None:
-        """⇧Tab: flip between the normal level and Pilot (YOLO) autonomy.
+        """⇧Tab: flip between the current autonomy level and Pilot (L4).
 
         Pilot keeps the one destructive guard (deletes still ask), so this
         is a mode switch, not a blanket approval bypass. The previous level
@@ -1622,11 +1768,11 @@ class UI:
             target = int(getattr(self, "_auto_prev", 3) or 3)
             if target >= 4:
                 target = 3
-            label = "auto mode OFF"
+            label = "Pilot mode OFF"
         else:
             self._auto_prev = current
             target = 4
-            label = "auto mode ON — safe actions run without asking"
+            label = "Pilot mode ON — safe actions run without asking (L4)"
         try:
             self.agent.set_autonomy(target)
             actual = int(getattr(self.agent, "autonomy", target))
@@ -1662,7 +1808,8 @@ class UI:
         if not lines:
             return
         width = max(20, self._width() - 6)
-        limit = len(lines) if expanded else self._cap(8)
+        preview = 8
+        limit = len(lines) if expanded else preview
         head = Text()
         head.append("  Thinking", style=f"bold {C['pink']}")
         if len(lines) > limit:
@@ -1677,17 +1824,20 @@ class UI:
             self.console.print(Text(
                 f"  │ … +{len(lines) - limit} rows (Ctrl+O to expand)",
                 style=C["dim"]))
-            # only a truncated block needs the Ctrl+O affordance; an
-            # already-complete block must not steal expansion from the
-            # last tool output
+        # Only a truncated, still-collapsed block needs the Ctrl+O target;
+        # an already-complete or already-expanded block must not steal
+        # expansion from the previous block.
+        if len(lines) > preview and not expanded:
             self._last_detail_event = (str(text), "thinking")
 
     def _toggle_detail_view(self) -> None:
-        """Ctrl+O: expand/collapse tool output (Qoder's "+N rows" control).
+        """Ctrl+O: expand the last block, then return to the compact view.
 
         Expanding re-prints the last finished block with every row instead
-        of the compact cap; collapsing restores the compact default for the
-        next block. Print failures can never take the UI down.
+        of the compact cap. Collapsing switches back to compact output for
+        the NEXT block — output already in the scrollback cannot be
+        un-printed, and the flash says so instead of pretending otherwise.
+        Print failures can never take the UI down.
         """
         expanded = not getattr(self, "_detail_expanded", False)
         self._detail_expanded = expanded
@@ -1697,8 +1847,8 @@ class UI:
                 ev, kind = stored
                 if kind == "thinking":
                     self._print_thinking_block(ev, expanded=True)
-                    self._set_flash("✦ thinking expanded (Ctrl+O to collapse)",
-                                    C["cyan"])
+                    self._set_flash(
+                        "✦ thinking expanded · Ctrl+O compact view", C["cyan"])
                     return
                 w = max(20, self._width() - 8)
                 if kind == "live":
@@ -1719,14 +1869,15 @@ class UI:
                     for seg, style in row:
                         line.append(seg, style=style)
                     self.console.print(line)
-                self._set_flash("✦ detail expanded (Ctrl+O to collapse)",
-                                C["cyan"])
+                self._set_flash("✦ expanded · Ctrl+O compact view", C["cyan"])
                 return
             except Exception:
                 pass
         self._set_flash(
             "✦ full output: on (next tool block)" if expanded
-            else "✦ full output: off", C["cyan"] if expanded else C["dim"])
+            else "✦ compact view for the next block "
+                 "(expanded output stays in scrollback)",
+            C["cyan"] if expanded else C["dim"])
 
     # -- dispatch: slash commands + turns ----------------------------------------------------
 
@@ -3816,11 +3967,13 @@ class UI:
             self._stop_spinner()
             self._busy = False
             self._set_status("")
+            self._invalidate_agents()  # board/roster reflect the finished turn
             self._invalidate()
 
     def _run_turn(self, text: str) -> None:
         self._turn_start_ts = time.time()
         self._stream_tokens_count = 0
+        self._invalidate_agents()
         self._set_status("thinking…")
         self._start_spinner()
         # Only retain the unfinished line; emit complete lines immediately.
@@ -4049,6 +4202,7 @@ class UI:
                     )
 
         def on_tool_call(ev: ToolEvent):
+            self._invalidate_agents()  # TaskGroup spawns must show immediately
             rem = "".join(stream_tail["parts"]).strip("\n")
             stream_tail["parts"].clear()
             stream_tail["pv"] = ""
@@ -4078,6 +4232,7 @@ class UI:
             self._set_status(f"running {ev.name}…")
 
         def on_tool_update(ev: ToolEvent):
+            self._invalidate_agents()  # worker progress/finish is real state
             if ev.name in ("write_file", "edit_file", "MultiEdit", "multiedit", "apply_patch") \
                     and ev.status in ("done", "error"):
                 if hasattr(self, "_diff_history"):
@@ -4510,7 +4665,7 @@ class UI:
                 effort_label=effort.label.lower(),
                 signed_in=self._signed_in_label(),
                 session=self.agent.session_id, cwd=self._cwd_label(),
-                colors=C))
+                colors=C, app_name=APP_NAME))
         except Exception:
             logo = Text()
             logo.append("◆ ", style=f"bold {C['accent']}")
@@ -4543,7 +4698,7 @@ class UI:
         hints.append("Ctrl+E", style=f"bold {C['cyan']}")
         hints.append(" effort · ", style=C["dim"])
         hints.append("Shift+Tab", style=f"bold {C['cyan']}")
-        hints.append(" auto mode · ", style=C["dim"])
+        hints.append(" pilot · ", style=C["dim"])
         hints.append("Ctrl+O", style=f"bold {C['cyan']}")
         hints.append(" expand output", style=C["dim"])
         self.console.print(hints)
