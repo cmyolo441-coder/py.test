@@ -249,8 +249,11 @@ def _test_effort():
                           "test effort")
 
 
-def test_build_payload_logs_diagnostics(caplog):
+def test_build_payload_logs_diagnostics(caplog, monkeypatch):
     model, effort = _test_model(), _test_effort()
+    # FullAgent's configured logger owns its stderr handler and disables
+    # propagation. Re-enable it for this capture so caplog sees the record.
+    monkeypatch.setattr(logging.getLogger("fullagent"), "propagate", True)
     h = [
         {"role": "user", "content": "hi"},
         _assistant_with_call("call_orphan"),  # (c) orphan
@@ -261,8 +264,9 @@ def test_build_payload_logs_diagnostics(caplog):
     assert any("orphan_tool_call" in m for m in msgs), msgs
 
 
-def test_build_payload_debug_dumps_offender(caplog):
+def test_build_payload_debug_dumps_offender(caplog, monkeypatch):
     model, effort = _test_model(), _test_effort()
+    monkeypatch.setattr(logging.getLogger("fullagent"), "propagate", True)
     h = [{"role": "bogus", "content": "MARKER_XYZ"}]
     with caplog.at_level(logging.DEBUG, logger="fullagent.client"):
         _client.build_payload(model, effort, h, None, stream=False)
@@ -271,8 +275,9 @@ def test_build_payload_debug_dumps_offender(caplog):
     assert any("MARKER_XYZ" in m for m in msgs), msgs  # offender dumped
 
 
-def test_clean_history_logs_nothing(caplog):
+def test_clean_history_logs_nothing(caplog, monkeypatch):
     model, effort = _test_model(), _test_effort()
+    monkeypatch.setattr(logging.getLogger("fullagent"), "propagate", True)
     with caplog.at_level(logging.DEBUG, logger="fullagent.client"):
         _client.build_payload(model, effort, _fresh_clean(), None,
                               stream=False)

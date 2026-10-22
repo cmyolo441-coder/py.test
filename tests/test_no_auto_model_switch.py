@@ -24,6 +24,7 @@ def test_provider_outage_does_not_auto_switch_or_retry_another_model(
     cfg = SimpleNamespace(
         model_id=selected,
         effort=config.DEFAULT_EFFORT,
+        prompt="main",
         extra={"failover_model": alternate},
     )
     agent = agent_module.Agent.__new__(agent_module.Agent)
@@ -38,6 +39,10 @@ def test_provider_outage_does_not_auto_switch_or_retry_another_model(
     agent._overflow_shrink = lambda *args, **kwargs: None
     agent._flight_prewarmer = SimpleNamespace(launch=lambda _agent: None)
     agent._push_status = lambda _status: None
+    # The real Agent always has Mastermind; this bare-bones test stub must
+    # supply the wire gate that _complete() calls on every request.
+    agent.mastermind = SimpleNamespace(
+        gate=SimpleNamespace(seal_wire=lambda *_a, **_k: None))
     calls = []
 
     def fail_with_outage(*args, **kwargs):
