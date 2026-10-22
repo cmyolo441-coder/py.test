@@ -1,5 +1,6 @@
 import io
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -203,7 +204,154 @@ class StreamingTests(unittest.TestCase):
         ui._run_turn_thread("hello")
         self.assertEqual(observed, [True])
 
+    @staticmethod
+    def _wait_idle(ui, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while ui._busy and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return not ui._busy
 
+    def test_busy_input_is_queued_and_runs_after_current_turn(self):
+        ui = self.make_ui()
+        first_started = threading.Event()
+        release_first = threading.Event()
+        second_started = threading.Event()
+        calls = []
+
+        def run(text, *args, **kwargs):
+            calls.append(text)
+            if text == "first":
+                first_started.set()
+                release_first.wait(5)
+            elif text == "second":
+                second_started.set()
+            return Turn(text)
+
+        ui.agent.run_turn = run
+        ui._dispatch("first")
+        self.assertTrue(first_started.wait(3), "first turn never started")
+
+        # Enter is accepted while busy, but must not start a second loop.
+        ui._dispatch("second")
+        self.assertEqual(ui._pending_count(), 1)
+        self.assertFalse(second_started.is_set(),
+                         "queued turn overlapped the running turn")
+        self.assertEqual(calls, ["first"])
+
+        release_first.set()
+        self.assertTrue(second_started.wait(5),
+                        "queued message never started")
+        self.assertTrue(self._wait_idle(ui))
+        self.assertEqual(calls, ["first", "second"])
+        self.assertEqual(ui._pending_count(), 0)
+
+    def test_queued_messages_drain_fifo(self):
+        ui = self.make_ui()
+        first_started = threading.Event()
+        release_first = threading.Event()
+        all_done = threading.Event()
+        calls = []
+
+        def run(text, *args, **kwargs):
+            calls.append(text)
+            if text == "first":
+                first_started.set()
+                release_first.wait(5)
+            if len(calls) == 3:
+                all_done.set()
+            return Turn(text)
+
+        ui.agent.run_turn = run
+        ui._dispatch("first")
+        self.assertTrue(first_started.wait(3))
+        ui._dispatch("second")
+        ui._dispatch("third")
+        self.assertEqual(ui._pending_count(), 2)
+
+        release_first.set()
+        self.assertTrue(all_done.wait(5), "queued turns did not drain")
+        self.assertTrue(self._wait_idle(ui))
+        self.assertEqual(calls, ["first", "second", "third"])
+        self.assertEqual(ui._pending_count(), 0)
+
+    def test_dispatch_waits_for_a_force_cleared_thread(self):
+        """The cancel watchdog may clear _busy while the old worker is
+        still alive; a new run_turn must not start until it returns."""
+        ui = self.make_ui()
+        ui._busy = False
+        ui._turn_alive = True
+
+        with patch("fullagent.tui.threading.Thread") as worker:
+            ui._dispatch("while old thread shutting down")
+            worker.return_value.start.assert_not_called()
+        self.assertEqual(ui._pending_count(), 1)
+
+        # Once the old worker finally returns, the queued text starts.
+        ui._turn_alive = False
+        with patch("fullagent.tui.threading.Thread") as worker:
+            ui._advance_queue()
+            worker.return_value.start.assert_called_once()
+
+    def test_cancel_drops_queued_followups(self):
+        ui = self.make_ui()
+        first_started = threading.Event()
+        release_first = threading.Event()
+        calls = []
+
+        def run(text, *args, **kwargs):
+            calls.append(text)
+            if text == "first":
+                first_started.set()
+                release_first.wait(5)
+                return Turn(text, error="cancelled")
+            return Turn(text)
+
+        ui.agent.run_turn = run
+        ui._dispatch("first")
+        self.assertTrue(first_started.wait(3))
+        ui._dispatch("follow-up")
+        self.assertEqual(ui._pending_count(), 1)
+
+        cleared = ui._request_cancel()
+        self.assertEqual(cleared, 1)
+        self.assertEqual(ui._pending_count(), 0)
+
+        release_first.set()
+        self.assertTrue(self._wait_idle(ui))
+        self.assertEqual(calls, ["first"])
+        self.assertEqual(ui._pending_count(), 0)
+
+    def test_message_queued_after_cancel_runs_next(self):
+        """Ctrl+C clears old follow-ups, not a message the user types
+        while the cancelled turn is still unwinding."""
+        ui = self.make_ui()
+        first_started = threading.Event()
+        release_first = threading.Event()
+        second_started = threading.Event()
+        calls = []
+
+        def run(text, *args, **kwargs):
+            calls.append(text)
+            if text == "first":
+                first_started.set()
+                release_first.wait(5)
+                return Turn(text, error="cancelled")
+            if text == "after-cancel":
+                second_started.set()
+            return Turn(text)
+
+        ui.agent.run_turn = run
+        ui._dispatch("first")
+        self.assertTrue(first_started.wait(3))
+        ui._request_cancel()
+        ui._dispatch("after-cancel")
+        self.assertEqual(ui._pending_count(), 1)
+
+        release_first.set()
+        self.assertTrue(second_started.wait(5),
+                        "post-cancel follow-up was dropped")
+        self.assertTrue(self._wait_idle(ui))
+        self.assertEqual(calls, ["first", "after-cancel"])
 
     def test_live_diff_streaming_on_tool_args_and_diff_command(self):
         import tempfile

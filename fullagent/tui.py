@@ -45,6 +45,7 @@ import sys
 import threading
 import time
 import unicodedata
+from collections import deque
 from html import escape as html_escape
 from pathlib import Path
 from typing import Callable
@@ -755,6 +756,15 @@ class UI:
 
         # turn state
         self._busy = False
+        # Follow-up messages typed while a turn is running.  They are
+        # drained strictly one at a time: a second agent.run_turn() must
+        # never overlap the first over the shared message list.
+        self._pending: deque[str] = deque()
+        self._turn_lock = threading.Lock()
+        # True from the moment a turn thread starts until it has fully
+        # returned.  _busy may be force-cleared by the cancel watchdog,
+        # but this stays set so a second run_turn cannot overlap history.
+        self._turn_alive = False
         self._status_text = ""
         self._spinner_i = 0
         self._spinner_gen = 0
@@ -1008,7 +1018,10 @@ class UI:
                 n_tok = getattr(self, "_stream_tokens_count", 0)
                 if n_tok > 2 and dt >= 0.2:
                     tok_rate = f" · ⚡{int(n_tok / dt)} tok/s"
-            tail = f"{tok_rate}{elapsed} · Esc cancel "
+            pending = self._pending_count()
+            queued = f" · {pending} msg queued" if pending else ""
+            tail = (f"{tok_rate}{elapsed}{queued} · Enter queue · "
+                    "Esc cancel ")
             max_status = max(0, inner - _disp_width(f" ⠹ {tail}") - 4)
             status = _truncate_w(self._status_text, max_status)
             bar_len = (_disp_width(f" {frame} ") + _disp_width(status)
@@ -1497,9 +1510,10 @@ class UI:
         ov = Condition(self._overlay_open)
         approving = Condition(self._approving)
         idle = ~approving  # normal input only when not at the approve bar
-        # submitting a new turn while one is already running would spawn
-        # concurrent agent.run_turn threads over the same message list
-        can_submit = focused & ~ov & idle & Condition(lambda: not self._busy)
+        # Enter always accepts input.  When a turn is already running the
+        # text is queued instead of starting a concurrent agent.run_turn;
+        # _dispatch() owns that decision and the serial drain.
+        can_submit = focused & ~ov & idle
 
         # --- approval bar: y / n / a ---
         # register the catch-all FIRST so it has the lowest priority; the
@@ -1643,8 +1657,12 @@ class UI:
         @kb.add("c-c", filter=focused & ~ov & idle)
         def _ctrl_c(event):
             if self._busy:
-                self._request_cancel()
+                cleared = self._request_cancel()
                 self._set_status("cancelling…")
+                if cleared:
+                    self._set_flash(
+                        f"⊘ cancelling — {cleared} queued message(s) cleared",
+                        C["yellow"])
             elif self.buffer.text:
                 self.buffer.reset()
                 self._set_flash("input cleared — Ctrl+C again or /exit to quit",
@@ -1657,9 +1675,14 @@ class UI:
         @kb.add(Keys.Escape, filter=focused & ~ov &
                 Condition(lambda: self._busy))
         def _esc_cancel(event):
-            self._request_cancel()
+            cleared = self._request_cancel()
             self._set_status("cancelling…")
-            self._set_flash("⊘ cancelling — force stopping…", C["yellow"])
+            if cleared:
+                self._set_flash(
+                    f"⊘ cancelling — {cleared} queued message(s) cleared",
+                    C["yellow"])
+            else:
+                self._set_flash("⊘ cancelling — force stopping…", C["yellow"])
 
         # Esc at the approve bar = "no", same as Ctrl+C there
         @kb.add(Keys.Escape, filter=approving)
@@ -1694,9 +1717,17 @@ class UI:
 
         return kb
 
-    def _request_cancel(self) -> None:
-        """Idempotently cancel this UI turn and the agent's request flag."""
-        self._cancel_flag.set()
+    def _request_cancel(self) -> int:
+        """Idempotently cancel this UI turn and drop pending follow-ups.
+
+        Returns the number of queued messages dropped so the key handler
+        can tell the user exactly what happened.
+        """
+        q, lock = self._queue_state()
+        with lock:
+            self._cancel_flag.set()
+            cleared = len(q)
+            q.clear()
         flag = getattr(self.agent, "_cancel_flag", None)
         if flag is not None:
             try:
@@ -1730,8 +1761,15 @@ class UI:
         def _watchdog():
             import time as _t
             _t.sleep(10)
-            if self._busy and self._cancel_flag.is_set():
-                self._busy = False
+            with lock:
+                stuck = self._busy and self._cancel_flag.is_set()
+                if stuck:
+                    # _turn_alive deliberately stays true: the worker still
+                    # owns the shared history.  New input is queued by
+                    # _dispatch() and drains only when that worker returns.
+                    self._busy = False
+                    q.clear()
+            if stuck:
                 try:
                     self._set_status("")
                     self._set_flash("⚠ turn force-stopped (was stuck)",
@@ -1739,6 +1777,7 @@ class UI:
                 except Exception:
                     pass
         _th.Thread(target=_watchdog, daemon=True).start()
+        return cleared
 
     def _bg(self, fn) -> None:
         """Run fn on a daemon thread with exceptions surfaced to the UI —
@@ -1881,25 +1920,75 @@ class UI:
 
     # -- dispatch: slash commands + turns ----------------------------------------------------
 
+    def _queue_state(self) -> tuple[deque[str], threading.Lock]:
+        """Return the follow-up queue and its lock.
+
+        Headless tests build ``UI`` with ``__new__`` and do not run
+        ``__init__``; creating the state lazily keeps those tests (and any
+        plugin that embeds the UI) working without a constructor change.
+        """
+        q = getattr(self, "_pending", None)
+        if q is None:
+            q = self._pending = deque()
+        lock = getattr(self, "_turn_lock", None)
+        if lock is None:
+            lock = self._turn_lock = threading.Lock()
+        return q, lock
+
+    def _pending_count(self) -> int:
+        q, lock = self._queue_state()
+        with lock:
+            return len(q)
+
     def _dispatch(self, text: str) -> None:
         if text.startswith("/"):
             self._handle_slash(text)
             return
-        if self._busy:
-            # a turn is already running — never overlap two agent loops
-            self._set_flash("busy — wait for the current turn (Ctrl+C to "
-                            "cancel)", C["yellow"])
+
+        q, lock = self._queue_state()
+        with lock:
+            q.append(text)
+            if self._busy or getattr(self, "_turn_alive", False):
+                # A turn is running (or its stuck thread has not returned
+                # yet).  Keep the text for the finish handler; never start
+                # a second agent.run_turn over the same history.
+                next_text = None
+            else:
+                next_text = q.popleft()
+                self._busy = True
+            pending = len(q)
+
+        if next_text is None:
+            preview = " ".join(text.split())
+            if len(preview) > 72:
+                preview = preview[:69] + "…"
+            notice = getattr(self, "print_info", None)
+            if callable(notice):
+                notice(f"  ⏳ queued #{pending} · {preview}", C["cyan"])
+            self._set_flash(
+                f"⏳ message #{pending} queued — runs after this turn",
+                C["cyan"])
+            self._invalidate()
             return
-        # Claim the turn on the UI thread, before a worker can be scheduled.
-        self._busy = True
+
         self._cancel_flag.clear()
         try:
-            self._emit_user(text)
-            threading.Thread(target=self._run_turn_thread, args=(text,),
+            threading.Thread(target=self._run_turn_thread, args=(next_text,),
                              daemon=True).start()
         except Exception:
-            self._busy = False
+            with lock:
+                q.appendleft(next_text)
+                self._busy = False
             raise
+
+        # Normally pending is 0 here.  A non-zero value means the queue
+        # already held an older message (for example after a failed
+        # hand-off); the new text is waiting behind it, so say so.
+        if pending:
+            notice = getattr(self, "print_info", None)
+            if callable(notice):
+                notice(f"  ⏳ queued #{pending} · "
+                       f"{' '.join(text.split())[:72]}", C["cyan"])
 
     def _handle_slash(self, text: str) -> None:
         parts = text.strip().split(None, 1)
@@ -3955,8 +4044,15 @@ class UI:
     # -- turn execution (worker thread) ---------------------------------------------------------
 
     def _run_turn_thread(self, text: str) -> None:
-        self._busy = True
+        _q, lock = self._queue_state()
+        with lock:
+            self._busy = True
+            self._turn_alive = True
         try:
+            # Announce here, not in _dispatch: a queued turn should appear
+            # in the transcript only when it actually starts, after the
+            # previous turn's answer, not at the moment it was typed.
+            self._emit_user(text)
             # Clear the agent's cancel flag on the turn thread, right before
             # run_turn: run_turn clears it again internally, but a cancel
             # landing in the window between thread start and that internal
@@ -3970,10 +4066,46 @@ class UI:
             self._run_turn(text)
         finally:
             self._stop_spinner()
-            self._busy = False
             self._set_status("")
             self._invalidate_agents()  # board/roster reflect the finished turn
             self._invalidate()
+            _q, lock = self._queue_state()
+            with lock:
+                self._turn_alive = False
+            self._advance_queue()
+
+    def _advance_queue(self) -> None:
+        """Release the turn slot, then start at most one queued message.
+
+        Called from the turn thread's ``finally`` — after ``_run_turn`` has
+        returned, including all focus-mode continuations.  The lock makes
+        the busy/queue hand-off atomic, so a message submitted at the same
+        instant either joins the queue or starts next, never both.
+        """
+        q, lock = self._queue_state()
+        next_text = None
+        with lock:
+            self._busy = False
+            if q:
+                # Anything still in the queue arrived after _request_cancel
+                # cleared the old follow-ups.  It is a fresh instruction,
+                # so start it with a clean cancel state.
+                next_text = q.popleft()
+                self._busy = True
+                self._cancel_flag.clear()
+
+        if next_text is None:
+            return
+        try:
+            threading.Thread(target=self._run_turn_thread,
+                             args=(next_text,), daemon=True).start()
+        except Exception as e:  # noqa: BLE001 — keep the message, free the UI
+            with lock:
+                q.appendleft(next_text)
+                self._busy = False
+            report = getattr(self, "print_error", None)
+            if callable(report):
+                report(f"could not start queued message: {e}")
 
     def _run_turn(self, text: str) -> None:
         self._turn_start_ts = time.time()
@@ -5261,6 +5393,54 @@ def _tui_selftest() -> None:
     assert all(g >= 0.095 for g in gaps), f"frames too close: {gaps[:5]}"
     print(f"PASS  frame spacing: {th3.frames} frames, "
           f"min gap {min(gaps):.3f}s (>= 0.1s throttle)")
+
+    # -- 4. follow-up queue: accepted while busy, FIFO, never overlapping -
+    ui2 = UI.__new__(UI)
+    ui2.cfg = SimpleNamespace(extra={"render_markdown": False},
+                              show_reasoning=False)
+    ui2._busy = False
+    ui2._cancel_flag = threading.Event()
+    ui2._focus_remaining = 0
+    ui2._status_text = ""
+    ui2._width = lambda: 80
+    ui2._start_spinner = lambda: None
+    ui2._stop_spinner = lambda: None
+    ui2._emit_user = lambda text: None
+    ui2._set_flash = lambda *args: None
+    ui2._print_turn_stats = lambda turn: None
+    ui2._invalidate = lambda: None
+    ui2.output = io.StringIO()
+    ui2.console = Console(file=ui2.output, width=80, color_system=None)
+    calls: list[str] = []
+    first_started = threading.Event()
+    release_first = threading.Event()
+
+    def fake_run2(text, *args, **kwargs):
+        calls.append(text)
+        if text == "first":
+            first_started.set()
+            release_first.wait(5)
+        return Turn(text)
+
+    ui2.agent = SimpleNamespace(save_session=lambda: None,
+                                run_turn=fake_run2)
+    try:
+        ui2._dispatch("first")
+        assert first_started.wait(3), "first turn did not start"
+        ui2._dispatch("second")
+        assert ui2._pending_count() == 1, ui2._pending_count()
+        assert calls == ["first"], f"queued turn overlapped: {calls}"
+        release_first.set()
+        deadline = tui_mod.time.monotonic() + 5
+        while ui2._busy and tui_mod.time.monotonic() < deadline:
+            tui_mod.time.sleep(0.01)
+        assert not ui2._busy, "queue drain left the UI busy"
+        assert calls == ["first", "second"], calls
+        assert ui2._pending_count() == 0
+    finally:
+        release_first.set()
+    print("PASS  follow-up queue: 1 running + 1 queued -> serial FIFO, "
+          "no overlapping run_turn")
 
     print("ALL TUI SELF-TESTS PASS")
 

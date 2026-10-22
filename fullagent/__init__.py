@@ -37,4 +37,4 @@ Package layout:
     __main__.py     entry point
 """
 
-__version__ = "3.3.0"
+__version__ = "3.3.1"

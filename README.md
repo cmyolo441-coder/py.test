@@ -9,7 +9,7 @@
 ╚═╝      ╚═════╝ ╚═════╝╚════╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝  ╚═╝
 ```
 
-<h1>FullAgent <sup><code>v3.3.0</code></sup></h1>
+<h1>FullAgent <sup><code>v3.3.1</code></sup></h1>
 
 **Advanced Terminal AI Agent — Pure Python, Real Code, World-Class TUI**
 
@@ -48,7 +48,7 @@
  ██╔══╝  ██╔══██║                   │ 3. Ask coding questions, edit code… │
  ██║     ██║  ██║                   │ 4. Be specific for the best results │
  ╚═╝     ╚═╝  ╚═╝                   ╰─────────────────────────────────────╯
-  FullAgent CLI v3.3.0
+  FullAgent CLI v3.3.1
 ```
 
 While a swarm is running the frame shows the Qoder-style board and footer:
@@ -116,7 +116,7 @@ without artificial animation delays.
  ██╔══╝  ██╔══██║                   │ 3. Ask coding questions, edit code, run… │
  ██║     ██║  ██║                   │ 4. Be specific for the best results      │
  ╚═╝     ╚═╝  ╚═╝                   ╰──────────────────────────────────────────╯
-  FullAgent CLI v3.3.0
+  FullAgent CLI v3.3.1
   API key · built-in (Kios API)
   DeepSeek V4.1 Flash Free  ·  high
   ~/Desktop  ·  session a1b2c3d4
@@ -192,7 +192,9 @@ and `python -m playwright install chromium`; if system Chromium is already on
   through the existing permission gate, with distinct workspace path scopes,
   shell/deletion tools withheld, and a recovery snapshot before every delegated
   write. Workers stay on the selected configured model unless a model is
-  explicitly selected; automatic model switching is disabled.
+  explicitly selected; automatic model switching is disabled. The input box
+  stays live while they run — follow-up messages are queued and drained one
+  at a time after the current turn, never as concurrent `run_turn` loops.
 - **Focus Mode** — deep work: `/focus 10` arms auto-continuation and the
   agent keeps working turn after turn until the goal closes, progress
   stalls, or the budget pauses. Every continuation decision is a sealed
@@ -235,6 +237,7 @@ without asking, from read-only observer to fully autonomous.
 | Key | Action |
 |---|---|
 | `Enter` | send |
+| `Enter` while a turn is running | queue a follow-up; it starts after the current turn finishes |
 | `Esc+Enter` | newline inside the box |
 | `/` | slash-command completion menu |
 | `Ctrl+T` or `/model` | model selector |
