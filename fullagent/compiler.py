@@ -37,6 +37,7 @@ from typing import Callable
 
 from .kernel import EventLog, fold
 from .roles import ROLES
+from .systemprompt import compiler_drafter_prompt
 from ._foundation import get_logger
 
 _log = get_logger("compiler")
@@ -87,13 +88,7 @@ class CompiledPlan:
 
 def _draft_prompt(goal: str) -> list[dict]:
     return [
-        {"role": "system", "content":
-            "You are the front-end of an agent work compiler. Decompose "
-            "the goal into 4-12 work items. Reply with ONLY a JSON array; "
-            "each element: {\"task\": string, \"role\": one of "
-            + ", ".join(sorted(ROLES)) + ", \"paths\": [files this item "
-            "may write or read], \"depends_on\": [indexes of items that "
-            "must finish first, 0-based]}. No prose, no markdown fence."},
+        {"role": "system", "content": compiler_drafter_prompt(sorted(ROLES))},
         {"role": "user", "content": f"GOAL: {goal}"},
     ]
 

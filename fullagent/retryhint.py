@@ -18,9 +18,17 @@ Wiring (see the ``# retryhint hook`` in ``agent.py`` ``_finish_one``)::
     if ev.status == "error":
         hint = note_failure(name, ev.result)
         if hint:
-            self.messages.append({"role": "system", "content": hint})
+            self.messages.append({
+                "role": "user",
+                "content": "[RUNTIME NOTE — harness guidance, "
+                           "subordinate to the system prompt]\\n" + hint,
+            })
     else:
         note_success(name)
+
+Runtime guidance deliberately travels in the user channel, tagged as
+subordinate: it must never become a second system prompt that shadows
+systemprompt.py.
 
 Only stdlib is imported. State is a small dict keyed by tool name, so it
 cannot grow unboundedly even in a very long session.

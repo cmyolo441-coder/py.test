@@ -25,8 +25,9 @@ failures; an empty write result is not "redundant").
 Integration: agent.py's turn loop instantiates one ``EarlyExitTracker``
 per turn (next to the loopdetect detector) and calls ``note()`` after
 every tool result inside ``_finish_one``. A non-None return is appended
-as a ``{"role": "system"}`` message — the same injection pattern retryhint
-already uses — so the model sees it before the next completion.
+as a tagged **user** runtime note — never a second system message — so the
+model sees it before the next completion without it competing with
+systemprompt.py.
 
 Only stdlib. Safe to import at module level (no heavy deps). Thread-safe.
 """

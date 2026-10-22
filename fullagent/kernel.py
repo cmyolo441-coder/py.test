@@ -207,6 +207,8 @@ class State:
     # Mastermind — prompt coherence ledger
     prompt_sealed: list[dict] = field(default_factory=list)
     prompt_dispatches: list[dict] = field(default_factory=list)
+    prompt_wire_restores: list[dict] = field(default_factory=list)
+    prompt_wire_cleaned: list[dict] = field(default_factory=list)
     # v3 advanced subsystems
     router_decisions: list[dict] = field(default_factory=list)
     semantic_index: list[dict] = field(default_factory=list)
@@ -1190,6 +1192,10 @@ def _fold_apply(st: State, ev: Event) -> None:
         st.prompt_sealed.append(d)
     elif t == "prompt.dispatch":
         st.prompt_dispatches.append(d)
+    elif t == "prompt.wire_restore":
+        st.prompt_wire_restores.append(d)
+    elif t == "prompt.wire_clean":
+        st.prompt_wire_cleaned.append(d)
     elif t == "router.decision":
         st.router_decisions.append(d)
     elif t == "semantic.indexed":

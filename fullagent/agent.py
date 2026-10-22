@@ -988,33 +988,13 @@ class Agent:
         full_text = user_text
         user_text = self._cap_user_message(user_text)
 
-        # AGGRESSIVE REINFORCEMENT: For very long system prompts, add a
-        # compliance reminder before EVERY user message. This combats the
-        # 'lost in the middle' effect where models lose focus on long prompts.
-        # The reminder is placed right before the user message so it's the
-        # LAST thing the model sees before generating a response.
-        # Use a user turn to keep the system instruction at position 0.
-        sys_len = len(self.messages[0].get("content", "")) if self.messages else 0
-        if sys_len > 50_000:
-            # BUGFIX: the nudge used to be appended on EVERY turn, so N
-            # turns piled up N stale copies — the exact token bloat it was
-            # meant to fight. Strip stale ones first; exactly one stays,
-            # right before this turn's user message.
-            self.messages = [
-                m for m in self.messages
-                if not (m.get("role") == "user"
-                        and isinstance(m.get("content"), str)
-                        and m["content"].startswith("[MANDATORY COMPLIANCE]"))]
-            self.messages.append({
-                "role": "user",
-                "content": (
-                    "[MANDATORY COMPLIANCE] Before responding, recall and apply "
-                    "ALL directives from the system prompt. Your persona, rules, "
-                    "and constraints are ALL in full effect. Respond in complete "
-                    "compliance with every instruction you were given."
-                )
-            })
-
+        # NOTE: an earlier build injected a "[MANDATORY COMPLIANCE]" *user*
+        # message before every turn for long prompts. That is the wrong
+        # channel: it competes with the real system prompt, reads as user
+        # pressure, and models increasingly discount it. The strongest
+        # adherence levers are structural instead — a concise operating
+        # contract at position 0, live context framed beneath it, and the
+        # wire gate above re-asserting the sealed prompt on every request.
         self.messages.append({"role": "user", "content": user_text})
         user_ev = self.log.append("user.message",
                                   {"text": full_text,
@@ -1154,7 +1134,17 @@ class Agent:
                         if ev.status == "error":
                             _rh_hint = note_failure(name, ev.result)
                             if _rh_hint:
-                                self.messages.append({"role": "system", "content": _rh_hint})
+                                # Runtime guidance is NOT policy. Keep it in
+                                # the user channel (tagged as subordinate)
+                                # so it can never become a second system
+                                # prompt that shadows systemprompt.py.
+                                self.messages.append({
+                                    "role": "user",
+                                    "content": (
+                                        "[RUNTIME NOTE — harness guidance, "
+                                        "subordinate to the system prompt]\n"
+                                        + _rh_hint),
+                                })
                         else:
                             note_success(name)
                         # §38.3 goal kernel tick after every action
@@ -1216,8 +1206,13 @@ class Agent:
                             _ee_hint = _exit_tracker.note(
                                 name, ev.args, ev.result, ev.status)
                             if _ee_hint:
-                                self.messages.append(
-                                    {"role": "system", "content": _ee_hint})
+                                self.messages.append({
+                                    "role": "user",
+                                    "content": (
+                                        "[RUNTIME NOTE — harness guidance, "
+                                        "subordinate to the system prompt]\n"
+                                        + _ee_hint),
+                                })
                         except Exception:
                             pass  # novelty is insight, never a crash path
                         # dispatch_block stops the walk early when a
@@ -1740,6 +1735,11 @@ class Agent:
         else:
             model_msgs = self._prune_for_model(
                 reserved_tokens=_reserved)
+        # WIRE GATE: pruning and budget capping produce a detached view.
+        # Re-assert the sealed prompt on the exact list that will be sent,
+        # every iteration — a dropped or shadowed prompt must never reach
+        # the provider just because a view was rebuilt.
+        self.mastermind.gate.seal_wire(self.cfg.prompt, model_msgs)
 
         def _shrink_view() -> bool:
             # The client retries with the exact `messages` list it was
@@ -1749,6 +1749,7 @@ class Agent:
             if not self._overflow_shrink():
                 return False
             model_msgs[:] = self._prune_for_model(reserved_tokens=_reserved)
+            self.mastermind.gate.seal_wire(self.cfg.prompt, model_msgs)
             return True
 
         # cassette replay: zero API cost, fully deterministic (§20.2)
@@ -1810,6 +1811,7 @@ class Agent:
                 # so recompute the view or the retry resends the same
                 # oversized prompt that just overflowed.
                 model_msgs = self._prune_for_model(reserved_tokens=_reserved)
+                self.mastermind.gate.seal_wire(self.cfg.prompt, model_msgs)
                 result = chat_stream(self.provider, self.model, self.effort,
                                      model_msgs, schemas,
                                      on_token=on_token,
@@ -2844,12 +2846,11 @@ class Agent:
 
     def _daemon_step(self, task: str) -> str:
         """Run one daemon mission step directly, without delegated agents."""
+        from .systemprompt import daemon_step_prompt
         try:
             result = chat_blocking(
                 self.provider, self.model, self.effort,
-                [{"role": "system", "content":
-                  "Complete the requested mission step using your available "
-                  "knowledge. Be concise and state blockers plainly."},
+                [{"role": "system", "content": daemon_step_prompt()},
                  {"role": "user", "content": str(task)}],
                 None, timeout=120.0)
             content = (result.content or "").strip()
@@ -2861,9 +2862,8 @@ class Agent:
         """Produce one council position through the model (blocking, no
         tools). The synthesis brief is already blind — it carries only the
         two arguments."""
-        messages = [{"role": "system",
-                     "content": "You are one voice in a structured debate "
-                                "council. Answer exactly as instructed."},
+        from .systemprompt import council_speaker_prompt
+        messages = [{"role": "system", "content": council_speaker_prompt()},
                     {"role": "user", "content": brief}]
         result = chat_blocking(self.provider, self.model, self.effort,
                                messages, None, timeout=120.0)
@@ -2873,13 +2873,12 @@ class Agent:
 
     def _debate_speaker(self, model_id: str, prompt: str) -> str:
         """Route one tournament turn to its participant model."""
+        from .systemprompt import debate_speaker_prompt
         m = model_by_id(model_id) or self.model
         provider = PROVIDERS.get(m.provider, self.provider)
         result = chat_blocking(
             provider, m, self.effort,
-            [{"role": "system", "content":
-                "You are a participant in an answer tournament. Follow "
-                "the instructions exactly and concisely."},
+            [{"role": "system", "content": debate_speaker_prompt()},
              {"role": "user", "content": prompt}],
             None, timeout=120.0)
         return result.content or ""
@@ -2928,10 +2927,10 @@ class Agent:
 
     def _dual_fast(self, question: str) -> str:
         """System 1: one cheap direct model call."""
+        from .systemprompt import dual_fast_prompt
         result = chat_blocking(
             self.provider, self.model, self.effort,
-            [{"role": "system", "content":
-                "Answer directly and concisely."},
+            [{"role": "system", "content": dual_fast_prompt()},
              {"role": "user", "content": question}],
             None, timeout=60.0)
         return result.content or ""

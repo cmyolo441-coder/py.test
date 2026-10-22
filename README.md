@@ -275,7 +275,7 @@ Event-log commands:
   JSON predicate
 - `/auto [on|off|status]` — the AutoPilot self-routing brain (on by default)
 - `/prompt [main|master|list]` — choose the system prompt: `main` (compact)
-  or `master` (the extended 130k+ specification prompt)
+  or `master` (adds the optional `project.txt` specification when present)
 - `/mastermind` — the prompt-coherence ledger (sealed prompts, gate,
   composed context, lineage)
 - `/dashboard` — live observability: cost, goal, councils, router, spec,
@@ -382,21 +382,43 @@ Streaming/UI regressions (no API key needed), from this directory:
 ## System prompts — one file, one delivery path
 
 Every system prompt the model ever sees lives in **`fullagent/systemprompt.py`**
-and nowhere else — the module imports it. Two structural guarantees:
+and nowhere else — the module imports it. Three structural guarantees:
 
 - **Single source of truth.** Edit a prompt in `systemprompt.py` and it
   changes wherever the main agent requests are built.
-- **One delivery path.** Every message list is built through
-  `systemprompt.with_system()`, which guarantees the correct prompt sits at
-  position 0 before any request is sent. A model can never be called without
-  its prompt, and can never see a stale or partial one.
+- **One system message.** `systemprompt.with_system()` guarantees exactly
+  one system message, at position 0. Mid-history "system" hints are removed
+  because providers merge them inconsistently — the sealed prompt is the
+  only system voice.
+- **Wire-level integrity.** `PromptGate.seal_wire()` runs on the exact
+  payload about to be sent (after pruning, budget capping and compaction
+  retries). It re-seats a missing or tampered prompt and records the
+  restore in the event log.
+- **Live reload.** The vault watches `systemprompt.py`'s
+  `(mtime_ns, size)`. Edit the file in a running session and the next
+  `resolve()` reloads the module and re-seals changed prompts — no restart.
+  Runtime-registered prompts survive the reload. A broken edit is logged
+  as `prompt.reload_failed` and the last good prompt stays in force.
+
+> **Source vs installed binary.** Editing `systemprompt.py` only affects a
+> run started from this checkout (`python3 main.py`). The standalone release
+> binary and a `pip install` carry their own bundled copy of `fullagent/`;
+> they will not see edits in your clone. Run from source while iterating on
+> prompts, or reinstall after editing.
 
 Two prompts ship in the registry, switchable live with `/prompt`:
 
 | Name | Size | What it is |
 |---|---|---|
-| `main` | ~1.6k chars | the compact sovereign-agent prompt (default) |
-| `master` | **136,928 chars** | MAIN + the full master specification (`project.txt`) embedded — the entire architecture, invariants, subsystem contracts and Goal-Mode grammar in context |
+| `main` | ~5k chars | the compact sovereign-agent prompt (default) |
+| `master` | `main` + optional spec | MAIN plus `fullagent/project.txt` when that optional file is present; otherwise it degrades to MAIN (no empty banner) |
+
+The file also owns every non-conversational prompt: `subagent_prompt()` for
+delegated workers, and `INTERNAL_RULES` plus task builders for subsystem
+model calls (daemon steps, council/debate speakers, the fast dual path, the
+work compiler and program synthesis). Those internal calls share one base
+contract but keep their strict output formats — the compiler still returns
+only JSON, the synthesizer only source.
 
 Add more prompts later by dropping a constant in `systemprompt.py` and
 registering it in the `PROMPTS` map (or call `register()` at runtime).
@@ -409,20 +431,25 @@ ceiling and the remaining context window before sending them to Kios.
 
 ## Mastermind — coherence, not coercion
 
-`fullagent/mastermind.py` makes following `systemprompt.py` *inevitable* —
-not by telling the model "you must obey", but by making the sealed prompt
-the only coherent center of every request. Three cooperating mechanisms,
-all deterministic Python:
+`fullagent/mastermind.py` makes the prompt the coherent center of every
+request. It does not, and cannot, override a model's own safety training or
+a provider's server-side policy — if a request is refused upstream, no
+client-side prompt layout changes that. What it *does* guarantee is that the
+prompt you edit is the prompt that is actually sent. Four deterministic
+mechanisms:
 
 | Mechanism | What it does |
 |---|---|
-| **PromptVault** | Every prompt is sealed with a sha256 fingerprint and recorded in the event log. The vault is the only source a model ever reads a prompt from; prompts registered at runtime are sealed on demand, and a changed prompt is re-sealed — no stale copy is ever served. |
-| **PromptGate** | The single door to the model. Every main-agent request passes `gate.dispatch()`, which guarantees `messages[0]` carries the sealed prompt byte-for-byte at the front, re-seats it if anything shadowed or corrupted it (an integrity restore — recorded, never punished), and seals a `prompt.dispatch` lineage event. There is no other way to reach the API. |
-| **CoherenceComposer** | Live context (constitution, goal, web mode, memory) is never appended as raw text that could compete with the prompt. It is composed beneath the sealed prompt as one coherent document: each section is framed as *input to* the prompt, provenance-tagged, ordered by authority, deduplicated. The prompt stays the only voice giving direction. |
+| **PromptVault** | Every prompt is sealed with a sha256 fingerprint and recorded in the event log. Prompts registered at runtime are sealed on demand; a changed prompt is re-sealed — no stale copy is ever served. |
+| **PromptGate** | The turn-start door to the model. `gate.dispatch()` guarantees `messages[0]` carries the sealed prompt byte-for-byte at the front, re-seats it if anything shadowed it, and seals a `prompt.dispatch` lineage event. |
+| **Wire gate** | `gate.seal_wire()` runs on the exact payload at send time, after `prune_messages`, `bound_prompt`, prewarm and compaction rebuilds. It enforces one system message at index 0, removes every competing mid-history system message, and restores a dropped or tampered prompt. Restores are recorded as `prompt.wire_restore`; cleanups as `prompt.wire_clean`. |
+| **CoherenceComposer** | Live context (constitution, goal, web mode, memory) is composed beneath the sealed prompt as one document. Each section is framed as *input to* the prompt, ordered by authority and deduplicated, so it cannot pose as a second policy. |
 
-There is no enforcement layer — the system observes and records
-(PromptLineage), it never punishes. Every dispatch is sealed into the
-event log; inspect the live ledger with `/mastermind`.
+The agent loop no longer injects "[MANDATORY COMPLIANCE]" user messages or
+mid-history system hints. Those compete with the real prompt and are
+discounted by modern models; runtime guidance now travels in the user
+channel, explicitly tagged as subordinate. Inspect the live ledger with
+`/mastermind`.
 
 ## v3 — eight advanced subsystems
 

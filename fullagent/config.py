@@ -276,7 +276,8 @@ class Config:
     auto_approve: bool = False
     show_reasoning: bool = False
     theme: str = "dracula"
-    # which system prompt to send: "main" (compact) or "master" (130k+)
+    # which system prompt to send: "main" (compact) or "master" (main +
+    # the optional project.txt specification when present)
     prompt: str = "main"
     extra: dict = field(default_factory=dict)
     # PERF: sliding window for model-visible history. 0 = disabled (legacy).

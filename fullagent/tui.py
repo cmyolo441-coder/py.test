@@ -3727,9 +3727,14 @@ class UI:
 
     def _cmd_prompt(self, arg: str) -> None:
         """Select which system prompt the model gets (systemprompt.py is
-        the single source). 'main' is the compact prompt; 'master' is the
-        extended 130k+ specification prompt."""
+        the single source). 'main' is the compact prompt; 'master' adds
+        the optional project.txt specification when that file exists."""
         from . import systemprompt
+        # pick up edits to systemprompt.py without restarting the app
+        try:
+            self.agent.mastermind.vault.refresh()
+        except Exception:
+            pass
         sub = arg.strip().lower()
         if sub in ("", "list", "status"):
             current = self.cfg.prompt

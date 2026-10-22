@@ -64,16 +64,14 @@ class SynthResult:
 def default_generator(provider, model, effort):
     """Production generator: spec -> function source."""
     from .client import chat_blocking
+    from .systemprompt import synth_generator_prompt
 
     def generate(spec: SynthSpec) -> str:
         ex = "\n".join(
             f"  {e['args']} == {e['want']!r}" for e in spec.examples)
         result = chat_blocking(
             provider, model, effort,
-            [{"role": "system", "content":
-                "You write small pure Python tools. Reply with ONLY the "
-                "function source — no imports, no prose, no markdown "
-                "fence. The function must be deterministic and pure."},
+            [{"role": "system", "content": synth_generator_prompt()},
              {"role": "user", "content":
                 f"Function name: {spec.name}\nPurpose: "
                 f"{spec.description}\nIt must satisfy:\n{ex}\n"
