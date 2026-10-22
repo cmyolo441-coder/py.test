@@ -1772,8 +1772,9 @@ class UI:
             if stuck:
                 try:
                     self._set_status("")
-                    self._set_flash("⚠ turn force-stopped (was stuck)",
-                                    C["yellow"])
+                    self._set_flash(
+                        "⚠ cancel timed out — worker still alive; "
+                        "input will queue", C["yellow"])
                 except Exception:
                     pass
         _th.Thread(target=_watchdog, daemon=True).start()
