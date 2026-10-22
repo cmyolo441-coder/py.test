@@ -106,12 +106,19 @@ class StreamingTests(unittest.TestCase):
     def test_busy_until_session_is_saved(self):
         ui = self.make_ui()
         ui.agent.run_turn = lambda text, *args, **kwargs: Turn(text)
+        starts_during_save = []
+
         def save():
             ui._dispatch("overlapping request")
+            starts_during_save.append(worker.return_value.start.call_count)
+
         ui.agent.save_session = save
         with patch("fullagent.tui.threading.Thread") as worker:
             ui._run_turn_thread("hello")
-            worker.return_value.start.assert_not_called()
+            # The turn was still busy inside save_session: no overlap.
+            self.assertEqual(starts_during_save, [0])
+            # Once the turn finished, the queued request starts once.
+            self.assertEqual(worker.return_value.start.call_count, 1)
             ui._dispatch("next request")
             self.assertEqual(worker.return_value.start.call_count, 1)
 
