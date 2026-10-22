@@ -62,8 +62,10 @@ def test_parallel_batch_really_runs_concurrently(tmp_path):
     try:
         workers = manager.spawn_many(["inspect module A", "inspect module B"])
         assert len(workers) == 2
+        assert manager.active_count() == 2
         assert manager.wait([w.id for w in workers], timeout=3) == {
             workers[0].id: "done", workers[1].id: "done"}
+        assert manager.active_count() == 0
     finally:
         manager.shutdown(wait=True)
 

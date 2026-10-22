@@ -8,6 +8,12 @@ After every finished tool call the agent asks it ``note(duration_s)``; a
 non-None return is the stop message, which says WHY the turn stopped
 (call-count cap vs time budget) and that "continue" resumes it.
 
+Scheduler yields are exempt: ``note(..., waiting_on_background=True)``
+for TaskCollect/TaskOutput waits on already-running subagents. Those
+waits are not tool execution, so they consume neither the call cap nor
+the time budget — a parent turn must stay alive while its own parallel
+workers finish.
+
 Tiers (tunables in config.py), evaluated live after every call:
   avg < FAST_CALL_AVG_THRESHOLD_S  -> ADAPTIVE_CAP_FAST calls, TURN_TIME_BUDGET_S
   avg > SLOW_CALL_AVG_THRESHOLD_S  -> ADAPTIVE_CAP_SLOW calls, TURN_TIME_BUDGET_SLOW_S
@@ -115,11 +121,21 @@ class AdaptiveTurnCap:
                 "stopped": self._stopped,
             }
 
-    def note(self, duration_s: float) -> str | None:
+    def note(self, duration_s: float, *,
+             waiting_on_background: bool = False) -> str | None:
         """Record one finished tool call. Returns the stop message once
         the cap trips, else None. After tripping, keeps returning the
-        same message without counting further (idempotent latch)."""
+        same message without counting further (idempotent latch).
+
+        ``waiting_on_background=True`` marks a scheduler-yield call (a
+        TaskCollect/TaskOutput wait on already-running work). Such a
+        call is not tool execution: it neither consumes the call cap nor
+        the time budget. Without this, eight parallel subagents could
+        exhaust the 120s slow budget while they are still working and
+        stop the parent turn before it can collect their reports."""
         d = self._clean_duration(duration_s)
+        if waiting_on_background:
+            return None
         with self._lock:
             if self._stopped:
                 return self._stop_message
@@ -268,6 +284,23 @@ if __name__ == "__main__":
     check("stops at custom base_cap=2", m1 is not None, m1 or "")
     check("latch: same message, no extra counting",
           m2 == m1 and cap.calls == 2, f"calls={cap.calls}")
+
+    # 8b. background waits are scheduler yields, not tool work: repeated
+    # 90s TaskCollect waits while 8 subagents are still running must not
+    # consume the call cap or trip the time budget. Real tool calls after
+    # them still count normally.
+    cap = AdaptiveTurnCap(base_cap=3, fast_cap=3, slow_cap=3,
+                          budget_s=0.5, slow_budget_s=0.5)
+    waits = [cap.note(90.0, waiting_on_background=True) for _ in range(8)]
+    check("background waits never stop the turn",
+          all(m is None for m in waits), waits)
+    check("background waits consume no calls or tool time",
+          cap.calls == 0 and cap.total_time == 0.0,
+          f"calls={cap.calls}, total={cap.total_time}")
+    check("real tool after background waits still counts",
+          cap.note(0.1) is None and cap.calls == 1, f"calls={cap.calls}")
+    check("real slow tool after background waits still trips budget",
+          cap.note(1.0) is not None, f"calls={cap.calls}")
 
     # 9. boundary tiers: exactly 5.0 -> normal (not fast); exactly
     # 15.0 -> normal (not slow).

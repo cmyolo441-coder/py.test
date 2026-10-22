@@ -1158,9 +1158,30 @@ class Agent:
                         # (fast <5s: up to 40 calls; slow >15s: 12 calls /
                         # 120s tool time; else 25 calls / 180s). The stop
                         # message says WHY (call count vs time budget) and
-                        # invites "continue".
+                        # invites "continue". Scheduler-yield tools
+                        # (TaskCollect/TaskOutput) are special: while
+                        # background workers are still active their wait is
+                        # not tool execution and must not kill the parent
+                        # turn before its subagents can report back. Once
+                        # everything has settled, the collect call counts
+                        # as a normal (zero-time) call so polling loops are
+                        # still bounded.
+                        _wait_tool = bool(getattr(
+                            self.tools.get(name), "background_wait", False))
+                        if _wait_tool:
+                            try:
+                                _bg_active = bool(
+                                    getattr(self, "subagents", None)
+                                    is not None
+                                    and self.subagents.active_count() > 0)
+                            except Exception:
+                                _bg_active = False
+                            _cap_msg = _turn_cap.note(
+                                0.0,
+                                waiting_on_background=_bg_active)
+                        else:
+                            _cap_msg = _turn_cap.note(ev.duration)
                         tool_calls_this_turn += 1
-                        _cap_msg = _turn_cap.note(ev.duration)
                         if _cap_msg is not None:
                             turn_stopped = True
                             turn.error = _cap_msg
@@ -3201,7 +3222,8 @@ class Agent:
                 "task_id": {"type": "string"},
                 "wait_seconds": {"type": "number", "minimum": 0,
                                  "maximum": 90}},
-             "required": ["task_id"]}, task_output)
+             "required": ["task_id"]}, task_output,
+            background_wait=True)
         self.tools["TaskCollect"] = Tool(
             "TaskCollect",
             "Wait once for a named batch (or up to eight explicit task IDs) and "
@@ -3214,7 +3236,8 @@ class Agent:
                              "minItems": 1, "maxItems": 8},
                 "wait_seconds": {"type": "number", "minimum": 0,
                                  "maximum": 90}},
-             "additionalProperties": False}, task_collect)
+             "additionalProperties": False}, task_collect,
+            background_wait=True)
         self.tools["TaskList"] = Tool(
             "TaskList", "List retained parallel subagents and their live states.",
             {"type": "object", "properties": {}}, task_list)

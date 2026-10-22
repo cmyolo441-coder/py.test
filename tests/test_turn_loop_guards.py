@@ -26,6 +26,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 
 # Isolate app state BEFORE fullagent.config computes APP_DIR at import.
 _tmp_home = tempfile.mkdtemp(prefix="turnloop_home_")
@@ -234,3 +235,47 @@ def test_focus_done_detection_needs_fresh_ticks(agent):
     idle = SimpleNamespace(error="", tools=[])
     assert agent.focus_continue(idle, 5) is not None  # 1st tick: continue
     assert agent.focus_continue(idle, 4) is None      # 2nd tick: done
+
+
+# --------------------------------------------------------------------------
+# 5. TaskCollect/TaskOutput waits on live subagents are not tool work
+# --------------------------------------------------------------------------
+
+def test_task_collect_wait_does_not_trip_tool_time_budget(agent, monkeypatch):
+    """The real end-to-end regression: two 0.2s TaskCollect waits while
+    background subagents are still active must not consume the 0.05s
+    tool-time budget. Before the fix, the first wait tripped the cap,
+    the second collection was blocked, and the parent turn died before
+    its workers could report back."""
+    import fullagent.config as config_mod
+
+    agent._ensure_session()
+    assert agent.tools["TaskCollect"].background_wait is True
+    assert agent.tools["TaskOutput"].background_wait is True
+
+    monkeypatch.setattr(config_mod, "TURN_TIME_BUDGET_S", 0.05)
+    monkeypatch.setattr(config_mod, "TURN_TIME_BUDGET_SLOW_S", 0.05)
+
+    def slow_collect(*args, **kwargs):
+        time.sleep(0.2)
+        return ("COLLECTED 1 SUBAGENT REPORT(S) · "
+                "1 still active after the wait")
+
+    monkeypatch.setattr(agent.subagents, "collect", slow_collect)
+    # Simulate the reported scenario: the collect waits time out while
+    # background workers are still active.
+    monkeypatch.setattr(agent.subagents, "active_count", lambda: 1)
+
+    block = [_tc(f"collect_{i}", "TaskCollect", {"wait_seconds": 1})
+             for i in range(2)]
+    agent._scripted._queue.append(
+        StreamResult(content="", reasoning="", tool_calls=block,
+                     usage=None, model="test"))
+
+    turn, _ = _run(agent, "wait for the running subagents")
+
+    assert turn.error == "", turn.error
+    assert [t.status for t in turn.tools if t.name == "TaskCollect"] == \
+        ["done", "done"]
+    assert agent._scripted.calls == 2  # one tool block + one final reply
+    _assert_paired(agent.messages)

@@ -40,6 +40,11 @@ class Tool:
     parameters: dict
     handler: Callable[..., str]
     risk: str = RISK_SAFE
+    # Scheduler-yield tools (TaskCollect/TaskOutput) may block while
+    # already-running background work continues. Their wall time is not
+    # tool execution cost: the adaptive turn cap must not treat it as a
+    # slow tool and stop the parent turn before the reports arrive.
+    background_wait: bool = False
 
     # Module-level cache: schemas are identical for every call, so build
     # once per tool name instead of re-serializing on every turn.

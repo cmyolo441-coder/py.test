@@ -953,6 +953,18 @@ class ParallelSubagents:
             f"(●{counts['running']} ○{counts['queued']} ✓{counts['done']})"
         )
 
+    def active_count(self) -> int:
+        """Number of queued/running/cancelling workers right now.
+
+        Used by the parent turn's adaptive cap: a TaskCollect/TaskOutput
+        wait while this is non-zero is a scheduler yield, not tool work.
+        """
+        with self._lock:
+            return sum(
+                worker.state in ACTIVE_STATES
+                for worker in self._workers.values()
+            )
+
     def collect(
         self,
         batch_id: str = "",
