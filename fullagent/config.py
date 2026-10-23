@@ -70,24 +70,26 @@ SESSIONS_DIR = APP_DIR / "sessions"
 EVENT_LOG_FILE = APP_DIR / "eventlog.jsonl"
 
 DEFAULT_TIMEOUT = 300.0
-MAX_TOOL_ITERATIONS = 200
+MAX_TOOL_ITERATIONS = 1000
 # PERF: hard cap on executed tool calls per turn — 200 iterations of LLM
-# round-trips at ~2.5s each was the 500s+ hang. 25 calls is plenty for a
-# single turn; the model can say "continue".
-MAX_TOOL_CALLS_PER_TURN = 25
-# PERF (worker 8/20): adaptive turn cap — a fixed 25 is dumb. Fast calls
-# (<5s rolling avg) may run up to ADAPTIVE_CAP_FAST; slow calls (>15s
-# rolling avg) are reined in to ADAPTIVE_CAP_SLOW calls / a smaller time
-# budget. Whichever of the call cap or the time budget hits first stops
-# the turn; the stop message says which one and invites "continue".
+# LONG-RUN MODE (v4): caps raised to marathon scale — a long autonomous
+# work session must never hit an artificial mid-task stop. Users who want
+# tighter caps can still override via config.json extra keys
+# "tool_call_cap" / "turn_time_budget" (read by agent.AdaptiveTurnCap).
+MAX_TOOL_CALLS_PER_TURN = 200
+# PERF (worker 8/20): adaptive turn cap — fast calls (<5s rolling avg)
+# may run up to ADAPTIVE_CAP_FAST; slow calls (>15s rolling avg) are
+# reined in to ADAPTIVE_CAP_SLOW calls / a smaller time budget. Whichever
+# of the call cap or the time budget hits first stops the turn; the stop
+# message says which one and invites "continue".
 # See fullagent/adaptivecap.py (AdaptiveTurnCap).
-ADAPTIVE_CAP_FAST = 40
-ADAPTIVE_CAP_SLOW = 12
+ADAPTIVE_CAP_FAST = 400
+ADAPTIVE_CAP_SLOW = 120
 FAST_CALL_AVG_THRESHOLD_S = 5.0
 SLOW_CALL_AVG_THRESHOLD_S = 15.0
 # Time budget for tool-call wall time per turn (ev.duration summed).
-TURN_TIME_BUDGET_S = 180.0
-TURN_TIME_BUDGET_SLOW_S = 120.0
+TURN_TIME_BUDGET_S = 3600.0
+TURN_TIME_BUDGET_SLOW_S = 1800.0
 # PERF: stop early when the same tool call returns an identical result
 # this many times in a row (no-progress loop).
 NO_PROGRESS_STALL_LIMIT = 3

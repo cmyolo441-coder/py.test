@@ -185,7 +185,17 @@ if __name__ == "__main__":
             failures.append(label)
 
     def drive(durations, **kw):
-        """Feed durations through a fresh cap; return (stop_at, message)."""
+        """Feed durations through a fresh cap; return (stop_at, message).
+
+        Scenarios run against the CLASSIC small caps (explicit overrides)
+        so the arithmetic stays deterministic no matter what marathon
+        scale the shipped config defaults to.
+        """
+        kw.setdefault("base_cap", 25)
+        kw.setdefault("fast_cap", 40)
+        kw.setdefault("slow_cap", 12)
+        kw.setdefault("budget_s", 180.0)
+        kw.setdefault("slow_budget_s", 120.0)
         cap = AdaptiveTurnCap(**kw)
         msg = None
         for i, d in enumerate(durations, 1):
@@ -194,19 +204,29 @@ if __name__ == "__main__":
                 return i, msg, cap.status()
         return None, None, cap.status()
 
-    FAST = config.ADAPTIVE_CAP_FAST          # 40
-    SLOW = config.ADAPTIVE_CAP_SLOW          # 12
-    BASE = config.MAX_TOOL_CALLS_PER_TURN    # 25
-    BUDGET = config.TURN_TIME_BUDGET_S       # 180
-    SLOW_BUDGET = config.TURN_TIME_BUDGET_SLOW_S  # 120
+    # 0. shipped defaults are marathon-scale (long-run mode): a long
+    # autonomous session must not hit an artificial mid-task stop.
+    check("default config is marathon-scale",
+          config.MAX_TOOL_CALLS_PER_TURN >= 200
+          and config.ADAPTIVE_CAP_FAST >= 400
+          and config.ADAPTIVE_CAP_SLOW >= 120
+          and config.TURN_TIME_BUDGET_S >= 3600
+          and config.TURN_TIME_BUDGET_SLOW_S >= 1800,
+          f"{config.MAX_TOOL_CALLS_PER_TURN}/{config.TURN_TIME_BUDGET_S}")
+
+    FAST = config.ADAPTIVE_CAP_FAST          # 400
+    SLOW = config.ADAPTIVE_CAP_SLOW          # 120
+    BASE = config.MAX_TOOL_CALLS_PER_TURN    # 200
+    BUDGET = config.TURN_TIME_BUDGET_S       # 3600
+    SLOW_BUDGET = config.TURN_TIME_BUDGET_SLOW_S  # 1800
 
     # 1. fast calls (2s avg): must sail PAST the old dumb 25 and stop at
     # the fast cap of 40 — with a call-count reason, not a budget reason.
     stop_at, msg, st = drive([2.0] * 60)
     check("fast 2s calls do not stop at the old 25",
-          stop_at is not None and stop_at > BASE, f"stopped at {stop_at}")
+          stop_at is not None and stop_at > 25, f"stopped at {stop_at}")
     check("fast 2s calls stop at the fast cap 40",
-          stop_at == FAST, f"stopped at {stop_at}")
+          stop_at == 40, f"stopped at {stop_at}")
     check("fast stop cites the call cap",
           msg is not None and "call cap of 40 reached" in msg, msg or "")
     check("fast stop invites continue",
@@ -238,7 +258,7 @@ if __name__ == "__main__":
     # punished. Total ~99s < 180s budget, so the count cap binds.
     stop_at, msg, st = drive([60.0] + [1.0] * 60)
     check("mixed slow-then-fast adapts back up to the 40-call fast cap",
-          stop_at == FAST, f"stopped at {stop_at}")
+          stop_at == 40, f"stopped at {stop_at}")
     check("mixed stop cites the call cap",
           msg is not None and "call cap of 40 reached" in msg, msg or "")
 

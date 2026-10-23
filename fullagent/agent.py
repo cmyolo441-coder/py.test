@@ -930,6 +930,22 @@ class Agent:
                   on_tool_args: Callable[[str, str], None] | None = None,
                   ) -> Turn:
         """Run one user turn through the full agent loop."""
+        # LONG-RUN helpers: optional config.json extra overrides for the
+        # adaptive tool-call cap ("tool_call_cap", "turn_time_budget", …).
+        def _int_extra(key: str) -> int | None:
+            try:
+                v = self.cfg.extra.get(key)
+                return int(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        def _float_extra(key: str) -> float | None:
+            try:
+                v = self.cfg.extra.get(key)
+                return float(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+
         # Worker 8/20: deferred session start — registers the full tool
         # set, feature modules, cassette, session.start, env probe.
         self._ensure_session()
@@ -1029,11 +1045,16 @@ class Agent:
         # PERF: adaptive cap on tool calls per turn + no-progress detection.
         # 200 LLM round-trips at ~2.5s each was the 500s+ hang.
         tool_calls_this_turn = 0
-        # Worker 8/20: fixed 25 was dumb — fast calls (<5s rolling avg)
-        # get up to 40, slow calls (>15s) stop at 12 calls / 120s tool
-        # time. _turn_cap makes the stop decision; the plain counter
-        # above stays for the live per-call progress display.
-        _turn_cap = AdaptiveTurnCap()
+        # Worker 8/20: adaptive cap — fast calls get a big budget, slow
+        # calls a smaller one. v4 LONG-RUN: user-tunable via config.json
+        # extra keys "tool_call_cap" / "turn_time_budget" (seconds).
+        _turn_cap = AdaptiveTurnCap(
+            base_cap=_int_extra("tool_call_cap"),
+            fast_cap=_int_extra("tool_call_cap_fast"),
+            slow_cap=_int_extra("tool_call_cap_slow"),
+            budget_s=_float_extra("turn_time_budget"),
+            slow_budget_s=_float_extra("turn_time_budget_slow"),
+        )
         _last_tool_sig = None
         _stall_count = 0
         turn_stopped = False
