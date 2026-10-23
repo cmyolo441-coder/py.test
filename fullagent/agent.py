@@ -701,6 +701,37 @@ class Agent:
         and seals a prompt.dispatch lineage event."""
         self.messages, _ = self.mastermind.gate.dispatch(
             self.cfg.prompt, self.messages, sections=sections)
+        # SOVEREIGN APEX (v5): sentinel per-turn nudge (P2) when the
+        # master prompt is active. Engine is cached; any failure here is
+        # chrome, never a crash path.
+        try:
+            if self.cfg.prompt == "master" and not self.cfg.extra.get(
+                    "apex_off"):
+                eng = self._apex_engine()
+                if eng is not None:
+                    self.messages = eng.turn_messages(
+                        self.messages, turn=len(self.turns))
+        except Exception:
+            pass
+
+    def _apex_engine(self):
+        """Lazily built ApexEngine (v5 enforcement orchestrator) for the
+        current master prompt + model. Rebuilt when the prompt or model
+        changes (the engine detects doc changes itself on rebuild)."""
+        eng = getattr(self, "_apex_cache", None)
+        try:
+            from .mastermind import _MASTER_SOVEREIGN  # noqa: F401
+            doc = self.mastermind.gate.vault.resolve(self.cfg.prompt)
+            model_label = self.cfg.model_id
+            if eng is None or eng.model_label != model_label \
+                    or eng.doc_text != getattr(eng, "_src", doc):
+                from .apex import ApexEngine
+                eng = ApexEngine.build(doc, model_label)
+                eng._src = doc
+                self._apex_cache = eng
+            return eng
+        except Exception:
+            return None
 
     def state(self):
         """Live projection of the event log (cost, goal, dead-ends, …)."""
@@ -1160,10 +1191,28 @@ class Agent:
                              "preview": ev.result[:300]},
                             actor="system", provenance="tool_output",
                             correlation_id=ev.clause_id)
+                        _tool_content = ev.result
+                        # SOVEREIGN SHIELD (v5): untrusted tool output is
+                        # scanned, defanged and fenced before it reaches
+                        # the model — injection attempts arrive as tagged
+                        # data, never as instructions.
+                        try:
+                            from .shield import shield_tool_output
+                            _sh = shield_tool_output(
+                                _tool_content, f"tool:{name}")
+                            _tool_content = _sh["content"]
+                            if _sh["quarantined"]:
+                                self.log.append(
+                                    "shield.quarantined",
+                                    {"tool": name, "risk": _sh["risk"],
+                                     "kinds": _sh["kinds"]},
+                                    actor="shield")
+                        except Exception:
+                            pass
                         self.messages.append({
                             "role": "tool",
                             "tool_call_id": tc["id"],
-                            "content": ev.result,
+                            "content": _tool_content,
                         })
                         # loopdetect hook: the same (tool, args, error) triple
                         # failing repeatedly means the model is stuck retrying
