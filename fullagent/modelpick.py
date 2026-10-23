@@ -169,13 +169,14 @@ def _selftest() -> None:
 
     # 2. exact id, label and fuzzy free-route name
     checks.append(("exact id", (resolve_model(DEFAULT_MODEL_ID) or Model("", "", "")).id == DEFAULT_MODEL_ID))
-    checks.append(("label match", (resolve_model("DeepSeek V4.1 Flash Free") or Model("", "", "")).id == DEFAULT_MODEL_ID))
+    checks.append(("label match", (resolve_model("DeepSeek V4.1 Flash 1017") or Model("", "", "")).id == DEFAULT_MODEL_ID))
     checks.append(("fuzzy 'deepseek'", (resolve_model("deepseek") or Model("", "", "")).id == DEFAULT_MODEL_ID))
     checks.append(("unknown -> None", resolve_model("no-such-model-zzz") is None))
-    # filter finds every configured free route
+    # filter finds every kios free route (gwarden route is not "-free" tagged)
     filt = list_models("free")
+    n_free = sum(1 for m in MODELS if m.id.endswith("-free"))
     checks.append(("substring filter finds free models",
-                   len(filt) == len(MODELS)
+                   len(filt) == n_free
                    and all(m["id"].endswith("-free") for m in filt)))
 
     # 3. format contains columns

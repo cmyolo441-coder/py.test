@@ -105,6 +105,8 @@ MAX_TOKENS = 200_000
 MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     # upstream: deepseek/deepseek-v4.1-flash (1,048,576-token window)
     "deepseek-v4.1-flash-free": 1_048_576,
+    # same flash family, Gwarden route (2026-10 snapshot)
+    "deepseek-v4.1-flash-1017": 1_048_576,
     # upstream: minimax/minimax-m3.1-flash:free (1,000,000-token window)
     "minimax-m3.1-flash-free": 1_000_000,
 }
