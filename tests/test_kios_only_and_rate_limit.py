@@ -4,12 +4,15 @@ from fullagent import client, config
 from fullagent.config import Model, Provider
 
 
-def test_kios_is_the_only_configured_provider():
-    assert list(config.PROVIDERS) == ["kios"]
+def test_configured_providers():
+    assert list(config.PROVIDERS) == ["kios", "gwarden"]
     assert {m.id for m in config.MODELS} == {
-        "deepseek-v4.1-flash-free", "minimax-m3.1-flash-free"}
-    assert all(m.provider == "kios" for m in config.MODELS)
-    assert config.DEFAULT_MODEL_ID == "deepseek-v4.1-flash-free"
+        "deepseek-v4.1-flash-1017", "deepseek-v4.1-flash-free",
+        "minimax-m3.1-flash-free"}
+    assert config.DEFAULT_MODEL_ID == "deepseek-v4.1-flash-1017"
+    gwarden = config.PROVIDERS["gwarden"]
+    assert gwarden.base_url == "https://gwarden.su/v1"
+    assert gwarden.api_key, "gwarden must have embedded zero-config key"
 
 
 def test_kios_ships_embedded_api_key():

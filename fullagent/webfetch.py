@@ -25,6 +25,7 @@ import html
 import ipaddress
 import json
 import os
+import threading
 import re
 import socket
 import time
@@ -215,7 +216,9 @@ def _cache_put(url: str, result: dict, cache_dir: str | None) -> None:
         d = _cache_dir(cache_dir)
         os.makedirs(d, exist_ok=True)
         path = _cache_path(url, cache_dir)
-        tmp = path + ".tmp"
+        # unique tmp name: two threads fetching the same URL must not
+        # interleave writes into one shared tmp file (torn cache entry)
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"fetched_at": time.time(), "url": url,
                        "result": result}, f)

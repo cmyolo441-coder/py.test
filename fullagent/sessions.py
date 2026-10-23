@@ -99,6 +99,8 @@ def save(agent: Any, session_id: Optional[str] = None,
             encoding="utf-8",
         ) as fh:
             json.dump(payload, fh, indent=1)
+            fh.flush()
+            os.fsync(fh.fileno())
             tmp = fh.name
         os.replace(tmp, dest)
         return dest

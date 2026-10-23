@@ -124,8 +124,17 @@ def _run_once(command: Any, shell: bool,
                 f"command not found: {command!r}",
                 "command not found")
     except subprocess.TimeoutExpired as e:
-        out = e.stdout.decode("utf-8", "replace") if e.stdout else ""
-        err = e.stderr.decode("utf-8", "replace") if e.stderr else ""
+        # text=True may leave stdout/stderr as str OR bytes depending on
+        # how far communicate() got before the timeout — handle both.
+        def _as_text(v):
+            if v is None:
+                return ""
+            if isinstance(v, bytes):
+                return v.decode("utf-8", "replace")
+            return str(v)
+
+        out = _as_text(e.stdout)
+        err = _as_text(e.stderr)
         return (-1, out, err + f"\n[attempt timed out after {timeout:g}s]",
                 "timeout")
     except OSError as e:

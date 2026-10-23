@@ -241,10 +241,8 @@ def _kill_group_proc(proc: subprocess.Popen) -> None:
     try:
         proc.wait(timeout=_STOP_GRACE_SECS)
         return
-    except subprocess.TimeoutExpired:
+    except (subprocess.TimeoutExpired, OSError):
         pass
-    except OSError:
-        return
     try:
         os.killpg(pgid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError):

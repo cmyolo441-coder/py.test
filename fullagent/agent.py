@@ -478,9 +478,16 @@ class Agent:
         # every other method) reference them as bare globals, which never
         # consult the module __getattr__.
         _ensure_submodules()
-        value = factory(self)
-        self.__dict__[name] = value
-        return value
+        # Double-checked lazy init: parallel tool threads can race the
+        # factory, building two instances with last-writer-wins caching
+        # (some calls using a discarded subsystem).
+        import threading as _th
+        with _th.Lock():
+            if name in self.__dict__:
+                return self.__dict__[name]
+            value = factory(self)
+            self.__dict__[name] = value
+            return value
 
     def __init__(self, cfg: Config):
         # Only the names __init__ itself needs; everything else stays

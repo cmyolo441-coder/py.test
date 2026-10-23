@@ -301,7 +301,16 @@ def main() -> int:
 
     # SPEED: print an instant banner BEFORE heavy init so the user
     # sees something immediately (<10ms), not after 1-2s of silence.
-    print("◆ FullAgent — starting...", flush=True)
+    # v4 aurora polish: gradient accent with plain fallback.
+    try:
+        from .fx import RAINBOW, gradient_text
+        from rich.console import Console
+        c = Console(force_terminal=True, width=60)
+        c.print("◆ ", style="bold #a55eea", end="")
+        c.print(gradient_text("FullAgent", RAINBOW), end="")
+        c.print(" — starting...", style="dim")
+    except Exception:
+        print("◆ FullAgent — starting...", flush=True)
 
     from . import config
     from .agent import Agent

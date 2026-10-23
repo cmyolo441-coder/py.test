@@ -628,6 +628,16 @@ class EventLog:
             # handle was closed/replaced underneath us — reopen once
             self._fh = None
             self._write_event(ev)
+        except OSError:
+            # ENOSPC/EIO etc. — the buffered handle may now hold a partial
+            # line; discarding it and forcing a fresh handle (whose torn-
+            # tail probe re-emits the newline guard) keeps the log valid.
+            try:
+                self._fh.close()
+            except Exception:
+                pass
+            self._fh = None
+            self._write_event(ev)
 
     def _write_event(self, ev: Event) -> None:
         if self._fh is None:

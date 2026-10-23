@@ -873,7 +873,7 @@ class ParallelSubagents:
             for f in row["files_touched"]:
                 if f not in files_touched:
                     files_touched.append(f)
-            all_diffs.extend(w.diffs)
+            all_diffs.extend(row.get("diffs", []))
         states = {
             s: sum(1 for r in data_rows if r["state"] == s)
             for s in ("queued", "running", "cancelling", "done", "blocked", "error", "cancelled")
@@ -1544,7 +1544,7 @@ class ParallelSubagents:
                 )
             except TurnCancelled:
                 raise
-            except BaseException as exc:
+            except Exception as exc:
                 if worker.stop_event.is_set():
                     raise TurnCancelled() from exc
                 if attempts >= worker.max_retries:

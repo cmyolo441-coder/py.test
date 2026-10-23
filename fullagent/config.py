@@ -197,6 +197,7 @@ def _provider_api_key(provider: str) -> str:
 # ~/.fullagent/<provider>_api_key file.
 _EMBEDDED_KEYS: dict[str, str] = {
     "kios": "sk-cFXQ576lsIctpudkYD5lPniF5UgHGLy1nKeXDscCEvK1LMZV",
+    "gwarden": "GWAR-OM8VK0HO-94OFH0DIE3T-U1B3V-WPPPNO-MF8VSR0U",
 }
 
 
@@ -208,6 +209,13 @@ PROVIDERS: dict[str, Provider] = {
         api_key=_provider_api_key("kios"),
         color="#8be9fd",
     ),
+    "gwarden": Provider(
+        key="gwarden",
+        name="Gwarden API",
+        base_url="https://gwarden.su/v1",
+        api_key=_provider_api_key("gwarden"),
+        color="#bd93f9",
+    ),
 }
 
 MODELS: list[Model] = [
@@ -216,6 +224,9 @@ MODELS: list[Model] = [
     # immediately instead of after a long hidden chain-of-thought.
     # MiniMax rejects that parameter ("Reasoning is mandatory for this
     # endpoint"), so it keeps the provider default.
+    Model("deepseek-v4.1-flash-1017", "gwarden", "DeepSeek V4.1 Flash 1017",
+          tag="gwarden", supports_tools=True, supports_reasoning=True,
+          context_window=model_context_window("deepseek-v4.1-flash-1017")),
     Model("deepseek-v4.1-flash-free", "kios", "DeepSeek V4.1 Flash Free",
           tag="free", supports_tools=True, supports_reasoning=True,
           context_window=model_context_window("deepseek-v4.1-flash-free")),
@@ -225,7 +236,7 @@ MODELS: list[Model] = [
 ]
 # Fastest Kios free route measured 2026-10-21 (~1s first token vs ~3s for
 # MiniMax and ~40s for qwen3.8-flash-free): default to it.
-DEFAULT_MODEL_ID = "deepseek-v4.1-flash-free"
+DEFAULT_MODEL_ID = "deepseek-v4.1-flash-1017"
 
 
 @dataclass(frozen=True)
@@ -343,9 +354,16 @@ class Config:
             }
             data.update(self.extra)
             # atomic write: a crash mid-write must never leave truncated
-            # JSON that would reset the whole config on next load
-            tmp = CONFIG_FILE.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(data, indent=2))
+            # JSON that would reset the whole config on next load.
+            # Unique tmp name + fsync: two threads/processes saving at
+            # once must not rename each other's torn tmp file.
+            import threading as _th
+            tmp = CONFIG_FILE.with_name(
+                f".{os.getpid()}.{_th.get_ident()}.json.tmp")
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(data, indent=2))
+                fh.flush()
+                os.fsync(fh.fileno())
             os.replace(tmp, CONFIG_FILE)
         except OSError:
             pass  # config persistence is a convenience, never a crash path

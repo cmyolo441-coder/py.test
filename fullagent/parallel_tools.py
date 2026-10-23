@@ -109,8 +109,14 @@ def _run_batch(
             # Esc/Ctrl+C during a parallel read batch must abort the turn.
             # Swallowing it left ev.status "running" and the turn continuing.
             raise
-        except Exception:
-            pass
+        except Exception as exc:
+            # Never leave a phantom "running" event behind: seal it as an
+            # error so the transcript/log stay consistent (worker 3 fix).
+            try:
+                ev.status = "error"
+                ev.result = f"ERROR: {type(exc).__name__}: {exc}"
+            except Exception:
+                pass
         finally:
             durations[idx] = time.perf_counter() - t0
 

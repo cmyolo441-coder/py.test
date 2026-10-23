@@ -221,8 +221,16 @@ def welcome(
 
     logo = Text()
     for i, line in enumerate(LOGO):
-        key = LOGO_STYLES[i % len(LOGO_STYLES)]
-        logo.append(line + "\n", style=f"bold {colors.get(key, '')}")
+        # v4 aurora polish: horizontal rainbow gradient across the logo
+        # rows (falls back to the flat style key if fx is unavailable).
+        try:
+            from .fx import RAINBOW
+            grad = RAINBOW[i % len(RAINBOW)]
+            logo.append(line + "\n",
+                        style=f"bold {grad}")
+        except Exception:
+            key = LOGO_STYLES[i % len(LOGO_STYLES)]
+            logo.append(line + "\n", style=f"bold {colors.get(key, '')}")
 
     identity = Text()
     identity.append(f"  {app_name} CLI ", style=f"bold {colors.get('fg', '')}")

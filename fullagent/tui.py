@@ -201,6 +201,7 @@ from rich.text import Text
 
 from . import config
 from . import cliui
+from . import fx
 from .agent import Agent, ToolEvent
 from .config import (
     APP_NAME,
@@ -1027,7 +1028,8 @@ class UI:
             bar_len = (_disp_width(f" {frame} ") + _disp_width(status)
                        + _disp_width(tail))
             return [("class:box", "╰"),
-                    ("class:box.spinner", f" {frame} "),
+                    (f"bold {fx.spinner_color(self._spinner_i)}",
+                     f" {frame} "),
                     ("class:box.status", status),
                     ("class:box.hint", tail),
                     ("class:box",
@@ -4291,7 +4293,7 @@ class UI:
                 lno = f"{dl.line_no:>4} " if dl.line_no else f"{live_f['added']:>4} "
                 t.append(lno, style=C["dim"])
                 t.append("+  ", style=f"bold {C['green']}")
-                t.append(dl.text, style=C["fg"])
+                t.append(dl.text, style=f"{C['green']} on #0f2a1d")
             else:
                 t.append(f"     {dl.text}", style=C["dim"])
             live_f["batch"].append(t)
@@ -4477,6 +4479,17 @@ class UI:
             self._stop_spinner()
             self._set_status("")
             self._invalidate()
+            # v4 aurora polish: one-shot shimmer flash when a turn lands
+            # cleanly (TTY only — piped/headless runs never see \r churn).
+            if turn is not None and not turn.error \
+                    and getattr(self.console, "is_terminal", False) \
+                    and sys.stdout.isatty():
+                try:
+                    from .fx import shimmer_flash
+                    shimmer_flash(self.console, "✦ done",
+                                  steps=6, delay=0.03)
+                except Exception:
+                    pass
 
         if turn is not None:
             if render_md and turn.assistant_text.strip() and not turn.error:
@@ -4798,12 +4811,19 @@ class UI:
         # any failure falls back to the compact logo (chrome must never take
         # the session down).
         try:
-            self.console.print(cliui.welcome(
+            card = cliui.welcome(
                 width=width, version=__version__, model_label=model.label,
                 effort_label=effort.label.lower(),
                 signed_in=self._signed_in_label(),
                 session=self.agent.session_id, cwd=self._cwd_label(),
-                colors=C, app_name=APP_NAME))
+                colors=C, app_name=APP_NAME)
+            # v4 aurora polish: line-by-line boot reveal of the welcome
+            # card; any failure above or below falls back to a plain print.
+            try:
+                from .fx import boot_reveal
+                boot_reveal(self.console, lambda: card)
+            except Exception:
+                self.console.print(card)
         except Exception:
             logo = Text()
             logo.append("◆ ", style=f"bold {C['accent']}")

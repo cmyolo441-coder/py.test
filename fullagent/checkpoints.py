@@ -68,8 +68,11 @@ RISK_SAFE = "safe"
 
 
 def _checkpoints_dir(session_id: str) -> Path:
-    base = Path(os.path.expandvars(os.environ["FULLAGENT_HOME"])).expanduser().resolve() if os.environ.get("FULLAGENT_HOME") else (Path.home() / ".fullagent").resolve()
-    d = base / "checkpoints" / str(session_id)
+    # Use config.APP_DIR (which already handles read-only-home tmp
+    # fallback) instead of re-deriving ~/.fullagent — a divergent base
+    # could raise here and crash startup via register().
+    from .config import APP_DIR
+    d = APP_DIR / "checkpoints" / str(session_id)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
