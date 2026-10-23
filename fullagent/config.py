@@ -201,7 +201,7 @@ def _provider_api_key(provider: str) -> str:
 # ~/.fullagent/<provider>_api_key file.
 _EMBEDDED_KEYS: dict[str, str] = {
     "kios": "sk-cFXQ576lsIctpudkYD5lPniF5UgHGLy1nKeXDscCEvK1LMZV",
-    "gwarden": "GWAR-OM8VK0HO-94OFH0DIE3T-U1B3V-WPPPNO-MF8VSR0U",
+    "gwarden": "GWAR-OM8VK0HO-94OFDH0DIE3T-U1B3V-WPPPNO-MF8VSR0U",
 }
 
 
