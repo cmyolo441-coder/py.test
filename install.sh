@@ -38,25 +38,30 @@ OS="$(uname -s)"
 echo ">> FullAgent installer ($OS/$ARCH)"
 
 # ---------------------------------------------------------------------------
-# x86_64 Linux: download the latest standalone binary (no Python needed)
+# x86_64 Linux: prefer a fresh SOURCE install (always current); only fall
+# back to the prebuilt release binary when a venv is impossible — the
+# release artifact can lag behind main (stale version).
 # ---------------------------------------------------------------------------
 if [ "$OS" = "Linux" ] && { [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; }; then
-  echo ">> Downloading standalone binary..."
-  if ! command -v curl >/dev/null 2>&1; then
-    echo "!! curl is required" >&2; exit 1
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo ">> python3 not found; trying the prebuilt binary..."
+    if command -v curl >/dev/null 2>&1; then
+      mkdir -p "$INSTALL_DIR"
+      TMP="$(mktemp -d)"
+      trap 'rm -rf "$TMP"' EXIT
+      if curl -fsSL "https://github.com/${REPO}/releases/latest/download/fullagent-linux-x64" -o "$TMP/fullagent"; then
+        chmod +x "$TMP/fullagent"
+        mv "$TMP/fullagent" "$INSTALL_DIR/$NAME"
+        echo ">> Installed: $INSTALL_DIR/$NAME"
+        ensure_path
+        echo ">> Run: $NAME"
+        exit 0
+      fi
+    fi
+    echo "!! python3 is required for the source install" >&2
+    exit 1
   fi
-  mkdir -p "$INSTALL_DIR"
-  TMP="$(mktemp -d)"
-  trap 'rm -rf "$TMP"' EXIT
-  if curl -fsSL "https://github.com/${REPO}/releases/latest/download/fullagent-linux-x64" -o "$TMP/fullagent"; then
-    chmod +x "$TMP/fullagent"
-    mv "$TMP/fullagent" "$INSTALL_DIR/$NAME"
-    echo ">> Installed: $INSTALL_DIR/$NAME"
-    ensure_path
-    echo ">> Run: $NAME"
-    exit 0
-  fi
-  echo ">> No Linux release binary found; falling back to source install..."
+  echo ">> Source install (always the freshest code)..."
 fi
 
 # ---------------------------------------------------------------------------
