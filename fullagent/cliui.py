@@ -474,6 +474,16 @@ def agent_board(
         (f"bold {colors.get('accent', '')}", f" ≡ {total} {noun} "),
         (colors.get("green", ""), "(" + " · ".join(parts) + ") "),
     ]
+    # v4 aurora polish: tint the swarm header with the fx rainbow so a
+    # running board reads as alive (falls back silently to the flat accent).
+    try:
+        from .fx import RAINBOW
+        head = [
+            ("bold " + RAINBOW[0], f" ≡ {total} {noun} "),
+            ("bold " + RAINBOW[3], "(" + " · ".join(parts) + ") "),
+        ]
+    except Exception:
+        pass
     tail: List[Fragment] = [(colors.get("dim", ""), " ↓ to manage ")]
     rows: List[List[Fragment]] = [align(head, tail, width, fill="─")]
 
@@ -502,6 +512,22 @@ def agent_board(
             (colors.get("dim", ""), " · "),
             (colors.get("fg", ""), truncate(action, room)),
         ])
+        # v4: live telemetry tail per worker — elapsed seconds and retry
+        # count, so a long swarm shows what each agent is up against.
+        try:
+            elapsed_s = int((float(row.get("elapsed_ms") or 0)) / 1000)
+            retries = int(row.get("retries") or 0)
+            bits = []
+            if elapsed_s >= 3:
+                bits.append(f"{elapsed_s}s")
+            if retries:
+                bits.append(f"retry {retries}")
+            if bits:
+                rows[-1] = rows[-1] + [
+                    (colors.get("dim", ""), "  " + " · ".join(bits)),
+                ]
+        except Exception:
+            pass
 
     hidden = total - min(total, max(1, int(limit)))
     if hidden > 0:

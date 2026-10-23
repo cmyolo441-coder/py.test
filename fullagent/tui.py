@@ -5276,13 +5276,27 @@ class UI:
         return t
 
     def print_reasoning(self, text: str) -> None:
-        preview = " ".join(text.strip().split())
-        if len(preview) > 300:
-            preview = preview[:297] + "…"
-        t = Text()
-        t.append("  💭 ", style=C["pink"])
-        t.append(preview, style=f"italic {C['dim']}")
-        self.console.print(t)
+        """REAL CHAIN OF THOUGHT: the model's actual thinking, streamed in
+        by client.py's on_reasoning, rendered at turn end as a bordered
+        🧠 panel (gradient header, italic dim body). Long thoughts are
+        tail-truncated to keep scrollback sane; the raw text stays in the
+        turn object for /export and the replay theater."""
+        body = text.strip()
+        if not body:
+            return
+        lines = body.splitlines()
+        MAX_LINES = 14
+        if len(lines) > MAX_LINES:
+            lines = (["  … (earlier thoughts trimmed — full chain kept in "
+                      f"the turn log)"]
+                     + lines[-MAX_LINES:])
+        body_text = Text("\n".join("  " + l for l in lines),
+                         style=f"italic {C['dim']}")
+        title = Text(" 🧠 chain of thought", style=f"bold {C['pink']}")
+        self.console.print(Panel(body_text, border_style=C["pink"],
+                                 expand=False,
+                                 width=min(self._width() - 2, 84),
+                                 padding=(0, 1)))
 
     def print_error(self, text: str) -> None:
         self.console.print(Panel(Text(text, style=C["red"]),

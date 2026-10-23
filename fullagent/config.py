@@ -253,16 +253,19 @@ class Effort:
 
 
 EFFORTS: list[Effort] = [
+    # REAL THINKING: medium+ efforts request a real chain-of-thought from
+    # the model (reasoning_effort -> payload.reasoning_effort in
+    # client.build_payload). Low stays instant/no-thinking.
     Effort("low", "LOW", "#6272a4", MAX_TOKENS, 0.2, None,
            "short answers, minimal tokens"),
-    Effort("medium", "MEDIUM", "#8be9fd", MAX_TOKENS, 0.4, None,
-           "balanced length and speed"),
-    Effort("high", "HIGH", "#50fa7b", MAX_TOKENS, 0.6, None,
-           "thorough, detailed answers"),
-    Effort("extrahigh", "EXTRA HIGH", "#ffb86c", MAX_TOKENS, 0.7, None,
-           "deep work, long outputs"),
-    Effort("ultrahigh", "ULTRA HIGH", "#ff5555", MAX_TOKENS, 0.8, None,
-           "maximum depth, exhaustive work"),
+    Effort("medium", "MEDIUM", "#8be9fd", MAX_TOKENS, 0.4, "low",
+           "balanced length, light thinking"),
+    Effort("high", "HIGH", "#50fa7b", MAX_TOKENS, 0.6, "medium",
+           "thorough, real chain-of-thought"),
+    Effort("extrahigh", "EXTRA HIGH", "#ffb86c", MAX_TOKENS, 0.7, "high",
+           "deep work, strong thinking"),
+    Effort("ultrahigh", "ULTRA HIGH", "#ff5555", MAX_TOKENS, 0.8, "high",
+           "maximum depth, strongest thinking"),
 ]
 
 DEFAULT_EFFORT = "high"

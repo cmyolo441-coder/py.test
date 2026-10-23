@@ -964,9 +964,13 @@ def build_payload(model: Model, effort: Effort, messages: list[dict],
     if tools and model.supports_tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
-    # Thinking remains disabled; Union Alpha does not advertise reasoning.
+    # REAL THINKING: request actual chain-of-thought from the model when
+    # the selected effort asks for it (reasoning_effort is set on medium+
+    # efforts). "none" stays the default so cheap/fast efforts never pay
+    # the hidden-CoT latency. The streamed reasoning reaches the TUI via
+    # client.py's on_reasoning callback (reasoning_content field).
     if model.supports_reasoning:
-        payload["reasoning_effort"] = "none"
+        payload["reasoning_effort"] = effort.reasoning_effort or "none"
     return payload
 
 
