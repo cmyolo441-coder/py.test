@@ -7,8 +7,8 @@ from fullagent.config import Model, Provider
 def test_configured_providers():
     assert list(config.PROVIDERS) == ["kios", "gwarden"]
     assert {m.id for m in config.MODELS} == {
-        "deepseek-v4.1-flash-1017", "deepseek-v4.1-flash-free",
-        "minimax-m3.1-flash-free"}
+        "deepseek-v4.1-flash-1017", "gemini-4-argon",
+        "deepseek-v4.1-flash-free", "minimax-m3.1-flash-free"}
     assert config.DEFAULT_MODEL_ID == "deepseek-v4.1-flash-1017"
     gwarden = config.PROVIDERS["gwarden"]
     assert gwarden.base_url == "https://gwarden.su/v1"

@@ -9,7 +9,7 @@
 ╚═╝      ╚═════╝ ╚═════╝╚════╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝  ╚═╝
 ```
 
-<h1>FullAgent <sup><code>v3.3.2</code></sup></h1>
+<h1>FullAgent <sup><code>v4.0.0</code></sup></h1>
 
 **Advanced Terminal AI Agent — Pure Python, Real Code, World-Class TUI**
 
@@ -48,7 +48,7 @@
  ██╔══╝  ██╔══██║                   │ 3. Ask coding questions, edit code… │
  ██║     ██║  ██║                   │ 4. Be specific for the best results │
  ╚═╝     ╚═╝  ╚═╝                   ╰─────────────────────────────────────╯
-  FullAgent CLI v3.3.2
+  FullAgent CLI v4.0.0
 ```
 
 While a swarm is running the frame shows the Qoder-style board and footer:
@@ -116,7 +116,7 @@ without artificial animation delays.
  ██╔══╝  ██╔══██║                   │ 3. Ask coding questions, edit code, run… │
  ██║     ██║  ██║                   │ 4. Be specific for the best results      │
  ╚═╝     ╚═╝  ╚═╝                   ╰──────────────────────────────────────────╯
-  FullAgent CLI v3.3.2
+  FullAgent CLI v4.0.0
   API key · built-in (Kios API)
   DeepSeek V4.1 Flash Free  ·  high
   ~/Desktop  ·  session a1b2c3d4

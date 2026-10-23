@@ -107,6 +107,8 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "deepseek-v4.1-flash-free": 1_048_576,
     # same flash family, Gwarden route (2026-10 snapshot)
     "deepseek-v4.1-flash-1017": 1_048_576,
+    # upstream: google/gemini-4-argon (1,000,000-token window)
+    "gemini-4-argon": 1_000_000,
     # upstream: minimax/minimax-m3.1-flash:free (1,000,000-token window)
     "minimax-m3.1-flash-free": 1_000_000,
 }
@@ -229,6 +231,9 @@ MODELS: list[Model] = [
     Model("deepseek-v4.1-flash-1017", "gwarden", "DeepSeek V4.1 Flash 1017",
           tag="gwarden", supports_tools=True, supports_reasoning=True,
           context_window=model_context_window("deepseek-v4.1-flash-1017")),
+    Model("gemini-4-argon", "gwarden", "Gemini 4 Argon",
+          tag="gwarden", supports_tools=True, supports_reasoning=True,
+          context_window=model_context_window("gemini-4-argon")),
     Model("deepseek-v4.1-flash-free", "kios", "DeepSeek V4.1 Flash Free",
           tag="free", supports_tools=True, supports_reasoning=True,
           context_window=model_context_window("deepseek-v4.1-flash-free")),
