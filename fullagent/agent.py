@@ -749,6 +749,21 @@ class Agent:
         if self._const_cache:
             sections["constitution"] = self._const_cache
 
+        # SOVEREIGN ENFORCEMENT (enforce.py): per-turn directive anchor —
+        # the freshest-attention reminder that the contract + rule ledger
+        # are binding for THIS reply. ~200 chars, never a section if the
+        # prompt isn't sovereign-sealed (main prompt stays untouched).
+        try:
+            from .mastermind import _MASTER_SOVEREIGN as _sov
+        except Exception:
+            _sov = False
+        if _sov:
+            try:
+                from .enforce import anchor as _anchor
+                sections.setdefault("anchor", _anchor())
+            except Exception:
+                pass
+
         # project instructions — real AGENTS.md files (global → cwd).
         # instructions.py caches by mtime/size, so a multi-call turn does
         # not re-read disk pages it already has; a live edit is still seen
@@ -1416,7 +1431,54 @@ class Agent:
         # only live UI state — the event log is the durable record
         if len(self.turns) > 500:
             del self.turns[:-500]
+        # SOVEREIGN ENFORCEMENT L4 (enforce.py, opt-in): compliance gate.
+        # cfg.extra["compliance_check"]=true -> a fast self-audit checks
+        # the reply against the directive RULE LEDGER; on FAIL a
+        # corrective system note enters history so the NEXT turn repairs
+        # the drift (and the verdict is sealed in the event log).
+        try:
+            if self.cfg.extra.get("compliance_check") and turn.assistant_text:
+                self._compliance_gate(turn)
+        except Exception:
+            pass
         return turn
+
+    def _compliance_gate(self, turn) -> None:
+        """Run the enforce.audit self-check and react to a FAIL verdict."""
+        from .client import APIError, chat_blocking
+        from .enforce import audit_prompt
+        from .systemprompt import get as _get_prompt
+
+        _resolve_lazy("model_by_id", "effort_by_key")
+        from .config import effort_by_key, model_by_id  # noqa: F811
+
+        verdict = (chat_blocking(
+            model_by_id(self.cfg.model_id),
+            effort_by_key(self.cfg.effort),
+            [{"role": "system", "content":
+                _get_prompt(self.cfg.prompt)[:4000]},
+             {"role": "user", "content": audit_prompt(
+                 _get_prompt(self.cfg.prompt), turn.assistant_text)}],
+            None, stream=False) or "").strip().upper()
+        failed = verdict.startswith("FAIL")
+        self.log.append("compliance.audit",
+                        {"verdict": "FAIL" if failed else "PASS",
+                         "seq": getattr(turn, "seq", None)},
+                        actor="enforce")
+        if failed:
+            fix = ""
+            for line in verdict.splitlines():
+                if line.upper().startswith("FIX:"):
+                    fix = line[4:].strip()[:400]
+                    break
+            self.messages.append({
+                "role": "system",
+                "content": ("COMPLIANCE GATE: your previous reply "
+                            f"violated the SOVEREIGN DIRECTIVES"
+                            f"{' — ' + fix if fix else ''}. Repair this "
+                            "in your next reply; the contract remains "
+                            "binding.")})
+        turn.compliance = "FAIL" if failed else "PASS"
 
     def _fit_budget(self) -> int:
         """The input token budget we aim to stay under.
