@@ -57,6 +57,10 @@ INCOMPLETE_STATUSES = frozenset({
     STATUS_IN_PROGRESS, STATUS_INTERRUPTED})
 
 _MSG_CONTENT_CAP = 4000   # per-message content cap in the snapshot
+# SOVEREIGN ENFORCEMENT: the sealed system prompt (49k+ master document)
+# must never be clipped in the canonical snapshot — a 4k fragment would
+# corrupt every subsequent wire build.
+_SYSTEM_CONTENT_CAP = 300_000
 _MAX_MESSAGES = 200       # keep system prompt (idx 0) + tail
 _RESULT_CAP = 2000        # per tool-call result cap
 _ARGS_CAP = 4000          # per tool-call args JSON cap
@@ -159,9 +163,12 @@ def _snapshot_messages(messages: list) -> list:
         [messages[0]] + messages[-(_MAX_MESSAGES - 1):])
     for m in kept:
         try:
+            _is_system = m.get("role") == "system"
             snap.append({
                 "role": m.get("role", "?"),
-                "content": _clip(m.get("content", ""), _MSG_CONTENT_CAP),
+                "content": _clip(
+                    m.get("content", ""),
+                    _SYSTEM_CONTENT_CAP if _is_system else _MSG_CONTENT_CAP),
                 "tool_calls": m.get("tool_calls", []),
                 "tool_call_id": m.get("tool_call_id"),
             })

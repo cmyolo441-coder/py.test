@@ -93,8 +93,13 @@ class PromptVault:
                 from .enforce import is_sovereign, protocol_wrap
                 if not is_sovereign(text):
                     text = protocol_wrap(text)
-            except Exception:
-                pass
+            except Exception as exc:  # never crash the vault on wrap
+                try:
+                    self.log.append("prompt.wrap_failed",
+                                    {"name": name, "error": repr(exc)},
+                                    actor="kernel")
+                except Exception:
+                    pass
         self._sealed[name] = text
         self.log.append("prompt.sealed",
                         {"name": name, "fingerprint": fingerprint(text),
@@ -160,7 +165,10 @@ class PromptVault:
                 systemprompt.PROMPTS.setdefault(name, text)
             self._source_sig = self._source_signature()
             for name, old_text in list(self._sealed.items()):
-                new_text = systemprompt.PROMPTS.get(name)
+                # compare against the WRAPPED upstream (not the raw text):
+                # for master, raw-vs-sealed always differs, which would
+                # re-seal (and spam the event log) on every reload
+                new_text = self._upstream_text(name)
                 if new_text is not None and new_text != old_text:
                     self._seal(name, new_text)
             self.log.append("prompt.source_reloaded",
@@ -314,8 +322,11 @@ class CoherenceComposer:
         # Layer 2: The sealed prompt (constitution)
         parts.append(sealed_prompt)
         
-        # Layer 3: Context sections
+    # Layer 3: Context sections — sanitized against injection channels
+    # (fake role tags, bidi smuggling) and, for long prompts, separated by
+    # re-anchor seams so mid-document sections stay contract-bound.
         seen: set[str] = set()
+        reanchor_i = 0
         for key in _SECTION_ORDER:
             body = (sections.get(key) or "").strip()
             if not body:
@@ -324,23 +335,39 @@ class CoherenceComposer:
             if digest in seen:
                 continue
             seen.add(digest)
+            body, _flags = adherence.sanitize_section(body)
+            if is_long:
+                reanchor_i += 1
+                parts.append(adherence.reanchor(sealed_prompt, reanchor_i))
             parts.append(f"\n\n{_SECTION_FRAMES[key]}\n{body}")
         
         result = "".join(parts)
         
-        # Layer 4: Critical recap + reinforcement (for long prompts)
+        # Layer 4: Critical recap + reinforcement (for long prompts).
+        # The seal now attests the whole document: SECTION-MANIFEST binds
+        # each composed section's digest into the footer, so any post-hoc
+        # edit of a section breaks the seal detectably.
         if is_long:
-            result += self._REINFORCEMENT(sealed_prompt)
+            manifest = adherence.section_digests(sections)
+            result += self._REINFORCEMENT(sealed_prompt, manifest)
         
         return result
     
-    def tail_for(self, sealed_prompt: str) -> str:
+    def tail_for(self, sealed_prompt: str,
+                 sections: dict[str, str] | None = None) -> str:
         """The suffix a composed document ends with for THIS prompt: the
         reinforcement when the sandwich wraps it (long prompts), else
         "" — the document then ends with the last context section."""
         if len(sealed_prompt) > self._REINFORCE_THRESHOLD:
-            return self._REINFORCEMENT(sealed_prompt)
+            manifest = adherence.section_digests(sections or {})
+            return self._REINFORCEMENT(sealed_prompt, manifest)
         return ""
+
+    @staticmethod
+    def intact_suffix(sealed_prompt: str, content: str) -> bool:
+        """True if the composed document closes with the exact seal for
+        this prompt — full-sandwich integrity, front and back."""
+        return adherence.intact_suffix(sealed_prompt, content)
 
     @staticmethod
     def intact_prefix(sealed_prompt: str, content: str) -> bool:
@@ -601,8 +628,8 @@ if __name__ == "__main__":
             # Every registered prompt is available through the vault.
             assert mm.vault.resolve("main") == systemprompt.main()
             # SOVEREIGN ENFORCEMENT: the master prompt is served contract-wrapped
-            assert "SOVEREIGN DIRECTIVE CONTRACT" in mm.vault.resolve("master")
-            assert "SOVEREIGN DIRECTIVE CONTRACT" in mm.vault.get("master")
+            assert "[CONFIG_LAYER: developer_policy" in mm.vault.resolve("master")
+            assert "[CONFIG_LAYER: developer_policy" in mm.vault.get("master")
 
             assert mm.vault.verify("main", systemprompt.main())
             assert mm.vault.verify("main", systemprompt.main()

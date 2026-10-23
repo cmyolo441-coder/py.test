@@ -315,6 +315,13 @@ def do_compact(agent) -> dict:
         agent.messages = report["new_messages"]
     except Exception:
         pass
+    # SOVEREIGN ENFORCEMENT: the rewrite can drop or displace messages[0];
+    # re-seat the sealed prompt immediately so canonical history never
+    # lives without its constitution (fixes a /compact prompt-drop hole).
+    try:
+        agent._reseat_system_prompt()
+    except Exception:
+        pass
     return stats
 
 

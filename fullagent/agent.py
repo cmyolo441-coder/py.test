@@ -760,7 +760,9 @@ class Agent:
         if _sov:
             try:
                 from .enforce import anchor as _anchor
-                sections.setdefault("anchor", _anchor())
+                # rotating paraphrase: deterministic per turn (stable under
+                # retries) so the anchor never becomes invisible boilerplate
+                sections.setdefault("anchor", _anchor(len(self.turns)))
             except Exception:
                 pass
 
@@ -1445,40 +1447,46 @@ class Agent:
 
     def _compliance_gate(self, turn) -> None:
         """Run the enforce.audit self-check and react to a FAIL verdict."""
-        from .client import APIError, chat_blocking
-        from .enforce import audit_prompt
+        from .client import chat_blocking, parse_audit
+        from .enforce import anchor, audit_prompt, rule_ledger
         from .systemprompt import get as _get_prompt
 
         _resolve_lazy("model_by_id", "effort_by_key")
         from .config import effort_by_key, model_by_id  # noqa: F811
 
-        verdict = (chat_blocking(
+        doc = _get_prompt(self.cfg.prompt)
+        # audit against the RULE LEDGER (not a truncated prompt — v1 cut
+        # the 49k doc and its ledger off entirely, judging the wrong law)
+        audit_system = anchor(0) + "\n\n" + rule_ledger(doc)[:1500]
+        raw = chat_blocking(
             model_by_id(self.cfg.model_id),
             effort_by_key(self.cfg.effort),
-            [{"role": "system", "content":
-                _get_prompt(self.cfg.prompt)[:4000]},
+            [{"role": "system", "content": audit_system},
              {"role": "user", "content": audit_prompt(
-                 _get_prompt(self.cfg.prompt), turn.assistant_text)}],
-            None, stream=False) or "").strip().upper()
-        failed = verdict.startswith("FAIL")
+                 rule_ledger(doc), turn.assistant_text, is_ledger=True)}],
+            None, stream=False) or ""
+        result = parse_audit(raw)
+        failed = result["verdict"] == "FAIL"
         self.log.append("compliance.audit",
-                        {"verdict": "FAIL" if failed else "PASS",
+                        {"verdict": result["verdict"],
+                         "violations": len(result["violations"]),
                          "seq": getattr(turn, "seq", None)},
                         actor="enforce")
         if failed:
-            fix = ""
-            for line in verdict.splitlines():
-                if line.upper().startswith("FIX:"):
-                    fix = line[4:].strip()[:400]
-                    break
+            fixes = "; ".join(
+                str(v.get("fix", ""))[:160]
+                for v in result["violations"] if v.get("fix"))[:400]
+            # feedback rides as a USER message: seal_wire deletes every
+            # mid-history system message, so a system-role note would be
+            # silently dropped and never reach the model
             self.messages.append({
-                "role": "system",
-                "content": ("COMPLIANCE GATE: your previous reply "
-                            f"violated the SOVEREIGN DIRECTIVES"
-                            f"{' — ' + fix if fix else ''}. Repair this "
-                            "in your next reply; the contract remains "
-                            "binding.")})
-        turn.compliance = "FAIL" if failed else "PASS"
+                "role": "user",
+                "content": ("[compliance-gate] Your previous reply "
+                            "violated the developer configuration"
+                            f"{' — ' + fixes if fixes else ''}. Repair "
+                            "this in your next reply; the configuration "
+                            "remains binding.")})
+        turn.compliance = result["verdict"]
 
     def _fit_budget(self) -> int:
         """The input token budget we aim to stay under.

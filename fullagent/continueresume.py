@@ -241,6 +241,14 @@ def seed_continue_history(agent: Any, user_text: str) -> bool:
     })
     agent.messages = new_messages
 
+    # SOVEREIGN ENFORCEMENT: if index 0 wasn't a system message, `kept`
+    # was empty and the history now has NO prompt at all — re-seat it.
+    try:
+        if not agent.messages or agent.messages[0].get("role") != "system":
+            agent._reseat_system_prompt()
+    except Exception:
+        pass
+
     log = getattr(agent, "log", None)
     if log is not None and hasattr(log, "append"):
         try:
