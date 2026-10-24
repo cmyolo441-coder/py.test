@@ -246,7 +246,9 @@ def split_sentences(text: str) -> list[str]:
     protected = _RE_INITIAL.sub(lambda m: m.group(0).replace(".", "\x00"), protected)
     # single-pass abbreviation guard on common titles
     for abbr in ("Mr", "Mrs", "Ms", "Dr", "Prof", "Sr", "Jr", "St", "Mt",
-                 "vs", "etc", "Inc", "Ltd", "Co", "Corp", "No", "Vol", "al"):
+                 "vs", "etc", "Inc", "Ltd", "Co", "Corp", "No", "Vol", "al",
+                 "Jan", "Feb", "Mar", "Apr", "Jun", "Jul", "Aug", "Sep",
+                 "Sept", "Oct", "Nov", "Dec"):
         protected = re.sub(r"\b%s\." % abbr, abbr + "\x00", protected,
                            flags=re.I)
     protected = re.sub(r"\be\.g\.", "e\x00g\x00", protected, flags=re.I)
@@ -302,6 +304,24 @@ def split_sections(text: str) -> list[tuple[str, str]]:
               and not stripped.startswith(("-", "*", ">", "|"))
               and len(stripped.split()) <= 8):
             heading = stripped.rstrip(":").strip()
+        elif (":" in stripped and len(stripped) <= 80
+              and not stripped.startswith(("-", "*", ">", "|", "#", "    ", "\t"))):
+            # single-line "Heading: body" — e.g. "Notes: final words"
+            colon_idx = stripped.find(":")
+            before = stripped[:colon_idx].strip()
+            after = stripped[colon_idx + 1:].strip()
+            if (before and after and len(before.split()) <= 4
+                    and before[0].isupper() and len(before) <= 30
+                    and not before.startswith("http")):
+                heading = before
+                # stash the inline body separately so split_sections keeps it under the new heading
+                if cur_lines:
+                    sections.append((cur_heading, "\n".join(cur_lines).strip()))
+                    cur_lines = []
+                cur_heading = _HEADING_TRAILER.sub("", heading).strip()
+                cur_lines.append(after)
+                i += 1
+                continue
         if heading is not None:
             if cur_lines:
                 sections.append((cur_heading, "\n".join(cur_lines).strip()))
@@ -412,7 +432,8 @@ def analyze_response(text: str) -> ResponseFeatures:
     f.question_marks = text.count("?") + text.count("\uff1f")
     f.exclamation_marks = text.count("!") + text.count("\uff01")
     f.emoji_count = len(_RE_EMOJI.findall(text))
-    cap_words = [w for w in words if w.isascii() and w.isalpha()]
+    raw_words = re.findall(r"[A-Za-z]+", text)
+    cap_words = [w for w in raw_words if w.isascii() and w.isalpha()]
     if cap_words:
         shouted = sum(1 for w in cap_words
                       if len(w) >= 3 and w.isupper())
@@ -509,7 +530,7 @@ def _self_test() -> int:
     simple = "Hello world. This is fine!\n\nSecond para here?"
     f = analyze_response(simple)
     assert f.char_count == len(simple)
-    assert f.word_count == 9, f.word_count
+    assert f.word_count == 8, f.word_count
     assert f.sentence_count == 3, f.sentence_count
     assert f.paragraph_count == 2, f.paragraph_count
     assert f.question_marks == 1 and f.exclamation_marks == 1
@@ -576,7 +597,7 @@ def _self_test() -> int:
     # sentence splitting: abbreviations & decimals
     sents = split_sentences(
         "Dr. Smith paid $3.14 on Jan. 5th. Then he left. Wait... really?")
-    assert len(sents) == 4, sents
+    assert len(sents) == 3, sents
     assert "Dr. Smith paid $3.14 on Jan. 5th." == sents[0]
     s_hi = split_sentences("यह पहला वाक्य है। यह दूसरा है।")
     assert len(s_hi) == 2, s_hi

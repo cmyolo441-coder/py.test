@@ -339,8 +339,15 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
 
 def cmd_selftest(_args: argparse.Namespace) -> int:
-    modules: List[str] = ["scoring", "gate", "report", "ruleextract",
-                          "responseanaly", "detect", "injection", "rulestore"]
+    modules: List[str] = [
+        "ruleextract", "rulestore", "scoring", "gate", "report",
+        "responseanaly", "detect", "injection", "ledger", "seal",
+        "canon", "policy", "attestation", "repair", "fuzz", "mutate",
+        "probes", "redteam", "shadow", "semantic", "semantics",
+        "metaguard", "critic", "cognify", "drift", "stream",
+        "consensus", "orchestrator", "warroom", "telemetry",
+        "dashboard", "forge", "sandbox", "cipherlab", "multiturn", "trust",
+    ]
     failed: List[str] = []
     ran: List[str] = []
     for name in modules:
