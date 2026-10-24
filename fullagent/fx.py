@@ -67,11 +67,17 @@ def boot_reveal(console, render: Callable[[], object],
     plain print on any failure.
     """
     try:
+        from rich.text import Text
+
         with console.capture() as cap:
             console.print(render())
         lines = cap.get().splitlines()
         for line in lines:
-            console.print(line)
+            # Colors are enabled for the real TUI, so capture returns ANSI
+            # sequences. Printing that raw string would make Rich escape the
+            # codes (and lose the gradient); parse them back into a Text so
+            # the reveal preserves every truecolor span.
+            console.print(Text.from_ansi(line))
             if delay > 0:
                 time.sleep(delay)
     except Exception:
@@ -89,8 +95,8 @@ def shimmer_flash(console, text: str, steps: int = 8,
     try:
         for k in range(max(1, steps)):
             t = Text()
-            t.append(text, style=f"bold {_hex(SPINNER_COLORS[
-                k % len(SPINNER_COLORS)])}")
+            color = _hex(SPINNER_COLORS[k % len(SPINNER_COLORS)])
+            t.append(text, style=f"bold {color}")
             console.print(t, end="\r", soft_wrap=False)
             time.sleep(delay)
         t = Text()

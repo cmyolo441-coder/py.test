@@ -19,9 +19,10 @@ browser = ["playwright>=1.45"]
 
 [project.scripts]
 fullagent = "fullagent.__main__:main"
+enforcex = "fullagent.enforcex.cli:main"
 
-[tool.setuptools]
-packages = ["fullagent"]
+[tool.setuptools.packages.find]
+include = ["fullagent*"]
 
 [tool.setuptools.dynamic]
 version = {attr = "fullagent.__version__"}

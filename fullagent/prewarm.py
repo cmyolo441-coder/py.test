@@ -196,17 +196,21 @@ class FlightBundle:
     est: int = 0                          # estimate_tokens(snapshot)
     schema_tokens: int = 0
     budget: int = 0
-    probes: dict = field(default_factory=dict)  # path -> (mtime_ns, size) | None
+    # path -> filestat fingerprint (mtime_ns, size, content_digest) | None
+    probes: dict = field(default_factory=dict)
     done: threading.Event = field(default_factory=threading.Event,
                                    repr=False)
 
 
 def _stat(path: str):
-    try:
-        st = os.stat(path)
-        return (st.st_mtime_ns, st.st_size)
-    except OSError:
-        return None
+    """Content identity shared with filestat's stale-edit baselines.
+
+    Using the same fingerprint (stat + digest) keeps prewarm's early-edit
+    notice comparable with agent._file_stats and catches same-size rewrites
+    inside a coarse filesystem timestamp tick.
+    """
+    from . import filestat
+    return filestat._stat(path)
 
 
 def _probe_paths(agent) -> list[str]:

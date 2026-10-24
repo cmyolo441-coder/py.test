@@ -23,6 +23,10 @@ from __future__ import annotations
 
 import json
 import threading
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # annotation only; the server is imported lazily in start()
+    from http.server import ThreadingHTTPServer
 
 from .kernel import EventLog, fold
 from .theater import Theater, _summary

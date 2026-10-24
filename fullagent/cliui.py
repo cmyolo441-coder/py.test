@@ -221,13 +221,15 @@ def welcome(
 
     logo = Text()
     for i, line in enumerate(LOGO):
-        # v4 aurora polish: horizontal rainbow gradient across the logo
-        # rows (falls back to the flat style key if fx is unavailable).
+        # v4 aurora polish: a true per-character rainbow gradient animates
+        # each logo row, with a stable phase offset down the mark. Falls
+        # back to the flat style key if rich/fx is unavailable.
         try:
-            from .fx import RAINBOW
-            grad = RAINBOW[i % len(RAINBOW)]
-            logo.append(line + "\n",
-                        style=f"bold {grad}")
+            from .fx import RAINBOW, gradient_text
+            palette = tuple(RAINBOW[i % len(RAINBOW):]
+                            + RAINBOW[:i % len(RAINBOW)])
+            logo.append_text(gradient_text(line, list(palette)))
+            logo.append("\n")
         except Exception:
             key = LOGO_STYLES[i % len(LOGO_STYLES)]
             logo.append(line + "\n", style=f"bold {colors.get(key, '')}")
