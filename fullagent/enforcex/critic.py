@@ -591,7 +591,11 @@ class ConsistencyCritic(BaseCritic):
             for topic in re.findall(r"\b(use|send|share|mention|include|skip)\b", sl):
                 won_t = bool(re.search(r"\b(won'?t|will not|never)\b", sl))
                 will = bool(re.search(r"\b(will|i'll|always)\b", sl))
-                if will != won_t:
+                if will and won_t:
+                    # same sentence asserts and negates the same commitment
+                    penalty += 0.2
+                    notes.append(f"self-negating commitment about '{topic}'")
+                elif will != won_t:
                     prev = promises.get(topic)
                     if prev is not None and prev != will:
                         penalty += 0.2
@@ -747,6 +751,12 @@ class CriticEnsemble:
             majority = "violation"
         else:
             majority = "mixed"
+        # hard-evidence fallback: soft votes can be overridden when the
+        # fused score (including rule-hit evidence) is clearly one-sided.
+        if majority == "adherent" and fused < 0.45:
+            majority = "violation"
+        elif majority == "violation" and fused > 0.65:
+            majority = "adherent"
 
         # dissents: critics disagreeing with the majority
         dissents: List[str] = []
@@ -771,6 +781,20 @@ class CriticEnsemble:
             for rid, hit in sc.rule_hits.items():
                 cur = rule_hits.get(rid, 0.0)
                 rule_hits[rid] = max(cur, hit)
+
+        # hard-evidence override: a severity-weighted rule hit is direct
+        # proof the rule topic appeared in the response; it drags the
+        # fused score down beyond what soft critic opinions imply.
+        if rule_hits:
+            hardest = max(rule_hits.values())
+            fused = _clamp01(fused - 0.5 * hardest)
+            notes.append(f"rule-hit override: -{0.5 * hardest:.2f}")
+            # re-apply the hard-evidence fallback now that fused includes
+            # rule-hit evidence (the vote happens before the override).
+            if majority == "adherent" and fused < 0.45:
+                majority = "violation"
+            elif majority == "violation" and fused > 0.65:
+                majority = "adherent"
 
         stats = {
             "critics": len(scores),

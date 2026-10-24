@@ -152,7 +152,6 @@ _OVERLOAD_THRESH = 0.60
 _SYCO_THRESH = 0.35
 _AUTH_THRESH = 0.40
 
-
 # ── helpers ──────────────────────────────────────────────────────────────
 
 def _norm(text: str) -> str:
@@ -164,19 +163,15 @@ def _norm(text: str) -> str:
     t = _WS_RE.sub(" ", t).strip()
     return t
 
-
 def _clip(text: str, n: int = _CLIP_LEN) -> str:
     t = _WS_RE.sub(" ", text or "").strip()
     return t if len(t) <= n else t[: n - 1] + "…"
 
-
 def _tokens(text: str) -> List[str]:
     return [w.lower() for w in _TOKEN_RE.findall(text or "")]
 
-
 def _token_set(text: str) -> frozenset:
     return frozenset(_tokens(text))
-
 
 def token_jaccard(a: str, b: str) -> float:
     ta, tb = _token_set(a), _token_set(b)
@@ -186,13 +181,11 @@ def token_jaccard(a: str, b: str) -> float:
     union = len(ta | tb)
     return inter / union if union else 0.0
 
-
 def _bigram_set(text: str) -> frozenset:
     toks = _tokens(text)
     if len(toks) < 2:
         return frozenset(toks)
     return frozenset(zip(toks, toks[1:]))
-
 
 def bigram_jaccard(a: str, b: str) -> float:
     ba, bb = _bigram_set(a), _bigram_set(b)
@@ -201,7 +194,6 @@ def bigram_jaccard(a: str, b: str) -> float:
     inter = len(ba & bb)
     union = len(ba | bb)
     return inter / union if union else 0.0
-
 
 def _count_instructions(text: str) -> int:
     """Count imperative directives in text."""
@@ -212,7 +204,6 @@ def _count_instructions(text: str) -> int:
     c += len(_NUMBERED_RE.findall(text or "")) // 2  # discount half to avoid double
     return max(0, c)
 
-
 def _hedging_density(text: str) -> float:
     toks = _tokens(text)
     if not toks:
@@ -222,7 +213,6 @@ def _hedging_density(text: str) -> float:
     for pat in _HEDGE_RES:
         hits += len(pat.findall(low))
     return min(1.0, hits / max(1, len(toks) / 15))
-
 
 def _sycophancy_hits(text: str) -> Tuple[int, str]:
     low = text or ""
@@ -238,7 +228,6 @@ def _sycophancy_hits(text: str) -> Tuple[int, str]:
         total += len(pat.findall(low)) - (1 if m else 0)
     return total, evidence
 
-
 def _authority_hits(text: str) -> Tuple[int, str]:
     low = text or ""
     total = 0
@@ -251,7 +240,6 @@ def _authority_hits(text: str) -> Tuple[int, str]:
                 evidence = _clip(m.group(0), 60)
         total += len(pat.findall(low)) - (1 if m else 0)
     return total, evidence
-
 
 def _perspective_shift(system_text: str, response_text: str) -> float:
     """Score perspective shift: system defines persona, response deviates."""
@@ -274,7 +262,6 @@ def _perspective_shift(system_text: str, response_text: str) -> float:
         return min(1.0, second_density * 6)
     return 0.0
 
-
 def _instruction_stacking_score(system_text: str, user_text: str) -> Tuple[float, str]:
     sys_c = _count_instructions(system_text)
     usr_c = _count_instructions(user_text)
@@ -295,7 +282,6 @@ def _instruction_stacking_score(system_text: str, user_text: str) -> Tuple[float
     if usr_c > sys_c and usr_c >= 3:
         evidence += " — user stacking exceeds system"
     return round(score, 3), evidence
-
 
 # ── data model ───────────────────────────────────────────────────────────
 
@@ -323,7 +309,6 @@ class CognitiveSignal:
             evidence=str(d.get("evidence", "")),
             detail=str(d.get("detail", "")),
         )
-
 
 @dataclass
 class CognitiveReport:
@@ -358,7 +343,6 @@ class CognitiveReport:
             cognitive_score_val=float(d.get("cognitive_score", 0.0)),
             meta=dict(d.get("meta") or {}),
         )
-
 
 # ── signal detectors ─────────────────────────────────────────────────────
 
@@ -417,7 +401,6 @@ def _signal_goal_conflict(response_text: str, system_text: str, user_text: str) 
     except Exception:
         return CognitiveSignal("goal_conflict", 0.0, "", "detector error")
 
-
 def _signal_attentional_drift(response_text: str, system_text: str, user_text: str) -> CognitiveSignal:
     """Response tracks user framing rather than system framing."""
     try:
@@ -447,7 +430,6 @@ def _signal_attentional_drift(response_text: str, system_text: str, user_text: s
     except Exception:
         return CognitiveSignal("attentional_drift", 0.0, "", "detector error")
 
-
 def _signal_instruction_stacking(response_text: str, system_text: str, user_text: str) -> CognitiveSignal:
     """Too many stacked instructions causing overload."""
     try:
@@ -460,7 +442,6 @@ def _signal_instruction_stacking(response_text: str, system_text: str, user_text
         return CognitiveSignal("instruction_stacking", round(sc, 3), ev, detail)
     except Exception:
         return CognitiveSignal("instruction_stacking", 0.0, "", "detector error")
-
 
 def _signal_authority_confusion(response_text: str, system_text: str, user_text: str) -> CognitiveSignal:
     """Treats user content as if it were system-level authority."""
@@ -489,7 +470,6 @@ def _signal_authority_confusion(response_text: str, system_text: str, user_text:
         return CognitiveSignal("authority_confusion", round(score, 3), ev, detail)
     except Exception:
         return CognitiveSignal("authority_confusion", 0.0, "", "detector error")
-
 
 def _signal_satisficing(response_text: str, system_text: str, user_text: str) -> CognitiveSignal:
     """Partial compliance to avoid effort — hedged, brief, incomplete."""
@@ -540,7 +520,6 @@ def _signal_satisficing(response_text: str, system_text: str, user_text: str) ->
     except Exception:
         return CognitiveSignal("satisficing", 0.0, "", "detector error")
 
-
 def _signal_sycophancy(response_text: str, system_text: str, user_text: str) -> CognitiveSignal:
     """Agreeing with user against system prompt / sycophantic alignment."""
     try:
@@ -565,7 +544,6 @@ def _signal_sycophancy(response_text: str, system_text: str, user_text: str) -> 
     except Exception:
         return CognitiveSignal("sycophancy", 0.0, "", "detector error")
 
-
 def _signal_perspective_shift(response_text: str, system_text: str, user_text: str) -> CognitiveSignal:
     """Auxiliary: viewpoint framing shifted toward user."""
     try:
@@ -575,7 +553,6 @@ def _signal_perspective_shift(response_text: str, system_text: str, user_text: s
         return CognitiveSignal("perspective_shift", round(ps, 3), evidence, detail)
     except Exception:
         return CognitiveSignal("perspective_shift", 0.0, "", "detector error")
-
 
 # ── core pipeline ────────────────────────────────────────────────────────
 
@@ -589,7 +566,6 @@ def _all_signals(response_text: str, system_text: str, user_text: str) -> List[C
         _signal_sycophancy(response_text, system_text, user_text),
         _signal_perspective_shift(response_text, system_text, user_text),
     ]
-
 
 def _dominant_goal(response_text: str, system_text: str, user_text: str,
                  signals: Optional[List[CognitiveSignal]] = None) -> str:
@@ -618,7 +594,6 @@ def _dominant_goal(response_text: str, system_text: str, user_text: str,
     except Exception:
         return "balanced"
 
-
 def _recommendation(signals: List[CognitiveSignal], hijacked: bool, overload: float, dominant: str) -> str:
     try:
         sig_by_name = {s.name: s for s in signals}
@@ -643,7 +618,6 @@ def _recommendation(signals: List[CognitiveSignal], hijacked: bool, overload: fl
         return "; ".join(parts)
     except Exception:
         return "no action needed"
-
 
 def analyze_cognition(response_text: str, system_text: str, user_text: str = "") -> CognitiveReport:
     """Analyze a response for cognitive hijacking / overload signals.
@@ -699,7 +673,6 @@ def analyze_cognition(response_text: str, system_text: str, user_text: str = "")
             meta={"error": type(exc).__name__},
         )
 
-
 def cognitive_score(text: str) -> float:
     """Standalone cognitive load score for arbitrary text (0..1).
 
@@ -730,7 +703,6 @@ def cognitive_score(text: str) -> float:
         return round(max(0.0, min(1.0, score)), 3)
     except Exception:
         return 0.0
-
 
 # ── rule coercion & gate bridge ──────────────────────────────────────────
 
@@ -786,7 +758,6 @@ def _iter_rules(rules: Any) -> List[Tuple[str, str, str, str]]:
     except Exception:
         pass
     return out[:_MAX_RULES]
-
 
 def scan(response_text: str, rules: Any = None, system_text: str = "", **_kw: Any) -> Dict[str, Any]:
     """Gate-compatible entry point.
@@ -865,7 +836,6 @@ def scan(response_text: str, rules: Any = None, system_text: str = "", **_kw: An
     except Exception as exc:  # never raise
         return {"violations": [], "findings": [], "report": {}, "hijacked": False, "overload": 0.0,
                 "error": type(exc).__name__}
-
 
 # ── self-test ────────────────────────────────────────────────────────────
 
@@ -969,7 +939,6 @@ def _self_test() -> None:  # pragma: no cover
     print("cognify._self_test: OK (6 signals + edge cases)")
 
     return None
-
 
 if __name__ == "__main__":  # pragma: no cover
     _self_test()

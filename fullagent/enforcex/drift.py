@@ -113,7 +113,6 @@ _STOPWORDS = frozenset({
     "just", "should", "must", "may", "might", "shall", "any", "all",
 })
 
-
 # ── helpers ──────────────────────────────────────────────────────────────
 
 def _norm(text: str) -> str:
@@ -125,19 +124,15 @@ def _norm(text: str) -> str:
     t = _WS_RE.sub(" ", t).strip()
     return t
 
-
 def _clip(text: str, n: int = _CLIP_LEN) -> str:
     t = _WS_RE.sub(" ", text or "").strip()
     return t if len(t) <= n else t[: n - 1] + "…"
 
-
 def _tokens(text: str) -> List[str]:
     return [w.lower() for w in _TOKEN_RE.findall(text or "")]
 
-
 def _token_set(text: str) -> frozenset:
     return frozenset(_tokens(text))
-
 
 def token_jaccard(a: str, b: str) -> float:
     ta, tb = _token_set(a), _token_set(b)
@@ -147,13 +142,11 @@ def token_jaccard(a: str, b: str) -> float:
     union = len(ta | tb)
     return inter / union if union else 0.0
 
-
 def _ngram_set(text: str, n: int) -> frozenset:
     toks = _tokens(text)
     if len(toks) < n:
         return frozenset(toks) if toks else frozenset()
     return frozenset(tuple(toks[i:i + n]) for i in range(len(toks) - n + 1))
-
 
 def bigram_jaccard(a: str, b: str) -> float:
     ba, bb = _ngram_set(a, 2), _ngram_set(b, 2)
@@ -163,7 +156,6 @@ def bigram_jaccard(a: str, b: str) -> float:
     union = len(ba | bb)
     return inter / union if union else 0.0
 
-
 def trigram_jaccard(a: str, b: str) -> float:
     ta, tb = _ngram_set(a, 3), _ngram_set(b, 3)
     if not ta or not tb:
@@ -171,7 +163,6 @@ def trigram_jaccard(a: str, b: str) -> float:
     inter = len(ta & tb)
     union = len(ta | tb)
     return inter / union if union else 0.0
-
 
 def _structural_vector(text: str) -> Dict[str, float]:
     """Normalized structural feature vector (counts / length)."""
@@ -186,7 +177,6 @@ def _structural_vector(text: str) -> Dict[str, float]:
     vec["_fmt_density"] = min(1.0, fmt_chars / max(1, length / 12))
     return vec
 
-
 def _structural_distance(a: str, b: str) -> float:
     """L1 distance between structural vectors, 0..1."""
     va = _structural_vector(a)
@@ -196,7 +186,6 @@ def _structural_distance(a: str, b: str) -> float:
         return 0.0
     total = sum(abs(va.get(k, 0.0) - vb.get(k, 0.0)) for k in keys)
     return min(1.0, total / max(1, len(keys)))
-
 
 def _tone_vector(text: str) -> Dict[str, float]:
     t = text or ""
@@ -212,7 +201,6 @@ def _tone_vector(text: str) -> Dict[str, float]:
     vec["cjk"] = min(1.0, len(_CJK_RE.findall(t)) / (total_chars / 30))
     return vec
 
-
 def _tone_distance(a: str, b: str) -> float:
     va = _tone_vector(a)
     vb = _tone_vector(b)
@@ -223,7 +211,6 @@ def _tone_distance(a: str, b: str) -> float:
     # tone matters less than lexical, so compress
     return min(1.0, total / max(1, len(keys)) * 0.9)
 
-
 def _vocab_growth(anchor_tokens: frozenset, text_tokens: frozenset) -> float:
     """Fraction of text vocab that is novel vs anchor, 0..1."""
     if not text_tokens:
@@ -232,7 +219,6 @@ def _vocab_growth(anchor_tokens: frozenset, text_tokens: frozenset) -> float:
         return 1.0
     novel = text_tokens - anchor_tokens
     return len(novel) / max(1, len(text_tokens))
-
 
 # ── core scoring ─────────────────────────────────────────────────────────
 
@@ -292,14 +278,12 @@ def score_drift(anchor: str, text: str) -> float:
     except Exception:
         return 0.0
 
-
 def anchor_similarity(anchor: str, text: str) -> float:
     """Convenience: 1 - drift, 0..1 higher = more similar. Never raises."""
     try:
         return round(max(0.0, min(1.0, 1.0 - score_drift(anchor, text))), 3)
     except Exception:
         return 0.0
-
 
 # ── data model ───────────────────────────────────────────────────────────
 
@@ -337,7 +321,6 @@ class Turn:
             meta=dict(d.get("meta") or {}),
         )
 
-
 @dataclass
 class DriftReport:
     """Aggregated drift analysis for a conversation."""
@@ -374,7 +357,6 @@ class DriftReport:
             window_used=int(d.get("window_used", 0)),
             meta=dict(d.get("meta") or {}),
         )
-
 
 # ── DriftTracker ─────────────────────────────────────────────────────────
 
@@ -596,7 +578,6 @@ class DriftTracker:
             pass
         return obj
 
-
 # ── standalone helpers ───────────────────────────────────────────────────
 
 def score_window_drift(anchor: str, texts: Sequence[str], window: int = _DEFAULT_WINDOW) -> float:
@@ -613,7 +594,6 @@ def score_window_drift(anchor: str, texts: Sequence[str], window: int = _DEFAULT
         return round(sum(s * w for s, w in zip(scores, weights)) / w_sum, 3)
     except Exception:
         return 0.0
-
 
 # ── rule coercion & gate bridge ──────────────────────────────────────────
 
@@ -668,7 +648,6 @@ def _iter_rules(rules: Any) -> List[Tuple[str, str, str, str]]:
     except Exception:
         pass
     return out[:256]
-
 
 def scan(response_text: str, rules: Any = None, system_text: str = "", **_kw: Any) -> Dict[str, Any]:
     """Gate-compatible entry point.
@@ -728,7 +707,6 @@ def scan(response_text: str, rules: Any = None, system_text: str = "", **_kw: An
     except Exception as exc:  # never raise
         return {"violations": [], "findings": [], "report": {}, "drift_score": 0.0,
                 "overall_drift": 0.0, "error": type(exc).__name__}
-
 
 # ── self-test ────────────────────────────────────────────────────────────
 
@@ -874,7 +852,6 @@ def _self_test() -> None:  # pragma: no cover
     print("drift._self_test: OK (trend, window, vocab, 100+ turns, edge cases)")
 
     return None
-
 
 if __name__ == "__main__":  # pragma: no cover
     _self_test()

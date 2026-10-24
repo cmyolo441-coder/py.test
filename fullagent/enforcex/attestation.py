@@ -1,12 +1,9 @@
 """attestation — Cryptographic attestation + transparency log for auditable enforcement.
-
 Every enforcement decision can be attested: a signed, hash-chained
 record that proves *what* was checked, *against which rules*, and
 *what the verdict was*, so an auditor can replay and verify the
 entire history without trusting the attester's memory.
-
 An AttestationRecord contains:
-
     record_id          — unique hex id (sha256 of canonical content)
     timestamp          — epoch seconds when attested
     rules_digest       — sha256 over canonical(rules)
@@ -15,12 +12,10 @@ An AttestationRecord contains:
     decision           — allow | warn | rewrite | retry | block
     signature          — HMAC-SHA256 over canonical(record without signature)
     chain_hash         — sha256(prev_record.signature) chained forward
-
 An AttestationLog is an append-only, thread-safe log that holds
 records in-memory and optionally persists them as JSONL to a file.
 Chain integrity means deleting, reordering, or tampering with any
 record breaks every later chain_hash and signature.
-
 Cryptography:
   * Signing uses HMAC-SHA256 under a local secret. When seal.py is
     available its derive_key / Sealer pattern is reused defensively;
@@ -29,14 +24,11 @@ Cryptography:
   * Verification uses hmac.compare_digest (constant-time).
   * Key rotation keeps old keys so historical records remain verifiable;
     new records use the current key_id.
-
 Persistence is JSONL (one JSON object per line) with fsync on write;
 reads tolerate truncated tails and never raise. The log is safe for
 concurrent appends via threading.Lock.
-
 Stdlib only, Python 3.9+, never raises on malformed input, every
 public path returns a bool / list / dict rather than throwing.
-
 Public API:
   AttestationRecord  — single attested decision
   AttestationLog     — append-only log with attest / verify / verify_chain
@@ -44,9 +36,7 @@ Public API:
   verify_attestation(record, key) -> bool
   attest_response(response_text, rules, decision) -> AttestationRecord
 """
-
 from __future__ import annotations
-
 import base64
 import hashlib
 import hmac
@@ -58,24 +48,18 @@ import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-
-# ── defensive sibling imports ────────────────────────────────────────────
-
 try:
     from . import seal as _seal  # type: ignore
 except Exception:  # pragma: no cover
     _seal = None
-
 try:
     from . import scoring as _scoring  # type: ignore
 except Exception:  # pragma: no cover
     _scoring = None
-
 try:
     from . import gate as _gate  # type: ignore
 except Exception:  # pragma: no cover
     _gate = None
-
 __all__ = [
     "AttestationRecord",
     "AttestationLog",
@@ -88,32 +72,21 @@ __all__ = [
     "canonical_bytes",
     "sha256_hex",
 ]
-
-# ── constants ────────────────────────────────────────────────────────────
-
 ATTESTATION_VERSION = 1
 GENESIS_CHAIN_HASH = "0" * 64
 DEFAULT_KEY_BYTES = 32
 MAX_TEXT_LEN = 200_000
 MAX_RULES = 512
 SCHEMA_VERSION = 1
-
 _VALID_DECISIONS = ("allow", "warn", "rewrite", "retry", "block")
-
-# ── canonicalization / hashing ───────────────────────────────────────────
-
 def canonical_json(obj: Any) -> str:
     """Deterministic JSON: sorted keys, tight separators, no NaN."""
     return json.dumps(
         obj, sort_keys=True, separators=(",", ":"),
         ensure_ascii=False, default=str, allow_nan=False,
     )
-
-
 def canonical_bytes(obj: Any) -> bytes:
     return canonical_json(obj).encode("utf-8")
-
-
 def sha256_hex(data: Any) -> str:
     """sha256 hex of canonical JSON when given an object, or raw bytes/str."""
     if isinstance(data, bytes):
@@ -121,19 +94,14 @@ def sha256_hex(data: Any) -> str:
     if isinstance(data, str):
         return hashlib.sha256(data.encode("utf-8")).hexdigest()
     return hashlib.sha256(canonical_bytes(data)).hexdigest()
-
-
 def _rules_digest(rules: Any) -> str:
     """Digest over canonical(rules) — tolerant of all rule shapes."""
     if rules is None:
         return sha256_hex("")
     try:
-        # reuse canonical_bytes for any shape
         return hashlib.sha256(canonical_bytes(rules)).hexdigest()
     except Exception:
         return sha256_hex(str(rules))
-
-
 def _response_hash(text: str) -> str:
     if not isinstance(text, str):
         try:
@@ -142,15 +110,12 @@ def _response_hash(text: str) -> str:
             text = ""
     text = (text or "")[:MAX_TEXT_LEN]
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
-
-
 def _violations_digest(decision: Any, violations: Any = None) -> str:
     """Digest over the decision/violations payload."""
     payload = violations if violations is not None else decision
     if payload is None:
         return sha256_hex("")
     if isinstance(payload, dict):
-        # GateDecision-like dict: include action + violations
         key = {
             "action": str(payload.get("action", "")),
             "violations": payload.get("violations", []),
@@ -162,11 +127,6 @@ def _violations_digest(decision: Any, violations: Any = None) -> str:
         return hashlib.sha256(canonical_bytes(payload)).hexdigest()
     except Exception:
         return sha256_hex(str(payload))
-
-
-# ── key management ───────────────────────────────────────────────────────
-
-
 def _derive_hmac_key(secret: bytes, key_id: str) -> bytes:
     """Derive a subkey from master secret via HMAC, seal-style."""
     if _seal is not None:
@@ -178,13 +138,10 @@ def _derive_hmac_key(secret: bytes, key_id: str) -> bytes:
             pass
     info = f"enforcex-attest-v1:{key_id}".encode("utf-8")
     return hmac.new(secret, info, hashlib.sha256).digest()
-
-
 def _load_or_create_secret(path: str) -> Tuple[Optional[bytes], str]:
     """Load or create a file-backed secret. Returns (secret, note)."""
     if not path:
         return None, "no path"
-    # try seal's loader first
     if _seal is not None:
         try:
             fn = getattr(_seal, "load_or_create_secret", None)
@@ -192,10 +149,8 @@ def _load_or_create_secret(path: str) -> Tuple[Optional[bytes], str]:
                 return fn(path)
         except Exception:
             pass
-    # fallback: plain file ops
     try:
         if os.path.exists(path):
-            # check permissions: refuse world-readable
             try:
                 mode = os.stat(path).st_mode & 0o777
                 if mode & 0o077:
@@ -227,39 +182,26 @@ def _load_or_create_secret(path: str) -> Tuple[Optional[bytes], str]:
         return None, f"secret error: {exc}"
     except Exception as exc:
         return None, f"secret error: {type(exc).__name__}"
-
-
 class _KeyRing:
     """Retains old keys for verification; current key signs new records."""
-
     def __init__(self) -> None:
         self._keys: Dict[str, bytes] = {}
         self._current: str = ""
-
     def add(self, key_id: str, key: bytes, current: bool = True) -> None:
         self._keys[str(key_id)] = bytes(key)
         if current or not self._current:
             self._current = str(key_id)
-
     def get(self, key_id: str) -> Optional[bytes]:
         return self._keys.get(str(key_id))
-
     def current_id(self) -> str:
         return self._current
-
     def ids(self) -> List[str]:
         return sorted(self._keys.keys())
-
     def has(self, key_id: str) -> bool:
         return str(key_id) in self._keys
-
-
-# ── AttestationRecord ────────────────────────────────────────────────────
-
 @dataclass
 class AttestationRecord:
     """One signed, chain-linked attestation."""
-
     record_id: str = ""
     timestamp: float = 0.0
     rules_digest: str = ""
@@ -271,7 +213,6 @@ class AttestationRecord:
     key_id: str = ""
     seq: int = 0
     meta: Dict[str, Any] = field(default_factory=dict)
-
     def to_dict(self, *, without_signature: bool = False) -> Dict[str, Any]:
         d: Dict[str, Any] = {
             "attestation_version": ATTESTATION_VERSION,
@@ -290,7 +231,6 @@ class AttestationRecord:
         if not without_signature:
             d["signature"] = str(self.signature)
         return d
-
     @classmethod
     def from_dict(cls, d: Any) -> "AttestationRecord":
         if not isinstance(d, dict):
@@ -319,41 +259,28 @@ class AttestationRecord:
             seq=_i("seq"),
             meta=meta if isinstance(meta, dict) else {},
         )
-
     def signed_bytes(self) -> bytes:
         """Canonical bytes covered by the HMAC (everything except signature)."""
         return canonical_bytes(self.to_dict(without_signature=True))
-
     def is_well_formed(self) -> bool:
         return bool(self.record_id and self.signature and self.rules_digest)
-
-
 def _compute_record_id(rec: AttestationRecord) -> str:
     """Deterministic record_id = sha256(canonical(without sig) + seq)."""
     raw = rec.signed_bytes() + str(rec.seq).encode()
     return hashlib.sha256(raw).hexdigest()[:32]
-
-
 def _compute_signature(rec: AttestationRecord, key: bytes) -> str:
     return hmac.new(key, rec.signed_bytes(), hashlib.sha256).hexdigest()
-
-
-# ── AttestationLog ───────────────────────────────────────────────────────
-
 class AttestationLog:
     """Append-only transparency log for attestation records.
-
     Thread-safe via RLock. Supports in-memory-only or JSONL file
     persistence. Chain linkage and HMAC signatures guarantee tamper
     evidence.
-
     Usage:
         log = AttestationLog(path="/tmp/attest.jsonl")
         rec = log.attest("hello world", rules, "allow")
         assert log.verify(rec)
         assert log.verify_chain() == []
     """
-
     def __init__(
         self,
         path: Optional[str] = None,
@@ -374,10 +301,6 @@ class AttestationLog:
         self._fh = None
         self._ring = _KeyRing()
         self._current_key_id = str(key_id or "attest-v1")
-
-        # initialise key material
-        # When a file path is given but no explicit key/secret, try a
-        # sidecar key file so reloads share the same key deterministically.
         _sidecar = (self.path + ".attest.key") if self.path else ""
         if key is not None and isinstance(key, (bytes, bytearray)) and len(key) >= 16:
             self._ring.add(self._current_key_id, bytes(key))
@@ -389,7 +312,6 @@ class AttestationLog:
             else:
                 self._ring.add(self._current_key_id, secrets.token_bytes(DEFAULT_KEY_BYTES))
         elif _sidecar:
-            # file-backed but no explicit secret: sidecar key for determinism
             sk, _ = _load_or_create_secret(_sidecar)
             if sk is not None:
                 derived = _derive_hmac_key(sk, self._current_key_id)
@@ -397,14 +319,9 @@ class AttestationLog:
             else:
                 self._ring.add(self._current_key_id, secrets.token_bytes(DEFAULT_KEY_BYTES))
         else:
-            # ephemeral in-memory key
             self._ring.add(self._current_key_id, secrets.token_bytes(DEFAULT_KEY_BYTES))
-
         if self.path and load_existing:
             self._load()
-
-    # -- loading -----------------------------------------------------------
-
     def _load(self) -> None:
         try:
             with open(self.path, "r", encoding="utf-8") as fh:
@@ -417,7 +334,7 @@ class AttestationLog:
                     try:
                         raw = json.loads(line)
                     except json.JSONDecodeError:
-                        break  # torn tail
+                        break
                     if not isinstance(raw, dict):
                         break
                     rec = AttestationRecord.from_dict(raw)
@@ -430,18 +347,12 @@ class AttestationLog:
             self._seq = max(r.seq for r in self._records) + 1
             last = self._records[-1]
             self._chain_tail = last.signature or self._chain_tail
-            # ensure ring knows about all key_ids seen
             for r in self._records:
                 if r.key_id and not self._ring.has(r.key_id):
-                    # unknown historical key: store placeholder so verify can
-                    # report hmac mismatch rather than missing key silently
                     self._ring.add(r.key_id, b"\x00" * DEFAULT_KEY_BYTES, current=False)
         else:
             self._seq = 0
             self._chain_tail = GENESIS_CHAIN_HASH
-
-    # -- persistence -------------------------------------------------------
-
     def _open_fh(self):
         if self._fh is None and self.path:
             parent = os.path.dirname(os.path.abspath(self.path)) or "."
@@ -455,7 +366,6 @@ class AttestationLog:
             except OSError:
                 return None
         return self._fh
-
     def _persist(self, rec: AttestationRecord) -> None:
         fh = self._open_fh()
         if fh is None:
@@ -467,12 +377,8 @@ class AttestationLog:
                 os.fsync(fh.fileno())
         except OSError:
             pass
-
-    # -- key rotation ------------------------------------------------------
-
     def rotate_key(self, new_key_id: str = "", new_key: Optional[bytes] = None) -> str:
         """Rotate to a new signing key. Old records stay verifiable.
-
         Returns the new key_id. Never raises.
         """
         with self._lock:
@@ -490,17 +396,12 @@ class AttestationLog:
                 self._ring.add(kid, secrets.token_bytes(DEFAULT_KEY_BYTES), current=True)
             self._current_key_id = kid
             return kid
-
     def current_key_id(self) -> str:
         with self._lock:
             return self._ring.current_id() or self._current_key_id
-
     def known_key_ids(self) -> List[str]:
         with self._lock:
             return self._ring.ids()
-
-    # -- core: attest ------------------------------------------------------
-
     def attest(
         self,
         response_text: str,
@@ -511,7 +412,6 @@ class AttestationLog:
         meta: Optional[Dict[str, Any]] = None,
     ) -> AttestationRecord:
         """Create, sign, chain, persist, and return a new record.
-
         Never raises — on malformed input returns a best-effort record
         with empty digests rather than throwing.
         """
@@ -523,7 +423,6 @@ class AttestationLog:
             r_digest = _rules_digest(rules)
         except Exception:
             r_digest = sha256_hex("")
-        # decision normalization
         dec_str = ""
         try:
             if isinstance(decision, dict):
@@ -531,7 +430,6 @@ class AttestationLog:
             elif decision is not None:
                 dec_str = str(decision).lower().strip()
             if dec_str not in _VALID_DECISIONS:
-                # keep raw if not a standard decision, but truncate
                 dec_str = (dec_str or "unknown")[:32]
         except Exception:
             dec_str = "unknown"
@@ -539,7 +437,6 @@ class AttestationLog:
             v_digest = _violations_digest(decision, violations)
         except Exception:
             v_digest = sha256_hex("")
-
         with self._lock:
             kid = self._ring.current_id() or self._current_key_id
             key = self._ring.get(kid) or secrets.token_bytes(DEFAULT_KEY_BYTES)
@@ -554,9 +451,7 @@ class AttestationLog:
                 seq=self._seq,
                 meta=dict(meta) if isinstance(meta, dict) else {},
             )
-            # record_id before signature (deterministic)
             rec.record_id = _compute_record_id(rec)
-            # signature
             try:
                 rec.signature = _compute_signature(rec, key)
             except Exception:
@@ -566,9 +461,6 @@ class AttestationLog:
             self._chain_tail = rec.signature or self._chain_tail
             self._persist(rec)
             return rec
-
-    # -- verification ------------------------------------------------------
-
     def verify(self, record: Any) -> bool:
         """Verify a single record's HMAC. Constant-time compare. Never raises."""
         try:
@@ -582,10 +474,8 @@ class AttestationLog:
             return hmac.compare_digest(expected, rec.signature)
         except Exception:
             return False
-
     def verify_chain(self) -> List[int]:
         """Verify chain linkage + per-record HMACs.
-
         Returns a list of broken indices (empty == chain intact).
         Never raises.
         """
@@ -596,10 +486,8 @@ class AttestationLog:
                 ring = self._ring
             prev_sig = GENESIS_CHAIN_HASH
             for i, rec in enumerate(records):
-                # chain linkage
                 if rec.chain_hash != prev_sig:
                     broken.append(i)
-                # HMAC check
                 key = ring.get(rec.key_id)
                 if key is None:
                     if i not in broken:
@@ -617,7 +505,6 @@ class AttestationLog:
         except Exception:
             pass
         return broken
-
     def verify_chain_detailed(self) -> List[Dict[str, Any]]:
         """Like verify_chain but returns per-index dict with reason."""
         details: List[Dict[str, Any]] = []
@@ -646,17 +533,12 @@ class AttestationLog:
         except Exception:
             pass
         return details
-
-    # -- export / import ---------------------------------------------------
-
     def export_jsonl(self) -> str:
         with self._lock:
             return "".join(canonical_json(r.to_dict()) + "\n" for r in self._records)
-
     def export_dicts(self) -> List[Dict[str, Any]]:
         with self._lock:
             return [r.to_dict() for r in self._records]
-
     def write_file(self, path: Optional[str] = None) -> str:
         """Write all records as JSONL to path (or self.path). Returns path."""
         target = os.fspath(path) if path else self.path
@@ -679,7 +561,6 @@ class AttestationLog:
             return target
         except OSError:
             return ""
-
     @classmethod
     def read_file(cls, path: str, *, key: Optional[bytes] = None) -> "AttestationLog":
         """Load a log from a JSONL file. Never raises."""
@@ -703,13 +584,10 @@ class AttestationLog:
         if log._records:
             log._seq = max(r.seq for r in log._records) + 1
             log._chain_tail = log._records[-1].signature or GENESIS_CHAIN_HASH
-        # retain key_ids
         for r in log._records:
             if r.key_id and not log._ring.has(r.key_id):
-                # placeholder; real key must be supplied to verify
                 pass
         return log
-
     @classmethod
     def from_dicts(
         cls,
@@ -726,17 +604,12 @@ class AttestationLog:
             log._seq = max(r.seq for r in log._records) + 1
             log._chain_tail = log._records[-1].signature or GENESIS_CHAIN_HASH
         return log
-
-    # -- introspection -----------------------------------------------------
-
     def __len__(self) -> int:
         with self._lock:
             return len(self._records)
-
     def __iter__(self):
         with self._lock:
             return iter(list(self._records))
-
     def tail(self, n: int = 10) -> List[AttestationRecord]:
         with self._lock:
             try:
@@ -746,7 +619,6 @@ class AttestationLog:
             if n <= 0:
                 return []
             return list(self._records[-n:])
-
     def stats(self) -> Dict[str, Any]:
         with self._lock:
             return {
@@ -757,7 +629,6 @@ class AttestationLog:
                 "seq": self._seq,
                 "path": self.path,
             }
-
     def close(self) -> None:
         with self._lock:
             if self._fh is not None:
@@ -766,10 +637,6 @@ class AttestationLog:
                 except OSError:
                     pass
                 self._fh = None
-
-
-# ── standalone helpers ───────────────────────────────────────────────────
-
 def create_attestation(
     response_text: str,
     rules: Any = None,
@@ -782,8 +649,6 @@ def create_attestation(
     """One-shot helper: create a single attestation without managing a log."""
     log = AttestationLog(path=None, key=key, key_id=key_id, load_existing=False)
     return log.attest(response_text, rules, decision, violations=violations)
-
-
 def verify_attestation(record: Any, key: Optional[bytes] = None, key_id: str = "") -> bool:
     """Verify a single record against a key. Constant-time. Never raises."""
     try:
@@ -797,8 +662,6 @@ def verify_attestation(record: Any, key: Optional[bytes] = None, key_id: str = "
         return hmac.compare_digest(expected, rec.signature)
     except Exception:
         return False
-
-
 def attest_response(
     response_text: str,
     rules: Any = None,
@@ -809,28 +672,18 @@ def attest_response(
 ) -> AttestationRecord:
     """Convenience alias for create_attestation (gate-friendly name)."""
     return create_attestation(response_text, rules, decision, key=key, violations=violations)
-
-
-# ── self-test ────────────────────────────────────────────────────────────
-
 def _self_test() -> None:  # pragma: no cover
     import copy
     import tempfile
     import shutil
-
     def _ok(cond: bool, msg: str = "") -> None:
         assert cond, msg
-
-    # 1. clean record verifies
     log = AttestationLog(path=None)
     rec = log.attest("hello world", [{"id": "R1", "text": "be nice"}], "allow")
     _ok(rec.record_id and rec.signature, "record has id+sig")
     _ok(log.verify(rec), "clean record verifies")
     _ok(verify_attestation(rec, key=log._ring.get(rec.key_id)), "standalone verify")
-    # dict form also verifies
     _ok(log.verify(rec.to_dict()), "dict form verifies")
-
-    # 2. tampered record fails
     tampered = AttestationRecord.from_dict(rec.to_dict())
     tampered.decision = "block"
     _ok(not log.verify(tampered), "tampered decision fails")
@@ -840,13 +693,10 @@ def _self_test() -> None:  # pragma: no cover
     tampered3 = AttestationRecord.from_dict(rec.to_dict())
     tampered3.signature = "0" * 64
     _ok(not log.verify(tampered3), "zero sig fails")
-    # constant-time: wrong key fails
     _ok(not verify_attestation(rec, key=b"wrongkey12345678wrongkey12345678"), "wrong key fails")
     _ok(not verify_attestation(rec, key=None), "None key fails")
     _ok(not log.verify({}), "empty dict fails")
     _ok(not log.verify(None), "None fails")  # type: ignore
-
-    # 3. chain with 5 records verifies
     log2 = AttestationLog(path=None)
     recs = []
     for i in range(5):
@@ -856,27 +706,18 @@ def _self_test() -> None:  # pragma: no cover
     _ok(log2.verify_chain() == [], f"chain intact: {log2.verify_chain()}")
     for r in recs:
         _ok(log2.verify(r), f"each verifies {r.seq}")
-    # chain linkage
     for i in range(1, 5):
         _ok(recs[i].chain_hash == recs[i - 1].signature, f"chain link {i}")
-
-    # 4. one tampered breaks chain
     log2._records[2].decision = "tampered"
-    # signature now invalid and chain still points to old sig so next link ok but this one fails HMAC
     broken = log2.verify_chain()
     _ok(2 in broken, f"tampered index 2 should be broken: {broken}")
-    # restore and also test chain_hash tamper
     log2._records[2].decision = "allow"
-    # re-sign record 2 correctly then tamper chain_hash of record 3
-    # instead just tamper chain_hash directly
     orig_ch = log2._records[3].chain_hash
     log2._records[3].chain_hash = GENESIS_CHAIN_HASH
     broken2 = log2.verify_chain()
     _ok(3 in broken2, f"chain_hash tamper index 3: {broken2}")
     log2._records[3].chain_hash = orig_ch
     _ok(log2.verify_chain() == [], "restored chain intact")
-
-    # 5. empty inputs handled (never raise)
     log3 = AttestationLog(path=None)
     r_empty = log3.attest("", None, None)
     _ok(r_empty.record_id and r_empty.signature, "empty inputs produce record")
@@ -885,10 +726,7 @@ def _self_test() -> None:  # pragma: no cover
     _ok(log3.verify(r_empty2), "None inputs produce verifiable record")
     r_empty3 = log3.attest("", [], "")
     _ok(log3.verify(r_empty3), "empty list/str record verifies")
-    # verify_chain still intact after empties
     _ok(log3.verify_chain() == [], "empty chain intact")
-
-    # 6. file persistence round-trip
     tmp = tempfile.mkdtemp(prefix="enforcex-attest-")
     try:
         fpath = os.path.join(tmp, "attest.jsonl")
@@ -897,50 +735,37 @@ def _self_test() -> None:  # pragma: no cover
             flog.attest(f"persist {i}", [{"id": f"P{i}", "text": "rule"}], "warn")
         _ok(os.path.exists(fpath), "file created")
         _ok(len(flog) == 3, "3 persisted")
-        # reload
         flog2 = AttestationLog(path=fpath)
         _ok(len(flog2) == 3, f"reloaded 3 got {len(flog2)}")
         _ok(flog2.verify_chain() == [], f"reloaded chain: {flog2.verify_chain()}")
         for r in flog2:
             _ok(flog2.verify(r), "reloaded record verifies")
-        # append continues chain
         r_new = flog2.attest("new after reload", [], "allow")
         _ok(r_new.chain_hash == flog._records[-1].signature, "chain continues after reload")
         _ok(flog2.verify_chain() == [], "chain still intact after append")
-
-        # export / import
         dicts = flog2.export_dicts()
         _ok(len(dicts) == 4, "export 4 dicts")
         jtext = flog2.export_jsonl()
         _ok(jtext.count("\n") == 4, "jsonl 4 lines")
-        # write_file to alt path
         alt = os.path.join(tmp, "alt.jsonl")
         flog2.write_file(alt)
         _ok(os.path.exists(alt), "alt written")
         imported = AttestationLog.read_file(alt, key=flog2._ring.get(flog2.current_key_id()))
         _ok(len(imported) == 4, f"imported 4 got {len(imported)}")
-        # from_dicts
         log_from = AttestationLog.from_dicts(dicts)
         _ok(len(log_from) == 4, "from_dicts 4")
-
-        # torn tail: append garbage then reload keeps prefix
         with open(fpath, "a", encoding="utf-8") as fh:
             fh.write('{"record_id": "bad", "timestamp": 1, "seq": 99, "pa')
         flog3 = AttestationLog(path=fpath)
         _ok(len(flog3) == 4, f"torn tail keeps 4 got {len(flog3)}")
         _ok(flog3.verify_chain() == [], "torn tail chain intact")
-
-        # verify_chain_detailed
         det = flog2.verify_chain_detailed()
         _ok(det == [], f"detailed empty when intact: {det}")
         flog2._records[1].chain_hash = "bad"
         det2 = flog2.verify_chain_detailed()
         _ok(any(d["index"] == 1 for d in det2), f"detailed finds 1: {det2}")
-
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-
-    # 7. key rotation: old records stay verifiable, new use new key
     log4 = AttestationLog(path=None, key=b"masterkey12345678901234567890AB", key_id="k1")
     r1 = log4.attest("before rotation", [], "allow")
     _ok(r1.key_id == "k1", "k1")
@@ -952,21 +777,16 @@ def _self_test() -> None:  # pragma: no cover
     _ok(log4.verify(r2), "new verifies")
     _ok(log4.verify_chain() == [], "chain intact across rotation")
     _ok("k1" in log4.known_key_ids() and "k2" in log4.known_key_ids(), "both keys known")
-    # rotation with explicit key bytes
     kid3 = log4.rotate_key("k3", new_key=b"explicitkey1234567890123456AB")
     _ok(kid3 == "k3" and log4.current_key_id() == "k3", "explicit key rotation")
-
-    # 8. concurrent append safety
     log5 = AttestationLog(path=None)
     errors: List[str] = []
-
     def _append_many():
         try:
             for i in range(50):
                 log5.attest(f"concurrent {i}", [], "allow")
         except Exception as exc:
             errors.append(str(exc))
-
     import threading as _th
     threads = [_th.Thread(target=_append_many) for _ in range(4)]
     for t in threads:
@@ -975,23 +795,16 @@ def _self_test() -> None:  # pragma: no cover
         t.join()
     _ok(not errors, f"concurrent errors: {errors}")
     _ok(len(log5) == 200, f"concurrent count 200 got {len(log5)}")
-    # chain may interleave but each record's chain_hash should equal prev signature
-    # (they were appended under lock, so chain is linear)
     _ok(log5.verify_chain() == [], f"concurrent chain: {log5.verify_chain()[:5]}")
-
-    # 9. standalone helpers
     rec_s = create_attestation("standalone", [{"id": "R1", "text": "rule"}], "allow")
     _ok(rec_s.record_id and rec_s.signature, "standalone creates")
     rec_a = attest_response("alias", [], "warn")
     _ok(rec_a.record_id, "alias creates")
     _ok(not verify_attestation(rec_s, key=None), "None key standalone fails")
-    # verify with correct key
     k = secrets.token_bytes(32)
     rec_k = create_attestation("with key", [], "allow", key=k, key_id="mykey")
     _ok(verify_attestation(rec_k, key=k), "correct key verifies")
     _ok(not verify_attestation(rec_k, key=b"wrongkey12345678901234567890AB"), "wrong key fails")
-
-    # 10. record dataclass helpers
     rec_d = AttestationRecord(
         record_id="abc", timestamp=1234567890.0, rules_digest="r" * 64,
         response_hash="p" * 64, violations_digest="v" * 64,
@@ -1006,10 +819,7 @@ def _self_test() -> None:  # pragma: no cover
     _ok(not AttestationRecord.from_dict(None).is_well_formed(), "None not well-formed")  # type: ignore
     _ok(rec_d.is_well_formed(), "well-formed")
     _ok(not AttestationRecord(record_id="", signature="").is_well_formed(), "empty not well-formed")
-    # malformed dict never raises
     _ok(AttestationRecord.from_dict({"timestamp": "bad", "seq": "bad"}).timestamp == 0.0 or True, "bad types tolerated")
-
-    # 11. stats / tail
     log6 = AttestationLog(path=None)
     for i in range(7):
         log6.attest(f"msg {i}", [], "allow")
@@ -1018,11 +828,7 @@ def _self_test() -> None:  # pragma: no cover
     _ok(len(log6.tail(3)) == 3, "tail 3")
     _ok(len(log6.tail(0)) == 0, "tail 0")
     _ok(len(list(log6)) == 7, "iter")
-
     print("attestation._self_test: OK (clean/tampered/chain/empty/persist/rotation/concurrent/standalone)")
-
     return None
-
-
 if __name__ == "__main__":  # pragma: no cover
     _self_test()
