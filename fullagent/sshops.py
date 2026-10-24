@@ -37,6 +37,12 @@ _AUTH_HINT = (
     "or start an ssh-agent and add your key (`ssh-add`), then retry."
 )
 
+_CONNECTION_HINT = (
+    "SSH connection failed. Verify the host and port are reachable and "
+    "that sshd is running; common causes are connection refused, a DNS "
+    "failure, or a network timeout."
+)
+
 
 def _ssh_binary() -> Optional[str]:
     return shutil.which("ssh")
@@ -95,7 +101,8 @@ def _format_result(host: str, command: str, completed: subprocess.CompletedProce
     if code == 0:
         return (f"[{host}] exit 0\n"
                 f"$ {command}\n{out}" if out else f"[{host}] exit 0 — no output")
-    hint = f"\n{_AUTH_HINT}" if _is_auth_failure(code, err) else ""
+    hint = (f"\n{_AUTH_HINT}" if _is_auth_failure(code, err)
+            else f"\n{_CONNECTION_HINT}" if code == 255 else "")
     return (f"[{host}] ERROR: ssh exited with code {code}\n"
             f"$ {command}\n"
             f"stdout: {out or '(empty)'}\n"

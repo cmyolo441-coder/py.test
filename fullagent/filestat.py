@@ -1,32 +1,36 @@
-"""File change detection: mtime+size tracking between read and edit.
+"""File change detection: stat + content fingerprint tracking between read/edit.
 
 Incident (512s turn): the agent's ``old_string`` didn't match the file at
 edit time — likely the file changed between the agent's read and its edit
 (external edit, another tool, a rerun). The failure surfaced as a cryptic
 "old_string not found" instead of pointing at the real cause.
 
-This module keeps a tiny per-agent store: ``{realpath: (mtime_ns, size)}``.
-``read_file`` records the stat when the agent reads; ``edit_file`` /
-``multi_edit`` re-stat before applying and, on mismatch, return a clear
-warning telling the agent to re-read and retry instead of failing
-cryptically. After the agent's own write/edit, the new stat is recorded so
-its own writes never trip the check.
+This module keeps a tiny per-agent store:
+``{realpath: (mtime_ns, size, content_digest)}``. ``read_file`` records the
+baseline when the agent reads; ``edit_file`` / ``multi_edit`` re-check before
+applying and, on mismatch, return a clear warning telling the agent to
+re-read and retry instead of failing cryptically. The content digest matters
+because some filesystems only expose coarse mtimes: a same-size rewrite within
+the timestamp tick would otherwise look unchanged. After the agent's own
+write/edit, the new baseline is recorded so its own writes never trip the
+check.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import threading
 import weakref
 from datetime import datetime
 
 _lock = threading.Lock()
-# agent -> {realpath: (mtime_ns, size)}. WeakKeyDictionary so dead agents
-# don't pin their stores. Agents that can't be weak-referenced (or a None
-# agent with no current agent set) fall back to _GLOBAL_STORE.
+# agent -> {realpath: (mtime_ns, size, content_digest)}. WeakKeyDictionary so
+# dead agents don't pin their stores. Agents that can't be weak-referenced (or
+# a None agent with no current agent set) fall back to _GLOBAL_STORE.
 _agent_stores: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
-_id_stores: dict[int, dict[str, tuple[int, int]]] = {}
-_GLOBAL_STORE: dict[str, tuple[int, int]] = {}
+_id_stores: dict[int, dict[str, tuple[int, int, str]]] = {}
+_GLOBAL_STORE: dict[str, tuple[int, int, str]] = {}
 _current: "weakref.ref | None" = None
 
 
@@ -82,7 +86,7 @@ def clear(agent) -> None:
         pass
 
 
-def _store_for(agent) -> dict[str, tuple[int, int]]:
+def _store_for(agent) -> dict[str, tuple[int, int, str]]:
     """Resolve the stat store for an agent (or the current/global one)."""
     with _lock:
         if agent is not None:
@@ -114,10 +118,25 @@ def _key(path: str) -> str:
         return os.path.abspath(path)
 
 
-def _stat(path: str) -> "tuple[int, int] | None":
+def _stat(path: str) -> "tuple[int, int, str] | None":
+    """Return an identity for the current file content.
+
+    mtime/size alone are not enough on filesystems with coarse timestamp
+    granularity: a same-length rewrite can land in the same timestamp tick.
+    A bounded-memory content digest closes that false-negative window.
+    """
     try:
         st = os.stat(path)
-        return (st.st_mtime_ns, st.st_size)
+        if not os.path.isfile(path):
+            return None
+        digest = hashlib.blake2b(digest_size=16)
+        with open(path, "rb") as fh:
+            while True:
+                chunk = fh.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        return (st.st_mtime_ns, st.st_size, digest.hexdigest())
     except OSError:
         return None
 
@@ -168,8 +187,9 @@ def check_stale(agent, path: str) -> str:
             return ""
         if cur == old:
             return ""
-        old_mtime, old_size = old
-        new_mtime, new_size = cur
+        # Tolerate two-field baselines created by an older process/version.
+        old_mtime, old_size = old[0], old[1]
+        new_mtime, new_size = cur[0], cur[1]
         # Refresh the baseline to the newest observed state so a second
         # edit attempt doesn't re-warn about the same external change.
         store[key] = cur

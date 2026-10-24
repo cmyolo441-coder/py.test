@@ -82,6 +82,10 @@ def _self_test() -> int:
             try:
                 rv = fn()
                 if rv is not None and rv != 0:
+                    # Never fail silently: the aggregate runner previously
+                    # only counted non-zero returns, leaving users with a
+                    # bare exit 1 and no module name to investigate.
+                    print(f"ENFORCEx FAIL {name}: returned {rv!r}")
                     failures += 1
             except AssertionError as exc:
                 print(f"ENFORCEx FAIL {name}: {exc}")
