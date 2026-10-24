@@ -347,6 +347,7 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
         "metaguard", "critic", "cognify", "drift", "stream",
         "consensus", "orchestrator", "warroom", "telemetry",
         "dashboard", "forge", "sandbox", "cipherlab", "multiturn", "trust",
+        "foresight", "shield",
     ]
     failed: List[str] = []
     ran: List[str] = []

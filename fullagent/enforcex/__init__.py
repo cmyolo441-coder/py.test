@@ -1,7 +1,7 @@
 """enforcex — System Prompt Compliance Enforcement Toolkit.
 
 Turns raw system-prompt text into structured, checkable rules and keeps
-them in a durable, versioned store. The package has grown to 34 submodules
+them in a durable, versioned store. The package has grown to ~40 submodules
 organized in layers:
 
   Core parse/store          — ruleextract, rulestore
@@ -13,6 +13,7 @@ organized in layers:
   Observability & packing   — telemetry, dashboard, forge, report, cli, sandbox
   Obfuscation & multiturn    — cipherlab (decode), multiturn (coercion tracker)
   Trust & governance         — trust (adaptive trust scoring)
+  Foresight & shield         — foresight (risk forecast), shield (few-shot shields)
 
 Design rules inherited from the fullagent house style:
   * stdlib only, Python 3.9+,
@@ -35,7 +36,7 @@ __all__ = [
     "semantic", "semantics", "metaguard", "critic", "cognify", "drift",
     "stream", "consensus", "orchestrator", "warroom",
     "telemetry", "dashboard", "forge", "report", "cli", "sandbox",
-    "cipherlab", "multiturn", "trust",
+    "cipherlab", "multiturn", "trust", "foresight", "shield",
     "__version__",
 ]
 
@@ -48,7 +49,7 @@ _LAZY_MODULES = (
     "canon", "policy", "attestation", "mutate", "redteam", "shadow",
     "semantic", "semantics", "metaguard", "critic", "cognify", "drift",
     "stream", "consensus", "orchestrator", "warroom", "report", "cli",
-    "sandbox", "cipherlab", "multiturn", "trust",
+    "sandbox", "cipherlab", "multiturn", "trust", "foresight", "shield",
 )
 
 
