@@ -89,8 +89,8 @@ def shimmer_flash(console, text: str, steps: int = 8,
     try:
         for k in range(max(1, steps)):
             t = Text()
-            t.append(text, style=f"bold {_hex(SPINNER_COLORS[
-                k % len(SPINNER_COLORS)])}")
+            color = _hex(SPINNER_COLORS[k % len(SPINNER_COLORS)])
+            t.append(text, style=f"bold {color}")
             console.print(t, end="\r", soft_wrap=False)
             time.sleep(delay)
         t = Text()
