@@ -134,11 +134,14 @@ class AdaptiveTurnCap:
         exhaust the 120s slow budget while they are still working and
         stop the parent turn before it can collect their reports."""
         d = self._clean_duration(duration_s)
-        if waiting_on_background:
-            return None
         with self._lock:
             if self._stopped:
+                # latch first: a background wait must never un-trip a
+                # turn that already stopped (the old order returned None
+                # for waits after the trip, masking the stop).
                 return self._stop_message
+            if waiting_on_background:
+                return None
             self.calls += 1
             self.total_time += d
             if self._avg is None:

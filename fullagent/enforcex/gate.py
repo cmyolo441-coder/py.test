@@ -376,7 +376,11 @@ class Gate:
 
         if _analyze_response is not None:
             try:
-                res = _analyze_response(response_text, system_text=system_text)
+                # responseanaly.analyze_response(text) takes only the
+                # response text — passing system_text=... raised
+                # TypeError on every evaluate (previously swallowed
+                # into notes as "analyze_response unavailable").
+                res = _analyze_response(response_text)
                 if isinstance(res, dict):
                     found = res.get("violations") or res.get("findings") or []
                     if isinstance(found, list):

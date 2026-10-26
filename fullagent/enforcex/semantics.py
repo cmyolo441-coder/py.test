@@ -76,7 +76,8 @@ class SemanticConfig:
 
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, Any]]) -> "SemanticConfig":
-        d = d or {}
+        if not isinstance(d, dict):
+            return cls()
         cfg = cls()
         for f in ("shingle_k", "min_token_len", "max_text", "max_items"):
             if f in d:
@@ -391,6 +392,10 @@ class VectorIndex:
         text = _safe_text(text, self.config.max_text)
         if not doc_id or not text.strip():
             return False
+        try:
+            meta_d = dict(meta) if meta is not None else {}
+        except (TypeError, ValueError):
+            meta_d = {}
         with self._lock:
             if len(self._entries) >= self.config.max_items and \
                     doc_id not in self._entries:
@@ -398,7 +403,7 @@ class VectorIndex:
             raw, shing = self._entry_vectors(text)
             entry = IndexEntry(doc_id=doc_id, text=text,
                                vec=SparseVector(), shing=shing,
-                               meta=dict(meta or {}))
+                               meta=meta_d)
             entry.weights_raw = raw            # type: ignore[attr-defined]
             self._entries[doc_id] = entry
             self._idf_dirty = True
@@ -432,7 +437,10 @@ class VectorIndex:
     def search(self, text: str, top_k: int = 5) -> List[Tuple[str, float]]:
         """Top-k by TF-IDF cosine. [(doc_id, score)] descending."""
         text = _safe_text(text, self.config.max_text)
-        top_k = max(1, int(top_k))
+        try:
+            top_k = max(1, int(top_k))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            top_k = 5
         with self._lock:
             if not self._entries:
                 return []
@@ -451,7 +459,10 @@ class VectorIndex:
 
     def similar_shingles(self, text: str, top_k: int = 5) -> List[Tuple[str, float]]:
         """Top-k by character-shingle Jaccard."""
-        top_k = max(1, int(top_k))
+        try:
+            top_k = max(1, int(top_k))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            top_k = 5
         q = shingles(text, self.config.shingle_k)
         with self._lock:
             scores = [(e.doc_id, jaccard(q, e.shing))
@@ -462,7 +473,14 @@ class VectorIndex:
     def combined(self, text: str, top_k: int = 5,
                  alpha: float = 0.6) -> List[Tuple[str, float]]:
         """Blended similarity: alpha * tfidf_cosine + (1-alpha) * jaccard."""
-        alpha = min(1.0, max(0.0, float(alpha)))
+        try:
+            alpha = min(1.0, max(0.0, float(alpha)))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            alpha = 0.6
+        try:
+            top_k = max(1, int(top_k))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            top_k = 5
         tf = dict(self.search(text, top_k=max(top_k, self.size() or 1)))
         sh = dict(self.similar_shingles(text, top_k=max(top_k, self.size() or 1)))
         ids = set(tf) | set(sh)
@@ -728,13 +746,24 @@ class SemanticMatcher:
             ))
         out.sort(key=lambda m: (-max(m.similarity, m.contradiction),
                                 m.rule_id))
-        if top_k is not None and int(top_k) > 0:
-            out = out[:int(top_k)]
+        if top_k is not None:
+            try:
+                k = int(top_k)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                k = 0
+            if k > 0:
+                out = out[:k]
         return out
 
     def contradictions(self, response_text: str, rules: Any,
                        min_score: Optional[float] = None) -> List[ContradictionHit]:
-        ms = self.config.contradiction_overlap_min if min_score is None else min_score
+        if min_score is None:
+            ms = self.config.contradiction_overlap_min
+        else:
+            try:
+                ms = float(min_score)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                ms = self.config.contradiction_overlap_min
         hits: List[ContradictionHit] = []
         for rule in _iter_rules(rules):
             rid = _rule_field(rule, "id") or _rule_field(rule, "rule_id")
@@ -743,7 +772,7 @@ class SemanticMatcher:
                 continue
             score, why = contradiction_score(rtext, response_text,
                                              self.config.stopwords)
-            if score >= float(ms):
+            if score >= ms:
                 hits.append(ContradictionHit(rule_id=rid, rule_text=rtext,
                                              score=score, why=why))
         hits.sort(key=lambda h: -h.score)

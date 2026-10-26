@@ -287,6 +287,20 @@ def anchor_similarity(anchor: str, text: str) -> float:
 
 # ── data model ───────────────────────────────────────────────────────────
 
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        return float(v) if v is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(v: Any, default: Any = 0) -> Any:
+    try:
+        return int(v) if v is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclass
 class Turn:
     """One scored turn in a conversation."""
@@ -311,14 +325,16 @@ class Turn:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Turn":
+        if not isinstance(d, dict):
+            return cls(text="", turn_id=0)
         return cls(
             text=str(d.get("text", "")),
-            turn_id=int(d.get("turn_id", 0)),
-            drift_score=float(d.get("drift_score", 0.0)),
-            anchor_similarity=float(d.get("anchor_similarity", 0.0)),
-            vocab_growth=float(d.get("vocab_growth", 0.0)),
+            turn_id=_safe_int(d.get("turn_id", 0)),
+            drift_score=_safe_float(d.get("drift_score", 0.0)),
+            anchor_similarity=_safe_float(d.get("anchor_similarity", 0.0)),
+            vocab_growth=_safe_float(d.get("vocab_growth", 0.0)),
             is_topic_shift=bool(d.get("is_topic_shift", False)),
-            meta=dict(d.get("meta") or {}),
+            meta=dict(d.get("meta")) if isinstance(d.get("meta"), dict) else {},
         )
 
 @dataclass
@@ -347,15 +363,23 @@ class DriftReport:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "DriftReport":
+        if not isinstance(d, dict):
+            return cls()
+        turns = d.get("turns", ())
+        if not isinstance(turns, (list, tuple)):
+            turns = ()
+        drifted = d.get("drifted_turns", ())
+        if not isinstance(drifted, (list, tuple)):
+            drifted = ()
         return cls(
-            turns=[Turn.from_dict(x) for x in d.get("turns", ()) if isinstance(x, dict)],
-            overall_drift=float(d.get("overall_drift", 0.0)),
-            drifted_turns=[int(x) for x in d.get("drifted_turns", ())],
+            turns=[Turn.from_dict(x) for x in turns if isinstance(x, dict)],
+            overall_drift=_safe_float(d.get("overall_drift", 0.0)),
+            drifted_turns=[x for x in (_safe_int(v, None) for v in drifted) if x is not None],
             trend=str(d.get("trend", "stable")),
             alert=bool(d.get("alert", False)),
-            vocab_growth_rate=float(d.get("vocab_growth_rate", 0.0)),
-            window_used=int(d.get("window_used", 0)),
-            meta=dict(d.get("meta") or {}),
+            vocab_growth_rate=_safe_float(d.get("vocab_growth_rate", 0.0)),
+            window_used=_safe_int(d.get("window_used", 0)),
+            meta=dict(d.get("meta")) if isinstance(d.get("meta"), dict) else {},
         )
 
 # ── DriftTracker ─────────────────────────────────────────────────────────
@@ -563,13 +587,18 @@ class DriftTracker:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "DriftTracker":
+        if not isinstance(d, dict):
+            return cls()
         obj = cls(
             anchor_text=str(d.get("anchor", "")),
-            window=int(d.get("window", _DEFAULT_WINDOW)),
-            threshold=float(d.get("threshold", _DEFAULT_THRESHOLD)),
+            window=_safe_int(d.get("window", _DEFAULT_WINDOW), _DEFAULT_WINDOW),
+            threshold=_safe_float(d.get("threshold", _DEFAULT_THRESHOLD), _DEFAULT_THRESHOLD),
         )
-        obj._turns = [Turn.from_dict(x) for x in d.get("turns", ()) if isinstance(x, dict)]
-        obj._next_id = int(d.get("next_id", len(obj._turns)))
+        turns = d.get("turns", ())
+        if not isinstance(turns, (list, tuple)):
+            turns = ()
+        obj._turns = [Turn.from_dict(x) for x in turns if isinstance(x, dict)]
+        obj._next_id = _safe_int(d.get("next_id", len(obj._turns)), len(obj._turns))
         # rebuild vocab_seen from turns
         try:
             for t in obj._turns:
@@ -620,6 +649,11 @@ def _iter_rules(rules: Any) -> List[Tuple[str, str, str, str]]:
                                     str(r.get("severity") or "low")))
                     elif isinstance(r, (list, tuple)) and len(r) >= 2:
                         out.append((str(r[0]), str(r[1]), "other", "low"))
+                    elif hasattr(r, "text"):
+                        out.append((str(getattr(r, "id", "") or getattr(r, "rule_id", "") or ""),
+                                    str(getattr(r, "text", "") or ""),
+                                    str(getattr(r, "category", "other") or "other"),
+                                    str(getattr(r, "severity", "low") or "low")))
                 return out
             for k, v in rules.items():
                 if isinstance(v, dict):

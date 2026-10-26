@@ -105,11 +105,22 @@ def send_email(to: Any, subject: str, body: str,
         return MISSING_CONFIG_MSG
     if isinstance(to, str):
         recipients: List[str] = [to]
+    elif isinstance(to, (list, tuple)):
+        recipients = list(to)
     else:
-        recipients = list(to or [])
+        # list(to) on an int/None used to raise TypeError here.
+        return "ERROR: 'to' must be an address string or a list of addresses"
     recipients = [r for r in recipients if _valid_email(r)]
     if not recipients:
         return "ERROR: no valid recipient address (each must contain @)"
+    if subject is None:
+        subject = ""
+    if not isinstance(subject, str):
+        # EmailMessage header assignment raises TypeError for non-str.
+        return "ERROR: subject must be a string"
+    if not isinstance(body, str):
+        # set_content() raises KeyError for non-str bodies.
+        return "ERROR: body must be a string"
     host = str(cfg.get("host") or "").strip()
     if not host:
         return "ERROR: smtp.json has no 'host'"
@@ -161,19 +172,23 @@ def config_status() -> str:
     data = _load_config()
     if data is None:
         return f"SMTP config found at {path} but it is not valid JSON"
+    pw_note = ("password is set but never displayed"
+               if data.get("password") else "no password stored")
     return (f"SMTP configured: host={data.get('host')}, "
             f"port={data.get('port')}, use_tls={bool(data.get('use_tls', True))}, "
             f"username={data.get('username') or '(none)'}, "
             f"from_addr={data.get('from_addr') or '(none)'} "
-            "(password is set but never displayed)")
+            f"({pw_note})")
 
 
 def _tool_send_email(to: str, subject: str, body: str) -> str:
     """Tool handler: ``to`` may be one address or comma/semicolon-separated."""
-    if "," in to or ";" in to:
+    if isinstance(to, str) and ("," in to or ";" in to):
         recipients: Any = [r.strip() for r in
                            to.replace(";", ",").split(",") if r.strip()]
     else:
+        # A list/tuple passes through to send_email's own validation;
+        # None/int used to raise TypeError on the `in` check above.
         recipients = to
     return send_email(recipients, subject, body)
 
@@ -187,8 +202,11 @@ def register(agent: Any) -> None:
     from .tools import Tool, RISK_CONFIRM, RISK_SAFE  # local import: no cycles
 
     tools = getattr(agent, "tools", None)
-    if tools is None:
-        return
+    if not isinstance(tools, dict):
+        # Duck-typed agents without a tools dict used to lose both
+        # registrations silently via the early return.
+        tools = {}
+        agent.tools = tools
     tools["EmailSend"] = Tool(
         "EmailSend",
         "Send a REAL email via configured SMTP. 'to' is one address or a "

@@ -70,6 +70,7 @@ _LAZY_IMPORTS: dict[str, str] = {
     "Provider": ".config",
     "PROVIDERS": ".config",
     "model_by_id": ".config",
+    "effort_by_key": ".config",
     "AttentionEconomy": ".attention",
     "BanditRouter": ".bandit",
     "Brain": ".brain",
@@ -1517,25 +1518,34 @@ class Agent:
 
     def _compliance_gate(self, turn) -> None:
         """Run the enforce.audit self-check and react to a FAIL verdict."""
-        from .client import chat_blocking, parse_audit
-        from .enforce import anchor, audit_prompt, rule_ledger
+        from .client import chat_blocking
+        from .enforce import anchor, audit_prompt, parse_audit, rule_ledger
         from .systemprompt import get as _get_prompt
 
-        _resolve_lazy("model_by_id", "effort_by_key")
+        _resolve_lazy("model_by_id", "effort_by_key", "PROVIDERS")
         from .config import effort_by_key, model_by_id  # noqa: F811
 
         doc = _get_prompt(self.cfg.prompt)
         # audit against the RULE LEDGER (not a truncated prompt — v1 cut
         # the 49k doc and its ledger off entirely, judging the wrong law)
         audit_system = anchor(0) + "\n\n" + rule_ledger(doc)[:1500]
-        raw = chat_blocking(
-            model_by_id(self.cfg.model_id),
-            effort_by_key(self.cfg.effort),
+        # chat_blocking's real signature is (provider, model, effort,
+        # messages, tools) and it returns a StreamResult — the old call
+        # passed (model, effort, messages, None, stream=False), which
+        # raised TypeError (no `stream` parameter) and, even if it had
+        # run, parse_audit() would have received a StreamResult instead
+        # of text and returned UNKNOWN for every audit. This matches the
+        # call shape used by _daemon_step/_council_speaker/_debate_speaker.
+        model = model_by_id(self.cfg.model_id) or self.model
+        effort = effort_by_key(self.cfg.effort) or self.effort
+        provider = PROVIDERS.get(model.provider, self.provider)
+        res = chat_blocking(
+            provider, model, effort,
             [{"role": "system", "content": audit_system},
              {"role": "user", "content": audit_prompt(
                  rule_ledger(doc), turn.assistant_text, is_ledger=True)}],
-            None, stream=False) or ""
-        result = parse_audit(raw)
+            None)
+        result = parse_audit(res.content or "")
         failed = result["verdict"] == "FAIL"
         self.log.append("compliance.audit",
                         {"verdict": result["verdict"],

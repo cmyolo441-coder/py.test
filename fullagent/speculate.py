@@ -96,9 +96,16 @@ def predict(user_text: str, recent_tools: list[dict],
                        0.6, "search verb in user message"))
 
     # 4: siblings of recently read files
+    if not isinstance(recent_tools, (list, tuple)):
+        recent_tools = []
     for call in recent_tools[-3:]:
+        if not isinstance(call, dict):
+            continue
         if call.get("name") == "read_file":
-            p = str(call.get("args", {}).get("path", ""))
+            _args = call.get("args") or {}
+            if not isinstance(_args, dict):
+                _args = {}
+            p = str(_args.get("path", ""))
             if "/" in p:
                 parent = p.rsplit("/", 1)[0]
                 add(Prediction("list_dir", {"path": parent},

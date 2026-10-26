@@ -38,10 +38,8 @@ input, and degrade gracefully when optional sibling modules are absent.
 
 from __future__ import annotations
 
-import hashlib
 import re
 import threading
-from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -145,7 +143,8 @@ class StreamConfig:
 
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, Any]]) -> "StreamConfig":
-        d = d or {}
+        if not isinstance(d, dict):
+            return cls()
         return cls(
             window=d.get("window", _DEFAULT_WINDOW),
             abort_threshold=d.get("abort_threshold", _DEFAULT_ABORT_THRESHOLD),
@@ -376,6 +375,12 @@ class StreamGate:
                     token = token[:_MAX_TOKEN_LEN]
                 # empty tokens still count but do not trigger a scan
                 self._tokens_seen += 1
+                # Whether the buffer held any real content BEFORE this
+                # token: the "first non-empty token" scan must key on
+                # content, not on the raw token counter — a leading
+                # empty token used to make the first real token miss
+                # the immediate scan.
+                buffer_had_content = bool(self._buffer.strip())
                 if token:
                     self._buffer += token
                     # memory bound: keep only the tail
@@ -384,7 +389,7 @@ class StreamGate:
                 # throttling: only scan every check_every_n tokens
                 # always scan the very first non-empty token so hostile
                 # single-token payloads are caught immediately
-                is_first_content = (self._tokens_seen == 1 and bool(token))
+                is_first_content = bool(token.strip()) and not buffer_had_content
                 if not is_first_content and (self._tokens_seen % self.config.check_every_n != 0):
                     return None
                 # rolling-hash duplicate suppression: if the window hash

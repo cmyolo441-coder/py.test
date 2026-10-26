@@ -318,6 +318,11 @@ class BudgetGovernor:
         """USD slice for a subtree — a hard cap a child operation cannot borrow
         past (§13.5)."""
         frac = self.budget.slices.get(subtree, 0.0)
+        if frac <= 0:
+            # a missing/zero slice is a zero cap, not NaN: with the
+            # default unlimited budget (max_usd=inf), inf * 0.0 is NaN
+            # and every comparison against it silently misbehaves.
+            return 0.0
         return self.budget.max_usd * frac
 
 

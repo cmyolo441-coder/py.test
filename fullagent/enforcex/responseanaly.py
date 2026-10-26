@@ -27,7 +27,6 @@ Thread-safe; stdlib only; never raises on malformed input.
 from __future__ import annotations
 
 import re
-import string
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field

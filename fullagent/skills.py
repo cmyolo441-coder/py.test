@@ -239,6 +239,17 @@ class SkillForge:
         On failure: seal skill.rejected with the exact reason."""
         self.log.append("skill.authored", skill.to_dict(), actor="sovereign")
 
+        # Gate 0: the name becomes a filename (<skills_dir>/<name>.py).
+        # An unchecked name such as "../escape" or "a/b" used to be
+        # written OUTSIDE the skills directory (path traversal) and
+        # still registered as a skill. Reject it instead of writing it.
+        if (not isinstance(skill.name, str) or not skill.name.strip()
+                or Path(skill.name).name != skill.name):
+            return self._reject(
+                skill,
+                f"unsafe skill name {skill.name!r}: names must be plain "
+                "filenames (no path separators or '..')")
+
         # gate 1: parse
         try:
             tree = ast.parse(skill.source)
@@ -574,12 +585,16 @@ class SkillMDManager:
 def make_skill_tool(skill: dict) -> Tool:
     """Build the ``skill_<name>`` Tool for one discovered skill."""
     name = skill["name"]
+    # Records from discover_skills() carry no "tool_name" (only
+    # SkillMDManager adds one) — indexing it raised KeyError for any
+    # caller that built a tool straight from a discovered record.
+    tool_name = skill.get("tool_name") or _sanitize_tool_name(name)
 
     def _handle_skill(task: str | None = None, **kwargs) -> str:
         return f"SKILL {name} INSTRUCTIONS:\n{skill['instructions']}"
 
     return Tool(
-        name=skill["tool_name"],
+        name=tool_name,
         description=(f"Skill '{name}': {skill['description']} "
                      "Invoke to load this skill's full instructions into "
                      "context, then follow them for the user's request. "

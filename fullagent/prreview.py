@@ -436,7 +436,11 @@ def _handle_review_pr(pr: str = "", repo: str = "", **kwargs: Any) -> str:
     pr = str(pr or "").strip()
     if not pr:
         return "Error: 'pr' is required (PR number, owner/repo#123, or a pull URL)."
-    return build_report(pr, fetch_pr_diff(pr, str(repo or "")))
+    # The TUI handler titles reports via _ref_label ("PR 3" for a bare
+    # number); the tool used the raw argument ("PR review: 3"), so the
+    # same PR got two different report titles depending on entry point.
+    return build_report(_ref_label(pr, str(repo or "")),
+                        fetch_pr_diff(pr, str(repo or "")))
 
 
 def make_review_pr_tool() -> Tool:

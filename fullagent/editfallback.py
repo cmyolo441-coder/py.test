@@ -128,7 +128,11 @@ def find_edit_span(text: str, old_string: str,
     """
     tried: list[str] = []
     if not isinstance(old_string, str) or not old_string:
-        return _fail(["old_string is empty"], text, old_string or "")
+        # A non-str old_string used to reach _best_guess_context, which
+        # iterates it and raised TypeError instead of a structured
+        # failure. Coerce to "" for the context computation.
+        return _fail(["old_string is empty"], text,
+                     old_string if isinstance(old_string, str) else "")
 
     # (a) exact match -- must be unique
     count = text.count(old_string)

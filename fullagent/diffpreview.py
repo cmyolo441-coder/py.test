@@ -69,7 +69,7 @@ def compute_diff_stats(old: str, new: str) -> Dict[str, Any]:
     }
 
 
-def _unified(old: str, new: str, path: str) -> str:
+def _unified(old: str, new: str, path: str, is_new: bool = False) -> str:
     """Unified diff of old -> new, capped at MAX_DIFF_LINES lines."""
     old_lines = old.splitlines()
     new_lines = new.splitlines()
@@ -77,7 +77,7 @@ def _unified(old: str, new: str, path: str) -> str:
         difflib.unified_diff(
             old_lines,
             new_lines,
-            fromfile="a/" + path if old else "/dev/null",
+            fromfile="/dev/null" if is_new else "a/" + path,
             tofile="b/" + path,
             lineterm="",
             n=_DIFF_CONTEXT,
@@ -350,11 +350,16 @@ def _diff_write_file(args: Dict[str, Any]) -> str:
     if not isinstance(content, str):
         return f"--- {path}\n(cannot preview: content is not a string)"
     old = _read_current(path)
+    # _read_current returns None for a missing/unreadable file and ""
+    # for an existing EMPTY file; the old `old == ""` test conflated
+    # the two and labelled empty files as new ("/dev/null" header).
+    is_new = old is None
     if old is None:
         old = ""
     new = content
-    return _summarize(path, old == "") + "\n" + (
-        _unified(old, new, path) or "(no changes — content matches the file)"
+    return _summarize(path, is_new) + "\n" + (
+        _unified(old, new, path, is_new=is_new)
+        or "(no changes — content matches the file)"
     )
 
 

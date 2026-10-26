@@ -71,7 +71,11 @@ SCHEMA = {
     "output_style": {
         "type": "choice",
         "choices": OUTPUT_STYLES,
-        "default": "concise",
+        # Must match outstyle.DEFAULT_STYLE ("detailed"): /config list
+        # used to report "concise" while the agent actually answered in
+        # the detailed style, because outstyle.load_style() defaults to
+        # detailed when nothing is persisted.
+        "default": "detailed",
         "desc": "response style: concise / detailed / explanatory",
     },
     "thinking_visible": {
@@ -138,7 +142,10 @@ class UserConfig:
         try:
             with open(self.path, "r", encoding="utf-8") as fh:
                 raw = json.load(fh)
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
+        # ValueError covers JSONDecodeError AND UnicodeDecodeError: a
+        # non-UTF-8 config file used to crash UserConfig() construction
+        # (and therefore register()) instead of degrading to defaults.
+        except (FileNotFoundError, ValueError, OSError):
             raw = {}
         with self._lock:
             self._data = dict(raw) if isinstance(raw, dict) else {}
@@ -339,7 +346,7 @@ def _selftest() -> None:
         assert cfg.get("default_model") == "", repr(cfg.get("default_model"))
         assert cfg.get("auto_approve") is False
         assert cfg.get("vim_mode") is False
-        assert cfg.get("output_style") == "concise"
+        assert cfg.get("output_style") == "detailed"
         assert cfg.get("thinking_visible") is True
         assert cfg.get("theme") == "default"
 

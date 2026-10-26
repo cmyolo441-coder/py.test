@@ -90,9 +90,9 @@ def boot_reveal(console, render: Callable[[], object],
 def shimmer_flash(console, text: str, steps: int = 8,
                   delay: float = 0.035) -> None:
     """Print `text` with a one-shot brightness shimmer (rising edge)."""
-    from rich.text import Text
-
     try:
+        from rich.text import Text
+
         for k in range(max(1, steps)):
             t = Text()
             color = _hex(SPINNER_COLORS[k % len(SPINNER_COLORS)])

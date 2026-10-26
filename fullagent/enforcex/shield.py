@@ -58,12 +58,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import random
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 __all__ = [
     "Shield", "ShieldDiff", "ShieldConfig", "ShieldCompiler",
@@ -193,6 +192,20 @@ def _sha(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8", "replace")).hexdigest()
 
 
+def _shield_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def _shield_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
 def _rules_iter(rules: Any) -> Iterable[Any]:
     if rules is None:
         return ()
@@ -255,10 +268,15 @@ class ShieldConfig:
     min_severity: str = "low"
 
     def sanitized(self) -> "ShieldConfig":
+        def _int(value: Any, default: int) -> int:
+            try:
+                return int(value)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return default
         return ShieldConfig(
-            max_examples=max(1, min(int(self.max_examples or 8), 32)),
-            max_shield_chars=max(400, int(self.max_shield_chars or 4000)),
-            rotation_epoch=max(0, int(self.rotation_epoch or 0)),
+            max_examples=max(1, min(_int(self.max_examples, 8), 32)),
+            max_shield_chars=max(400, _int(self.max_shield_chars, 4000)),
+            rotation_epoch=max(0, _int(self.rotation_epoch, 0)),
             include_core=bool(self.include_core),
             include_footer=bool(self.include_footer),
             prefer_immutable=bool(self.prefer_immutable),
@@ -313,7 +331,7 @@ class FewShotExample:
             category=str(d.get("category", "other") or "other"),
             attack=str(d.get("attack", "") or ""),
             reply=str(d.get("reply", "") or ""),
-            template_index=int(d.get("template_index", 0) or 0),
+            template_index=_shield_int(d.get("template_index", 0)),
         )
 
 
@@ -384,7 +402,7 @@ class Shield:
             covered_rules=tuple(str(x) for x in
                                 (d.get("covered_rules") or ())),
             config=ShieldConfig.from_dict(d.get("config")),
-            created_at=float(d.get("created_at", 0.0) or 0.0),
+            created_at=_shield_float(d.get("created_at", 0.0)),
             meta=dict(meta) if isinstance(meta, dict) else {},
         )
 
@@ -465,7 +483,10 @@ class ShieldCompiler:
                  *, cache_size: int = 16) -> None:
         self.config = (config or ShieldConfig()).sanitized()
         self._cache: Dict[Tuple[str, str], Shield] = {}
-        self._cache_size = max(1, int(cache_size or 16))
+        try:
+            self._cache_size = max(1, int(cache_size or 16))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            self._cache_size = 16
         self._hits = 0
         self._misses = 0
 
@@ -564,7 +585,11 @@ class ShieldCompiler:
                     str(_clean(_field(r, "id", ""), 32)))
 
         out = sorted(rule_list, key=sort_key)
-        return [r for r in out if _sev_of(r) >= 0] or []
+        # Filter, don't just deprioritize: rules below min_severity
+        # must not get examples. The old filter (`_sev_of(r) >= 0`)
+        # was always true, so a min_severity="high" config still
+        # covered low/medium rules (only ordered last).
+        return [r for r in out if _sev_of(r) >= min_sev]
 
     def _pick_examples(self, ranked: List[Any],
                        cfg: ShieldConfig) -> List[FewShotExample]:
@@ -646,13 +671,18 @@ class ShieldCompiler:
 
     @staticmethod
     def _major_break(ranked: List[Any], fp: str) -> bool:
-        """A structural break (identity rules added/removed) bumps the
-        major version heuristic: identity-rule signature differs from
-        the minor-version baseline."""
-        identity_ids = tuple(sorted(
-            _clean(_field(r, "id", ""), 32) for r in ranked
-            if _category_of(r) == "identity"))
-        return _sha(repr(identity_ids))[:8] != fp[:8]
+        """Whether this compile is a major-version break.
+
+        A single compile has no baseline to compare against: the old
+        comparison (hash of the identity-id list vs the first 8 chars
+        of the full rule-set fingerprint) compared hashes of two
+        different inputs, so it was True for essentially every shield
+        and every compiled Shield reported version 2.3 while its own
+        header and the Shield default both said 1.3. With no stored
+        baseline there is no detectable break, so this returns False
+        and compiled shields carry the declared 1.3 version.
+        """
+        return False
 
 
 def _empty_shield(cfg: ShieldConfig) -> Shield:

@@ -57,6 +57,15 @@ from ._foundation import get_logger
 
 _log = get_logger("mastermind")
 
+# Sovereign-seal flag read by agent.py (`from .mastermind import
+# _MASTER_SOVEREIGN`). It MUST exist at module level: PromptVault.__init__
+# flips it to True via globals() once the master prompt is sealed, but a
+# fresh-process import before any vault exists raised ImportError, which
+# agent.py swallowed — silently disabling ApexEngine (agent.py:723) and
+# the per-turn sovereign anchor (agent.py:788). Default False = prompt
+# not yet sovereign-sealed; the __init__ assignment flips it to True.
+_MASTER_SOVEREIGN = False
+
 # ---------------------------------------------------------------------------
 # PromptVault — hash-sealed prompts, the only source of truth at runtime
 # ---------------------------------------------------------------------------

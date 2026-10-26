@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 
 __all__ = [
     "Slot", "InjectionPlan", "SentinelPayload", "WireSentinel",
-    "injection_plan_for", "SENTINEL_MARK",
+    "injection_plan_for", "build_payload", "SENTINEL_MARK",
 ]
 
 # structural marker — deliberately short, neutral, and paired with a
@@ -49,7 +49,9 @@ SENTINEL_MARK = "cfg-inject:"
 
 
 def _fp(text: str) -> str:
-    return hashlib.sha256((text or "").encode(
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
+    return hashlib.sha256(text.encode(
         "utf-8", "replace")).hexdigest()[:10]
 
 
@@ -168,6 +170,8 @@ class WireSentinel:
     def apply(self, messages: list[dict]) -> list[dict]:
         """Return a NEW message list with P0/P1/P3 injected. The input
         list and its dicts are never mutated."""
+        if not isinstance(messages, (list, tuple)):
+            return []
         out = [dict(m) if isinstance(m, dict) else m for m in messages]
         if not out or not isinstance(out[0], dict):
             return out
@@ -212,6 +216,8 @@ class WireSentinel:
         """P2: insert a short system-role nudge immediately before the
         final user message. Rotating content per turn (anti-attenuation)
         lives in the payload.anchor_nudge builder, not here."""
+        if not isinstance(messages, (list, tuple)):
+            return []
         out = [dict(m) if isinstance(m, dict) else m for m in messages]
         if not self.plan.has(Slot.PRE_USER):
             return out
@@ -247,6 +253,8 @@ class WireSentinel:
     def strip(self, messages: list[dict]) -> list[dict]:
         """Remove every sentinel artifact (by fingerprint AND slot tag).
         User-visible content is preserved byte-for-byte."""
+        if not isinstance(messages, (list, tuple)):
+            return []
         out = []
         for m in messages:
             if not isinstance(m, dict):
@@ -287,6 +295,8 @@ class WireSentinel:
         return text
 
     def verify_clean(self, messages: list[dict]) -> bool:
+        if not isinstance(messages, (list, tuple)):
+            return True
         for m in messages:
             if isinstance(m, dict) and isinstance(m.get("content"), str):
                 if SENTINEL_MARK in m["content"]:
@@ -299,6 +309,8 @@ class WireSentinel:
 
     @staticmethod
     def _final_user_index(messages: list[dict]) -> int:
+        if not isinstance(messages, (list, tuple)):
+            return -1
         for i in range(len(messages) - 1, -1, -1):
             m = messages[i]
             if isinstance(m, dict) and m.get("role") == "user":
@@ -317,12 +329,14 @@ def build_payload(contract_head: str, ledger_block: str,
                   audit_echo: str = "") -> SentinelPayload:
     """Assemble the payload and derive its fingerprint from the union of
     all blocks (any content change → new fingerprint → fresh injection)."""
+    def _s(v) -> str:
+        return v if isinstance(v, str) else ("" if v is None else str(v))
+    contract_head, ledger_block, anchor_nudge, inline_tag = (
+        _s(contract_head), _s(ledger_block), _s(anchor_nudge),
+        _s(inline_tag))
+    audit_echo = _s(audit_echo)
     fp = _fp(contract_head + "\x00" + ledger_block + "\x00"
              + anchor_nudge + "\x00" + inline_tag)
-    if audit_echo:
-        inline_extra = ""
-    else:
-        inline_extra = ""
     return SentinelPayload(
         contract_head=contract_head,
         ledger_block=ledger_block,

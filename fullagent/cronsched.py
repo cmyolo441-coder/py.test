@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from . import config
-from .tools import Tool
+from .tools import RISK_CONFIRM, RISK_SAFE, Tool
 
 # Wake interval of the scheduler loop.
 POLL_SECONDS = 30
@@ -137,6 +137,8 @@ def _parse(expr: str) -> tuple[set[int], set[int], set[int],
     Returns (minutes, hours, doms, months, dows, dom_restricted,
     dow_restricted). DOW is normalized so 7 == 0 (Sunday).
     """
+    if not isinstance(expr, str):
+        raise ValueError("cron expression must be a string")
     parts = expr.split()
     if len(parts) != 5:
         raise ValueError(
@@ -224,7 +226,7 @@ class CronScheduler:
     # -- public API ---------------------------------------------------------
     def add(self, cron_expr: str, command: str) -> tuple[int, float]:
         expr = validate_cron_expr(cron_expr)
-        if not command or not command.strip():
+        if not isinstance(command, str) or not command.strip():
             raise ValueError("command must not be empty")
         now = time.time()
         nxt = next_run_after(expr, datetime.now()).timestamp()
@@ -268,7 +270,10 @@ class CronScheduler:
         return changed
 
     def runs(self, cron_id: int, limit: int = 5) -> list[dict]:
-        limit = max(1, min(50, int(limit)))
+        try:
+            limit = max(1, min(50, int(limit)))
+        except (TypeError, ValueError):
+            limit = 5
         with self._lock:
             cur = self._conn.execute(
                 "SELECT * FROM runs WHERE cron_id = ?"
@@ -464,7 +469,7 @@ def _sched() -> CronScheduler:
 def _handle_cron_add(cron_expr: str, command: str) -> str:
     try:
         cron_id, nxt = _sched().add(cron_expr, command)
-    except ValueError as e:
+    except (ValueError, TypeError) as e:
         return f"error: {e}"
     return (f"✓ cron #{cron_id} added: `{cron_expr}` → {command}\n"
             f"  next run: {_fmt_ts(nxt)}")
@@ -484,18 +489,35 @@ def _handle_cron_list() -> str:
     return "\n".join(lines)
 
 
+def _coerce_cron_id(id: Any) -> int | None:
+    """Tool-arg id -> int, or None when it is not an integer at all.
+
+    int("abc") / int(None) used to raise out of these handlers.
+    """
+    try:
+        return int(id)
+    except (TypeError, ValueError):
+        return None
+
+
 def _handle_cron_remove(id: int) -> str:
-    if _sched().remove(int(id)):
+    cron_id = _coerce_cron_id(id)
+    if cron_id is None:
+        return f"error: cron id must be an integer, got {id!r}"
+    if _sched().remove(cron_id):
         return f"✓ cron #{id} removed (run history cleared)"
     return f"error: no cron with id {id}"
 
 
 def _handle_cron_log(id: int, limit: int = 5) -> str:
     sched = _sched()
-    row = sched._row(int(id))
+    cron_id = _coerce_cron_id(id)
+    if cron_id is None:
+        return f"error: cron id must be an integer, got {id!r}"
+    row = sched._row(cron_id)
     if row is None:
         return f"error: no cron with id {id}"
-    runs = sched.runs(int(id), limit)
+    runs = sched.runs(cron_id, limit)
     if not runs:
         return f"cron #{id} (`{row['cron_expr']}`) has not run yet"
     lines = [f"last {len(runs)} run(s) of cron #{id}:"]
@@ -531,6 +553,10 @@ def register(agent: Any) -> None:
                         "description": "shell command to run"},
         }, "required": ["cron_expr", "command"]},
         handler=_handle_cron_add,
+        # Scheduling an arbitrary shell command must go through the
+        # approval gate like JobStart/docker_run; the Tool default is
+        # RISK_SAFE, which used to let CronAdd run unapproved.
+        risk=RISK_CONFIRM,
     )
     agent.tools["CronList"] = Tool(
         name="CronList",
@@ -538,6 +564,7 @@ def register(agent: Any) -> None:
                      "enabled state, and last run time."),
         parameters={"type": "object", "properties": {}},
         handler=lambda: _handle_cron_list(),
+        risk=RISK_SAFE,
     )
     agent.tools["CronRemove"] = Tool(
         name="CronRemove",
@@ -546,6 +573,7 @@ def register(agent: Any) -> None:
             "id": {"type": "integer", "description": "cron id"},
         }, "required": ["id"]},
         handler=_handle_cron_remove,
+        risk=RISK_CONFIRM,
     )
     agent.tools["CronLog"] = Tool(
         name="CronLog",
@@ -557,6 +585,7 @@ def register(agent: Any) -> None:
                       "description": "how many runs to show (default 5)"},
         }, "required": ["id"]},
         handler=_handle_cron_log,
+        risk=RISK_SAFE,
     )
     agent.cron_scheduler = _scheduler
 

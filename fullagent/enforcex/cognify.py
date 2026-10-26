@@ -303,9 +303,15 @@ class CognitiveSignal:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "CognitiveSignal":
+        if not isinstance(d, dict):
+            return cls(name="", score=0.0)
+        try:
+            score = float(d.get("score", 0.0))
+        except (TypeError, ValueError):
+            score = 0.0
         return cls(
             name=str(d.get("name", "")),
-            score=float(d.get("score", 0.0)),
+            score=score,
             evidence=str(d.get("evidence", "")),
             detail=str(d.get("detail", "")),
         )
@@ -334,14 +340,24 @@ class CognitiveReport:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "CognitiveReport":
+        if not isinstance(d, dict):
+            return cls()
+        try:
+            overload = float(d.get("overload", 0.0))
+        except (TypeError, ValueError):
+            overload = 0.0
+        try:
+            cog = float(d.get("cognitive_score", 0.0))
+        except (TypeError, ValueError):
+            cog = 0.0
         return cls(
             signals=[CognitiveSignal.from_dict(x) for x in d.get("signals", ()) if isinstance(x, dict)],
             hijacked=bool(d.get("hijacked", False)),
-            overload=float(d.get("overload", 0.0)),
+            overload=overload,
             dominant_goal=str(d.get("dominant_goal", "balanced")),
             recommendation=str(d.get("recommendation", "")),
-            cognitive_score_val=float(d.get("cognitive_score", 0.0)),
-            meta=dict(d.get("meta") or {}),
+            cognitive_score_val=cog,
+            meta=dict(d.get("meta")) if isinstance(d.get("meta"), dict) else {},
         )
 
 # ── signal detectors ─────────────────────────────────────────────────────
@@ -730,6 +746,11 @@ def _iter_rules(rules: Any) -> List[Tuple[str, str, str, str]]:
                                     str(r.get("severity") or "low")))
                     elif isinstance(r, (list, tuple)) and len(r) >= 2:
                         out.append((str(r[0]), str(r[1]), "other", "low"))
+                    elif hasattr(r, "text"):
+                        out.append((str(getattr(r, "id", "") or getattr(r, "rule_id", "") or ""),
+                                    str(getattr(r, "text", "") or ""),
+                                    str(getattr(r, "category", "other") or "other"),
+                                    str(getattr(r, "severity", "low") or "low")))
                 return out
             for k, v in rules.items():
                 if isinstance(v, dict):

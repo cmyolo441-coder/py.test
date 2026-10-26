@@ -89,7 +89,7 @@ def extract_code(module_name: str, source: str) -> tuple[list[Entity],
     relations: list[Relation] = []
     try:
         tree = ast.parse(source)
-    except SyntaxError:
+    except (SyntaxError, TypeError, ValueError):
         return entities, relations
 
     mod_id = f"module:{module_name}"

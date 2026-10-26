@@ -795,6 +795,22 @@ class CriticEnsemble:
                 majority = "violation"
             elif majority == "violation" and fused > 0.65:
                 majority = "adherent"
+            # The override can flip the majority, so dissents (and the
+            # uncertainty flag derived from them) must be recomputed
+            # against the FINAL majority. Previously they were left at
+            # their pre-override values: e.g. majority="violation"
+            # with every critic >= 0.5 still reported dissents=[].
+            dissents = []
+            for n, sc in scores.items():
+                if majority == "adherent" and sc.score < 0.5:
+                    dissents.append(n)
+                elif majority == "violation" and sc.score >= 0.5:
+                    dissents.append(n)
+                elif majority == "mixed":
+                    dissents.append(n)
+            uncertain = (len(dissents) >= 2
+                         or spread > self.uncertainty_threshold
+                         or NEUTRAL - 0.05 <= fused <= NEUTRAL + 0.05)
 
         stats = {
             "critics": len(scores),

@@ -255,7 +255,12 @@ def register(agent: Any) -> None:
     idempotent, and snapshot failures never block an edit.
     """
     session_id = getattr(agent, "session_id", None)
-    tools: Dict[str, Any] = getattr(agent, "tools", {})
+    tools: Dict[str, Any] = getattr(agent, "tools", None)  # type: ignore[assignment]
+    if not isinstance(tools, dict):
+        # An agent without a tools dict used to lose the EditRollback
+        # registration silently (writes went to a throwaway dict).
+        tools = {}
+        agent.tools = tools
     for name in _EDIT_TOOL_NAMES:
         tool = tools.get(name)
         if tool is not None and callable(getattr(tool, "handler", None)):

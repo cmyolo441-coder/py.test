@@ -50,9 +50,8 @@ from __future__ import annotations
 import hashlib
 import re
 import time
-import unicodedata
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set
 
 # ── defensive sibling imports ────────────────────────────────────────────
 
@@ -325,7 +324,9 @@ class SandboxRule:
         }
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "SandboxRule":
+    def from_dict(cls, d: Any) -> "SandboxRule":
+        if not isinstance(d, dict):
+            return cls(rule_id="", check_fn=None)
         return cls(
             rule_id=str(d.get("rule_id", "")),
             check_fn=None,
@@ -358,15 +359,22 @@ class SandboxResult:
         }
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "SandboxResult":
+    def from_dict(cls, d: Any) -> "SandboxResult":
+        if not isinstance(d, dict):
+            return cls(rule_id="", passed=False)
+        try:
+            ops = int(d.get("ops", 0))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            ops = 0
+        viols = d.get("violations", ())
         return cls(
             rule_id=str(d.get("rule_id", "")),
             passed=bool(d.get("passed", False)),
             error=str(d.get("error", "")),
             attenuated=bool(d.get("attenuated", False)),
             timed_out=bool(d.get("timed_out", False)),
-            ops=int(d.get("ops", 0)),
-            violations=list(d.get("violations", ())),
+            ops=ops,
+            violations=list(viols) if isinstance(viols, (list, tuple)) else [],
             evidence=str(d.get("evidence", "")),
         )
 
@@ -387,12 +395,16 @@ class SandboxReport:
         }
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "SandboxReport":
+    def from_dict(cls, d: Any) -> "SandboxReport":
+        if not isinstance(d, dict):
+            return cls()
+        blocked = d.get("blocked_escalations", ())
+        meta = d.get("meta")
         return cls(
             results=[SandboxResult.from_dict(x) for x in d.get("results", ()) if isinstance(x, dict)],
             all_passed=bool(d.get("all_passed", True)),
-            blocked_escalations=list(d.get("blocked_escalations", ())),
-            meta=dict(d.get("meta") or {}),
+            blocked_escalations=list(blocked) if isinstance(blocked, (list, tuple)) else [],
+            meta=dict(meta) if isinstance(meta, dict) else {},
         )
 
 # ── core: rule coercion ──────────────────────────────────────────────────
@@ -439,10 +451,10 @@ def _coerce_rules(
                                        capabilities=_caps_for(rid, caps),
                                        description=txt[:200], raw=r))
             return out[:_MAX_RULES]
-        # list of SandboxRules already
-        if isinstance(rules, (list, tuple)) and rules and isinstance(rules[0], SandboxRule):
-            return list(rules)[:_MAX_RULES]  # type: ignore
-        # list/tuple of rule-ish objects
+        # list/tuple of rule-ish objects (SandboxRule items are handled
+        # per-item below; a blanket early return here used to drop every
+        # non-SandboxRule item in a mixed list whenever the first item
+        # happened to be a SandboxRule).
         if isinstance(rules, (list, tuple)):
             for idx, item in enumerate(rules):
                 if isinstance(item, SandboxRule):
@@ -763,7 +775,10 @@ class Sandbox:
         max_ops: int = _DEFAULT_MAX_OPS,
         timeout_s: float = _DEFAULT_TIMEOUT_S,
     ) -> None:
-        self.max_ops = max(1, int(max_ops) if isinstance(max_ops, int) else _DEFAULT_MAX_OPS)
+        try:
+            self.max_ops = max(1, int(max_ops))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            self.max_ops = _DEFAULT_MAX_OPS
         try:
             self.timeout_s = max(0.05, float(timeout_s))
         except Exception:
@@ -850,7 +865,11 @@ class Sandbox:
 
             return SandboxReport(
                 results=results,
-                all_passed=bool(all_passed and not blocked_escalations or all(r.passed for r in results)),
+                # A blocked escalation must fail the report even if
+                # every rule individually passed: the old expression
+                # `(all_passed and not blocked) or all(passed)` reduced
+                # to all(passed) because all_passed already was that.
+                all_passed=bool(all_passed and not blocked_escalations),
                 blocked_escalations=blocked_escalations,
                 meta={"rule_count": len(results), "hash": self._hash,
                       "blocked_count": len(blocked_escalations)},

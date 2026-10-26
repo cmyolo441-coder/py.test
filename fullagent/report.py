@@ -16,6 +16,7 @@ from __future__ import annotations
 import re
 import time
 from datetime import datetime
+from typing import Any
 
 from .kernel import EventLog, fold
 from ._foundation import get_logger
@@ -32,6 +33,22 @@ INTERESTING = ("user.message", "assistant.message", "tool.call",
 # ---------------------------------------------------------------------------
 # Data gathering (one pass over the log)
 # ---------------------------------------------------------------------------
+
+def _safe_int(v: Any) -> int:
+    """int() that never raises on a malformed log value (→ 0)."""
+    try:
+        return int(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+
+
+def _safe_float(v: Any) -> float:
+    """float() that never raises on a malformed log value (→ 0.0)."""
+    try:
+        return float(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
+
 
 def _gather(log: EventLog) -> dict:
     st = fold(log)
@@ -58,9 +75,14 @@ def _gather(log: EventLog) -> dict:
             m = models.setdefault(str(d.get("model", "?")),
                                   {"tokens_in": 0, "tokens_out": 0,
                                    "usd": 0.0, "calls": 0})
-            m["tokens_in"] += int(d.get("tokens_in", 0) or 0)
-            m["tokens_out"] += int(d.get("tokens_out", 0) or 0)
-            m["usd"] += float(d.get("usd", 0.0) or 0.0)
+            # A cost event with a non-numeric value (e.g. a string in a
+            # hand-written/corrupted log line) used to raise ValueError
+            # here and kill the whole export, while fold() itself
+            # coerces safely — so export and forecast disagreed on the
+            # same log. Treat malformed numbers as 0, like fold does.
+            m["tokens_in"] += _safe_int(d.get("tokens_in", 0) or 0)
+            m["tokens_out"] += _safe_int(d.get("tokens_out", 0) or 0)
+            m["usd"] += _safe_float(d.get("usd", 0.0) or 0.0)
             m["calls"] += 1
         if t in INTERESTING:
             timeline.append({"seq": ev.seq, "ts": ev.ts, "type": t,

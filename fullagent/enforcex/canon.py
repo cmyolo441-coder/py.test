@@ -206,6 +206,8 @@ class Contract:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Contract":
+        if not isinstance(d, dict):
+            return cls(canon_id="", version=1, sha256="")
         clauses = [Clause.from_dict(x) for x in d.get("clauses", ())
                    if isinstance(x, dict)]
         meta = d.get("meta") if isinstance(d.get("meta"), dict) else {}

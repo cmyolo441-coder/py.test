@@ -81,10 +81,15 @@ class TodoManager:
         status = str(item.get("status", STATUS_PENDING))
         if status not in VALID_STATUSES:
             status = STATUS_PENDING
+        # An explicit None used to become the literal string "None"
+        # (str(None)) — a phantom todo reading "None" — and it slipped
+        # past _handle_todo_write's non-empty check for the same reason.
+        content = item.get("content", "")
+        active = item.get("activeForm", "")
         return {
-            "content": str(item.get("content", "")),
+            "content": "" if content is None else str(content),
             "status": status,
-            "activeForm": str(item.get("activeForm", "")),
+            "activeForm": "" if active is None else str(active),
         }
 
     def set_todos(self, todos: List[Dict[str, Any]]) -> None:
@@ -139,7 +144,9 @@ def _handle_todo_write(todos: Any = None, **kwargs: Any) -> str:
     if not todos:
         return "Error: 'todos' must not be empty."
     for t in todos:
-        if not isinstance(t, dict) or not str(t.get("content", "")).strip():
+        content = t.get("content", "") if isinstance(t, dict) else ""
+        if not isinstance(t, dict) or not (
+                "" if content is None else str(content)).strip():
             return "Error: every todo needs a non-empty 'content' string."
     mgr = _get_manager()
     mgr.set_todos(todos)

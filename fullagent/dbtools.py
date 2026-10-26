@@ -182,7 +182,24 @@ def db_query(db_path: str, sql: str, confirm: bool = False) -> str:
     text = sql.strip()
     if isinstance(confirm, str):
         confirm = confirm.strip().lower() in ("1", "true", "yes", "y")
-    first = text.lstrip("(").split(None, 1)
+    # Strip leading SQL comments before classifying: a SELECT hidden
+    # behind "-- ..." or "/* ... */" used to be classified by its first
+    # token ("--" / "/*") and refused as a non-SELECT statement.
+    stripped = text
+    while True:
+        s = stripped.lstrip()
+        if s.startswith("--"):
+            stripped = s.split("\n", 1)[1] if "\n" in s else ""
+            continue
+        if s.startswith("/*"):
+            end = s.find("*/")
+            if end == -1:
+                stripped = ""
+                break
+            stripped = s[end + 2:]
+            continue
+        break
+    first = stripped.lstrip("(").split(None, 1)
     keyword = (first[0].upper() if first else "")
     read_only = keyword in _READ_ONLY_STARTERS
     if not read_only and not confirm:

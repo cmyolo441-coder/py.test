@@ -174,6 +174,8 @@ def adherence_bar(rate: Any, width: int = 12,
 def box_line(left: str, right: str, width: int = 78,
              use_color: bool = False) -> str:
     """One line with left text and right-aligned text, dots between."""
+    left = "" if left is None else str(left)
+    right = "" if right is None else str(right)
     width = max(10, int(width or 78))
     lw = _visible_len(left)
     rw = _visible_len(right)
@@ -246,14 +248,6 @@ def ascii_table(headers: Sequence[str], rows: Iterable[Iterable[Any]],
                 take = min(overflow, widths[i] - 4)
                 widths[i] -= take
                 overflow -= take
-
-    def _fmt(cells: Sequence[str], colored: bool = False) -> str:
-        parts: List[str] = []
-        for i, cell in enumerate(cells):
-            w = widths[i] if i < len(widths) else len(str(cell))
-            col = color_map.get((i, i)) if False else None
-            parts.append(str(cell)[:w].ljust(w))
-        return "  │  ".join(parts)
 
     lines = ["  │  ".join(h.ljust(widths[i]) for i, h in enumerate(head))]
     lines.append("──┼──".join("─" * w for w in widths))
@@ -396,7 +390,12 @@ def top_violated_rules(state: Any, top: int = 10, use_color: bool = False,
 
 def severity_summary(state: Any, use_color: bool = False) -> str:
     """Severity heat bars aggregated from rule severities / violations."""
-    rules = _rules_from_state(_as_state(state))
+    # Coerce first: callers may pass None, a snapshot object, or any
+    # other state shape, and this renderer must never raise (the old
+    # code called state.get() on the raw argument and crashed on
+    # anything that was not a dict).
+    state = _as_state(state)
+    rules = _rules_from_state(state)
     counts: Dict[str, int] = {}
     for r in rules:
         for sev, n in (r.get("severities") or {}).items():

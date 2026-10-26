@@ -47,6 +47,11 @@ def _load(path: str) -> dict:
         raise ValueError(f"Invalid notebook JSON: {e}") from e
     if not isinstance(nb, dict) or not isinstance(nb.get("cells"), list):
         raise ValueError("Not a valid nbformat notebook: missing 'cells' list")
+    # A non-dict cell used to escape _safe() as AttributeError (cell.get
+    # in _save/_source_text) instead of becoming an ERROR string.
+    if not all(isinstance(c, dict) for c in nb["cells"]):
+        raise ValueError("Not a valid nbformat notebook: every cell must "
+                         "be an object")
     return nb
 
 

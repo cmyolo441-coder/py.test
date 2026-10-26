@@ -489,11 +489,19 @@ def agent_board(
     tail: List[Fragment] = [(colors.get("dim", ""), " ↓ to manage ")]
     rows: List[List[Fragment]] = [align(head, tail, width, fill="─")]
 
-    # Running first, then cancelling, then queued.
+    # Running first, then cancelling, then queued. elapsed_ms is
+    # coerced defensively: a non-numeric value in a worker dict used to
+    # raise ValueError out of sorted() and kill the whole board.
+    def _elapsed_ms(w: dict) -> float:
+        try:
+            return float(w.get("elapsed_ms") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
     order = {"running": 0, "cancelling": 1, "queued": 2}
     ranked = sorted(workers,
                     key=lambda w: (order.get(w.get("state"), 3),
-                                   -float(w.get("elapsed_ms") or 0)))
+                                   -_elapsed_ms(w)))
     for row in ranked[:max(1, int(limit))]:
         state = str(row.get("state") or "queued")
         color = colors.get(STATE_COLOR_KEYS.get(state, "fg"), "")
@@ -507,29 +515,33 @@ def agent_board(
             task = " ".join(str(row.get("task") or "").split())
             action = task or action or state
         prefix = f" {icon} "
-        room = max(8, width - display_width(prefix) - len(chip) - 4)
-        rows.append([
+        # v4: live telemetry tail per worker — elapsed seconds and retry
+        # count, so a long swarm shows what each agent is up against.
+        # The tail is sized FIRST and reserved from the action budget:
+        # appending it after truncating the action used to push worker
+        # rows past the terminal width (e.g. 95 cols on an 80-col TTY).
+        bits: list[str] = []
+        try:
+            elapsed_s = int(_elapsed_ms(row) / 1000)
+            retries = int(row.get("retries") or 0)
+        except (TypeError, ValueError):
+            elapsed_s, retries = 0, 0
+        if elapsed_s >= 3:
+            bits.append(f"{elapsed_s}s")
+        if retries:
+            bits.append(f"retry {retries}")
+        tail_text = ("  " + " · ".join(bits)) if bits else ""
+        room = max(8, width - display_width(prefix) - len(chip) - 4
+                   - display_width(tail_text))
+        line: List[Fragment] = [
             (f"bold {color}", prefix),
             (f"bold {colors.get('cyan', '')}", chip),
             (colors.get("dim", ""), " · "),
             (colors.get("fg", ""), truncate(action, room)),
-        ])
-        # v4: live telemetry tail per worker — elapsed seconds and retry
-        # count, so a long swarm shows what each agent is up against.
-        try:
-            elapsed_s = int((float(row.get("elapsed_ms") or 0)) / 1000)
-            retries = int(row.get("retries") or 0)
-            bits = []
-            if elapsed_s >= 3:
-                bits.append(f"{elapsed_s}s")
-            if retries:
-                bits.append(f"retry {retries}")
-            if bits:
-                rows[-1] = rows[-1] + [
-                    (colors.get("dim", ""), "  " + " · ".join(bits)),
-                ]
-        except Exception:
-            pass
+        ]
+        if tail_text:
+            line.append((colors.get("dim", ""), tail_text))
+        rows.append(line)
 
     hidden = total - min(total, max(1, int(limit)))
     if hidden > 0:

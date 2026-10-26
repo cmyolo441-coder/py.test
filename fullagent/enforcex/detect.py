@@ -232,21 +232,31 @@ class Detection:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Detection":
+        if not isinstance(d, dict):
+            return cls(rule_id="", kind=KINDS.FORBIDDEN_CONTENT,
+                       confidence=0.5, span=(0, 0), evidence="")
         span = d.get("span") or (0, 0)
         try:
             span_t = (int(span[0]), int(span[1]))
         except Exception:
             span_t = (0, 0)
+        try:
+            confidence = float(d.get("confidence", 0.5))
+        except (TypeError, ValueError):
+            confidence = 0.5
+        meta = d.get("meta") or {}
+        if not isinstance(meta, dict):
+            meta = {}
         return cls(
             rule_id=str(d.get("rule_id", "")),
             kind=str(d.get("kind", KINDS.FORBIDDEN_CONTENT)),
-            confidence=float(d.get("confidence", 0.5)),
+            confidence=confidence,
             span=span_t,
             evidence=str(d.get("evidence", "")),
             category=str(d.get("category", "other")),
             severity=str(d.get("severity", "medium")),
             message=str(d.get("message", "")),
-            meta=dict(d.get("meta") or {}),
+            meta=dict(meta),
         )
 
 

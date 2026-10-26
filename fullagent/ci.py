@@ -57,7 +57,12 @@ class CIPilot:
         self.root = Path(root)
         self.runner = runner
         self.poll = poll
-        self._snapshot: dict[str, tuple[float, int]] = {}
+        # None = "never scanned yet". An empty dict is a REAL snapshot
+        # (an empty project): the old code used {} as the sentinel, so
+        # check_once() treated every scan of an empty tree as "first
+        # scan" and never reported files added to an empty project
+        # (or re-added after everything was deleted).
+        self._snapshot: dict[str, tuple[float, int]] | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self.records: list[RunRecord] = []
@@ -146,7 +151,7 @@ class CIPilot:
     def check_once(self) -> RunRecord | None:
         """Diff the tree since the last look; run impacted tests."""
         current = self._scan()
-        if self._snapshot:
+        if self._snapshot is not None:
             changed = sorted(
                 p for p, sig in current.items()
                 if self._snapshot.get(p) != sig)

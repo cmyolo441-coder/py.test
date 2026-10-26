@@ -110,9 +110,12 @@ class LedgerEntry:
     doc_id: str = ""
 
     def xml(self) -> str:
-        esc = (self.text.replace("&", "&")
-               .replace("<", "<").replace(">", ">")
-               .replace('"', '"'))
+        # Escape in & first: the old code replaced each char with itself,
+        # so "<", "&" and '"' in rule text broke the XML (and could
+        # inject markup into the wire format).
+        esc = (self.text.replace("&", "&amp;")
+               .replace("<", "&lt;").replace(">", "&gt;")
+               .replace('"', "&quot;"))
         return (f'<rule id="{self.rule_id}" pri="{self.importance:.2f}" '
                 f'scope="{self.scope}" src="{SourceLevel.name(self.source_level)}">'
                 f'{esc}</rule>')
@@ -213,15 +216,20 @@ class RuleLedger:
         limit = max_chars or self.size_for_budget(self.doc_chars)
         out: list[LedgerEntry] = []
         used = 0
+        truncated = False
         for e in self.entries:
             w = len(e.xml()) + 1
             if used + w > limit and out:
-                self.truncated = True
+                truncated = True
                 break
             out.append(e)
             used += w
+        # The old code set truncated only on `self` and returned a fresh
+        # ledger with truncated=False, so callers checking the RETURNED
+        # ledger (e.g. build_ledger's result) never saw the truncation.
+        self.truncated = truncated
         return RuleLedger(entries=out, doc_id=self.doc_id,
-                          doc_chars=self.doc_chars)
+                          doc_chars=self.doc_chars, truncated=truncated)
 
 
 # ── dedup: near-duplicate collapse ──────────────────────────────────────

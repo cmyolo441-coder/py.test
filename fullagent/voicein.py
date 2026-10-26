@@ -321,6 +321,11 @@ def handle_voice(ui: Any, arg: str) -> None:
         except ValueError:
             ui.print_error("usage: /voice [seconds]  (1-120)")
             return
+    # Announce the duration that will actually be recorded:
+    # record_and_transcribe() clamps to 1..120, but the old code printed
+    # the raw value, so "/voice -5" announced "-5s" and "/voice 999"
+    # announced "999s" while recording 1s / 120s.
+    seconds = max(1, min(MAX_RECORD_SECONDS, seconds))
     if whisper_backend() is None:
         ui.print_error(WHISPER_NOT_INSTALLED)
         return

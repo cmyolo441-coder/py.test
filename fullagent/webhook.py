@@ -360,7 +360,10 @@ def register(agent: Any, port: int | None = None) -> None:
 
     tools = getattr(agent, "tools", None)
     if not isinstance(tools, dict):
-        return
+        # Duck-typed agents without a tools dict used to lose all four
+        # tool registrations silently via the early return.
+        tools = {}
+        agent.tools = tools
     tools["WebhookAdd"] = Tool(
         name="WebhookAdd",
         description=("Register an HTTP webhook: incoming POSTs to "

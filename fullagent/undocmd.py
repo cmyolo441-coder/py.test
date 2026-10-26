@@ -167,7 +167,12 @@ def undo_last(agent: Any) -> str:
     for ev in reversed(events):
         if getattr(ev, "type", None) != "snapshot.taken":
             continue
+        # A poisoned event whose data is a bare string (not a dict)
+        # used to raise AttributeError on .get() and kill /undo
+        # outright; skip it like any non-matching event instead.
         data = getattr(ev, "data", None) or {}
+        if not isinstance(data, dict):
+            continue
         before = str(data.get("before_tool", "") or "").strip().lower()
         if before in _FILE_MUTATION_TOOLS:
             target = ev
@@ -175,7 +180,10 @@ def undo_last(agent: Any) -> str:
     if target is None:
         return _NOTHING_TO_UNDO
 
-    tree_hash = str((target.data or {}).get("tree", "") or "")
+    target_data = getattr(target, "data", None)
+    if not isinstance(target_data, dict):
+        target_data = {}
+    tree_hash = str(target_data.get("tree", "") or "")
     manifest = None
     try:
         manifest = store.load_tree(tree_hash)

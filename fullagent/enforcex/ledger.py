@@ -55,13 +55,35 @@ class LedgerError(Exception):
 
 # ── hashing primitives ───────────────────────────────────────────────────
 
+def _sanitize(obj: Any) -> Any:
+    """Replace non-finite floats (NaN/inf) with None so canonical JSON
+    never raises: the old allow_nan=False made seal()/persist() crash
+    on any payload containing NaN, contradicting Ledger.append's
+    "never raises" contract. Dict keys are left untouched (JSON keys
+    must stay strings); only values are sanitized."""
+    if isinstance(obj, float):
+        return obj if obj == obj and abs(obj) != float("inf") else None
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize(v) for v in obj]
+    return obj
+
+
 def canonical_json(obj: Any) -> str:
-    """Deterministic JSON: sorted keys, tight separators, no NaN."""
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+    """Deterministic JSON: sorted keys, tight separators, no NaN
+    (non-finite floats are encoded as null, never raised)."""
+    return json.dumps(_sanitize(obj), sort_keys=True, separators=(",", ":"),
                       ensure_ascii=False, default=str, allow_nan=False)
 
 
-def sha256_hex(text: str) -> str:
+def sha256_hex(text: Any) -> str:
+    if isinstance(text, bytes):
+        return hashlib.sha256(text).hexdigest()
+    if not isinstance(text, str):
+        # attestation-style coercion: hash the canonical form of
+        # non-string input instead of raising AttributeError on .encode
+        return hashlib.sha256(canonical_json(text).encode("utf-8")).hexdigest()
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
@@ -158,6 +180,8 @@ class LedgerEntry:
 def verify_chain_dicts(dicts: Sequence[Dict[str, Any]]) -> Tuple[bool, str]:
     """Verify hash linkage + self-consistency over raw dicts.
     Returns (ok, first_bad_reason)."""
+    if not isinstance(dicts, (list, tuple)):
+        return False, "chain is not a list of dicts"
     prev = GENESIS_HASH
     expected_seq = 0
     for i, raw in enumerate(dicts):
@@ -479,6 +503,8 @@ class Ledger:
         """Build a ledger from raw dicts; failed verification keeps the
         entries but `verify()` will report the damage."""
         led = cls(path=None, load_existing=False)
+        if not isinstance(dicts, (list, tuple)):
+            return led
         prev = GENESIS_HASH
         for i, raw in enumerate(dicts):
             entry = LedgerEntry.from_dict(raw)

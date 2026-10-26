@@ -57,6 +57,8 @@ def embed(text: str) -> dict[int, float]:
 
     Unigrams plus bigrams, stop-words dropped, signed feature hashing so
     hash collisions partially cancel instead of always adding."""
+    if not isinstance(text, str):
+        return {}
     tokens = [t for t in _TOKEN_RE.findall(text.lower())
               if t not in _STOP and len(t) > 1]
     grams = list(tokens) + [f"{a}_{b}" for a, b in zip(tokens, tokens[1:])]

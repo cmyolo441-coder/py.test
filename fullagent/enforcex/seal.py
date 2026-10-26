@@ -419,6 +419,10 @@ class Sealer:
     def seal(self, payload: Any, *, note: str = "",
              meta: Optional[Dict[str, Any]] = None) -> SealEnvelope:
         """Seal a payload; chains to this sealer's previous seal."""
+        try:
+            meta_d = dict(meta) if meta is not None else {}
+        except (TypeError, ValueError):
+            meta_d = {}
         digest = payload_digest(payload)
         with self._lock:
             kid = self._ring.current_id or "none"
@@ -431,7 +435,7 @@ class Sealer:
                 payload_len=len(canonical_bytes(payload)),
                 prev_seal=self._last_seal,
                 note=str(note or ""),
-                meta=dict(meta or {}),
+                meta=meta_d,
             )
             mac = hmac.new(subkey, env.signed_bytes(), hashlib.sha256)
             env.hmac = mac.hexdigest()
@@ -459,7 +463,13 @@ class Sealer:
         if env.seal_version != SEAL_VERSION:
             return SealResult(False, f"unsupported seal_version "
                                      f"{env.seal_version}")
-        digest = payload_digest(payload)
+        try:
+            digest = payload_digest(payload)
+        except (TypeError, ValueError):
+            # Non-canonical payloads (e.g. NaN/inf floats, which strict
+            # JSON rejects) cannot be proven intact: fail verification
+            # instead of raising out of a "never raises" path.
+            return SealResult(False, "payload not canonicalizable")
         if not hmac.compare_digest(digest, env.payload_sha256):
             return SealResult(False, "payload digest mismatch")
         with self._lock:
@@ -476,6 +486,8 @@ class Sealer:
         env = SealEnvelope.from_dict(envelope)
         if not env.hmac or not env.key_id:
             return SealResult(False, "envelope missing hmac/key_id")
+        if not isinstance(raw, (bytes, bytearray, memoryview)):
+            return SealResult(False, "raw payload is not bytes")
         if hashlib.sha256(raw).hexdigest() != env.payload_sha256:
             return SealResult(False, "payload digest mismatch")
         with self._lock:
@@ -495,7 +507,8 @@ class Sealer:
         prev = GENESIS_SEAL
         last_ts = 0.0
         last_seq = -1
-        for i, pair in enumerate(pairs or []):
+        pairs_list = list(pairs) if pairs is not None else []
+        for i, pair in enumerate(pairs_list):
             if not isinstance(pair, (tuple, list)) or len(pair) != 2:
                 return SealResult(False, f"chain item {i}: not a pair")
             payload, env_raw = pair
@@ -519,7 +532,7 @@ class Sealer:
             prev = env.hmac
             last_seq = env.seq
             last_ts = env.ts
-        return SealResult(True, f"chain of {len(pairs)} verified")
+        return SealResult(True, f"chain of {len(pairs_list)} verified")
 
     # ── export / import ───────────────────────────────────────────────
 

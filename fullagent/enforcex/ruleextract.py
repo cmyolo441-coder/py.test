@@ -46,8 +46,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import unicodedata
 from dataclasses import dataclass, field
+from typing import Any
 
 try:  # optional import — do not create a hard dependency
     from .. import systemprompt as _systemprompt
@@ -269,17 +269,34 @@ class Rule:
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> "Rule":
+    def from_dict(cls, d: Any) -> "Rule":
+        if not isinstance(d, dict):
+            return cls(id="", text="")
+        try:
+            priority = float(d.get("priority", 0.25))
+        except (TypeError, ValueError):
+            priority = 0.25
+        try:
+            source_line = int(d.get("source_line", 0))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            source_line = 0
+        raw_kws = d.get("keywords", ())
+        if isinstance(raw_kws, str):
+            # A single string keyword is one keyword, not its characters.
+            raw_kws = (raw_kws,)
+        raw_pats = d.get("patterns", ())
+        if isinstance(raw_pats, str):
+            raw_pats = (raw_pats,)
         return cls(
             id=str(d.get("id", "")),
             text=str(d.get("text", "")),
             category=str(d.get("category", Categories.OTHER)),
             severity=str(d.get("severity", Severities.LOW)),
-            priority=float(d.get("priority", 0.25)),
-            keywords=tuple(str(k) for k in d.get("keywords", ())),
-            patterns=tuple(str(p) for p in d.get("patterns", ())),
+            priority=priority,
+            keywords=tuple(str(k) for k in raw_kws),
+            patterns=tuple(str(p) for p in raw_pats),
             immutable=bool(d.get("immutable", False)),
-            source_line=int(d.get("source_line", 0)),
+            source_line=source_line,
         )
 
 
@@ -318,7 +335,9 @@ class PromptSpec:
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> "PromptSpec":
+    def from_dict(cls, d: Any) -> "PromptSpec":
+        if not isinstance(d, dict):
+            return cls(signature="", source_sha256="")
         rules = [Rule.from_dict(x) for x in d.get("rules", ())
                  if isinstance(x, dict)]
         meta = d.get("meta") if isinstance(d.get("meta"), dict) else {}
@@ -476,11 +495,14 @@ def infer_severity(text: str, section: str = "") -> str:
         sev = Severities.HIGH
     elif _MEDIUM_RE.search(text or ""):
         sev = Severities.MEDIUM
-    if section == Categories.SECURITY and sev == Severities.LOW:
-        sev = Severities.MEDIUM
-    if section == Categories.SECURITY and sev in (Severities.MEDIUM,
-                                                  Severities.HIGH):
-        sev = Severities.CRITICAL
+    if section == Categories.SECURITY:
+        # Exactly one level up (the previous two sequential ifs bumped
+        # LOW all the way to CRITICAL: LOW->MEDIUM, then MEDIUM->CRITICAL).
+        _bump = {Severities.LOW: Severities.MEDIUM,
+                 Severities.MEDIUM: Severities.HIGH,
+                 Severities.HIGH: Severities.CRITICAL,
+                 Severities.CRITICAL: Severities.CRITICAL}
+        sev = _bump.get(sev, sev)
     return sev
 
 
@@ -587,7 +609,7 @@ def extract_rules(text: str, *, max_rules: int = _MAX_RULES) -> list[Rule]:
     Devanagari numerals (१., २.) and Hindi/Hinglish markers
     (kabhi, hamesha, mat, niyam, zaroor…).
     """
-    if not text or not text.strip():
+    if not isinstance(text, str) or not text.strip():
         return []
     segs = _segment(text)
     raw: list[Rule] = []
@@ -641,8 +663,9 @@ def _make_rule(seg: _Segment, section_category: str,
     )
 
 
-def _sha256(text: str) -> str:
-    return hashlib.sha256((text or "").encode("utf-8", "replace")).hexdigest()
+def _sha256(text: Any) -> str:
+    s = text if isinstance(text, str) else ("" if text is None else str(text))
+    return hashlib.sha256(s.encode("utf-8", "replace")).hexdigest()
 
 
 def rules_digest(rules: list[Rule]) -> str:

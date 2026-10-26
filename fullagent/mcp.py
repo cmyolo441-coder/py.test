@@ -94,11 +94,14 @@ def load_config(path: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
 
 
 def _as_timeout(value: Any, fallback: float) -> float:
+    import math
     try:
         t = float(value)
     except (TypeError, ValueError):
         return fallback
-    if t <= 0:
+    # NaN slips past `t <= 0` and then poisons every deadline/select
+    # timeout downstream; infinities must also not become a timeout.
+    if not math.isfinite(t) or t <= 0:
         return fallback
     return min(t, 300.0)
 
@@ -117,6 +120,9 @@ class _MCPClient:
         self._proc: Optional[subprocess.Popen] = None
         self._next_id = 0
         self.alive = False
+        # Bytes read past the first newline, stashed per-connection
+        # (was a class attribute shared across clients).
+        self._rest: bytes = b""
 
     # -- lifecycle ------------------------------------------------------
     def connect(self, timeout: Optional[float] = None) -> None:
@@ -173,9 +179,6 @@ class _MCPClient:
         except (OSError, BrokenPipeError) as e:
             raise MCPError(f"write to MCP server '{self.name}' failed: {e}")
 
-    # stash for bytes read past the first newline
-    _rest: bytes = b""
-
     def _read_line(self, timeout: float) -> Optional[str]:
         """Read one stdout line within timeout; None on timeout/EOF.
 
@@ -185,7 +188,7 @@ class _MCPClient:
         proc = self._proc
         assert proc is not None and proc.stdout is not None
         deadline = time.monotonic() + timeout
-        buf = bytearray(getattr(self, "_rest", b""))
+        buf = bytearray(self._rest)
         self._rest = b""
         while True:
             if b"\n" in buf:
@@ -204,8 +207,16 @@ class _MCPClient:
             if not r:
                 self._rest = bytes(buf)
                 return None
-            chunk = (proc.stdout.read1(4096) if hasattr(proc.stdout, "read1")
-                     else proc.stdout.read(4096))
+            # Read via os.read on the raw fd, NOT proc.stdout.read1():
+            # the buffered reader can hold a whole second line in its
+            # internal buffer while select() reports "no data", so a
+            # large (>buffer) response used to time out spuriously even
+            # though its bytes had already arrived.
+            try:
+                chunk = os.read(proc.stdout.fileno(), 4096)
+            except OSError:
+                self._rest = bytes(buf)
+                return None  # EOF / closed
             if not chunk:
                 self._rest = bytes(buf)
                 return None  # EOF

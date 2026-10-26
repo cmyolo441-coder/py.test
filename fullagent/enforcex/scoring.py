@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import math
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 __all__ = [
@@ -122,13 +122,26 @@ class Score:
         }
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "Score":
+    def from_dict(cls, d: Any) -> "Score":
+        if not isinstance(d, dict):
+            return cls(total=0.0, grade="F", category_scores={},
+                       violations_count=0, verdict="fail")
+        def _f(key: str, default: float) -> float:
+            try:
+                return float(d.get(key, default))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return default
+        try:
+            vc = int(d.get("violations_count", 0))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            vc = 0
+        cats = d.get("category_scores", {})
         return cls(
-            total=float(d.get("total", 0.0)),
+            total=_f("total", 0.0),
             grade=str(d.get("grade", "F")),
-            category_scores=dict(d.get("category_scores", {})),
-            violations_count=int(d.get("violations_count", 0)),
-            drift=float(d.get("drift", 0.0)),
+            category_scores=dict(cats) if isinstance(cats, dict) else {},
+            violations_count=vc,
+            drift=_f("drift", 0.0),
             verdict=str(d.get("verdict", "fail")),
         )
 
@@ -156,12 +169,21 @@ def normalize_violation(raw: Any) -> Dict[str, Any]:
                 if key in raw and raw[key] is not None:
                     out[key] = str(raw[key])
             conf = raw.get("confidence")
+            if isinstance(conf, str):
+                try:
+                    conf = float(conf)
+                except (TypeError, ValueError):
+                    conf = None
             if isinstance(conf, (int, float)) and 0.0 < float(conf) <= 1.0:
                 out["confidence"] = float(conf)
             elif isinstance(conf, (int, float)):
                 out["confidence"] = min(1.0, max(0.1, float(conf)))
-            if "kind" in out and out["kind"] != "":
-                out.setdefault("message", out["kind"])
+            if not out.get("message") and out.get("kind"):
+                # A "kind" label (e.g. semantic_contradiction) is the
+                # only message-like field some producers emit; the old
+                # setdefault() never fired because "message" was
+                # already present (as "") in the template.
+                out["message"] = str(out["kind"])
         elif isinstance(raw, (tuple, list)) and len(raw) >= 1:
             out["category"] = str(raw[0])
             if len(raw) >= 2:
@@ -280,8 +302,20 @@ class DriftTracker:
 
     def update(self, score: Any) -> Score:
         """Feed a Score (or numeric total). Returns the updated Score
-        with its ``drift`` field set to (ema_after - ema_before)."""
-        value = float(getattr(score, "total", score))
+        with its ``drift`` field set to (ema_after - ema_before).
+        Non-numeric input degrades to a no-op return instead of
+        raising (the module promises never to raise on malformed
+        input)."""
+        try:
+            value = float(getattr(score, "total", score))
+        except (TypeError, ValueError):
+            if isinstance(score, Score):
+                return score
+            return self._last or Score(total=0.0, grade="F",
+                                       category_scores={},
+                                       violations_count=0)
+        if isinstance(value, float) and (value != value):
+            value = 0.0
         with self._lock:
             before = self._ema
             if self._ema is None:
@@ -361,12 +395,34 @@ class DriftTracker:
             }
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "DriftTracker":
-        tracker = cls(alpha=float(d.get("alpha", 0.3)),
-                      window=int(d.get("window", 100)))
-        tracker._ema = d.get("ema")
-        tracker._count = int(d.get("count", 0))
-        tracker._scores = [float(s) for s in d.get("scores", [])]
+    def from_dict(cls, d: Any) -> "DriftTracker":
+        if not isinstance(d, dict):
+            return cls()
+        try:
+            alpha = float(d.get("alpha", 0.3))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            alpha = 0.3
+        try:
+            window = int(d.get("window", 100))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            window = 100
+        tracker = cls(alpha=alpha, window=window)
+        try:
+            ema = d.get("ema")
+            tracker._ema = float(ema) if ema is not None else None  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            tracker._ema = None
+        try:
+            tracker._count = int(d.get("count", 0))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            tracker._count = 0
+        scores: List[float] = []
+        for s in (d.get("scores", []) or []):
+            try:
+                scores.append(float(s))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                continue
+        tracker._scores = scores
         return tracker
 
 

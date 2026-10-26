@@ -175,6 +175,8 @@ class TaintAnalyzer:
         return False
 
     def analyze(self, source: str) -> list[TaintFinding]:
+        if not isinstance(source, str):
+            return []
         # fast path: obviously-safe input skips the AST parse entirely
         if not _looks_risky(source):
             return []
@@ -320,6 +322,8 @@ def _own_nodes(fn: ast.AST):
 
 def cyclomatic(source: str) -> list[Complexity]:
     """Cyclomatic complexity per function: 1 + number of branch nodes."""
+    if not isinstance(source, str):
+        return []
     # fast path: no function definitions -> nothing to score, skip parse.
     # (A word-boundary regex: "def " misses `def\tf():`, which is legal.)
     if not _FUNC_LIKE.search(source):

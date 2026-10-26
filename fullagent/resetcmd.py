@@ -90,7 +90,10 @@ def reset_conversation(agent: Any) -> dict:
     message list (system + summary, if any). Never raises — a failed
     partial reset is worse than no reset.
     """
-    from . import tooldedup
+    try:
+        from . import tooldedup
+    except Exception:  # noqa: BLE001 — a missing module must not kill /reset
+        tooldedup = None  # type: ignore[assignment]
 
     stats: dict = {"dropped": 0, "summary": "", "messages": 0}
     try:
@@ -151,7 +154,8 @@ def reset_conversation(agent: Any) -> dict:
 
     # Clear: per-turn caches.
     try:
-        tooldedup.reset(agent)
+        if tooldedup is not None:
+            tooldedup.reset(agent)
     except Exception:  # noqa: BLE001
         pass
     try:

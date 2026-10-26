@@ -101,8 +101,24 @@ class Histogram:
     maximum: float = -math.inf
 
     def __post_init__(self) -> None:
-        edges = sorted(float(e) for e in (self.edges or (10.0,)))
-        self.edges = tuple(edges)
+        raw_edges = self.edges
+        if isinstance(raw_edges, str):
+            raw_edges = (raw_edges,)
+        edges: List[float] = []
+        for e in (raw_edges or (10.0,)):
+            try:
+                edges.append(float(e))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                continue
+        if not edges:
+            edges = [10.0]
+        self.edges = tuple(sorted(edges))
+        try:
+            self.max_samples = int(self.max_samples)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            self.max_samples = 10_000
+        if self.max_samples < 100:
+            self.max_samples = 100
         self._lock = threading.RLock()
 
     # -- recording ---------------------------------------------------------
@@ -173,7 +189,16 @@ class Histogram:
 
     def percentiles(self, ps: Sequence[float] = (50, 90, 95, 99)
                     ) -> Dict[str, Optional[float]]:
-        return {f"p{int(p)}": self.percentile(p) for p in (ps or (50,))}
+        out: Dict[str, Optional[float]] = {}
+        for p in (ps or (50,)):
+            try:
+                key = f"p{int(p)}"  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                # percentile() guards its own value, but the dict key
+                # conversion above used to raise first.
+                continue
+            out[key] = self.percentile(p)
+        return out
 
     def summary(self) -> Dict[str, Any]:
         with self._lock:
@@ -206,19 +231,38 @@ class Histogram:
             }
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "Histogram":
-        h = cls(
-            name=str(d.get("name", "h")),
-            edges=tuple(float(e) for e in d.get("edges", ())),
-            max_samples=int(d.get("max_samples", 10_000)),
-        )
-        for k, v in (d.get("buckets") or {}).items():
+    def from_dict(cls, d: Any) -> "Histogram":
+        if not isinstance(d, dict):
+            return cls(name="h")
+        raw_edges = d.get("edges", ())
+        if isinstance(raw_edges, str):
+            raw_edges = (raw_edges,)
+        edges: List[float] = []
+        for e in (raw_edges or ()):
             try:
-                h.buckets[str(k)] = int(v)
+                edges.append(float(e))  # type: ignore[arg-type]
             except (TypeError, ValueError):
                 continue
-        for s in (d.get("samples") or []):
-            h.observe(s)
+        try:
+            max_samples = int(d.get("max_samples", 10_000))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            max_samples = 10_000
+        h = cls(
+            name=str(d.get("name", "h")),
+            edges=tuple(edges) if edges else (10.0,),
+            max_samples=max_samples,
+        )
+        buckets = d.get("buckets") or {}
+        if isinstance(buckets, dict):
+            for k, v in buckets.items():
+                try:
+                    h.buckets[str(k)] = int(v)
+                except (TypeError, ValueError):
+                    continue
+        samples = d.get("samples") or []
+        if isinstance(samples, (list, tuple)):
+            for s in samples:
+                h.observe(s)
         # restore the true count/total beyond the trimmed samples
         try:
             h.count = max(h.count, int(d.get("count", 0)))
@@ -234,13 +278,22 @@ class RateWindow:
     """Events-per-second over a sliding time window."""
 
     def __init__(self, window_seconds: float = 60.0) -> None:
-        self.window = max(1.0, float(window_seconds))
+        try:
+            self.window = max(1.0, float(window_seconds))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            self.window = 60.0
         self._events: List[float] = []       # timestamps
         self._lock = threading.RLock()
 
     def record(self, ts: Optional[float] = None, n: int = 1) -> None:
-        now = float(ts) if ts is not None else time.time()
-        n = max(1, min(1000, int(n)))
+        try:
+            now = float(ts) if ts is not None else time.time()
+        except (TypeError, ValueError):
+            now = time.time()
+        try:
+            n = max(1, min(1000, int(n)))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            n = 1
         with self._lock:
             for _ in range(n):
                 self._events.append(now)
@@ -280,12 +333,23 @@ class RateWindow:
             return {"window": self.window, "events": list(self._events)}
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "RateWindow":
-        rw = cls(window_seconds=float(d.get("window", 60.0)))
+    def from_dict(cls, d: Any) -> "RateWindow":
+        if not isinstance(d, dict):
+            return cls()
         try:
-            rw._events = [float(t) for t in d.get("events", ())]
+            window = float(d.get("window", 60.0))  # type: ignore[arg-type]
         except (TypeError, ValueError):
-            rw._events = []
+            window = 60.0
+        rw = cls(window_seconds=window)
+        events: List[float] = []
+        raw = d.get("events", ())
+        if isinstance(raw, (list, tuple)):
+            for t in raw:
+                try:
+                    events.append(float(t))  # type: ignore[arg-type]
+                except (TypeError, ValueError):
+                    continue
+        rw._events = events
         return rw
 
 
@@ -315,8 +379,12 @@ class EventBus:
             return self._next_id
 
     def unsubscribe(self, handle: int) -> bool:
+        try:
+            key = int(handle)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return False
         with self._lock:
-            return self._subs.pop(int(handle), None) is not None
+            return self._subs.pop(key, None) is not None
 
     def emit(self, topic: str, payload: Any = None) -> int:
         """Deliver an event to all matching subscribers. Returns number
@@ -508,7 +576,10 @@ class Telemetry:
             while len(self._sessions) > max(16, self._max_sessions):
                 self._sessions.popitem(last=False)
         st["evaluations"] += 1
-        st["violations"] += max(0, int(violations or 0))
+        try:
+            st["violations"] += max(0, int(violations or 0))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            pass
         a = str(action or "allow").lower()
         st["actions"][a] = st["actions"].get(a, 0) + 1
         try:
@@ -633,37 +704,60 @@ class Telemetry:
                             self._histograms[str(k)] = h
                     except Exception:
                         continue
-            for rid, v in (data.get("rules") or {}).items():
-                if not isinstance(v, dict):
-                    continue
-                with self._lock:
-                    st = self._rule_stats.setdefault(str(rid), {
-                        "checks": 0, "violations": 0, "severities": {},
-                        "last_seen": 0.0})
-                    st["checks"] = max(st["checks"], int(v.get("checks", 0) or 0))
-                    st["violations"] = max(st["violations"],
-                                           int(v.get("violations", 0) or 0))
-                    for sev, n in (v.get("severities") or {}).items():
-                        st["severities"][sev] = max(
-                            st["severities"].get(sev, 0), int(n or 0))
-            for sid, v in (data.get("sessions") or {}).items():
-                if not isinstance(v, dict):
-                    continue
-                for _ in range(min(int(v.get("evaluations", 0) or 0), 1000)):
-                    self.record_session(str(sid), action="allow",
-                                        violations=0)
-                for action, n in (v.get("actions") or {}).items():
-                    for _ in range(min(int(n or 0), 1000)):
-                        self.record_session(str(sid), action=str(action))
-                # restore score series (latest 100)
-                with self._lock:
-                    st = self._sessions.get(str(sid))
-                    if st is not None:
-                        try:
-                            st["scores"] = [float(s) for s in
-                                            (v.get("scores") or ())][-200:]
-                        except (TypeError, ValueError):
-                            pass
+            # Per-entry guards: one bad rule/session must not abort
+            # the whole merge (the old code raised out of the outer
+            # try on the first bad numeric, losing even the good
+            # sections already merged).
+            def _mi(value: Any, default: int = 0) -> int:
+                try:
+                    return int(value or 0)  # type: ignore[arg-type]
+                except (TypeError, ValueError):
+                    return default
+            rules = data.get("rules") or {}
+            if isinstance(rules, dict):
+                for rid, v in rules.items():
+                    if not isinstance(v, dict):
+                        continue
+                    with self._lock:
+                        st = self._rule_stats.setdefault(str(rid), {
+                            "checks": 0, "violations": 0, "severities": {},
+                            "last_seen": 0.0})
+                        st["checks"] = max(st["checks"],
+                                           _mi(v.get("checks", 0)))
+                        st["violations"] = max(st["violations"],
+                                               _mi(v.get("violations", 0)))
+                        sevs = v.get("severities") or {}
+                        if isinstance(sevs, dict):
+                            for sev, n in sevs.items():
+                                st["severities"][sev] = max(
+                                    st["severities"].get(sev, 0), _mi(n))
+            sessions = data.get("sessions") or {}
+            if isinstance(sessions, dict):
+                for sid, v in sessions.items():
+                    if not isinstance(v, dict):
+                        continue
+                    for _ in range(min(_mi(v.get("evaluations", 0)), 1000)):
+                        self.record_session(str(sid), action="allow",
+                                            violations=0)
+                    actions = v.get("actions") or {}
+                    if isinstance(actions, dict):
+                        for action, n in actions.items():
+                            for _ in range(min(_mi(n), 1000)):
+                                self.record_session(str(sid),
+                                                    action=str(action))
+                    # restore score series (latest 100)
+                    with self._lock:
+                        st = self._sessions.get(str(sid))
+                        if st is not None:
+                            scores: List[float] = []
+                            raw_scores = v.get("scores") or ()
+                            if isinstance(raw_scores, (list, tuple)):
+                                for s in raw_scores:
+                                    try:
+                                        scores.append(float(s))  # type: ignore[arg-type]
+                                    except (TypeError, ValueError):
+                                        continue
+                            st["scores"] = scores[-200:]
             return True
         except Exception:
             return False

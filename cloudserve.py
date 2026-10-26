@@ -186,13 +186,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not _turn_lock.acquire(blocking=False):
             return self._send_json(
                 429, {"ok": False, "error": "another turn is running, try again"})
+        worker = None
         try:
-            self._stream_chat(prompt)
+            worker = self._stream_chat(prompt)
         finally:
-            _turn_lock.release()
+            # The lock must be held until the turn REALLY finishes.
+            # _stream_chat only waits up to 5s for the worker after a
+            # client disconnect; the old code released the lock here
+            # unconditionally, so a second turn could start on the same
+            # shared Agent while the first was still mutating it —
+            # breaking the documented "one turn at a time" guarantee.
+            # If the worker is still alive, a daemon watcher releases
+            # the lock when it actually exits; otherwise release now.
+            if worker is not None and worker.is_alive():
+                def _deferred_release(w=worker):
+                    w.join()
+                    _turn_lock.release()
+                threading.Thread(target=_deferred_release,
+                                 daemon=True).start()
+            else:
+                _turn_lock.release()
 
     # -- SSE streaming ------------------------------------------------
-    def _stream_chat(self, prompt: str) -> None:
+    # Returns the worker thread, so the caller can tell whether the
+    # turn is still running when the stream ends (e.g. the client
+    # disconnected mid-turn). On a failure before/during the headers
+    # with the worker already started, the worker is still returned
+    # (not raised) — the caller must not release the turn lock until
+    # that worker actually finishes.
+    def _stream_chat(self, prompt: str):
         q: "queue.Queue[tuple]" = queue.Queue()
         DONE = object()
         cancelled = threading.Event()
@@ -228,41 +250,50 @@ class Handler(http.server.BaseHTTPRequestHandler):
         worker = threading.Thread(target=_run, daemon=True)
         worker.start()
 
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self.end_headers()
-
-        def _write(payload: bytes) -> bool:
-            try:
-                self.wfile.write(payload)
-                self.wfile.flush()
-                return True
-            except (BrokenPipeError, ConnectionResetError):
-                return False
-
         try:
-            while True:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+
+            def _write(payload: bytes) -> bool:
                 try:
-                    etype, payload = q.get(timeout=15)
-                except queue.Empty:
-                    if not _write(b": ping\n\n"):  # keepalive
-                        return
-                    continue
-                if etype is DONE:
-                    return
-                line = "data: %s\n\n" % json.dumps(
-                    {"type": etype, "text": payload}, ensure_ascii=False)
-                if not _write(line.encode("utf-8")):
-                    return
-        finally:
+                    self.wfile.write(payload)
+                    self.wfile.flush()
+                    return True
+                except (BrokenPipeError, ConnectionResetError):
+                    return False
+
+            try:
+                while True:
+                    try:
+                        etype, payload = q.get(timeout=15)
+                    except queue.Empty:
+                        if not _write(b": ping\n\n"):  # keepalive
+                            return worker
+                        continue
+                    if etype is DONE:
+                        return worker
+                    line = "data: %s\n\n" % json.dumps(
+                        {"type": etype, "text": payload}, ensure_ascii=False)
+                    if not _write(line.encode("utf-8")):
+                        return worker
+            finally:
+                cancelled.set()
+                worker.join(timeout=5.0)
+                # SSE has no Content-Length: the client only sees EOF when we
+                # close. Without this the connection stays open (keep-alive)
+                # and the client hangs after DONE.
+                self.close_connection = True
+        except Exception:
+            # Headers/write failed with the turn already running (client
+            # gone before the stream started): return the worker so the
+            # caller defers the turn-lock release until it finishes,
+            # instead of letting a second turn overlap it.
             cancelled.set()
-            worker.join(timeout=5.0)
-            # SSE has no Content-Length: the client only sees EOF when we
-            # close. Without this the connection stays open (keep-alive)
-            # and the client hangs after DONE.
-            self.close_connection = True
+            return worker
+        return worker
 
 
 class ThreadedServer(socketserver.ThreadingMixIn,

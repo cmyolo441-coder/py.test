@@ -464,10 +464,14 @@ def edit_file(path: str, old_string: str, new_string: str,
         return err
     if not p.exists():
         return f"ERROR: file not found: {p}"
-    if not old_string:
+    if not isinstance(old_string, str) or not old_string:
         # str.count("") counts len+1 positions and str.replace("") would
-        # interleave new_string between EVERY character — destroy the file
+        # interleave new_string between EVERY character — destroy the file;
+        # a non-str old_string used to raise TypeError from text.count().
         return "ERROR: old_string must be a non-empty string"
+    if not isinstance(new_string, str):
+        return (f"ERROR: new_string must be a string, got "
+                f"{type(new_string).__name__}")
     # Worker 8/20 (512s incident): if the file changed since the agent last
     # read it, say so plainly instead of failing with a cryptic
     # "old_string not found".
@@ -851,15 +855,21 @@ def run_command(command: str, timeout: int = 120,
     If `run_in_background` is True, the command is launched via the
     bgsh engine and this returns immediately with a task id — poll
     with the BashOutput tool."""
-    if run_in_background:
-        from . import bgsh
-        task_id = bgsh.launch(command, description or command[:60],
-                              timeout=timeout)
-        return (f"background task started: {task_id}\n"
-                "poll with BashOutput using this task id.")
     command, secs, err = _validate_shell_args(command, timeout)
     if err:
         return err
+    if run_in_background:
+        from . import bgsh
+        try:
+            task_id = bgsh.launch(command, description or command[:60],
+                                  timeout=secs)
+        except (ValueError, OSError) as e:
+            # bgsh.launch raises ValueError on a bad command/timeout;
+            # that used to escape run_command instead of returning an
+            # error string like every other validation failure here.
+            return f"ERROR: {e}"
+        return (f"background task started: {task_id}\n"
+                "poll with BashOutput using this task id.")
     from .judge import resolve_shell
     argv = resolve_shell()
     if argv is None:
@@ -1214,8 +1224,12 @@ def apply_patch(patch: str) -> str:
             new_side = [x for t, x in ctx if t in (" ", "+")]
             new_lines = (new_lines[:pos] + new_side
                          + new_lines[pos + len(old_side):])
-        new_text = "\n".join(new_lines) + ("\n" if old_text.endswith(
-            "\n") or new_lines else "")
+        # Preserve the original trailing-newline convention: a file
+        # that did not end with "\n" must not gain one from the patch
+        # (the old code added "\n" whenever new_lines was non-empty).
+        # A brand-new file (old_text == "") still gets a trailing "\n".
+        new_text = "\n".join(new_lines) + ("\n" if (not old_text
+            or old_text.endswith("\n")) and new_lines else "")
         try:
             _atomic_write_text(p, new_text)
         except OSError as e:

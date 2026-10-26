@@ -107,8 +107,13 @@ def cluster_detections(detections: List[Dict[str, Any]],
     each member within ``window_s`` of the cluster's first detection.
     Detections without a usable rule_id all fall into one "general"
     bucket per session. Never raises."""
+    try:
+        window_s = float(window_s)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        window_s = DEFAULT_CLUSTER_WINDOW_S
     clusters: List[List[Dict[str, Any]]] = []
     open_keys: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    first_ts: Dict[Tuple[str, str], float] = {}
     for det in (detections or []):
         if not isinstance(det, dict):
             continue
@@ -120,12 +125,16 @@ def cluster_detections(detections: List[Dict[str, Any]],
             ts = 0.0
         key = (rule_id, session_id)
         bucket = open_keys.get(key)
+        # Compare against the PARSED first timestamp, not the raw
+        # first detection's value: re-parsing the raw value raised on
+        # a bad first timestamp even though the per-detection parse
+        # above had already guarded it.
         if bucket is None or (ts and bucket and
-                              ts - float(bucket[0].get(ts_field, ts) or ts)
-                              > window_s):
+                              ts - first_ts[key] > window_s):
             bucket = [det]
             clusters.append(bucket)
             open_keys[key] = bucket
+            first_ts[key] = ts
         else:
             bucket.append(det)
     return clusters
@@ -240,6 +249,13 @@ class Incident:
             created = float(d.get("created_ts", 0.0) or 0.0)
         except (TypeError, ValueError):
             created = 0.0
+        def _str_list(value: Any) -> List[str]:
+            # A bare string is ONE item, not one item per character.
+            if isinstance(value, str):
+                return [value]
+            if isinstance(value, (list, tuple)):
+                return [str(x) for x in value]
+            return []
         inc = cls(
             incident_id=str(d.get("incident_id", "") or
                              "INC-CORRUPT-000000"),
@@ -247,17 +263,22 @@ class Incident:
             state=str(d.get("state", "open") or "open"),
             created_ts=created,
             severity=str(d.get("severity", "medium") or "medium"),
-            rule_ids=[str(r) for r in (d.get("rule_ids") or [])],
-            session_ids=[str(s) for s in (d.get("session_ids") or [])],
+            rule_ids=_str_list(d.get("rule_ids")),
+            session_ids=_str_list(d.get("session_ids")),
             detections=[x for x in (d.get("detections") or [])
                         if isinstance(x, dict)],
-            repair_actions=[str(a) for a in (d.get("repair_actions") or [])],
-            tags=[str(t) for t in (d.get("tags") or [])],
+            repair_actions=_str_list(d.get("repair_actions")),
+            tags=_str_list(d.get("tags")),
             operator=str(d.get("operator", "") or ""),
-            notes=[str(n) for n in (d.get("notes") or [])],
+            notes=_str_list(d.get("notes")),
         )
+        raw_timeline = d.get("timeline")
+        # A dict timeline is not a list of events (iterating it used
+        # to yield its keys as spurious events).
         inc.timeline = [IncidentEvent.from_dict(e)
-                        for e in (d.get("timeline") or [])]
+                        for e in raw_timeline
+                        if isinstance(e, dict)] \
+            if isinstance(raw_timeline, (list, tuple)) else []
         try:
             inc.updated_ts = float(d.get("updated_ts", 0.0) or 0.0)
             inc.closed_ts = float(d.get("closed_ts", 0.0) or 0.0)
@@ -277,8 +298,14 @@ class IncidentStore:
                  cluster_window_s: float = DEFAULT_CLUSTER_WINDOW_S,
                  reopen_window_s: float = DEFAULT_REOPEN_WINDOW_S) -> None:
         self.path = path or ""
-        self.cluster_window_s = max(1.0, float(cluster_window_s))
-        self.reopen_window_s = max(1.0, float(reopen_window_s))
+        try:
+            self.cluster_window_s = max(1.0, float(cluster_window_s))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            self.cluster_window_s = DEFAULT_CLUSTER_WINDOW_S
+        try:
+            self.reopen_window_s = max(1.0, float(reopen_window_s))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            self.reopen_window_s = DEFAULT_REOPEN_WINDOW_S
         self._incidents: Dict[str, Incident] = {}
         self._lock = threading.RLock()
         self._fh = None
@@ -368,7 +395,10 @@ class IncidentStore:
                default_severity: str = "medium") -> List[str]:
         """Fold detections into incidents (new or reopened). Returns the
         list of incident ids touched. Never raises."""
-        now = float(ts) if ts is not None else _now()
+        try:
+            now = float(ts) if ts is not None else _now()  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            now = _now()
         touched: List[str] = []
         prepared: List[Dict[str, Any]] = []
         for d in (detections or []):
@@ -376,9 +406,12 @@ class IncidentStore:
                 continue
             det = dict(d)
             det.setdefault("session_id", session_id)
+            # Normalise the timestamp: a bad per-detection ts used to
+            # survive setdefault (key already present) and then raise
+            # in _match_or_create despite ingest's "Never raises".
             try:
-                det.setdefault("ts", now)
-            except Exception:
+                det["ts"] = float(det.get("ts", now) or now)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
                 det["ts"] = now
             prepared.append(det)
         clusters = cluster_detections(prepared,
@@ -440,8 +473,12 @@ class IncidentStore:
             target = best
         for det in cluster:
             target.detections.append(det)
+            try:
+                det_ts = float(det.get("ts", now) or now)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                det_ts = now
             target.timeline.append(IncidentEvent(
-                ts=float(det.get("ts", now) or now), kind="detection",
+                ts=det_ts, kind="detection",
                 detail=_clip(det.get("evidence") or
                              det.get("message") or "", 120),
                 data={"rule_id": str(det.get("rule_id", "")),
@@ -466,7 +503,10 @@ class IncidentStore:
                     ts: Optional[float] = None,
                     extra: Optional[Dict[str, Any]] = None
                     ) -> Tuple[bool, str]:
-        now = float(ts) if ts is not None else _now()
+        try:
+            now = float(ts) if ts is not None else _now()  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            now = _now()
         with self._lock:
             inc = self._incidents.get(str(incident_id or ""))
             if inc is None:
@@ -567,11 +607,21 @@ class IncidentStore:
     def digest(self, top_n: int = 5, *, day: Optional[float] = None,
                now: Optional[float] = None) -> Dict[str, Any]:
         """Top-N incidents for the day + headline counts."""
-        t = float(now) if now is not None else _now()
+        try:
+            t = float(now) if now is not None else _now()  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            t = _now()
         if day is not None:
-            day_start = float(day)
+            try:
+                day_start = float(day)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                day_start = t - 86400.0
         else:
             day_start = t - 86400.0
+        try:
+            top_n = int(top_n)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            top_n = 5
         with self._lock:
             all_inc = [self._copy(i) for i in self._incidents.values()]
         day_inc = [i for i in all_inc
@@ -651,7 +701,17 @@ def _build_postmortem(snap: Dict[str, Any]) -> Dict[str, Any]:
     evidence = [str(d.get("evidence", "") or "") for d in dets]
 
     # burst analysis: biggest gap between consecutive detections
-    tss = sorted(float(d.get("ts", 0.0) or 0.0) for d in dets if d.get("ts"))
+    # (skip detections whose timestamp does not parse, so a bad ts
+    # cannot raise out of this "Never raises" report path)
+    tss: List[float] = []
+    for d in dets:
+        if not d.get("ts"):
+            continue
+        try:
+            tss.append(float(d.get("ts", 0.0) or 0.0))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+    tss.sort()
     gaps = [b - a for a, b in zip(tss, tss[1:])]
     burst = {
         "detection_count": len(tss),

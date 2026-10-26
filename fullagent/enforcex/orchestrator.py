@@ -420,7 +420,18 @@ class Orchestrator:
 
     def clear_stage(self, name: str) -> bool:
         """Remove an override so the builtin stage runs again."""
-        return self._stages.pop(name, None) is not None
+        if name not in STAGE_ORDER:
+            return False
+        if name not in self._stages:
+            return False
+        builtin = getattr(self, "_stage_" + name, None)
+        if callable(builtin):
+            # Restore the builtin instead of deleting the stage: deleting
+            # left the stage skipped/disabled on every later enforce().
+            self._stages[name] = builtin
+        else:
+            self._stages.pop(name, None)
+        return True
 
     def register_multiplier(self, fn: MultiplierFn,
                             name: Optional[str] = None) -> bool:

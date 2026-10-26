@@ -92,6 +92,14 @@ class KnowledgeFabric:
                              "all required")
         now = time.time()
         start = valid_from if valid_from is not None else now
+        # history() formats confidence with %.2f: a non-numeric
+        # confidence (e.g. "high" from a caller) was stored verbatim
+        # and crashed history() later with ValueError. Coerce here,
+        # at the single write path, instead of at every read.
+        try:
+            confidence = float(confidence)
+        except (TypeError, ValueError):
+            confidence = 1.0
         fact = Fact(subject=subject, predicate=predicate, obj=obj,
                     valid_from=start, txn_time=now,
                     confidence=confidence)

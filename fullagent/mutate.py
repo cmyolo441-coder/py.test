@@ -146,9 +146,11 @@ def _count_sites(tree: ast.Module, cls) -> int:
 def generate_mutants(source: str,
                      max_mutants: int = MAX_MUTANTS) -> list[dict]:
     """Produce concrete mutants: [{kind, description, source}]."""
+    if not isinstance(source, str):
+        return []
     try:
         tree = ast.parse(source)
-    except SyntaxError:
+    except (SyntaxError, ValueError):
         return []
     mutants: list[dict] = []
     for kind, cls in _MUTATORS:

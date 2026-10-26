@@ -70,9 +70,14 @@ def _background_tasks(agent) -> int:
     try:
         from . import bgsh
         tasks = bgsh.list_background_tasks() or []
+        # bgsh's terminal statuses are done/error/killed ("failed" and
+        # "stopped" are the bgtui aliases for the same finished states).
+        # A finished error task used to be counted as still active here,
+        # inflating the /status background count forever (until evicted).
         return sum(1 for task in tasks
                    if isinstance(task, dict)
-                   and task.get("status") not in ("done", "failed", "killed"))
+                   and task.get("status") not in
+                   ("done", "error", "failed", "killed", "stopped"))
     except Exception:
         return 0
 def _permission_mode(agent) -> str:

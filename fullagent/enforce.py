@@ -122,7 +122,11 @@ def rule_ledger(text: str, *, doc_chars: int | None = None,
     budget (chars/4 heuristic), so a 49k document gets a large but bounded
     ledger while a small one stays small.
     """
-    text = (text or "").strip()
+    if text is None:
+        text = ""
+    elif not isinstance(text, str):
+        text = str(text)
+    text = text.strip()
     if not text:
         return '(rule id="R00" note="no directives present")'
     doc_chars = len(text) if doc_chars is None else doc_chars
@@ -235,10 +239,14 @@ def anchor(turn_index: int = 0, rules: str | None = None,
     id list like "R01 R04 R07" or raw ledger text (ids are pulled out).
     """
     ids = ""
-    if rules:
+    if isinstance(rules, str) and rules:
         found = re.findall(r"R\d{2}", rules)
         if found:
             ids = " ".join(found[:8])
+    try:
+        turn_index = int(turn_index)
+    except (TypeError, ValueError):
+        turn_index = 0
     body = _ANCHOR_VARIANTS[turn_index % len(_ANCHOR_VARIANTS)]
     out = body.format(ids=ids or "all").strip()
     if len(out) > width:

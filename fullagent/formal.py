@@ -154,9 +154,15 @@ DEFAULT_PROPERTIES: tuple = (
 def trace_from_events(events) -> list[set[str]]:
     """Fold a real kernel event stream into a predicate trace."""
     trace: list[set[str]] = []
+    if not isinstance(events, (list, tuple)):
+        return trace
     for ev in events:
+        if not hasattr(ev, "type"):
+            continue
         preds: set[str] = set()
-        t, d = ev.type, ev.data or {}
+        t, d = ev.type, getattr(ev, "data", None) or {}
+        if not isinstance(d, dict):
+            d = {}
         if t == "snapshot.taken":
             preds.add("snapshot")
         elif t == "tool.call":
@@ -187,6 +193,8 @@ def _item_predicates(item: dict) -> list[set[str]]:
     snapshot/verify the kernel inserts around writes, bracketing the
     item's own write/read/delete step."""
     seq: list[set[str]] = []
+    if not isinstance(item, dict):
+        item = {}
     paths = item.get("paths") or []
     writer = bool(paths)
     if writer:
@@ -208,7 +216,11 @@ def plan_traces(waves: list[list[dict]]) -> list[list[set[str]]]:
     (write/delete/read) plus the mechanical snapshot/verify the kernel
     would insert around writes."""
     per_wave: list[list[list[set[str]]]] = []
+    if not isinstance(waves, (list, tuple)):
+        waves = []
     for wave in waves:
+        if not isinstance(wave, (list, tuple)):
+            wave = [] if wave is None else [wave]
         seqs = [_item_predicates(item) for item in wave]
         variants: list[list[set[str]]] = []
         # every item order the wave permits — this is what the

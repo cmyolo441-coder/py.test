@@ -43,7 +43,10 @@ _VALID_HASH = frozenset("0123456789abcdef")
 
 
 def _valid_hash(h: str) -> bool:
-    return len(h) == 64 and all(c in _VALID_HASH for c in h)
+    # A non-str hash (e.g. a corrupt tree manifest holding an int)
+    # used to raise TypeError from len() instead of being rejected.
+    return (isinstance(h, str) and len(h) == 64
+            and all(c in _VALID_HASH for c in h))
 
 
 class SnapshotStore:
@@ -162,6 +165,11 @@ class SnapshotStore:
                         removed += 1
                     except OSError:
                         pass
+                continue
+            if not isinstance(blob, str):
+                # Corrupt manifest entry: count it missing instead of
+                # crashing in get_blob/_valid_hash.
+                missing += 1
                 continue
             data = self.get_blob(blob)
             if data is None:

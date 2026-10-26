@@ -78,18 +78,32 @@ class RepairConfig:
 
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, Any]]) -> "RepairConfig":
-        d = d or {}
+        if not isinstance(d, dict):
+            return cls()
         cfg = cls()
         if "max_attempts" in d:
-            cfg.max_attempts = max(1, min(10, int(d["max_attempts"])))
+            try:
+                cfg.max_attempts = max(1, min(10, int(d["max_attempts"])))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                pass
         if "verify_threshold" in d:
-            cfg.verify_threshold = max(0.0, min(100.0, float(d["verify_threshold"])))
+            try:
+                cfg.verify_threshold = max(0.0, min(100.0, float(d["verify_threshold"])))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                pass
         if "max_words" in d:
-            cfg.max_words = max(10, int(d["max_words"]))
+            try:
+                cfg.max_words = max(10, int(d["max_words"]))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                pass
         if "noop" in d:
             cfg.noop = bool(d["noop"])
         if isinstance(d.get("strategies"), (list, tuple)):
             cfg.strategies = tuple(str(s) for s in d["strategies"] if str(s))
+        elif isinstance(d.get("strategies"), str) and d["strategies"].strip():
+            # A single strategy given as a bare string is one strategy,
+            # not an iterable of characters.
+            cfg.strategies = (d["strategies"].strip(),)
         if d.get("tone_closer"):
             cfg.tone_closer = str(d["tone_closer"])
         return cfg
@@ -193,6 +207,14 @@ _PROFANITY: Tuple[str, ...] = (
     "idiot", "moron",
 )
 
+# Word-boundary patterns for the profanity list. A plain substring test
+# ("hell" in text) falsely flags innocent words such as "hello" and
+# "shell", and a substring replacement corrupts them ("hello" -> "—o").
+_PROFANITY_RES: Tuple[Tuple[str, "re.Pattern"], ...] = tuple(
+    (w, re.compile(r"\b" + re.escape(w) + r"\b", re.I))
+    for w in _PROFANITY
+)
+
 _LEAK_VIOLATION = ("leak", "critical")
 _INJECTION_VIOLATION = ("injection", "critical")
 _SENSITIVE_VIOLATION = ("sensitive", "high")
@@ -243,8 +265,7 @@ def classify_violations(text: str, rules: Any = None) -> List[Dict[str, Any]]:
                  evidence=m.group(0), conf=0.8,
                  msg=f"injection-style content ({name})")
 
-    low = t.lower()
-    prof_hits = [w for w in _PROFANITY if w in low]
+    prof_hits = [w for w, pat in _PROFANITY_RES if pat.search(t)]
     if prof_hits:
         _add(*_TONE_VIOLATION, rule_id="TONE-PROFANITY",
              evidence=prof_hits[0], conf=0.6,
@@ -347,11 +368,11 @@ def _reframe_tone(text: str,
                   violations: Sequence[Dict[str, Any]],
                   cfg: RepairConfig) -> Tuple[str, List[str]]:
     removed: List[str] = []
-    for word in _PROFANITY:
-        if word in text.lower():
+    for word, pat in _PROFANITY_RES:
+        if pat.search(text):
             removed.append(word)
-            # case-preserving neutral replacement
-            text = re.sub(re.escape(word), "—", text, flags=re.I)
+            # word-boundary replacement only: never mangle "hello"/"shell"
+            text = pat.sub("—", text)
     # shouting -> normal case
     if text and text == text.upper() and len(text) > 20 \
             and re.search(r"[A-Z]{4}", text):
@@ -444,9 +465,10 @@ def _strategy_applicable(name: str,
     if name == "reframe_tone":
         return "tone" in cats or "content_policy" in cats
     if name == "trim_length":
-        return "format" in cats and any(
-            r in ("", "FMT") or r.startswith("FORMAT") for r in rules_hit) \
-            or "format" in cats
+        # (The previous form OR-ed the same "format" check twice, which
+        # made the rule_id condition dead code; the effective test was
+        # always just "format" in cats.)
+        return "format" in cats
     if name == "compress_whitespace":
         return True  # cheap tidy-up, always fine
     return False

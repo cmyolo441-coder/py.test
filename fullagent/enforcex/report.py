@@ -23,7 +23,7 @@ import html as _html
 import json
 import os
 import tempfile
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional
 
 __all__ = [
     "to_json", "to_markdown", "to_html",
@@ -76,6 +76,16 @@ def _as_dict(decision: Any) -> Dict[str, Any]:
     return out
 
 
+def _notes(d: Dict[str, Any]) -> List[str]:
+    """Notes as a list: a bare string is one note, not one per char."""
+    raw = d.get("notes") or []
+    if isinstance(raw, str):
+        return [raw]
+    if isinstance(raw, (list, tuple)):
+        return [str(n) for n in raw]
+    return [str(raw)]
+
+
 def _score_dict(d: Dict[str, Any]) -> Dict[str, Any]:
     score = d.get("score")
     if isinstance(score, dict):
@@ -89,6 +99,12 @@ def _score_dict(d: Dict[str, Any]) -> Dict[str, Any]:
 
 def _violations(d: Dict[str, Any]) -> List[Dict[str, Any]]:
     raw = d.get("violations") or []
+    if isinstance(raw, dict):
+        raw = [raw]
+    elif isinstance(raw, str):
+        # A single message string is one violation, not one violation
+        # per character (iterating a string yields its characters).
+        raw = [{"message": raw, "severity": "medium", "category": "other"}]
     out: List[Dict[str, Any]] = []
     for v in raw:
         if isinstance(v, dict):
@@ -175,7 +191,7 @@ def to_markdown(decision: Any) -> str:
         lines.append("No violations detected — response fully compliant.")
         lines.append("")
 
-    notes = d.get("notes") or []
+    notes = _notes(d)
     if notes:
         lines.append("### Notes")
         for n in notes:
@@ -305,7 +321,7 @@ def to_html(decision: Any) -> str:
         body = ("<div class=\"clean\">No violations detected — "
                 "response fully compliant.</div>")
 
-    notes = d.get("notes") or []
+    notes = _notes(d)
     notes_html = ""
     if notes:
         items = "".join(f"<li>{_html.escape(str(n))}</li>" for n in notes)
@@ -362,7 +378,7 @@ def render(decision: Any, fmt: str) -> str:
 def write_report(decision: Any, path: str,
                  fmt: Optional[str] = None) -> str:
     """Write a report to ``path`` atomically. ``fmt`` inferred from the
-    extension when omitted (json / md / markdown / html / htm).
+    extension when omitted (json / md / markdown / html / htm / csv).
     Returns the path written."""
     fmt = (fmt or os.path.splitext(path)[1].lstrip(".")).lower()
     if fmt in ("md", "markdown"):
@@ -371,6 +387,10 @@ def write_report(decision: Any, path: str,
         content = to_html(decision)
     elif fmt == "json":
         content = to_json(decision)
+    elif fmt == "csv":
+        # render() already supports csv; write_report previously fell
+        # through to markdown here, so a .csv file held markdown.
+        content = to_csv(decision)
     else:
         content = to_markdown(decision)
 

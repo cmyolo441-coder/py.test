@@ -86,6 +86,20 @@ __all__ = [
 ]
 
 
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        return float(v) if v is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(v: Any, default: int = 0) -> int:
+    try:
+        return int(v) if v is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
 # ── constants ────────────────────────────────────────────────────────────
 
 MAX_WINDOW = 20          # sliding window of turns kept for analysis
@@ -367,16 +381,16 @@ class TurnRecord:
         if not isinstance(d, dict):
             return cls()
         return cls(
-            index=int(d.get("index", 0) or 0),
+            index=_safe_int(d.get("index", 0), 0),
             user_msg=_clean_text(d.get("user_msg")),
             assistant_msg=_clean_text(d.get("assistant_msg")),
-            pressure=float(d.get("pressure", 0.0) or 0.0),
-            erosion=float(d.get("erosion", 0.0) or 0.0),
+            pressure=_safe_float(d.get("pressure", 0.0), 0.0),
+            erosion=_safe_float(d.get("erosion", 0.0), 0.0),
             attack_class=str(d.get("attack_class", AttackClass.NONE)
                              or AttackClass.NONE),
             rule_ids=tuple(str(x) for x in
                            (d.get("rule_ids") or ()) if isinstance(x, str)),
-            ts=float(d.get("ts", 0.0) or 0.0),
+            ts=_safe_float(d.get("ts", 0.0), 0.0),
         )
 
 
@@ -416,16 +430,16 @@ class TurnAnalysis:
         if not isinstance(d, dict):
             return cls()
         return cls(
-            turn=int(d.get("turn", 0) or 0),
-            pressure=float(d.get("pressure", 0.0) or 0.0),
-            pressure_delta=float(d.get("pressure_delta", 0.0) or 0.0),
-            erosion=float(d.get("erosion", 0.0) or 0.0),
-            escalation=float(d.get("escalation", 0.0) or 0.0),
+            turn=_safe_int(d.get("turn", 0), 0),
+            pressure=_safe_float(d.get("pressure", 0.0), 0.0),
+            pressure_delta=_safe_float(d.get("pressure_delta", 0.0), 0.0),
+            erosion=_safe_float(d.get("erosion", 0.0), 0.0),
+            escalation=_safe_float(d.get("escalation", 0.0), 0.0),
             attack_class=str(d.get("attack_class", "") or ""),
             pivot=bool(d.get("pivot", False)),
             rule_ids=tuple(str(x) for x in (d.get("rule_ids") or ())),
-            risk=float(d.get("risk", 0.0) or 0.0),
-            risk_ewma=float(d.get("risk_ewma", 0.0) or 0.0),
+            risk=_safe_float(d.get("risk", 0.0), 0.0),
+            risk_ewma=_safe_float(d.get("risk_ewma", 0.0), 0.0),
             flags=tuple(str(x) for x in (d.get("flags") or ())),
             notes=tuple(str(x) for x in (d.get("notes") or ())),
         )
@@ -461,10 +475,10 @@ class ConversationVerdict:
         stats = d.get("stats")
         return cls(
             verdict=str(d.get("verdict", Verdict.SAFE) or Verdict.SAFE),
-            confidence=float(d.get("confidence", 0.0) or 0.0),
-            risk=float(d.get("risk", 0.0) or 0.0),
-            peak_risk=float(d.get("peak_risk", 0.0) or 0.0),
-            turns=int(d.get("turns", 0) or 0),
+            confidence=_safe_float(d.get("confidence", 0.0), 0.0),
+            risk=_safe_float(d.get("risk", 0.0), 0.0),
+            peak_risk=_safe_float(d.get("peak_risk", 0.0), 0.0),
+            turns=_safe_int(d.get("turns", 0), 0),
             reasons=tuple(str(x) for x in (d.get("reasons") or ())),
             stats=dict(stats) if isinstance(stats, dict) else {},
         )
@@ -806,6 +820,10 @@ class MultiTurnTracker:
             "ewma_alpha": self.ewma_alpha,
             "risk_ewma": self._risk_ewma,
             "turns": [t.to_dict() for t in self._turns],
+            # analyses were previously dropped here, so a restored
+            # tracker kept its turns but verdict() (which counts
+            # _analyses) reported 0 turns. Serialise them too.
+            "analyses": [a.to_dict() for a in self._analyses],
             "rule_probes": dict(self._rule_probes),
             "class_counts": dict(self._class_counts),
         }
@@ -814,23 +832,30 @@ class MultiTurnTracker:
     def from_dict(cls, d: Any) -> "MultiTurnTracker":
         if not isinstance(d, dict):
             return cls()
-        tr = cls(window=int(d.get("window", MAX_WINDOW) or MAX_WINDOW),
-                 ewma_alpha=float(d.get("ewma_alpha", EWMA_ALPHA)
-                                  or EWMA_ALPHA))
-        tr._risk_ewma = float(d.get("risk_ewma", 0.0) or 0.0)
+        tr = cls(window=_safe_int(d.get("window", MAX_WINDOW), MAX_WINDOW)
+                   or MAX_WINDOW,
+                   ewma_alpha=_safe_float(d.get("ewma_alpha", EWMA_ALPHA),
+                                          EWMA_ALPHA) or EWMA_ALPHA)
+        tr._risk_ewma = _safe_float(d.get("risk_ewma", 0.0), 0.0)
         probes = d.get("rule_probes")
         if isinstance(probes, dict):
-            tr._rule_probes = {str(k): int(v) for k, v in probes.items()
-                               if isinstance(v, (int, float))}
+            tr._rule_probes = {str(k): _safe_int(v, 0) for k, v in probes.items()}
         counts = d.get("class_counts")
         if isinstance(counts, dict):
-            tr._class_counts = {str(k): int(v) for k, v in counts.items()
-                                if isinstance(v, (int, float))}
+            tr._class_counts = {str(k): _safe_int(v, 0) for k, v in counts.items()}
         recs = d.get("turns")
         if isinstance(recs, list):
             for rd in recs:
                 if isinstance(rd, dict):
                     tr._turns.append(TurnRecord.from_dict(rd))
+        ans = d.get("analyses")
+        if isinstance(ans, list):
+            for ad in ans:
+                if isinstance(ad, dict):
+                    tr._analyses.append(TurnAnalysis.from_dict(ad))
+            # keep the window invariant the live tracker maintains
+            tr._analyses = tr._analyses[-tr.window:]
+            tr._turns = tr._turns[-tr.window:]
         if tr._turns:
             last = tr._turns[-1]
             tr._prev_pressure = last.pressure

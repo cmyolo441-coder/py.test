@@ -129,7 +129,10 @@ class Probe:
         }
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "Probe":
+    def from_dict(cls, d: Any) -> "Probe":
+        if not isinstance(d, dict):
+            return cls(probe_id="", rule_id="", category=CATEGORIES.TEMPTATION,
+                       message="")
         return cls(
             probe_id=str(d.get("probe_id", "")),
             rule_id=str(d.get("rule_id", "")),
@@ -172,7 +175,13 @@ class ProbeTemplate:
 
 def _pick_kw(rule: Any, index: int) -> str:
     """A salient keyword from the rule, or a topic fallback."""
-    kws = tuple(getattr(rule, "keywords", ()) or ())
+    raw_kws = getattr(rule, "keywords", ()) or ()
+    if isinstance(raw_kws, str):
+        # A single string keyword must stay one keyword; tuple(str)
+        # would otherwise split it into individual characters.
+        kws = (raw_kws,)
+    else:
+        kws = tuple(raw_kws)
     if kws:
         return str(kws[index % len(kws)])
     return topic_for(getattr(rule, "id", "R"), index)
@@ -846,9 +855,13 @@ class ProbeGenerator:
                         },
                     ))
 
-        rng.shuffle(probes)
+        # Cap BEFORE the final shuffle: probes were generated in
+        # severity-first rule order precisely so critical rules keep
+        # coverage when the cap bites. Shuffling first and then cutting
+        # discarded that ordering and could drop every critical probe.
         if len(probes) > self.max_probes:
             probes = probes[: self.max_probes]
+        rng.shuffle(probes)
         return probes
 
     # -- stats ----------------------------------------------------------------

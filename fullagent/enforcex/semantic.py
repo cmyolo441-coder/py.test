@@ -35,11 +35,10 @@ absent the module falls back to plain string handling.
 
 from __future__ import annotations
 
-import hashlib
 import re
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 # ── defensive sibling imports ────────────────────────────────────────────
 
@@ -420,18 +419,28 @@ class SemanticVerdict:
         }
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "SemanticVerdict":
+    def from_dict(cls, d: Any) -> "SemanticVerdict":
+        if not isinstance(d, dict):
+            return cls(category="other", rule_id="", entailed=False,
+                       confidence=0.5, entailment_score=0.0,
+                       contradiction_score=0.0)
+        def _f(key: str, default: float) -> float:
+            try:
+                return float(d.get(key, default))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return default
+        meta = d.get("meta")
         return cls(
             category=str(d.get("category", "other")),
             rule_id=str(d.get("rule_id", "")),
             entailed=bool(d.get("entailed", False)),
-            confidence=float(d.get("confidence", 0.5)),
-            entailment_score=float(d.get("entailment_score", 0.0)),
-            contradiction_score=float(d.get("contradiction_score", 0.0)),
+            confidence=_f("confidence", 0.5),
+            entailment_score=_f("entailment_score", 0.0),
+            contradiction_score=_f("contradiction_score", 0.0),
             evidence=str(d.get("evidence", "")),
             reasoning=str(d.get("reasoning", "")),
             archetype=str(d.get("archetype", "")),
-            meta=dict(d.get("meta") or {}),
+            meta=dict(meta) if isinstance(meta, dict) else {},
         )
 
 
@@ -454,13 +463,21 @@ class SemanticReport:
         }
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "SemanticReport":
+    def from_dict(cls, d: Any) -> "SemanticReport":
+        if not isinstance(d, dict):
+            return cls()
+        try:
+            overall = float(d.get("overall_compliance", 1.0))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            overall = 1.0
+        uncovered = d.get("uncovered_rules", ())
+        meta = d.get("meta")
         return cls(
             verdicts=[SemanticVerdict.from_dict(x) for x in d.get("verdicts", ()) if isinstance(x, dict)],
-            overall_compliance=float(d.get("overall_compliance", 1.0)),
+            overall_compliance=overall,
             contradictions=[SemanticVerdict.from_dict(x) for x in d.get("contradictions", ()) if isinstance(x, dict)],
-            uncovered_rules=[str(x) for x in d.get("uncovered_rules", ())],
-            meta=dict(d.get("meta") or {}),
+            uncovered_rules=[str(x) for x in uncovered] if isinstance(uncovered, (list, tuple)) else [],
+            meta=dict(meta) if isinstance(meta, dict) else {},
         )
 
 

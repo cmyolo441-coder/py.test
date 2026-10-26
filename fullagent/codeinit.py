@@ -218,7 +218,12 @@ def _detect_commands(root: Path, key_files: list[str]) -> tuple[list[str], list[
                 pass
             _add(build, "python -m build")
             _add(test, "pytest")
-        elif kf == "requirements.txt":
+        elif kf == "requirements.txt" or kf.endswith("/requirements.txt"):
+            # key_files are repo-relative posix paths, so a nested
+            # requirements.txt ("sub/requirements.txt") never matched
+            # the old exact comparison — unlike Makefile/pyproject/
+            # package.json, which all use endswith. The install command
+            # was silently dropped for nested projects.
             _add(build, "pip install -r requirements.txt")
         elif kf.endswith("package.json"):
             try:

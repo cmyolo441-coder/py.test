@@ -328,7 +328,13 @@ def _smart_retry_multiedit(p: Path, edits: list[dict[str, Any]],
         except (OSError, UnicodeDecodeError) as e:
             return f"ERROR: re-read failed during smart retry: {e}"
         trial = [dict(e) for e in edits]
-        trial[fail_idx] = {"old_string": old, "new_string": new}
+        # Keep the failing edit's other keys (start_line/end_line
+        # anchors): rebuilding it from only old/new used to drop the
+        # line anchor, so a retry could resolve a different span than
+        # the caller anchored.
+        trial[fail_idx] = dict(failing)
+        trial[fail_idx]["old_string"] = old
+        trial[fail_idx]["new_string"] = new
         # The core py_compile gate fires inside _apply_edits: a
         # syntax-breaking retry makes no write and reports nothing.
         ok, message, _fi, _new_text = _apply_edits(p, trial, fresh,

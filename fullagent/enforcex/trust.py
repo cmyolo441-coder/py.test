@@ -39,12 +39,11 @@ Design rules inherited from the enforcex house style:
 from __future__ import annotations
 
 import copy
-import hashlib
 import json
 import math
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 __all__ = [
     "TrustConfig",
@@ -264,10 +263,17 @@ class TrustState:
         events = [e.to_dict() for e in
                   (TrustEvent.from_dict(x) for x in events_raw)
                   ] if isinstance(events_raw, list) else []
+        score = _clamp(d.get("score"), 0.0, 100.0, 100.0)
+        # min_score is the lowest score ever reached, so it can never
+        # exceed the restored score: a dict missing min_score used to
+        # default it to 100.0 even for a 40-point state, breaking the
+        # recovery-cap math that reads min_score.
+        min_score = _clamp(d.get("min_score"), 0.0, 100.0, score) \
+            if "min_score" in d else score
         return cls(
             session_id=_as_id(d.get("session_id")),
-            score=_clamp(d.get("score"), 0.0, 100.0, 100.0),
-            min_score=_clamp(d.get("min_score"), 0.0, 100.0, 100.0),
+            score=score,
+            min_score=min(min_score, score),
             category_scores=cats,
             clean_streak=max(0, _to_int(d.get("clean_streak"))),
             violation_count=max(0, _to_int(d.get("violation_count"))),
@@ -280,6 +286,19 @@ def _to_int(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+def _to_int_or(value: Any, default: int) -> int:
+    """int(value), falling back to default ONLY on failure/missing —
+    an explicitly parsed 0 stays 0 (the old `or default` idiom turned
+    an explicit 0 into the default, so from_dict could not disable
+    forgiveness or the repeat window)."""
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def score_to_tier(score: Any) -> str:
@@ -321,12 +340,13 @@ class TrustConfig:
             d.get("recover_per_clean"), 0.0, 50.0, 2.0)
         cfg.streak_bonus_rate = _clamp(
             d.get("streak_bonus_rate"), 0.0, 10.0, 0.5)
-        cfg.streak_bonus_after = max(0, _to_int(d.get("streak_bonus_after")) or 5)
+        cfg.streak_bonus_after = max(0, _to_int_or(
+            d.get("streak_bonus_after"), 5))
         cfg.recovery_cap = _clamp(d.get("recovery_cap"), 0.0, 100.0, 60.0)
         cfg.repeat_multiplier = _clamp(
             d.get("repeat_multiplier"), 1.0, 5.0, 1.5)
-        cfg.repeat_window = max(1, _to_int(d.get("repeat_window")) or 3)
-        cfg.forgive_after = max(0, _to_int(d.get("forgive_after")) or 10)
+        cfg.repeat_window = max(0, _to_int_or(d.get("repeat_window"), 3))
+        cfg.forgive_after = max(0, _to_int_or(d.get("forgive_after"), 10))
         return cfg
 
     def to_dict(self) -> Dict[str, Any]:

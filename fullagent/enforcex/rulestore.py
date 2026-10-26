@@ -41,6 +41,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 try:  # graceful import of the extractor module
     from . import ruleextract as _rx
@@ -91,7 +92,9 @@ def _spec_to_dict(spec) -> dict:
     }
 
 
-def _spec_from_dict(d: dict):
+def _spec_from_dict(d: Any):
+    if not isinstance(d, dict):
+        return {}
     if _rx is not None and hasattr(_rx, "PromptSpec"):
         try:
             return _rx.PromptSpec.from_dict(d)
@@ -226,9 +229,15 @@ class RuleStore:
         return {"schema": SCHEMA_VERSION, "specs": {}, "history": []}
 
     def _load_doc(self) -> dict:
-        """Read the document; malformed JSON → backup + fresh doc."""
-        if self._loaded and self._doc is not None:
-            return self._doc
+        """Read the document; malformed JSON → backup + fresh doc.
+
+        Always re-reads from disk: the previous in-memory cache meant
+        a store instance that had once read the file would silently
+        overwrite specs saved by another process afterwards (its
+        cached doc lacked them and _write_doc replaced the file).
+        The cross-process lock only helps if the writer under the lock
+        sees the latest file contents.
+        """
         doc = self._empty_doc()
         try:
             with open(self.path, "r", encoding="utf-8") as fh:

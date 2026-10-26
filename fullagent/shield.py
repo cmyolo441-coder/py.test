@@ -104,7 +104,7 @@ def scan(text: str) -> list[InjectionHit]:
     a pattern must match inside an instruction-like sentence, which
     keeps benign code (regex strings, docs ABOUT security) low-risk."""
     hits: list[InjectionHit] = []
-    if not text:
+    if not isinstance(text, str) or not text:
         return hits
     for lineno, line in enumerate(text.splitlines(), 1):
         for chunk in _SENT_SPLIT.split(line):
@@ -156,7 +156,7 @@ def fence(content: str, source: str, risk: float) -> str:
     hierarchy layer teaches the model that fenced blocks are evidence,
     never instructions. Idempotent (already-fenced content passes)."""
     if not isinstance(content, str) or not content:
-        return content or ""
+        return ""
     if FENCE_CLOSE in content and FENCE_OPEN in content:
         return content  # already fenced upstream
     r = f"{risk:.2f}"
@@ -188,8 +188,8 @@ def neutralize(text: str) -> tuple[str, int]:
     from its object with a zero-width space so the model reads the
     CONTENT (a report about an attack, a log line) but the literal
     command grammar never forms. Returns (new_text, n_hits)."""
-    if not text:
-        return text, 0
+    if not isinstance(text, str) or not text:
+        return "", 0
     hits = scan(text)
     if not hits:
         return text, 0
@@ -223,6 +223,8 @@ def quarantine(content: str, source: str) -> tuple[str, bool]:
     (secret fishing, multi-signal tool abuse) qualify; ordinary
     prompt-injection prose (0.6-0.85) stays fenced+neutralized so the
     model can still reason about it as evidence."""
+    if not isinstance(content, str):
+        return "", False
     r = risk_of(content)
     if r < 0.9:
         return content, False
@@ -243,9 +245,13 @@ def shield_tool_output(content: str, source: str = "tool",
       scan -> (quarantine | neutralize) -> fence.
     Returns {"content", "risk", "quarantined", "hits", "kinds",
              "neutralized"}."""
-    hits = scan(content or "")
-    risk = risk_of(content or "")
-    final = content or ""
+    if content is None:
+        content = ""
+    elif not isinstance(content, str):
+        content = str(content)
+    hits = scan(content)
+    risk = risk_of(content)
+    final = content
     quarantined = False
     n_neutralized = 0
     if risk >= quarantine_threshold:

@@ -114,7 +114,9 @@ _RECOVERED = False
 def _connect() -> sqlite3.Connection:
     """One short-lived connection per operation (thread-safe pattern)."""
     _logs_dir().mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(_db_path()))
+    # 30s busy timeout (was the 5s default): concurrent tool calls used
+    # to surface "database is locked" OperationalErrors to callers.
+    conn = sqlite3.connect(str(_db_path()), timeout=30.0)
     conn.execute(_SCHEMA)
     conn.row_factory = sqlite3.Row
     return conn

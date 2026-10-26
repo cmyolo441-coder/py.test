@@ -5294,6 +5294,7 @@ class UI:
                          style=f"italic {C['dim']}")
         title = Text(" 🧠 chain of thought", style=f"bold {C['pink']}")
         self.console.print(Panel(body_text, border_style=C["pink"],
+                                 title=title,
                                  expand=False,
                                  width=min(self._width() - 2, 84),
                                  padding=(0, 1)))

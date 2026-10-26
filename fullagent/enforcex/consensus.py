@@ -130,6 +130,9 @@ def _coerce_rules(rules: Any) -> List[Dict[str, Any]]:
                                        r.get("category") or "other", r.get("severity") or "low", r.get("keywords"), r.get("patterns"), bool(r.get("immutable", False))))
                     elif isinstance(r, str) and r.strip():
                         out.append(_mk("", r))
+                    elif hasattr(r, "text"):
+                        out.append(_mk(getattr(r, "id", "") or getattr(r, "rule_id", ""), getattr(r, "text", ""), getattr(r, "category", "other"),
+                                       getattr(r, "severity", "low"), getattr(r, "keywords", ()), getattr(r, "patterns", ()), bool(getattr(r, "immutable", False))))
                 return out[:_MAX_RULES]
             for k, v in rules.items():
                 if isinstance(v, dict):
@@ -201,9 +204,23 @@ class Vote:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Vote":
+        if not isinstance(d, dict):
+            return cls(voter_name="")
+        try:
+            confidence = float(d.get("confidence", 0.5))
+        except (TypeError, ValueError):
+            confidence = 0.5
+        vios = d.get("violations") or []
+        if isinstance(vios, dict):
+            vios = [vios]
+        elif not isinstance(vios, (list, tuple)):
+            vios = []
+        meta = d.get("meta") or {}
+        if not isinstance(meta, dict):
+            meta = {}
         return cls(voter_name=str(d.get("voter_name", "")), action=str(d.get("action", "allow")),
-                   confidence=float(d.get("confidence", 0.5)), violations=list(d.get("violations") or []),
-                   reasoning=str(d.get("reasoning", "")), abstained=bool(d.get("abstained", False)), meta=dict(d.get("meta") or {}))
+                   confidence=confidence, violations=list(vios),
+                   reasoning=str(d.get("reasoning", "")), abstained=bool(d.get("abstained", False)), meta=dict(meta))
 
 
 @dataclass
@@ -240,9 +257,16 @@ class Voter:
             vios = raw.get("violations") or raw.get("findings") or []
             if not isinstance(vios, list):
                 vios = [vios] if vios else []
+            try:
+                conf = float(raw.get("confidence", 0.7))
+            except (TypeError, ValueError):
+                conf = 0.7
+            meta = raw.get("meta") or {}
+            if not isinstance(meta, dict):
+                meta = {}
             return Vote(voter_name=self.name, action="abstain" if abstained else action,
-                        confidence=float(raw.get("confidence", 0.7)), violations=list(vios),
-                        reasoning=str(raw.get("reasoning") or raw.get("message") or ""), abstained=abstained, meta=dict(raw.get("meta") or {}))
+                        confidence=conf, violations=list(vios),
+                        reasoning=str(raw.get("reasoning") or raw.get("message") or ""), abstained=abstained, meta=dict(meta))
         if isinstance(raw, str):
             act = raw.lower().strip()
             if act not in _ACTION_ORDER:
@@ -268,11 +292,23 @@ class ConsensusResult:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "ConsensusResult":
+        if not isinstance(d, dict):
+            return cls()
+        try:
+            weighted = float(d.get("weighted_score", 0.0))
+        except (TypeError, ValueError):
+            weighted = 0.0
+        breakdown = d.get("breakdown") or {}
+        if not isinstance(breakdown, dict):
+            breakdown = {}
+        meta = d.get("meta") or {}
+        if not isinstance(meta, dict):
+            meta = {}
         return cls(votes=[Vote.from_dict(x) for x in d.get("votes", ()) if isinstance(x, dict)],
-                   weighted_score=float(d.get("weighted_score", 0.0)), quorum_met=bool(d.get("quorum_met", False)),
+                   weighted_score=weighted, quorum_met=bool(d.get("quorum_met", False)),
                    final_action=str(d.get("final_action", "allow")),
                    dissent=[Vote.from_dict(x) for x in d.get("dissent", ()) if isinstance(x, dict)],
-                   breakdown=dict(d.get("breakdown") or {}), meta=dict(d.get("meta") or {}))
+                   breakdown=dict(breakdown), meta=dict(meta))
 
 
 @dataclass

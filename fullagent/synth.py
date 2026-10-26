@@ -100,6 +100,8 @@ class ProgramSynthesizer:
 
     def validate_source(self, source: str, name: str) -> tuple[str, str]:
         """Mechanical AST gates. Returns (fn_name, problem)."""
+        if not isinstance(source, str):
+            return "", "source must be a string"
         try:
             tree = ast.parse(textwrap.dedent(source))
         except SyntaxError as e:
@@ -147,7 +149,13 @@ class ProgramSynthesizer:
         for i, ex in enumerate(spec.examples):
             # examples are author-supplied data — a missing "args" key
             # must fail the example, not crash the synthesizer
+            if not isinstance(ex, dict):
+                failures.append(f"example {i}: not a dict")
+                continue
             args = ex.get("args") or {}
+            if not isinstance(args, dict):
+                failures.append(f"example {i}: 'args' not a dict")
+                continue
             want = ex.get("want")
             ok, got, note = self._call_with_timeout(fn, args,
                                                     _CALL_TIMEOUT_S)
@@ -201,7 +209,7 @@ class ProgramSynthesizer:
         # so exec() must run the same string — otherwise an indented
         # draft passes validation and then dies with IndentationError
         raw = self.generator(spec)
-        source = textwrap.dedent(raw or "")
+        source = textwrap.dedent(raw if isinstance(raw, str) else "")
         self.log.append("synth.tool.drafted",
                         {"name": spec.name,
                          "chars": len(source)}, actor="sovereign")

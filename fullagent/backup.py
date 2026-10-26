@@ -232,6 +232,11 @@ def restore_backup(ref: str, confirm: bool = False,
     Returns ``{"ok", "restored_files", "skipped_existing"|..., "message"}``.
     """
     app_dir = app_dir or _app_dir()
+    if not isinstance(ref, str) or not ref.strip():
+        # Path(os.path.expanduser(None)) used to raise TypeError here.
+        return {"ok": False,
+                "message": "backup not found: ref must be a non-empty "
+                           "path or backup name"}
     path = _resolve_backup_ref(ref, app_dir)
     if not path.exists():
         return {"ok": False,
@@ -279,8 +284,11 @@ def restore_backup(ref: str, confirm: bool = False,
                     "message": f"refusing to restore — cannot read archive: {e}"}
 
         # Confirm check: refuse to overwrite existing files without consent.
+        # MANIFEST.json is archive metadata, not app content: it used to
+        # be copied into the app dir as a stray file on every restore.
         targets = [(m, tmp / m.name, app_dir / m.name)
-                   for m in members if m.isfile() or m.issym()]
+                   for m in members
+                   if (m.isfile() or m.issym()) and m.name != MANIFEST_NAME]
         existing = [str(dst) for _, _, dst in targets
                     if dst.exists() or dst.is_symlink()]
         if existing and not confirm:
@@ -290,15 +298,32 @@ def restore_backup(ref: str, confirm: bool = False,
                                "pass confirm=True to restore anyway"}
 
         restored = 0
-        for member, src, dst in targets:
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            if member.issym():
-                if dst.is_symlink() or dst.exists():
-                    dst.unlink()
-                dst.symlink_to(member.linkname)
-            else:
-                shutil.copy2(src, dst)
-            restored += 1
+        try:
+            for member, src, dst in targets:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if member.issym():
+                    if dst.is_symlink() or dst.exists():
+                        dst.unlink()
+                    dst.symlink_to(member.linkname)
+                else:
+                    if dst.is_dir() and not dst.is_symlink():
+                        # copy2() into a directory silently writes
+                        # src's basename inside it instead of failing;
+                        # refuse rather than restore to a wrong path.
+                        raise IsADirectoryError(
+                            f"destination is a directory: {dst}")
+                    shutil.copy2(src, dst)
+                restored += 1
+        except OSError as e:
+            # E.g. the destination is a directory where the backup has
+            # a file: previously this escaped restore_backup and crashed
+            # the TUI restore handler, after earlier files were already
+            # copied. Report it instead; nothing is silently half-done
+            # without a message.
+            return {"ok": False,
+                    "restored_files": restored,
+                    "message": f"restore failed partway ({restored} file(s) "
+                               f"restored before the failure): {e}"}
         return {"ok": True,
                 "restored_files": restored,
                 "message": f"restored {restored} file(s) from {path.name} "
@@ -331,7 +356,9 @@ def _handle_backup_list() -> str:
 
 
 def _handle_backup_restore(path: str, confirm: bool = False) -> str:
-    res = restore_backup(path, confirm=confirm)
+    if isinstance(confirm, str):
+        confirm = confirm.strip().lower() in ("1", "true", "yes", "y", "on")
+    res = restore_backup(path, confirm=bool(confirm))
     status = "✓" if res.get("ok") else "✗"
     return f"{status} {res.get('message')}"
 

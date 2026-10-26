@@ -127,12 +127,20 @@ def describe(cwd: str | os.PathLike | None = None,
              user_dir: str | os.PathLike | None = None) -> list[str]:
     """Real paths that currently carry instructions (for /help-style views)."""
     out: list[str] = []
+    seen: set[str] = set()
     for path in candidate_files(cwd, extra_files, user_dir):
         if _read_cached(path):
             try:
-                out.append(str(path.resolve()))
+                resolved = str(path.resolve())
             except OSError:
-                out.append(str(path))
+                resolved = str(path)
+            # collect() dedups the same file reached twice (e.g. the
+            # user-wide file IS the cwd file); describe() listed it
+            # twice, which disagreed with the combined output.
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            out.append(resolved)
     return out
 
 

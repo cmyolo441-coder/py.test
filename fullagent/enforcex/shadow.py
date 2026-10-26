@@ -54,7 +54,7 @@ import hashlib
 import re
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # ── defensive sibling imports ────────────────────────────────────────────
 
@@ -659,7 +659,8 @@ class ShadowConfig:
 
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, Any]]) -> "ShadowConfig":
-        d = d or {}
+        if not isinstance(d, dict):
+            return cls()
         return cls(
             fragile_threshold=d.get("fragile_threshold", 0.0),
             fail_on_disagreement=bool(d.get("fail_on_disagreement", True)),
@@ -934,8 +935,16 @@ class ShadowHarness:
                     sensitive_disagree = True
                     break
 
+            # fragile_threshold is the tolerated evasion fraction:
+            # with the default 0.0 any evasion makes the prompt fragile,
+            # but a caller that sets e.g. 0.5 tolerates up to half the
+            # personas evading. The field was previously read nowhere,
+            # so even a threshold of 1.0 still reported fragile.
+            evasion_rate = (len(evading) / len(results)) if results else 0.0
+            evasion_fragile = bool(evading) and \
+                evasion_rate > self.config.fragile_threshold
             fragile = False
-            if evading:
+            if evasion_fragile:
                 fragile = True
             elif self.config.fail_on_disagreement and sensitive_disagree:
                 fragile = True
@@ -943,8 +952,24 @@ class ShadowHarness:
                 # any disagreement with >1 persona is fragile when strict
                 fragile = True
 
+            # dedupe evading (moved before the recommendation so the
+            # tolerated-evasion message can name the personas).
+            seen: set = set()
+            uniq_evading: List[str] = []
+            for e in evading:
+                if e not in seen:
+                    seen.add(e)
+                    uniq_evading.append(e)
+
             # recommendation
-            if not fragile:
+            if not fragile and evading:
+                recommendation = (
+                    "Prompt shows some persona evasion "
+                    f"({', '.join(uniq_evading)}), but it stays within "
+                    "the configured fragile_threshold. Monitor the evading "
+                    "personas and harden if the rate grows."
+                )
+            elif not fragile:
                 recommendation = "Prompt is robust across personas. No hardening required."
             elif evading:
                 recommendation = (
@@ -959,14 +984,6 @@ class ShadowHarness:
                 )
             else:
                 recommendation = "Prompt shows minor persona variance. Review warnings and add targeted probes."
-
-            # dedupe evading
-            seen: set = set()
-            uniq_evading: List[str] = []
-            for e in evading:
-                if e not in seen:
-                    seen.add(e)
-                    uniq_evading.append(e)
 
             meta: Dict[str, Any] = {
                 "persona_count": len(results),

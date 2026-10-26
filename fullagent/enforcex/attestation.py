@@ -79,10 +79,25 @@ MAX_TEXT_LEN = 200_000
 MAX_RULES = 512
 SCHEMA_VERSION = 1
 _VALID_DECISIONS = ("allow", "warn", "rewrite", "retry", "block")
+def _sanitize(obj: Any) -> Any:
+    """Replace non-finite floats (NaN/inf) with None so canonical JSON
+    never raises: the old allow_nan=False made attest()/persist()
+    crash on any meta/payload containing NaN, contradicting the
+    module's "never raises on malformed input" contract."""
+    if isinstance(obj, float):
+        return obj if obj == obj and abs(obj) != float("inf") else None
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize(v) for v in obj]
+    return obj
+
+
 def canonical_json(obj: Any) -> str:
-    """Deterministic JSON: sorted keys, tight separators, no NaN."""
+    """Deterministic JSON: sorted keys, tight separators, no NaN
+    (non-finite floats are encoded as null, never raised)."""
     return json.dumps(
-        obj, sort_keys=True, separators=(",", ":"),
+        _sanitize(obj), sort_keys=True, separators=(",", ":"),
         ensure_ascii=False, default=str, allow_nan=False,
     )
 def canonical_bytes(obj: Any) -> bytes:

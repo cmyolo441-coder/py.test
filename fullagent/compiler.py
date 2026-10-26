@@ -385,12 +385,20 @@ class IntentCompiler:
             all_reports.extend(reports)
         result = {"goal": plan.goal, "waves": len(plan.waves),
                   "items": len(all_reports),
+                  # Executor reports are documented as dicts, but an
+                  # executor returning a non-dict (e.g. a plain string)
+                  # used to crash the whole run here with
+                  # AttributeError: 'str' object has no attribute 'get'.
+                  # Non-dict reports count as items, not as done/blocked.
                   "done": sum(1 for r in all_reports
-                              if r.get("status") == "done"),
+                              if isinstance(r, dict)
+                              and r.get("status") == "done"),
                   "blocked": sum(1 for r in all_reports
-                                 if r.get("status") == "blocked"),
+                                 if isinstance(r, dict)
+                                 and r.get("status") == "blocked"),
                   "error": sum(1 for r in all_reports
-                               if r.get("status") == "error"),
+                               if isinstance(r, dict)
+                               and r.get("status") == "error"),
                   "est_cost": plan.est_cost,
                   "compile_ms": plan.compile_ms}
         self.log.append("compile.done", result, actor="system")

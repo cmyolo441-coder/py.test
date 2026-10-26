@@ -289,6 +289,15 @@ def _host_error(host: str | None) -> str:
             ip = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
         except ValueError:
             continue
+        # RFC 2544 benchmarking range (198.18.0.0/15) is NOT a host-local
+        # address: it is never assigned to a real service, and NAT/gateway
+        # runtimes (including this VM's egress gateway) answer DNS with
+        # it for public hosts. Blocking it made every fetch fail there.
+        # Loopback, RFC1918 private, link-local (incl. 169.254.169.254
+        # metadata) and other non-global addresses stay blocked.
+        if (ip.version == 4
+                and ip in ipaddress.ip_network("198.18.0.0/15")):
+            continue
         if not ip.is_global:
             # loopback / private / link-local (169.254.169.254) / CGNAT
             return f"blocked non-public address for {host}: {ip}"
@@ -508,7 +517,8 @@ if __name__ == "__main__":
             check("final url from redirect chain",
                   r1.get("url") == url + "/final")
             check("title in result", r1.get("title") == "Test & Page")
-            check("text in result", "Visible paragraph one." in r1["text"])
+            check("text in result",
+                  "Visible paragraph one." in r1.get("text", ""))
             check("truncated False on short page",
                   r1.get("truncated") is False)
             check("first call hit network", calls["n"] == 1)

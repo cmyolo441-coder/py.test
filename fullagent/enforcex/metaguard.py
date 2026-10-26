@@ -532,11 +532,24 @@ class MetaGuard:
                 findings = getattr(inj, "matches", None) or \
                     getattr(inj, "findings", None) or []
                 for m in findings:
+                    # InjectionReport.matches are plain dicts (see
+                    # injection.to_violations), not objects — getattr
+                    # on a dict always fell back to ""/"medium", so
+                    # every finding used to arrive with an empty
+                    # vector and empty evidence. Handle both shapes.
+                    if isinstance(m, dict):
+                        vector = m.get("vector") or m.get("kind") or ""
+                        severity = m.get("severity") or "medium"
+                        evidence = m.get("evidence") or ""
+                    else:
+                        vector = getattr(m, "vector",
+                                         getattr(m, "kind", ""))
+                        severity = getattr(m, "severity", "medium")
+                        evidence = getattr(m, "evidence", "")
                     report.injection_findings.append({
-                        "vector": str(getattr(m, "vector",
-                                              getattr(m, "kind", ""))),
-                        "severity": str(getattr(m, "severity", "medium")),
-                        "evidence": str(getattr(m, "evidence", ""))[:120],
+                        "vector": str(vector),
+                        "severity": str(severity),
+                        "evidence": str(evidence)[:120],
                     })
                 inj_score = float(getattr(inj, "score", 0.0) or 0.0)
                 if inj_score > 0:

@@ -139,6 +139,8 @@ class Council:
     def convene(self, question: str) -> Verdict:
         """Run one full debate: thesis, then antithesis (serial), then the
         blind synthesis. Never raises — failures land in Verdict.error."""
+        if not isinstance(question, str):
+            question = "" if question is None else str(question)
         with self.log._lock:
             council_id = f"council-{self.log.head() + 1}"
             self.log.append("council.convened",

@@ -171,7 +171,7 @@ class GoalContract:
         """Enforce the Goal Mode rules at load time (Appendix B). Returns
         the normalised clause list; raises GoalContractError naming the
         offending clause."""
-        if not clauses:
+        if not isinstance(clauses, (list, tuple)) or not clauses:
             raise GoalContractError("a contract needs at least one clause")
         if closing_rule not in CLOSING_RULES:
             raise GoalContractError(
@@ -183,6 +183,10 @@ class GoalContract:
         total = 0.0
         seen_ids: set[str] = set()
         for i, c in enumerate(clauses):
+            if not isinstance(c, dict):
+                raise GoalContractError(
+                    f"clause C{i + 1}: must be an object, "
+                    f"got {type(c).__name__}")
             cid = str(c.get("id") or f"C{i + 1}")
             text = str(c.get("text", "")).strip()
             if not text:

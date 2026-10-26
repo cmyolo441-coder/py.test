@@ -36,7 +36,7 @@ from .ledger import LedgerEntry, RuleLedger, token_estimate
 __all__ = [
     "Check", "CheckType", "build_rubric", "verify_prompt",
     "parse_verdicts", "ComplianceScore", "decide",
-    "run_pipeline_plan", "REPAIR_PROMPT",
+    "run_pipeline_plan", "REPAIR_PROMPT", "classify",
 ]
 
 
@@ -86,7 +86,7 @@ _IMPERATIVE_HARD = re.compile(
 
 
 def classify(text: str) -> str:
-    t = (text or "").lower()
+    t = str(text or "").lower()
     for pattern, ctype in _TYPE_HINTS:
         if re.search(pattern, t):
             return ctype
@@ -142,7 +142,10 @@ def run_pipeline_plan(rubric: list[Check], reply: str,
     startup or compaction, long replies, many hard rules) get the full
     audit; everything else gets a spot-check of the top hard rules;
     trivial replies skip the gate entirely (cost control)."""
-    reply = reply or ""
+    rubric = [c for c in rubric if hasattr(c, "hard") and hasattr(c, "text")] \
+        if isinstance(rubric, (list, tuple)) else []
+    reply = reply if isinstance(reply, str) else ("" if reply is None
+                                                  else str(reply))
     n_hard = sum(1 for c in rubric if c.hard)
     reply_tokens = token_estimate(reply)
     high_stakes = first_turn or after_compaction or reply_tokens > 600 \
@@ -194,9 +197,13 @@ follows nor violates the rule. Do not invent checks.
 
 def verify_prompt(checks: list[Check], reply: str) -> str:
     """S3: render the verification prompt for any chat model."""
-    lines = "\n".join(c.prompt_line() for c in checks) or "- (no checks)"
-    return _VERIFY_TMPL.format(checks=lines,
-                               reply=(reply or "")[:6000])
+    safe = [c for c in checks
+            if hasattr(c, "prompt_line")] if isinstance(
+                checks, (list, tuple)) else []
+    lines = "\n".join(c.prompt_line() for c in safe) or "- (no checks)"
+    reply = reply if isinstance(reply, str) else ("" if reply is None
+                                                  else str(reply))
+    return _VERIFY_TMPL.format(checks=lines, reply=reply[:6000])
 
 
 # repair prompt — fed back to the model when S5 decides to retry
@@ -242,7 +249,9 @@ def parse_verdicts(raw: str, checks: list[Check]) -> ComplianceScore:
     if not isinstance(rows, list):
         return ComplianceScore(score=0.0, verdict="UNKNOWN",
                                repair_hint="verifier returned no checks")
-    by_id = {c.rule_id: c for c in checks}
+    by_id = {c.rule_id: c for c in checks
+             if hasattr(c, "rule_id")} if isinstance(
+                 checks, (list, tuple)) else {}
     total_w = 0.0
     pass_w = 0.0
     score = ComplianceScore(score=0.0, verdict="UNKNOWN")

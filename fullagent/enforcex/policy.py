@@ -182,7 +182,13 @@ class PolicyRule:
         r.mode = parse_mode(r.mode)
         r.downgrade_mode = parse_mode(
             r.downgrade_mode, default=r.mode) if r.downgrade_mode else ""
-        r.precedence = int(r.precedence)
+        try:
+            r.precedence = int(r.precedence)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            # A non-numeric precedence from from_dict/JSON must not make
+            # normalized() (and hence Policy()) raise; fall back to the
+            # default precedence instead of crashing on malformed input.
+            r.precedence = 100
         r.stages = tuple(s.strip().lower() for s in _to_str_list(r.stages))
         r.not_stages = tuple(s.strip().lower() for s in _to_str_list(r.not_stages))
         r.min_confidence = _to_float(r.min_confidence, 0.0, 0.0, 1.0)
@@ -525,9 +531,11 @@ class Policy:
             if not rule.applies_in_stage(stage):
                 chain.append(f"skip(stage) {rule.rule_id}")
                 continue
-            candidates.append((spec, rule.precedence, -idx, rule))
+            candidates.append((spec, rule.precedence, idx, rule))
         if candidates:
             # most specific; then highest precedence; then latest declared
+            # (reverse sort on the declaration index: a larger index is
+            # a later-declared rule, so it must sort first on ties).
             candidates.sort(key=lambda t: (t[0], t[1], t[2]), reverse=True)
             best = candidates[0][3]
             chain.append("resolved:" + best.rule_id)

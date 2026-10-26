@@ -78,6 +78,46 @@ def _die(msg: str, code: int = EXIT_USAGE) -> int:
     return code
 
 
+def _rule_items(rules: Any) -> List[Any]:
+    """Flatten any rules shape to a list of rule items.
+
+    ruleextract.extract_rules returns a list of Rule objects (with
+    .id/.text/.category/.severity attributes, not dict keys); a
+    PromptSpec carries them under .rules, and a dict may carry them
+    under "rules". Normalising here keeps the table/digest below
+    honest for every shape instead of printing Rule reprs.
+    """
+    if rules is None:
+        return []
+    if hasattr(rules, "rules") and not isinstance(rules, (str, bytes)):
+        try:
+            return list(getattr(rules, "rules") or ())
+        except Exception:
+            return []
+    if isinstance(rules, dict):
+        if isinstance(rules.get("rules"), (list, tuple)):
+            return list(rules["rules"])
+        return list(rules.values())
+    try:
+        return list(rules)
+    except Exception:
+        return [rules]
+
+
+def _rule_field(item: Any, *names: str) -> str:
+    """One field of a rule item, dict- or attribute-shaped."""
+    if isinstance(item, dict):
+        for name in names:
+            if item.get(name) not in (None, ""):
+                return str(item[name])
+        return ""
+    for name in names:
+        val = getattr(item, name, None)
+        if val not in (None, ""):
+            return str(val)
+    return ""
+
+
 def _extract_rules(prompt_text: str) -> Any:
     """Defensively extract rules from a system prompt. Returns None when
     no extractor is available."""
@@ -88,11 +128,6 @@ def _extract_rules(prompt_text: str) -> Any:
         if callable(fn):
             try:
                 return fn(prompt_text)
-            except TypeError:
-                try:
-                    return fn(prompt_text)  # keep signature simple
-                except Exception:
-                    return None
             except Exception:
                 return None
     return None
@@ -103,18 +138,12 @@ def _rules_digest(rules: Any) -> str:
     if rules is None:
         return "(no extractor available — gate will run with defaults)"
     try:
-        if isinstance(rules, dict):
-            if "digest" in rules:
-                return str(rules["digest"])
-            items = rules
-        else:
-            items = list(rules)
+        if isinstance(rules, dict) and "digest" in rules:
+            return str(rules["digest"])
+        items = _rule_items(rules)
         ids = []
         for it in items:
-            if isinstance(it, dict):
-                ids.append(str(it.get("rule_id") or it.get("id") or "?"))
-            else:
-                ids.append(str(it)[:12])
+            ids.append(_rule_field(it, "rule_id", "id") or "?")
         count = len(ids)
         tail = ",".join(ids[:6]) + ("..." if count > 6 else "")
         return f"{count} rules [{tail}]"
@@ -126,21 +155,21 @@ def _print_rules_table(rules: Any) -> None:
     if rules is None:
         return
     try:
-        items = list(rules.values()) if isinstance(rules, dict) else list(rules)
+        items = _rule_items(rules)
     except Exception:
         return
     print()
     print(f"{'RULE':<14} {'CAT':<16} {'SEV':<10} TEXT")
     print("-" * 78)
     for it in items:
-        if isinstance(it, dict):
-            rid = str(it.get("rule_id") or it.get("id") or "?")[:13]
-            cat = str(it.get("category") or "?")[:15]
-            sev = str(it.get("severity") or it.get("weight") or "?")[:9]
-            text = str(it.get("text") or it.get("rule") or "")[:60]
-        else:
-            rid, cat, sev, text = str(it)[:13], "-", "-", str(it)[:60]
-        print(f"{rid:<14} {cat:<16} {sev:<10} {text}")
+        rid = _rule_field(it, "rule_id", "id") or "?"
+        cat = _rule_field(it, "category") or "-"
+        sev = _rule_field(it, "severity", "weight") or "-"
+        text = _rule_field(it, "text", "rule")
+        if not text and not isinstance(it, dict) \
+                and not hasattr(it, "text"):
+            text = str(it)
+        print(f"{rid[:13]:<14} {cat[:15]:<16} {sev[:9]:<10} {text[:60]}")
     print()
 
 

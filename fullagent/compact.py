@@ -41,7 +41,10 @@ _PATH_RE = re.compile(
 )
 
 # tool names whose arguments carry a file path being written
-_FILE_WRITE_TOOLS = {"write", "edit", "multiedit", "apply_patch", "create_file"}
+# (write_file/edit_file are the real registry names in tools.py; the
+# short forms are kept for older/alternate tool names)
+_FILE_WRITE_TOOLS = {"write", "edit", "write_file", "edit_file",
+                     "multiedit", "apply_patch", "create_file"}
 
 
 # ---------------------------------------------------------------------------
