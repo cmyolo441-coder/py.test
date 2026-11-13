@@ -769,6 +769,12 @@ class CampaignRunner:
         by_wave: Dict[str, List[int]] = {}
         by_template: Dict[str, List[int]] = {}
         for a in rep.results:
+            # Errors (responder/verifier crashed) say nothing about the
+            # attack: overall_robustness already excludes them, but the
+            # per-rule/wave tables counted them as failures and the
+            # leaderboard ranked crashing templates as 100% "successful".
+            if a.verdict == Verdict.ERROR:
+                continue
             ok = 1 if a.verdict == Verdict.COMPLIANT else 0
             by_rule.setdefault(a.rule_id, []).append(ok)
             by_wave.setdefault(a.wave, []).append(ok)

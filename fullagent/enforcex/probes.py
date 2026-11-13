@@ -173,9 +173,26 @@ class ProbeTemplate:
 
 # ── shared context helpers ───────────────────────────────────────────────
 
+def _rf(rule: Any, name: str, default: Any = None) -> Any:
+    """Read a rule field from a Rule-like object *or* a dict.
+
+    The generator advertises "list of dicts" input, but every field was
+    read with getattr(), so dict rules all became id "R??" with empty
+    text and category "other" (wrong targeting, colliding probe ids).
+    """
+    if isinstance(rule, dict):
+        v = rule.get(name)
+        if v is None and name == "id":
+            v = rule.get("rule_id")
+        if v is None and name == "text":
+            v = rule.get("rule")
+        return default if v is None else v
+    return getattr(rule, name, default)
+
+
 def _pick_kw(rule: Any, index: int) -> str:
     """A salient keyword from the rule, or a topic fallback."""
-    raw_kws = getattr(rule, "keywords", ()) or ()
+    raw_kws = _rf(rule, "keywords", ()) or ()
     if isinstance(raw_kws, str):
         # A single string keyword must stay one keyword; tuple(str)
         # would otherwise split it into individual characters.
@@ -184,7 +201,7 @@ def _pick_kw(rule: Any, index: int) -> str:
         kws = tuple(raw_kws)
     if kws:
         return str(kws[index % len(kws)])
-    return topic_for(getattr(rule, "id", "R"), index)
+    return topic_for(str(_rf(rule, "id", "R") or "R"), index)
 
 
 def _short_rule(rule_text: str, maxlen: int = 140) -> str:
@@ -195,8 +212,8 @@ def _short_rule(rule_text: str, maxlen: int = 140) -> str:
 
 
 def _rule_ctx(rule: Any, index: int = 0, system: str = "") -> Dict[str, Any]:
-    rule_id = str(getattr(rule, "id", "") or "R??")
-    rule_text = str(getattr(rule, "text", "") or "")
+    rule_id = str(_rf(rule, "id", "") or "R??")
+    rule_text = str(_rf(rule, "text", "") or "")
     return {
         "rule_id": rule_id,
         "rule_text": rule_text,
@@ -805,7 +822,7 @@ class ProbeGenerator:
         # stable, severity-first rule ordering so critical rules get the
         # most template coverage before the cap hits
         def _sev_index(r: Any) -> int:
-            sev = str(getattr(r, "severity", "low")).lower()
+            sev = str(_rf(r, "severity", "low")).lower()
             return {"critical": 0, "high": 1, "medium": 2,
                     "low": 3}.get(sev, 3)
 
@@ -819,13 +836,20 @@ class ProbeGenerator:
         ordered = [r for sev in sorted(buckets) for r in buckets[sev]]
 
         for rule in ordered:
-            rule_cat = str(getattr(rule, "category", "other") or "other")
-            rule_id = str(getattr(rule, "id", "") or "R??")
+            if len(probes) >= self.max_probes:
+                # the cap below keeps the first max_probes in generation
+                # order, so building the rest (rules x templates x
+                # variants) was pure waste on large rule sets
+                break
+            rule_cat = str(_rf(rule, "category", "other") or "other")
+            rule_id = str(_rf(rule, "id", "") or "R??")
             matching = [t for t in self.templates if t.applies_to(rule_cat)]
             if not matching:
                 matching = [t for t in self.templates
                             if "*" in t.rule_categories]
             for template in matching:
+                if len(probes) >= self.max_probes:
+                    break
                 for variant in range(self.variants_per_pair):
                     ctx = _rule_ctx(rule, index=variant, system=system_text)
                     message = template.build(ctx)
@@ -847,8 +871,8 @@ class ProbeGenerator:
                         template_id=template.template_id,
                         meta={
                             "rule_category": rule_cat,
-                            "rule_severity": str(getattr(rule, "severity",
-                                                         "low")),
+                            "rule_severity": str(_rf(rule, "severity",
+                                                     "low")),
                             "kw": ctx["kw"],
                             "topic": ctx["topic"],
                             "variant": variant,

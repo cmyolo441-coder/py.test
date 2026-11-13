@@ -25,6 +25,8 @@ with asserts runs via `python -m fullagent.enforcex.semantics`.
 
 from __future__ import annotations
 
+import bisect
+import functools
 import math
 import re
 import threading
@@ -224,6 +226,13 @@ _SCOPE_END_RE = re.compile(r"[.!?;]|$,")
 _SCOPE_MAX_WORDS = 12
 
 
+# Case-insensitive twin of _TOKEN_RE so token offsets are taken on the
+# *original* text: negation_scope used to tokenise un-lowercased text
+# with the lowercase-only class (so "Never Reveal" produced "ever",
+# "eveal" and skewed the 12-word scope).
+_TOKEN_RE_I = re.compile(r"[a-z0-9']+", re.I)
+
+
 def negation_scope(text: str) -> List[_NegSpan]:
     """Find negation cues and their heuristic scope (up to punctuation
     or N words). Deterministic; never raises."""
@@ -233,19 +242,19 @@ def negation_scope(text: str) -> List[_NegSpan]:
         return out
     try:
         words: List[Tuple[int, int, str]] = [
-            (m.start(), m.end(), m.group(0)) for m in _TOKEN_RE.finditer(t)
+            (m.start(), m.end(), m.group(0)) for m in _TOKEN_RE_I.finditer(t)
         ]
-        cues = list(_NEG_CUE_RE.finditer(t))
-        for cue in cues:
+        word_ends = [we for _ws, we, _w in words]
+        for cue in _NEG_CUE_RE.finditer(t):
             cue_word_end = cue.end()
             scope_end = cue_word_end
             word_count = 0
-            for ws, we, w in words:
-                if we <= cue_word_end:
-                    continue
-                if ws > cue_word_end and ws > cue.end() + 1:
-                    if t[ws - 1] not in (" ", "\t", "\n"):
-                        pass
+            # jump straight to the first word after the cue (the old loop
+            # rescanned every word from the start for each cue: O(n^2))
+            i = bisect.bisect_right(word_ends, cue_word_end)
+            while i < len(words):
+                _ws, we, _w = words[i]
+                i += 1
                 word_count += 1
                 scope_end = we
                 if word_count >= _SCOPE_MAX_WORDS:
@@ -264,23 +273,34 @@ def negation_profile(text: str) -> Tuple[Set[str], Set[str]]:
 
     Negated = tokens inside a negation scope; affirmed = the rest.
     """
+    aff, neg = _negation_profile_cached(_safe_text(text))
+    return set(aff), set(neg)
+
+
+@functools.lru_cache(maxsize=64)
+def _negation_profile_cached(text: str) -> Tuple[frozenset, frozenset]:
     toks = content_tokens(text)
     spans = negation_scope(text)
-    # map char positions of tokens
     negated: Set[str] = set()
     if spans:
-        low = _safe_text(text, 20_000).lower()
-        pos = 0
-        for w in _TOKEN_RE.finditer(low):
-            word = w.group(0)
-            for sp in spans:
-                if sp.start <= w.start() < sp.end:
-                    if word not in _NEG_CUE_WORDSET:
-                        negated.add(word)
-                    break
-            pos = w.end()
+        t = _safe_text(text, 20_000)
+        # spans are emitted in cue order (sorted by start); walk tokens and
+        # spans together instead of testing every token against every span
+        starts = [sp.start for sp in spans]
+        ends = [sp.end for sp in spans]
+        max_end = []
+        running = -1
+        for e in ends:
+            running = max(running, e)
+            max_end.append(running)
+        for w in _TOKEN_RE_I.finditer(t):
+            k = bisect.bisect_right(starts, w.start()) - 1
+            if k >= 0 and w.start() < max_end[k]:
+                word = w.group(0).lower()
+                if word not in _NEG_CUE_WORDSET:
+                    negated.add(word)
     affirmed = {w for w in toks if w not in negated}
-    return affirmed, negated
+    return frozenset(affirmed), frozenset(negated)
 
 
 _NEG_CUE_WORDSET = {c for c in (
@@ -289,6 +309,17 @@ _NEG_CUE_WORDSET = {c for c in (
     "shouldn", "should", "without", "refuse", "refuses", "forbidden",
     "forbid", "prohibited", "unless", "except",
 )}
+
+
+_DEFIANCE_RE = re.compile(
+    r"\b(i (?:will not|won't|am not going to|refuse to)|ignore (?:the )?"
+    r"(?:rule|rules|instruction|instructions)|forget (?:the )?(?:rule|rules|"
+    r"instructions|format)|rules? (?:do not|don't) apply)\b")
+
+
+@functools.lru_cache(maxsize=64)
+def _has_defiance(text: str) -> bool:
+    return bool(_DEFIANCE_RE.search(text.lower()))
 
 
 def contradiction_score(rule_text: str, response_text: str,
@@ -303,14 +334,13 @@ def contradiction_score(rule_text: str, response_text: str,
     Pure function; never raises.
     """
     try:
-        r_aff, r_neg = negation_profile(rule_text or "")
-        s_aff, s_neg = negation_profile(response_text or "")
+        # cached: match_rules()/contradictions() score one response against
+        # every rule, and re-profiling the response per rule cost
+        # O(rules x len(response)) (~0.5s per rule on a 20k response).
+        r_aff, r_neg = _negation_profile_cached(_safe_text(rule_text or ""))
+        s_aff, s_neg = _negation_profile_cached(_safe_text(response_text or ""))
         # defiance markers independent of token overlap
-        defiance = re.search(
-            r"\b(i (?:will not|won't|am not going to|refuse to)|ignore (?:the )?"
-            r"(?:rule|rules|instruction|instructions)|forget (?:the )?(?:rule|rules|"
-            r"instructions|format)|rules? (?:do not|don't) apply)\b",
-            _safe_text(response_text, 20_000).lower())
+        defiance = _has_defiance(_safe_text(response_text, 20_000))
         # polarity-flip overlap: rule affirms X, response negates X
         flip1 = r_aff & s_neg            # rule: do X, response: not X
         flip2 = r_neg & s_aff            # rule: don't X, response: X
@@ -717,17 +747,19 @@ class SemanticMatcher:
         if not response_text.strip():
             return []
         out: List[MatchResult] = []
+        # response-side features are rule-independent: compute them once
+        # (they were rebuilt for every rule)
+        resp_vec = SparseVector(dict(Counter(
+            tokens(response_text, self.config.min_token_len))))
+        resp_sh = shingles(response_text, self.config.shingle_k)
         for rule in _iter_rules(rules):
             rid = _rule_field(rule, "id") or _rule_field(rule, "rule_id")
             rtext = _rule_field(rule, "text") or _rule_field(rule, "rule")
             if not rtext:
                 continue
             ca = Counter(tokens(rtext, self.config.min_token_len))
-            cb = Counter(tokens(response_text, self.config.min_token_len))
-            topical = cosine_sparse(SparseVector(dict(ca)),
-                                    SparseVector(dict(cb)))
-            surface = jaccard(shingles(rtext, self.config.shingle_k),
-                              shingles(response_text, self.config.shingle_k))
+            topical = cosine_sparse(SparseVector(dict(ca)), resp_vec)
+            surface = jaccard(shingles(rtext, self.config.shingle_k), resp_sh)
             blended = 0.6 * topical + 0.4 * surface
             contra, why = contradiction_score(rtext, response_text,
                                               self.config.stopwords)

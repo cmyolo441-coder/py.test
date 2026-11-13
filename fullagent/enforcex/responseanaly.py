@@ -272,6 +272,16 @@ def split_sentences(text: str) -> list[str]:
 _HEADING_TRAILER = re.compile(r"\s*[:\-–—]\s*$")
 
 
+def _strip_heading_trailer(heading: str) -> str:
+    r"""_HEADING_TRAILER.sub("", h).strip() without the regex: the leading
+    \s* made the search quadratic on whitespace-heavy lines (20k spaces
+    took seconds per heading)."""
+    t = heading.rstrip()
+    if t and t[-1] in ":-–—":
+        t = t[:-1]
+    return t.strip()
+
+
 def split_sections(text: str) -> list[tuple[str, str]]:
     """Split a reply into (heading, body) pairs.
 
@@ -324,7 +334,7 @@ def split_sections(text: str) -> list[tuple[str, str]]:
                 if cur_lines:
                     sections.append((cur_heading, "\n".join(cur_lines).strip()))
                     cur_lines = []
-                cur_heading = _HEADING_TRAILER.sub("", heading).strip()
+                cur_heading = _strip_heading_trailer(heading)
                 cur_lines.append(after)
                 i += 1
                 continue
@@ -332,7 +342,7 @@ def split_sections(text: str) -> list[tuple[str, str]]:
             if cur_lines:
                 sections.append((cur_heading, "\n".join(cur_lines).strip()))
                 cur_lines = []
-            cur_heading = _HEADING_TRAILER.sub("", heading).strip()
+            cur_heading = _strip_heading_trailer(heading)
             # a markdown body may follow on the same line after ATX heading
             if m and stripped != line.strip():
                 rest = line[m.end():].strip()

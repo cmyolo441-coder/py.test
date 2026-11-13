@@ -118,3 +118,13 @@ def test_enforcex_semantic_clip_prefix_only():
     full = sem._WS_RE.sub(" ", big).strip()
     assert out == full[:99] + "…"
     assert sem._clip("  a  b  ", 100) == "a b"
+
+
+def test_responseanaly_heading_trailer_linear():
+    import time
+    from fullagent.enforcex import responseanaly as ra
+    t = time.perf_counter()
+    assert ra._strip_heading_trailer("Title" + " " * 200000 + ":") == "Title"
+    assert time.perf_counter() - t < 0.5
+    assert ra._strip_heading_trailer("Setup —  ") == "Setup"
+    assert ra._strip_heading_trailer("a: :") == "a:"

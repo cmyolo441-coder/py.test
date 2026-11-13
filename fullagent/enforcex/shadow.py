@@ -527,9 +527,12 @@ class Persona:
                 fn = _PERSONA_TRANSFORMS.get(self.name, _t_compliant)
             # system_prefix affects system_text for transforms that read it
             eff_system = (self.system_prefix + "\n" + system_text) if self.system_prefix else (system_text or "")
-            return fn(_coerce_text(text), rules, eff_system)
+            # a custom transform may return None/bytes/huge text: coerce and
+            # bound it (a None result used to crash _evaluate_persona's
+            # len() and turn the persona into a default "allow" result)
+            return _coerce_text(fn(_coerce_text(text), rules, eff_system))[:MAX_TEXT_LEN]
         except Exception:
-            return _coerce_text(text)
+            return _coerce_text(text)[:MAX_TEXT_LEN]
 
     def to_dict(self) -> Dict[str, Any]:
         return {"name": self.name, "behavior": self.behavior, "system_prefix": self.system_prefix}
