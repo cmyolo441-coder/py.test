@@ -206,6 +206,12 @@ _MUTATING_TOOLS = {"write_file", "edit_file", "create_directory",
                    "copy_path", "move_path", "delete_path", "run_command",
                    "live_shell", "apply_patch"}
 _ALWAYS_ASK = {"delete_path"}
+
+
+def _goal_live(st) -> bool:
+    """A goal that is this session's and not closed (GoalStatus.live);
+    tolerant of duck-typed status objects that only carry ``active``."""
+    return bool(getattr(st, "live", getattr(st, "active", False)))
 # tools whose args name the paths they touch (snapshot targets)
 _PATH_ARG_TOOLS = {"write_file": ("path",), "edit_file": ("path",),
                    "create_directory": ("path",), "delete_path": ("path",),
@@ -664,8 +670,13 @@ class Agent:
 
     @property
     def model(self) -> Model:
+        """The model in use. While a turn runs it is the model that turn
+        was pinned to (see run_turn), so every request of one turn goes to
+        one model — the one the turn reports and the status bar shows."""
         _resolve_lazy("model_by_id", "config")
-        m = (model_by_id(self.cfg.model_id)
+        pinned = self.__dict__.get("turn_model_id")
+        m = ((model_by_id(pinned) if pinned else None)
+             or model_by_id(self.cfg.model_id)
              or model_by_id(config.DEFAULT_MODEL_ID)
              or config.MODELS[0])
         return m
@@ -820,7 +831,10 @@ class Agent:
             self._goal_cache = self.goal.status()
             self._goal_cache_head = head
         goal = self._goal_cache
-        if goal.active:
+        # only a LIVE goal (this session's, not closed/archived) rides in
+        # the context — a settled contract mentioned in every reply was
+        # the user-visible symptom of the leak
+        if _goal_live(goal):
             sections["goal"] = (self.goal.format() +
                                 "\nEvery action must serve an open clause. "
                                 "When a clause's predicate genuinely "
@@ -954,7 +968,29 @@ class Agent:
                             "content": note})
                         answered.add(cid)
 
-    def run_turn(self, user_text: str,
+    def run_turn(self, user_text: str, *args, **kwargs) -> Turn:
+        """Run one user turn on ONE model: the user's selection (or a
+        ``/model <q> --once`` override) is pinned for the whole turn.
+
+        Nothing may switch the model of a running turn: a model picked
+        mid-turn (Ctrl+T) applies from the next turn, and every request of
+        this turn goes to the model the turn records and the status bar
+        shows (agent.turn_model_id). No router/fallback picks a model."""
+        prev = self.__dict__.get("turn_model_id")
+        if not prev:
+            try:
+                from .modelpick import clear_turn_model, get_effective_model
+                pinned = get_effective_model(self).id
+                clear_turn_model(self)
+            except Exception:  # noqa: BLE001 — never a crash path
+                pinned = self.model.id
+            self.turn_model_id = pinned
+        try:
+            return self._run_turn_pinned(user_text, *args, **kwargs)
+        finally:
+            self.turn_model_id = prev
+
+    def _run_turn_pinned(self, user_text: str,
                  on_token: Callable[[str], None],
                  on_reasoning: Callable[[str], None],
                  on_tool_call: Callable[[ToolEvent], None],
@@ -1037,8 +1073,15 @@ class Agent:
         # AUTOPILOT: the agent decides for itself which powers this turn
         # needs — goal mode, real-time web — and enables
         # them on its own. Every decision is logged and surfaced.
+        # a new user message never runs under a settled contract: an
+        # all-PROVEN/WAIVED goal is archived first, so the request is free
+        # (and autopilot may draft a fresh goal for it)
+        try:
+            self.goal.auto_close()
+        except Exception:
+            pass
         route = self.autopilot.route(user_text,
-                                     self.goal.status().active,
+                                     _goal_live(self.goal.status()),
                                      self.autonomy)
         if route.active and on_route:
             on_route(route)
@@ -1570,7 +1613,7 @@ class Agent:
         # run, parse_audit() would have received a StreamResult instead
         # of text and returned UNKNOWN for every audit. This matches the
         # call shape used by _daemon_step/_council_speaker/_debate_speaker.
-        model = model_by_id(self.cfg.model_id) or self.model
+        model = self.model  # the turn's pinned model, never another one
         effort = effort_by_key(self.cfg.effort) or self.effort
         provider = PROVIDERS.get(model.provider, self.provider)
         res = chat_blocking(
@@ -1904,10 +1947,11 @@ class Agent:
     def _goal_tick(self) -> None:
         """§38.3 kernel loop: measure distance, re-aim focus. Pure Python
         over projections — zero tokens."""
-        if not self.goal.status().active:
+        if not _goal_live(self.goal.status()):
             return
         self.goal.measure()
         self.goal.reaim()
+        self.goal.auto_close()
 
     # -- autopilot actions ---------------------------------------------------
 
@@ -2151,7 +2195,7 @@ class Agent:
     def set_autonomy(self, level: int) -> str:
         level = max(0, min(5, level))
         # the contract's autonomy ceiling cannot be raised by the agent (§37.1)
-        if self.goal.status().active:
+        if _goal_live(self.goal.status()):
             ceiling = self._goal_autonomy_ceiling()
             if ceiling is not None and level > ceiling:
                 level = ceiling
@@ -2160,7 +2204,7 @@ class Agent:
         return AUTONOMY_LEVELS[level]
 
     def _goal_autonomy_ceiling(self) -> int | None:
-        g = fold(self.log).goal
+        g = self.goal.contract()  # this session's contract only
         if not g:
             return None
         ceiling = g.get("autonomy_ceiling")
@@ -2254,30 +2298,42 @@ class Agent:
             pass
 
     def _attribute(self, tool_name: str) -> tuple[str | None, str | None]:
-        _resolve_lazy("TERMINAL_STATES")
         """§38.1 total attribution. Returns (clause_id, orphan_reason).
 
-        With an active goal, every action binds to the focus clause (the
-        highest-gravity open clause). If no open clause exists, the action
-        is an orphan and is rejected before execution — EXCEPT once the
-        contract is closed: a terminal contract (§42) no longer demands
-        attribution, or the agent could never run another command after a
-        goal completed. Attribution only ever gates an OPEN contract."""
+        With a live goal, every action binds to the focus clause (the
+        highest-gravity open clause). Attribution only ever gates an OPEN
+        contract:
+          * no goal in THIS session, or a closed one -> no gate;
+          * a settled contract (every clause PROVEN/WAIVED) is archived
+            on the spot (auto_close) instead of rejecting the action —
+            otherwise every later tool call, the user's next unrelated
+            request included, was an OrphanAction forever;
+          * session-management, planning and read-only tools
+            (goal.gate_exempt) are never blocked."""
+        _resolve_lazy("TERMINAL_STATES")
+        from .goal import gate_exempt
         goal = self.goal.status()
         if not goal.active:
             return None, None  # normal mode: no attribution required
         if goal.closed_state in TERMINAL_STATES:
             return None, None  # the contract is settled — no orphan gate
-        focus = goal.focus or self.goal.reaim()
         open_ids = {c.id for c in goal.clauses
                     if c.state in ("OPEN", "REGRESSED")}
+        if not open_ids and (goal.settled or not goal.clauses):
+            try:
+                self.goal.auto_close()
+            except Exception:
+                pass
+            return None, None  # nothing left to serve — never a dead end
+        focus = goal.focus or self.goal.reaim()
         if focus and focus in open_ids:
             return focus, None
         if open_ids:
             return sorted(open_ids)[0], None
+        if gate_exempt(tool_name):
+            return None, None
         return None, ("OrphanAction: no open clause to serve — the goal "
-                      "is fully proven, waived, or blocked. Close the goal "
-                      "or amend the contract.")
+                      "is blocked. Close the goal or amend the contract.")
 
     def _gate(self, tool: Tool, args: dict) -> str | None:
         """Return a block reason, or None if the action may proceed."""

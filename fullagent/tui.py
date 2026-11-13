@@ -377,6 +377,52 @@ _BG_LOCK = threading.Lock()
 # trailing-edge throttle drain (see UI._start_spinner).
 _STATUS_LOCK = threading.Lock()
 
+
+def _register_terminal_reports() -> None:
+    """Teach prompt_toolkit's VT100 parser the focus in/out reports.
+
+    A terminal left in focus-reporting mode (DECSET 1004 — other TUIs
+    enable it and do not always reset it) sends ``ESC [ I`` / ``ESC [ O``
+    whenever the window gains or loses focus. prompt_toolkit does not
+    know them, so they arrived as a bare Escape plus the text "[I" — and
+    the bare Escape cancelled the running turn ("⊘ cancelled" under a
+    reply that had already finished). Mapped to Keys.Ignore they are
+    swallowed like the other reports prompt_toolkit already ignores.
+    """
+    try:
+        from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
+        for seq in ("\x1b[I", "\x1b[O"):
+            ANSI_SEQUENCES.setdefault(seq, Keys.Ignore)
+    except Exception:
+        pass
+
+
+_register_terminal_reports()
+
+
+def tui_log_path():
+    """Where log records go while the interactive TUI runs
+    (``<APP_DIR>/logs/fullagent.log``; FULLAGENT_HOME moves APP_DIR)."""
+    return config.APP_DIR / "logs" / "fullagent.log"
+
+
+def _is_stray_escape(event) -> bool:
+    """True when an Escape key event is the head of an unrecognised
+    terminal escape sequence, not an Esc keypress.
+
+    A real Esc reaches the key processor alone (the parser emits it only
+    after its escape timeout, with nothing behind it). When prompt_toolkit
+    falls back to matching a bare Escape because the following keys made
+    no binding — ESC [ 9 7 ; 5 u (CSI-u key), a device-attributes reply, a
+    cursor report split across reads — the rest of the sequence is still
+    in the key buffer behind it. Such an Escape must never cancel a turn.
+    """
+    try:
+        kp = event.key_processor
+        return len(kp.key_buffer) > len(event.key_sequence)
+    except Exception:
+        return False
+
 # Slash commands that replace or rewrite agent.messages / the timeline;
 # refused while a turn is running (see UI._handle_slash).
 _HISTORY_MUTATING_CMDS = frozenset({
@@ -885,7 +931,11 @@ class UI:
     # -- small helpers ---------------------------------------------------------
 
     def _model(self) -> Model:
-        m = model_by_id(self.cfg.model_id)
+        # while a turn runs, show the model that turn is pinned to (the one
+        # every request of it goes to), not a pick that applies next turn
+        pinned = getattr(self.agent, "turn_model_id", None)
+        m = (model_by_id(pinned) if isinstance(pinned, str) and pinned
+             else None) or model_by_id(self.cfg.model_id)
         if m is None:
             # stale config (model id removed upstream) — fall back instead
             # of asserting: an AssertionError here would propagate out of
@@ -1075,12 +1125,15 @@ class UI:
         # turn: refreshed at most once a second OFF the render loop (a
         # failure keeps the previous reading, or hides the segment).
         goal = self._bg_cached("goal", 1.0, lambda: self.agent.goal.status())
-        if goal is not None and goal.active:
-            pct = max(0, min(100, (1 - goal.distance) * 100))
-            filled = int(round(pct / 20))
-            bar = "▰" * filled + "▱" * (5 - filled)
-            segs.append((f" ◎ goal {bar} {pct:.0f}% ",
-                         "class:box.status"))
+        # progress by clause STATE (all proven = 100%), hidden once the
+        # goal is closed/archived — not the confidence-weighted 1-distance
+        try:
+            from .goal import progress_bar
+            meter = progress_bar(goal)
+        except Exception:
+            meter = None
+        if meter:
+            segs.append((f" ◎ goal {meter} ", "class:box.status"))
         if self._focus_remaining > 0:
             segs.append((f" 🎯 focus×{self._focus_remaining} ",
                          "class:box.flash"))
@@ -2043,6 +2096,19 @@ class UI:
             self._answer_approve("n")
 
         # --- overlay navigation ---
+        # Typing while a picker is open means the user is back at the
+        # prompt: close the picker and type the character. Otherwise the
+        # arrows (history recall) moved the hidden-in-plain-sight model
+        # picker and the Enter meant to send the message committed another
+        # model instead (the "model switched by itself" report).
+        @kb.add(Keys.Any, filter=ov & idle)
+        def _ov_typed(event):
+            data = getattr(event, "data", "") or ""
+            if len(data) == 1 and data.isprintable():
+                self.overlay.close()
+                self.buffer.insert_text(data)
+                self._invalidate()
+
         @kb.add(Keys.Enter, filter=ov)
         def _ov_enter(event):
             self.overlay.select()
@@ -2176,6 +2242,10 @@ class UI:
         @kb.add(Keys.Escape, filter=focused & ~ov &
                 Condition(lambda: self._busy))
         def _esc_cancel(event):
+            if _is_stray_escape(event):
+                # head of an unknown terminal report (CSI-u key, DA
+                # reply, split cursor report) — not the user's Esc
+                return
             cleared = self._request_cancel()
             self._set_status("cancelling…")
             if cleared:
@@ -2781,10 +2851,7 @@ class UI:
                     self.print_error(
                         f"unknown model: {arg} — use /model to browse")
                 else:
-                    self.cfg.model_id = m.id
-                    self.cfg.save()
-                    self.print_info(f"✓ model → {m.label} ({m.id})",
-                                    C["green"])
+                    self._choose_model(m, via="/model")
             else:
                 # Open the interactive selector (same as Ctrl+T) instead of
                 # just printing the list — users couldn't figure out how to
@@ -3827,7 +3894,7 @@ class UI:
             proven = sum(1 for c in goal.clauses if c.state == "PROVEN")
             lines.append(f"goal: {goal.statement} — "
                          f"{proven}/{len(goal.clauses)} clauses "
-                         f"({(1 - goal.distance) * 100:.0f}% done)")
+                         f"({goal.progress * 100:.0f}% done)")
         if st.dead_ends:
             lines.append(f"dead ends: {len(st.dead_ends)}")
         if st.verdicts:
@@ -5170,31 +5237,12 @@ class UI:
             self._stop_spinner()
             self._set_status("")
             self._invalidate()
-            # v4 aurora polish: one-shot shimmer flash when a turn lands
-            # cleanly (TTY only — piped/headless runs never see \r churn).
-            if turn is not None and not turn.error \
-                    and getattr(self.console, "is_terminal", False) \
-                    and sys.stdout.isatty():
-                try:
-                    from .fx import shimmer_flash
-                    # Under patch_stdout (the live app) the "\r" frames are
-                    # buffered until the final newline, so the animation is
-                    # never seen — its 6 sleeps only held the turn (and any
-                    # queued message) for ~0.2s every turn. Animate only
-                    # when writes reach the terminal directly.
-                    proxied = type(sys.stdout).__name__ == "StdoutProxy"
-                    shimmer_flash(self.console, "✦ done",
-                                  steps=1 if proxied else 6,
-                                  delay=0.0 if proxied else 0.03)
-                except Exception:
-                    pass
 
         if turn is not None:
-            if render_md and turn.assistant_text.strip() and not turn.error:
-                # the finished reply, rendered once as rich Markdown
-                self.console.print()
-                self.console.print(Markdown(turn.assistant_text),
-                                   soft_wrap=True)
+            # Order of the turn's tail: reasoning panel → rendered reply →
+            # error/cancel line → "✦ done" → stats. The done flash used to
+            # run in the finally above, so the Thinking block (and the
+            # Markdown reply) landed AFTER "✦ done".
             # thinking module: collapsible reasoning display; falls back
             # to the legacy show_reasoning flag
             _think_visible = self.cfg.show_reasoning
@@ -5210,11 +5258,18 @@ class UI:
                     self._print_thinking_block(turn.reasoning, expanded=_exp)
                 except Exception:
                     self.print_reasoning(turn.reasoning)
+            if render_md and turn.assistant_text.strip() and not turn.error:
+                # the finished reply, rendered once as rich Markdown
+                self.console.print()
+                self.console.print(Markdown(turn.assistant_text),
+                                   soft_wrap=True)
             if turn.error:
                 if turn.error == "cancelled":
                     self.print_info("⊘ cancelled", C["yellow"])
                 else:
                     self.print_error(turn.error)
+            else:
+                self._print_turn_done()
             self._print_turn_stats(turn)
             # Feature: smart follow-up suggestions after each turn
             try:
@@ -5259,6 +5314,28 @@ class UI:
                     self._emit_user("CONTINUE (focus mode)")
                     return cont
         return None
+
+    def _print_turn_done(self) -> None:
+        """v4 aurora polish: one-shot "✦ done" shimmer when a turn lands
+        cleanly (TTY only — piped/headless runs never see \\r churn).
+        Printed after everything else the turn shows (reasoning, reply,
+        notices), right before the stats footer."""
+        if not (getattr(self.console, "is_terminal", False)
+                and sys.stdout.isatty()):
+            return
+        try:
+            from .fx import shimmer_flash
+            # Under patch_stdout (the live app) the "\r" frames are
+            # buffered until the final newline, so the animation is
+            # never seen — its 6 sleeps only held the turn (and any
+            # queued message) for ~0.2s every turn. Animate only
+            # when writes reach the terminal directly.
+            proxied = type(sys.stdout).__name__ == "StdoutProxy"
+            shimmer_flash(self.console, "✦ done",
+                          steps=1 if proxied else 6,
+                          delay=0.0 if proxied else 0.03)
+        except Exception:
+            pass
 
     def _print_turn_stats(self, turn) -> None:
         parts = [f"{turn.duration:.1f}s"]
@@ -5401,21 +5478,48 @@ class UI:
                 current = i
 
         def on_select(idx: int):
-            m = MODELS[idx]
-            self.cfg.model_id = m.id
-            self.cfg.save()
-            self._set_flash(f"model → {m.label} ({m.id})", C["green"])
-            # SPEED: pre-warm the connection to the new provider so the
-            # next turn hits a warm socket instantly
-            from .client import prewarm_connection
-            from .config import PROVIDERS
-            p = PROVIDERS.get(m.provider)
-            if p:
-                prewarm_connection(p)
+            self._choose_model(MODELS[idx], via="picker")
 
         self.overlay = OverlayList("SELECT MODEL", items, current, on_select)
         self.overlay.open()
         self._invalidate()
+
+    def _choose_model(self, m: Model, via: str) -> None:
+        """The ONE place the session model changes: an explicit user pick.
+
+        Never silent: a permanent transcript line (not just a flash) and a
+        ``model.changed`` event in the log, so a switch is always visible
+        and auditable. Re-picking the current model changes nothing. A pick
+        made while a turn runs applies from the next turn (the running turn
+        stays on the model it was pinned to)."""
+        old = self.cfg.model_id
+        if m.id == old:
+            self._set_flash(f"model unchanged — {m.label}", C["dim"])
+            return
+        self.cfg.model_id = m.id
+        self.cfg.save()
+        prov = PROVIDERS.get(m.provider)
+        busy = bool(getattr(self, "_busy", False)
+                    or getattr(self.agent, "turn_model_id", None))
+        self.print_info(
+            f"✓ model → {m.label} ({m.id} · "
+            f"{prov.name if prov else m.provider})"
+            + (" — applies from the next turn" if busy else ""), C["green"])
+        self._set_flash(f"model → {m.label} ({m.id})", C["green"])
+        try:
+            self.agent.log.append("model.changed",
+                                  {"from": old, "to": m.id, "via": via},
+                                  actor="human")
+        except Exception:  # noqa: BLE001 — auditing never breaks the UI
+            pass
+        # SPEED: pre-warm the connection to the new provider so the
+        # next turn hits a warm socket instantly
+        if prov:
+            try:
+                from .client import prewarm_connection
+                prewarm_connection(prov)
+            except Exception:  # noqa: BLE001
+                pass
 
     def open_effort_selector(self) -> None:
         items = []
@@ -5503,19 +5607,27 @@ class UI:
         # raw=True: let rich's ANSI escape sequences pass through untouched;
         # with the default (raw=False) prompt_toolkit replaces ESC with "?"
         # and all colors show up as literal "[1;38;2..." text.
-        with patch_stdout(raw=True):
-            try:
-                self.app.run()
-            except KeyboardInterrupt:
-                pass
-            except EOFError:
-                # stdin closed (piped/non-interactive) — exit cleanly
-                self.console.print()
-                self.print_info("⊘ no interactive terminal — run fullagent "
-                                "in a real TTY, or use headless commands "
-                                "(python main.py --help)", C["yellow"])
-        self._shutdown_subagents()
-        self.agent.save_session()
+        # While the app owns the terminal, every log record (fullagent and
+        # root, any thread, loggers created later) goes to a file: a raw
+        # stderr write is not proxied by patch_stdout and lands INSIDE the
+        # prompt box (e.g. "WARNING │ fullagent.client │ token pre-check").
+        from ._foundation import capture_logs_to_file
+        with capture_logs_to_file(tui_log_path()) as log_path:
+            self.log_path = log_path
+            with patch_stdout(raw=True):
+                try:
+                    self.app.run()
+                except KeyboardInterrupt:
+                    pass
+                except EOFError:
+                    # stdin closed (piped/non-interactive) — exit cleanly
+                    self.console.print()
+                    self.print_info("⊘ no interactive terminal — run "
+                                    "fullagent in a real TTY, or use "
+                                    "headless commands "
+                                    "(python main.py --help)", C["yellow"])
+            self._shutdown_subagents()
+            self.agent.save_session()
 
     def print_banner(self) -> None:
         from . import __version__

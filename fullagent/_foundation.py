@@ -14,6 +14,7 @@ Design principles:
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import hashlib
 import logging
@@ -66,12 +67,125 @@ def _configure_root() -> None:
         _configured = True
         level_name = os.environ.get("FULLAGENT_LOG_LEVEL", "QUIET").upper()
         level = getattr(Level, level_name, Level.QUIET).value
-        handler = logging.StreamHandler(sys.stderr)
+        handler = _ConsoleHandler(sys.stderr)
         handler.setFormatter(logging.Formatter(_LOG_FORMAT, _DATE_FORMAT))
         root = logging.getLogger("fullagent")
         root.setLevel(level)
         root.addHandler(handler)
         root.propagate = False
+
+
+# While the interactive TUI owns the terminal, every log record must go
+# to a file: a raw stderr write lands INSIDE prompt_toolkit's prompt box
+# (patch_stdout only proxies stdout) and corrupts the layout. The sink is
+# process-global, so records from worker threads and from loggers created
+# after the capture started are covered too.
+_capture_sink: "logging.Handler | None" = None
+
+
+class _ConsoleHandler(logging.StreamHandler):
+    """The FullAgent stderr handler. While a TUI log capture is active it
+    forwards records to the capture's file handler instead of the console
+    — even if it was (re)attached after the capture began."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        sink = _capture_sink
+        if sink is not None:
+            if sink is not self:
+                sink.handle(record)
+            return
+        super().emit(record)
+
+
+_CONSOLE_STREAMS_NAMES = ("stderr", "stdout", "__stderr__", "__stdout__")
+
+
+def _is_console_handler(h: logging.Handler) -> bool:
+    """True for handlers that write to the terminal (stderr/stdout)."""
+    if isinstance(h, logging.FileHandler):
+        return False
+    if type(h).__name__ == "RichHandler":
+        return True
+    if not isinstance(h, logging.StreamHandler):
+        return False
+    stream = getattr(h, "stream", None)
+    if stream is None:
+        return False
+    if any(stream is getattr(sys, n, None) for n in _CONSOLE_STREAMS_NAMES):
+        return True
+    try:
+        return stream.fileno() in (1, 2)
+    except Exception:
+        return False
+
+
+@contextlib.contextmanager
+def capture_logs_to_file(path: "str | os.PathLike[str]"):
+    """Route ALL logging (fullagent and root) to ``path`` for the duration.
+
+    Used by the interactive TUI: no log record may reach stdout/stderr
+    while prompt_toolkit draws the prompt box. Console handlers found on
+    any logger are detached and restored on exit; the FullAgent stderr
+    handler, the root logger, ``logging.lastResort`` and ``warnings``
+    all go to the file. If the file cannot be opened the records are
+    dropped rather than printed over the UI. Yields the log path.
+    """
+    global _capture_sink
+    _configure_root()
+    log_path = Path(path)
+    fmt = logging.Formatter(_LOG_FORMAT, "%Y-%m-%d %H:%M:%S")
+    sink: logging.Handler
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        sink = logging.FileHandler(log_path, encoding="utf-8", delay=True)
+    except Exception:
+        sink = logging.NullHandler()
+    sink.setFormatter(fmt)
+
+    detached: list[tuple[logging.Logger, logging.Handler]] = []
+    root = logging.getLogger()
+    fa = logging.getLogger("fullagent")
+    with _config_lock:
+        prev_sink = _capture_sink
+        _capture_sink = sink
+        loggers = [root] + [lg for lg in list(
+            logging.Logger.manager.loggerDict.values())
+            if isinstance(lg, logging.Logger)]
+        for lg in loggers:
+            for h in list(lg.handlers):
+                if _is_console_handler(h) and not isinstance(
+                        h, _ConsoleHandler):
+                    lg.removeHandler(h)
+                    detached.append((lg, h))
+        root.addHandler(sink)
+        if not fa.propagate:
+            fa.addHandler(sink)
+        prev_last_resort = logging.lastResort
+        logging.lastResort = sink
+        warnings_were_captured = getattr(
+            logging, "_warnings_showwarning", None) is not None
+    if not warnings_were_captured:
+        logging.captureWarnings(True)
+    try:
+        yield log_path
+    finally:
+        if not warnings_were_captured:
+            logging.captureWarnings(False)
+        with _config_lock:
+            for lg in (root, fa):
+                try:
+                    lg.removeHandler(sink)
+                except Exception:
+                    pass
+            for lg, h in detached:
+                if h not in lg.handlers:
+                    lg.addHandler(h)
+            logging.lastResort = prev_last_resort
+            _capture_sink = prev_sink
+        try:
+            sink.close()
+        except Exception:
+            pass
 
 
 def get_logger(name: str) -> logging.Logger:

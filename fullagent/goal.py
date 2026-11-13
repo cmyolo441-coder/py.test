@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import time
 from ._foundation import get_logger
 
@@ -81,6 +82,27 @@ TERMINAL_STATES = frozenset(
     (ACHIEVED, PARTIAL, STALLED, BLOCKED, ABANDONED))
 
 MIN_PROOF_CONFIDENCE = 0.85  # §39.3 hard rule for closing ACHIEVED
+
+# §38.1 attribution gate exemptions. Session management (switching away
+# from / out of a contract), planning and read-only inspection can never
+# be an OrphanAction: blocking them is what dead-ended a user whose old
+# goal was settled — not even SessionNew or TodoWrite could run.
+GATE_EXEMPT_TOOLS = frozenset({
+    # session management
+    "SessionNew", "SessionList", "SessionSwitch",
+    # planning
+    "TodoWrite", "TodoRead", "EnterPlanMode", "ExitPlanMode",
+    # read-only inspection
+    "read_file", "list_dir", "list_directory", "glob_files", "grep",
+    "search_files", "file_info", "web_search", "web_fetch",
+    "Read", "Glob", "Grep", "WebFetch", "WebSearch",
+})
+
+
+def gate_exempt(tool_name: str) -> bool:
+    """True for tools the goal attribution gate must never block."""
+    name = str(tool_name or "")
+    return name in GATE_EXEMPT_TOOLS or name.startswith("Session")
 
 
 class GoalContractError(ValueError):
@@ -144,6 +166,43 @@ class GoalStatus:
         return sum(c.weight * c.confidence for c in self.clauses
                    if c.state == "PROVEN")
 
+    @property
+    def progress(self) -> float:
+        """Share of the contract that is DONE, by clause state (0..1).
+
+        This is what the user sees (goal bar, /state, the compass). It
+        is deliberately not ``1 - distance``: distance (§39.1) weights
+        each proof by its confidence, so a contract whose clauses are
+        ALL PROVEN by file_exists (0.70) read "70%" forever. Progress
+        counts PROVEN/WAIVED clause weight; advisory clauses only count
+        when the contract has nothing else."""
+        if not self.clauses:
+            return 0.0
+        scope = [c for c in self.clauses if not c.advisory] or self.clauses
+        total = sum(max(0.0, c.weight) for c in scope)
+        done = [c for c in scope if c.state in ("PROVEN", "WAIVED")]
+        if total <= 0:
+            return len(done) / len(scope)
+        return max(0.0, min(1.0, sum(max(0.0, c.weight) for c in done)
+                            / total))
+
+    @property
+    def settled(self) -> bool:
+        """Every clause PROVEN or WAIVED — nothing left to serve."""
+        return bool(self.clauses) and all(
+            c.state in ("PROVEN", "WAIVED") for c in self.clauses)
+
+    @property
+    def closed(self) -> bool:
+        """A goal.closed event sealed a terminal state (§42)."""
+        return self.closed_state in TERMINAL_STATES
+
+    @property
+    def live(self) -> bool:
+        """Active and not yet closed/archived — the only state in which
+        a contract is shown to the model/user or gates tool calls."""
+        return self.active and not self.closed
+
     def clause(self, clause_id: str) -> ClauseState | None:
         for c in self.clauses:
             if (c.id.lower() == clause_id.lower()
@@ -162,16 +221,30 @@ class GoalContract:
     def __init__(self, log: EventLog, judge=None) -> None:
         self.log = log
         self.judge = judge  # fullagent.judge.Judge — required for proofs
-        # incremental contract scan: (branch, log cursor, last goal.set
-        # seq, goal-relevant events since it, latest goal.closed state)
+        # incremental contract scan: (branch, log cursor, {session:
+        # [last goal.set seq, contract, goal-relevant events since it,
+        # latest goal.closed state]})
         self._scan_cache: tuple | None = None
+        # auto_close is reached from parallel tool workers — one seal only
+        self._close_lock = threading.Lock()
 
     _RELEVANT = frozenset({"clause.proven", "clause.regressed",
                            "clause.waived", "goal.focus"})
 
-    def _contract_scan(self) -> tuple[int, tuple[Event, ...], str | None]:
-        """(last goal.set seq, goal-relevant events after it, latest
-        goal.closed state after it) for the current branch.
+    def _session_scan(self) -> tuple[int, dict | None,
+                                     tuple[Event, ...], str | None]:
+        """(last goal.set seq, its contract, goal-relevant events after
+        it, latest goal.closed state after it) for the CURRENT SESSION
+        on the current branch.
+
+        SCOPE: the event log is one persistent file shared by every
+        session ever run (APP_DIR/eventlog.jsonl). A goal belongs to the
+        session that set it — reading "the latest goal.set in the log"
+        let a brand-new session (fresh start, /new, SessionNew, a switch)
+        inherit some earlier run's contract, inject it into the live
+        context and gate every tool call on it. Contracts and their
+        proofs are therefore bucketed by Event.session and only the
+        bucket of ``log.session`` is ever read.
 
         PERF: status() runs several times per tool iteration (goal tick,
         measure, reaim, gravity, cost attribution) and each call used to
@@ -188,28 +261,47 @@ class GoalContract:
             if sc is not None and sc[0] == br:
                 delta = log.delta_since(sc[1], br)
             if delta is None:
-                last_set, relevant, closed = -1, [], None
+                buckets: dict[str, list] = {}
                 evs = log.events(br)
             else:
-                _, _, last_set, relevant, closed = sc
+                buckets = sc[2]
                 evs = delta
             rel = self._RELEVANT
             for ev in evs:
                 t = ev.type
+                sess = ev.session or ""
                 if t == "goal.set":
-                    last_set = ev.seq
-                    relevant = []
-                    closed = None
-                elif t in rel:
-                    relevant.append(ev)
+                    data = ev.data if isinstance(ev.data, dict) else {}
+                    buckets[sess] = [ev.seq, data, [], None]
+                    continue
+                b = buckets.get(sess)
+                if b is None:
+                    continue  # no contract in that session — irrelevant
+                if t in rel:
+                    b[2].append(ev)
                 elif t == "goal.closed":
                     d = ev.data if isinstance(ev.data, dict) else {}
-                    closed = d.get("state")
-            self._scan_cache = (br, log.cursor(br), last_set, relevant,
-                                closed)
+                    b[3] = d.get("state")
+            self._scan_cache = (br, log.cursor(br), buckets)
+            b = buckets.get(getattr(log, "session", "") or "")
+            if b is None:
+                return -1, None, (), None
             # a snapshot: the cached list keeps growing under later calls
             # (the TUI polls status() from a background thread)
-            return last_set, tuple(relevant), closed
+            return b[0], b[1], tuple(b[2]), b[3]
+
+    def _contract_scan(self) -> tuple[int, tuple[Event, ...], str | None]:
+        """(last goal.set seq, goal-relevant events after it, latest
+        goal.closed state after it) — current session only."""
+        last_set, _, relevant, closed = self._session_scan()
+        return last_set, relevant, closed
+
+    def contract(self) -> dict | None:
+        """The current session's raw frozen contract (None if none)."""
+        g = self._session_scan()[1]
+        if not g or not (g.get("statement") or g.get("clauses")):
+            return None
+        return g
 
     # -- contract construction (§37) -----------------------------------------
 
@@ -629,7 +721,7 @@ class GoalContract:
             c.state == "OPEN" and not c.proof for c in missing) else STALLED, \
             reasons
 
-    def close(self, fresh: bool = True) -> dict:
+    def close(self, fresh: bool = True, auto: bool = False) -> dict:
         """The closure ritual (§42.2): re-prove every clause from scratch,
         re-check anti-clauses, then compute the terminal state and seal a
         goal.closed event. Returns {state, reasons, bundle}."""
@@ -648,10 +740,29 @@ class GoalContract:
             # recomputed separately by closure_check and evidence_bundle)
             st = self.status()
         state, reasons = self.closure_check(st)
-        self.log.append("goal.closed", {"state": state, "reasons": reasons},
-                        actor="kernel")
+        data = {"state": state, "reasons": reasons}
+        if auto:
+            data["auto"] = True
+        self.log.append("goal.closed", data, actor="kernel")
         return {"state": state, "reasons": reasons,
                 "bundle": self.evidence_bundle(st)}
+
+    def auto_close(self) -> str | None:
+        """Archive a SETTLED contract (every clause PROVEN or WAIVED) by
+        sealing its goal.closed event. Returns the terminal state, or
+        None when there is nothing to close.
+
+        Without this a fully proven contract stayed open forever: it kept
+        riding in the live context, and with no open clause left every
+        tool call was rejected as an OrphanAction — the user's next
+        request could not run at all. No re-proof (fresh=False): each
+        clause was already proven by its own Judge predicate, and
+        closure_check still grades weak proofs as PARTIAL (§39.3)."""
+        with self._close_lock:
+            st = self.status()
+            if not st.active or st.closed or not st.settled:
+                return None
+            return self.close(fresh=False, auto=True)["state"]
 
     def evidence_bundle(self, st: GoalStatus | None = None) -> str:
         """§42.3 — the deliverable of Goal Mode: a proof per clause with
@@ -688,10 +799,13 @@ class GoalContract:
 
     def status(self) -> GoalStatus:
         """Fold the log and compute the live GoalStatus (§39 formula)."""
-        st = fold(self.log)
-        g = st.goal
+        # SCOPE: the contract of THIS session only (see _session_scan) —
+        # fold().goal is the latest goal.set of ANY session in the shared
+        # log, which is how an old run's goal leaked into a new session.
+        last_set_seq, g, relevant, scanned_closed = self._session_scan()
         if not g or not (g.get("statement") or g.get("clauses")):
             return GoalStatus()
+        st = fold(self.log)
         clauses_raw = g.get("clauses") or []
         # proof history, walked with event seqs: latest proof per clause
         # wins; a regression AFTER a proof reopens the clause (§42.4).
@@ -700,7 +814,6 @@ class GoalContract:
         # SPEED: one log walk collects last_set_seq + buffers the small
         # set of goal-relevant events; the filter then runs over the
         # buffer, not the log (was: three full log walks).
-        last_set_seq, relevant, scanned_closed = self._contract_scan()
         proven: dict[str, tuple[int, dict]] = {}
         regressed_after: dict[str, int] = {}
         waived: set[str] = set()
@@ -750,8 +863,15 @@ class GoalContract:
 
         # velocity + ETA from sealed goal.distance measures
         measures = st.distance_measures
-        velocity = (measures[-1].get("velocity", 0.0)
-                    if measures and isinstance(measures[-1], dict) else 0.0)
+        last_m = measures[-1] if measures else None
+        m_seq = last_m.get("seq", 0) if isinstance(last_m, dict) else 0
+        # only a measure of THIS contract (another session's goal may
+        # have been measured last in the shared log)
+        velocity = (last_m.get("velocity", 0.0)
+                    if isinstance(last_m, dict)
+                    and isinstance(m_seq, (int, float))
+                    and not isinstance(m_seq, bool)
+                    and m_seq > last_set_seq else 0.0)
         if isinstance(velocity, bool) or \
                 not isinstance(velocity, (int, float)):
             velocity = 0.0
@@ -778,12 +898,10 @@ class GoalContract:
         complete = bool(non_advisory) and all(
             c.state in ("PROVEN", "WAIVED") for c in non_advisory)
 
-        # Prefer the fold's goal_closed — it only remembers a goal.closed
-        # AFTER the current goal.set, so a stale close from a previous
-        # contract can't leak through. _last_closed_state is the fallback
-        # for older logs folded before the kernel tracked it.
-        closed_state = (str(st.goal_closed.get("state", ""))
-                        if st.goal_closed else scanned_closed)
+        # the latest goal.closed AFTER this session's goal.set — a stale
+        # close from a previous contract (or another session's close)
+        # can't leak through
+        closed_state = scanned_closed
 
         return GoalStatus(
             active=True,
@@ -811,11 +929,12 @@ class GoalContract:
         if not s.active:
             return "GOAL: none"
         bar_w = 24
-        filled = int(round((1.0 - s.distance) * bar_w))
+        filled = int(round(s.progress * bar_w))
         bar = "█" * filled + "░" * (bar_w - filled)
-        lines = [f'GOAL "{s.statement}"  contract {s.contract_id}',
+        closed = f"  [{s.closed_state}]" if s.closed else ""
+        lines = [f'GOAL "{s.statement}"  contract {s.contract_id}{closed}',
                  f" distance {s.distance:.2f} [{bar}] "
-                 f"{(1 - s.distance) * 100:.0f}% proven"
+                 f"{s.progress * 100:.0f}% proven"
                  f"   velocity {s.velocity:+.3f}/10 steps"
                  + (f"   ETA ~{s.eta_steps} steps" if s.eta_steps else "")]
         for c in s.clauses:
@@ -838,6 +957,21 @@ class GoalContract:
 # ---------------------------------------------------------------------------
 # fold helpers
 # ---------------------------------------------------------------------------
+
+def progress_bar(st: GoalStatus | None, width: int = 5) -> str | None:
+    """The compact goal meter for status bars: "▰▰▰▱▱ 60%", or None when
+    there is no live goal (none, another session's, or closed/archived).
+    Driven by clause states (GoalStatus.progress), so a contract whose
+    clauses are all PROVEN reads 100% — never the confidence-weighted
+    1-distance (e.g. 70% for file_exists proofs)."""
+    if st is None or not getattr(st, "active", False):
+        return None
+    if getattr(st, "closed_state", None) in TERMINAL_STATES:
+        return None
+    pct = max(0.0, min(100.0, float(st.progress) * 100.0))
+    filled = max(0, min(width, int(round(pct / 100.0 * width))))
+    return "▰" * filled + "▱" * (width - filled) + f" {pct:.0f}%"
+
 
 def st_head_delta(log: EventLog, since_seq: int) -> int:
     return max(1, log.head() - since_seq)
