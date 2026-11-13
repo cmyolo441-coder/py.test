@@ -138,7 +138,7 @@ def _normalize_category(value: Any) -> str:
 def _clamp(value: Any, lo: float, hi: float, default: float) -> float:
     try:
         f = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
     if math.isnan(f):
         return default
@@ -222,6 +222,10 @@ class TrustState:
     clean_streak: int = 0
     violation_count: int = 0
     events: List[Dict[str, Any]] = field(default_factory=list)
+    #: snapshot of the state just before ``events[0]`` once old history
+    #: has been compacted (None while the full history is retained).
+    #: replay() starts from it, so the audit path stays exact.
+    history_base: Optional[Dict[str, Any]] = None
 
     @property
     def tier(self) -> str:
@@ -246,6 +250,8 @@ class TrustState:
             "clean_streak": self.clean_streak,
             "violation_count": self.violation_count,
             "events": copy.deepcopy(self.events),
+            **({"history_base": copy.deepcopy(self.history_base)}
+               if self.history_base else {}),
         }
 
     @classmethod
@@ -270,6 +276,7 @@ class TrustState:
         # recovery-cap math that reads min_score.
         min_score = _clamp(d.get("min_score"), 0.0, 100.0, score) \
             if "min_score" in d else score
+        base = d.get("history_base")
         return cls(
             session_id=_as_id(d.get("session_id")),
             score=score,
@@ -278,13 +285,14 @@ class TrustState:
             clean_streak=max(0, _to_int(d.get("clean_streak"))),
             violation_count=max(0, _to_int(d.get("violation_count"))),
             events=events,
+            history_base=dict(base) if isinstance(base, dict) else None,
         )
 
 
 def _to_int(value: Any) -> int:
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
 
 
@@ -297,7 +305,7 @@ def _to_int_or(value: Any, default: int) -> int:
         return default
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
@@ -364,6 +372,39 @@ class TrustConfig:
 
 # ── the ledger ───────────────────────────────────────────────────────────
 
+#: per-session retained event history. Older events are folded into
+#: TrustState.history_base so memory and per-call cost stay bounded over
+#: a long session (the full list used to be deep-copied on every
+#: record()/state() call: O(n) per call, O(n^2) per session).
+MAX_EVENTS = 2000
+_COMPACT_TO = 1500
+
+
+def _copy_state(st: TrustState) -> TrustState:
+    """Cheap independent copy (no deepcopy of the whole history)."""
+    return TrustState(
+        session_id=st.session_id,
+        score=st.score,
+        min_score=st.min_score,
+        category_scores=dict(st.category_scores),
+        clean_streak=st.clean_streak,
+        violation_count=st.violation_count,
+        events=[_copy_event(e) for e in st.events],
+        history_base=copy.deepcopy(st.history_base)
+        if st.history_base else None,
+    )
+
+
+def _copy_event(e: Any) -> Any:
+    if not isinstance(e, dict):
+        return e
+    out = dict(e)
+    meta = out.get("meta")
+    if isinstance(meta, dict):
+        out["meta"] = copy.deepcopy(meta) if meta else {}
+    return out
+
+
 class TrustLedger:
     """Event-sourced per-session trust ledger.
 
@@ -408,14 +449,23 @@ class TrustLedger:
             ev = TrustEvent.from_dict(event)
         else:
             ev = TrustEvent(kind="clean")
+        # normalise a directly-constructed TrustEvent too: an unknown
+        # category used to create a brand-new per-category score
+        # ("weird") that then dominated effective_score forever.
+        ev = TrustEvent.from_dict(ev.to_dict()) if isinstance(ev, TrustEvent) \
+            and (ev.category not in CATEGORY_WEIGHTS
+                 or ev.severity not in SEVERITY_PENALTIES
+                 or ev.kind not in ("violation", "clean", "adjust", "reset")) \
+            else ev
         sid = _as_id(session_id)
         with self._lock:
             state = self._states.get(sid)
             if state is None:
                 state = self._new_state(sid)
             state = self._apply(state, ev)
+            self._compact(state)
             self._states[sid] = state
-            return copy.deepcopy(state)
+            return _copy_state(state)
 
     def state(self, session_id: Any) -> TrustState:
         """Current state for *session_id* (created on first access)."""
@@ -425,7 +475,7 @@ class TrustLedger:
             if st is None:
                 st = self._new_state(sid)
                 self._states[sid] = st
-            return copy.deepcopy(st)
+            return _copy_state(st)
 
     def tier(self, state: Any) -> str:
         """Tier for a state, score or raw number.  Never raises."""
@@ -458,10 +508,16 @@ class TrustLedger:
         with self._lock:
             st = self._states.get(sid)
             events = list(st.events) if st else []
-        rebuilt = self._new_state(sid)
+            base = copy.deepcopy(st.history_base) if st and st.history_base \
+                else None
+        rebuilt = self._base_state(sid, base)
+        n_ctx = len(rebuilt.events)       # escalation context, not history
         for raw in events:
             rebuilt = self._apply(rebuilt, TrustEvent.from_dict(raw),
                                   record_history=False)
+        if n_ctx:
+            rebuilt.events = rebuilt.events[n_ctx:]
+        rebuilt.history_base = base
         return rebuilt
 
     # ── serialization ──────────────────────────────────────────────
@@ -516,6 +572,34 @@ class TrustLedger:
             },
         )
 
+    def _base_state(self, sid: str, base: Optional[Dict[str, Any]]) -> TrustState:
+        if not base:
+            return self._new_state(sid)
+        st = TrustState.from_dict(base)
+        st.session_id = sid
+        st.history_base = None
+        return st
+
+    def _compact(self, state: TrustState) -> None:
+        """Fold the oldest events into history_base once the retained
+        history exceeds MAX_EVENTS (caller holds the lock)."""
+        if len(state.events) <= MAX_EVENTS:
+            return
+        drop = len(state.events) - _COMPACT_TO
+        dropped = state.events[:drop]
+        base = self._base_state(state.session_id, state.history_base)
+        for raw in dropped:
+            base = self._apply(base, TrustEvent.from_dict(raw),
+                               record_history=False)
+        # keep the few events escalation looks back at, so replay from
+        # the base reproduces repeat-multiplier math exactly
+        ctx = max(0, int(self.config.repeat_window))
+        base_d = base.to_dict()
+        base_d["events"] = [dict(e) for e in base.events[-ctx:]] if ctx else []
+        base_d.pop("history_base", None)
+        state.history_base = base_d
+        state.events = state.events[drop:]
+
     def _apply(self, state: TrustState, event: TrustEvent,
                record_history: bool = True) -> TrustState:
         cfg = self.config
@@ -536,6 +620,9 @@ class TrustLedger:
             old = state.category_scores.get(cat, state.score)
             state.category_scores[cat] = _clamp(
                 old + delta, 0.0, 100.0, old)
+            # a manual downward adjustment is a new low for the
+            # recovery-cap math, exactly like a violation
+            state.min_score = min(state.min_score, state.score)
             return state
 
         if event.kind == "violation":

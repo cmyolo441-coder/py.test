@@ -253,12 +253,12 @@ class AttestationRecord:
         def _f(key: str, default: float = 0.0) -> float:
             try:
                 return float(d.get(key, default))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return default
         def _i(key: str, default: int = 0) -> int:
             try:
                 return int(d.get(key, default))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return default
         meta = d.get("meta")
         return cls(
@@ -285,6 +285,17 @@ def _compute_record_id(rec: AttestationRecord) -> str:
     return hashlib.sha256(raw).hexdigest()[:32]
 def _compute_signature(rec: AttestationRecord, key: bytes) -> str:
     return hmac.new(key, rec.signed_bytes(), hashlib.sha256).hexdigest()
+
+
+def _sig_ok(key: bytes, rec: AttestationRecord) -> bool:
+    """Constant-time signature check on bytes (str compare_digest raises
+    on non-ASCII input). Never raises."""
+    try:
+        expected = hmac.new(key, rec.signed_bytes(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected.encode("ascii"),
+                                   str(rec.signature).encode("utf-8", "replace"))
+    except Exception:
+        return False
 class AttestationLog:
     """Append-only transparency log for attestation records.
     Thread-safe via RLock. Supports in-memory-only or JSONL file
@@ -316,12 +327,17 @@ class AttestationLog:
         self._fh = None
         self._ring = _KeyRing()
         self._current_key_id = str(key_id or "attest-v1")
+        # master secret (file-backed) when one is in use: rotations derive
+        # from it and reloads re-derive rotated key_ids, so every record
+        # signed under this secret stays verifiable across restarts.
+        self._master: Optional[bytes] = None
         _sidecar = (self.path + ".attest.key") if self.path else ""
         if key is not None and isinstance(key, (bytes, bytearray)) and len(key) >= 16:
             self._ring.add(self._current_key_id, bytes(key))
         elif self.secret_path:
             secret, _note = _load_or_create_secret(self.secret_path)
             if secret is not None:
+                self._master = secret
                 derived = _derive_hmac_key(secret, self._current_key_id)
                 self._ring.add(self._current_key_id, derived)
             else:
@@ -329,6 +345,7 @@ class AttestationLog:
         elif _sidecar:
             sk, _ = _load_or_create_secret(_sidecar)
             if sk is not None:
+                self._master = sk
                 derived = _derive_hmac_key(sk, self._current_key_id)
                 self._ring.add(self._current_key_id, derived)
             else:
@@ -362,9 +379,17 @@ class AttestationLog:
             self._seq = max(r.seq for r in self._records) + 1
             last = self._records[-1]
             self._chain_tail = last.signature or self._chain_tail
-            for r in self._records:
-                if r.key_id and not self._ring.has(r.key_id):
-                    self._ring.add(r.key_id, b"\x00" * DEFAULT_KEY_BYTES, current=False)
+            # Unknown key_ids used to be registered with an ALL-ZERO key,
+            # so anyone could append/alter a record under a new key_id,
+            # sign it with zeros and have verify() accept it. Only keys
+            # derivable from our own master secret are trusted; records
+            # under any other key_id stay unverifiable.
+            if self._master is not None:
+                for r in self._records:
+                    if r.key_id and not self._ring.has(r.key_id):
+                        self._ring.add(r.key_id,
+                                       _derive_hmac_key(self._master, r.key_id),
+                                       current=False)
         else:
             self._seq = 0
             self._chain_tail = GENESIS_CHAIN_HASH
@@ -407,6 +432,12 @@ class AttestationLog:
                     self._ring.add(kid, derived, current=True)
                 else:
                     self._ring.add(kid, secrets.token_bytes(DEFAULT_KEY_BYTES), current=True)
+            elif self._master is not None:
+                # sidecar-backed log: derive so the rotated key survives a
+                # reload (a random key made post-rotation records
+                # unverifiable after restart)
+                self._ring.add(kid, _derive_hmac_key(self._master, kid),
+                               current=True)
             else:
                 self._ring.add(kid, secrets.token_bytes(DEFAULT_KEY_BYTES), current=True)
             self._current_key_id = kid
@@ -466,7 +497,13 @@ class AttestationLog:
                 seq=self._seq,
                 meta=dict(meta) if isinstance(meta, dict) else {},
             )
-            rec.record_id = _compute_record_id(rec)
+            try:
+                rec.record_id = _compute_record_id(rec)
+            except Exception:
+                # meta that cannot be canonicalized (e.g. non-str keys):
+                # drop it rather than raise from a never-raises path
+                rec.meta = {"meta_dropped": True}
+                rec.record_id = _compute_record_id(rec)
             try:
                 rec.signature = _compute_signature(rec, key)
             except Exception:
@@ -485,8 +522,7 @@ class AttestationLog:
             key = self._ring.get(rec.key_id)
             if key is None:
                 return False
-            expected = hmac.new(key, rec.signed_bytes(), hashlib.sha256).hexdigest()
-            return hmac.compare_digest(expected, rec.signature)
+            return _sig_ok(key, rec)
         except Exception:
             return False
     def verify_chain(self) -> List[int]:
@@ -508,12 +544,7 @@ class AttestationLog:
                     if i not in broken:
                         broken.append(i)
                 else:
-                    try:
-                        expected = hmac.new(key, rec.signed_bytes(), hashlib.sha256).hexdigest()
-                        if not hmac.compare_digest(expected, rec.signature):
-                            if i not in broken:
-                                broken.append(i)
-                    except Exception:
+                    if not _sig_ok(key, rec):
                         if i not in broken:
                             broken.append(i)
                 prev_sig = rec.signature
@@ -536,12 +567,8 @@ class AttestationLog:
                 if key is None:
                     reason = (reason + "; " if reason else "") + f"unknown key_id {rec.key_id!r}"
                 else:
-                    try:
-                        expected = hmac.new(key, rec.signed_bytes(), hashlib.sha256).hexdigest()
-                        if not hmac.compare_digest(expected, rec.signature):
-                            reason = (reason + "; " if reason else "") + "signature mismatch"
-                    except Exception as exc:
-                        reason = (reason + "; " if reason else "") + f"hmac error {type(exc).__name__}"
+                    if not _sig_ok(key, rec):
+                        reason = (reason + "; " if reason else "") + "signature mismatch"
                 if reason:
                     details.append({"index": i, "record_id": rec.record_id, "reason": reason})
                 prev_sig = rec.signature
@@ -563,16 +590,27 @@ class AttestationLog:
             parent = os.path.dirname(os.path.abspath(target)) or "."
             os.makedirs(parent, exist_ok=True)
             tmp = target + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                with self._lock:
+            with self._lock:
+                with open(tmp, "w", encoding="utf-8") as fh:
                     for r in self._records:
                         fh.write(canonical_json(r.to_dict()) + "\n")
-                fh.flush()
-                try:
-                    os.fsync(fh.fileno())
-                except OSError:
-                    pass
-            os.replace(tmp, target)
+                    fh.flush()
+                    try:
+                        os.fsync(fh.fileno())
+                    except OSError:
+                        pass
+                # Replacing our OWN log file swaps the inode under the open
+                # append handle: later attest() calls then wrote into the
+                # unlinked old file and were silently lost. Drop the handle
+                # so the next append reopens the new file.
+                if self.path and os.path.abspath(target) == \
+                        os.path.abspath(self.path) and self._fh is not None:
+                    try:
+                        self._fh.close()
+                    except OSError:
+                        pass
+                    self._fh = None
+                os.replace(tmp, target)
             return target
         except OSError:
             return ""
@@ -652,6 +690,20 @@ class AttestationLog:
                 except OSError:
                     pass
                 self._fh = None
+
+    def __enter__(self) -> "AttestationLog":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.close()
+
+    def __del__(self) -> None:  # best effort: never leak the append fd
+        try:
+            fh = self.__dict__.get("_fh")
+            if fh is not None:
+                fh.close()
+        except Exception:
+            pass
 def create_attestation(
     response_text: str,
     rules: Any = None,
@@ -673,8 +725,7 @@ def verify_attestation(record: Any, key: Optional[bytes] = None, key_id: str = "
             return False
         if not rec.signature:
             return False
-        expected = hmac.new(bytes(key), rec.signed_bytes(), hashlib.sha256).hexdigest()
-        return hmac.compare_digest(expected, rec.signature)
+        return _sig_ok(bytes(key), rec)
     except Exception:
         return False
 def attest_response(

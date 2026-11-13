@@ -80,38 +80,75 @@ class Cassette:
         """Build the offset index in ONE pass; load nothing eagerly.
 
         Responses are faulted in from disk on first replay (lazy), so
-        opening a gigabyte cassette is instant and RAM stays flat."""
-        with self.path.open("r", encoding="utf-8") as f:
-            while True:
-                off = f.tell()
-                line = f.readline()
-                if not line:
-                    break
-                if not line.strip():
+        opening a gigabyte cassette is instant and RAM stays flat.
+
+        Binary mode: offsets are real byte positions, and one non-UTF-8 /
+        truncated line (a crash mid-record, a hand edit) is skipped like
+        any other corrupt line instead of raising UnicodeDecodeError out
+        of the text reader — which aborted Agent construction whenever
+        FULLAGENT_CASSETTE pointed at such a file. A line that is valid
+        JSON but not an object (a stray list/number) no longer raises
+        AttributeError either."""
+        try:
+            f = self.path.open("rb")
+        except OSError as exc:
+            _log.warning("cassette: cannot open %s: %s", self.path, exc)
+            return
+        with f:
+            off = 0
+            for raw in f:
+                line_off = off
+                off += len(raw)
+                if not raw.strip():
                     continue
                 try:
-                    pair = json.loads(line)
-                except ValueError:
+                    pair = json.loads(raw.decode("utf-8"))
+                except ValueError:          # incl. UnicodeDecodeError
+                    continue
+                if not isinstance(pair, dict):
                     continue
                 key = pair.get("key")
-                if key:
+                if isinstance(key, str) and key:
                     # last occurrence wins (re-recorded pairs)
-                    self._offsets[key] = off
+                    self._offsets[key] = line_off
 
     def _read_at(self, off: int) -> dict | None:
         """Fault one response in from disk by offset."""
         try:
-            with self.path.open("r", encoding="utf-8") as f:
+            with self.path.open("rb") as f:
                 f.seek(off)
-                pair = json.loads(f.readline())
-                resp = pair.get("response")
-                return resp if isinstance(resp, dict) else None
+                pair = json.loads(f.readline().decode("utf-8"))
         except (OSError, ValueError):
             return None
+        if not isinstance(pair, dict):
+            return None
+        resp = pair.get("response")
+        return resp if isinstance(resp, dict) else None
 
     def _open_append(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._fh = self.path.open("a", encoding="utf-8")
+        # binary append: tell() is a true byte offset (the replay index
+        # seeks a binary handle to it)
+        self._fh = self.path.open("ab")
+        self._fh.seek(0, os.SEEK_END)
+
+    def close(self) -> None:
+        """Release the persistent append handle (record mode)."""
+        with self._lock:
+            fh, self._fh = self._fh, None
+            if fh is not None:
+                try:
+                    fh.close()
+                except OSError:
+                    pass
+
+    def __del__(self) -> None:  # best effort: never leak the fd
+        try:
+            fh = self._fh
+            if fh is not None:
+                fh.close()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _persist(self, line: str) -> None:
         """Append one pre-serialized line through the persistent handle.
@@ -119,12 +156,13 @@ class Cassette:
         Flushes to the OS on every write (survives a process crash; only a
         power loss can drop the tail). Reopens once if the handle died or
         the directory vanished underneath us."""
+        data = line.encode("utf-8", errors="replace")
         try:
             if self._fh is None:
                 self._open_append()
             assert self._fh is not None
             off_before = self._fh.tell()
-            self._fh.write(line)
+            self._fh.write(data)
             self._fh.flush()
             try:
                 os.fsync(self._fh.fileno())
@@ -138,7 +176,7 @@ class Cassette:
                 self._open_append()
                 assert self._fh is not None
                 off_before = self._fh.tell()
-                self._fh.write(line)
+                self._fh.write(data)
                 self._fh.flush()
             except OSError:
                 # disk truly unwritable: report the offset as unknown;
@@ -171,6 +209,15 @@ class Cassette:
         line = json.dumps({"key": key, "response": stored},
                           ensure_ascii=False, default=str) + "\n"
         with self._lock:
+            # an identical re-record (same request, same response — e.g.
+            # a deterministic retry, or re-recording an unchanged session)
+            # used to append a duplicate line every time: the cassette
+            # grew without bound for no information
+            hot = self._store.get(key)
+            if hot is not None and key in self._offsets and \
+                    _canonical(hot) == _canonical(stored):
+                self._store.move_to_end(key)
+                return
             off = self._persist(line)
             self._store_put(key, stored)
             if off is not None:
@@ -254,5 +301,16 @@ if __name__ == "__main__":
         # replay survives reload from disk
         play2 = Cassette(path, mode="replay")
         assert play2.replay("model-x", msgs, None) == resp
+
+        # an identical re-record does not grow the file
+        rec.record("model-x", msgs, None, resp)
+        assert len(path.read_text().strip().splitlines()) == 1
+        rec.close()
+
+        # corrupt / non-UTF-8 / non-object lines are skipped, never fatal
+        with path.open("ab") as fh:
+            fh.write(b"\xff\xfe garbage\n[1, 2]\n")
+        play3 = Cassette(path, mode="replay")
+        assert play3.replay("model-x", msgs, None) == resp
 
     print("CASSETTE SELF-TEST PASS")

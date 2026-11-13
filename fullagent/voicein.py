@@ -235,8 +235,10 @@ def _capture_cmd(tool: str, seconds: int, out_wav: str,
             raise ValueError("arecord only supports ALSA input")
         return ["arecord", "-d", str(seconds), "-f", "S16_LE",
                 "-r", "16000", "-c", "1", "-t", "wav", out_wav]
-    # ffmpeg
-    cmd = ["ffmpeg", "-y", "-v", "error", "-f", fmt, "-i", src,
+    # ffmpeg — "-nostdin": ffmpeg otherwise reads the controlling
+    # terminal for its interactive keys (q, ?, +/-), switching it to
+    # non-canonical mode and swallowing the TUI's keystrokes
+    cmd = ["ffmpeg", "-nostdin", "-y", "-v", "error", "-f", fmt, "-i", src,
            "-t", str(seconds), "-ar", "16000", "-ac", "1",
            "-c:a", "pcm_s16le", out_wav]
     return cmd
@@ -268,12 +270,20 @@ def record_and_transcribe(seconds: int = 10) -> str:
     try:
         cmd = _capture_cmd(tool, seconds, tmp)
         try:
+            # stdin=DEVNULL: the recorder must never inherit (and grab)
+            # the TUI's terminal; utf-8/replace: a non-UTF-8 byte in the
+            # capture tool's stderr (localized ALSA messages) used to
+            # raise UnicodeDecodeError straight out of the tool/handler
             proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace",
+                                  stdin=subprocess.DEVNULL,
                                   timeout=seconds + 60)
         except subprocess.TimeoutExpired:
             return f"recording timed out after {seconds}s"
         except FileNotFoundError:
             return NO_CAPTURE_TOOL
+        except OSError as exc:
+            return f"recording failed ({tool}): {exc}"
         if proc.returncode != 0:
             err = (proc.stderr or "").strip().splitlines()
             tail = err[-1] if err else "unknown error"
@@ -304,6 +314,24 @@ def _handle_voice_transcribe(wav_path: str) -> str:
 # TUI handler — /voice [seconds]
 # ---------------------------------------------------------------------------
 
+#: Prefixes of every non-transcript message record_and_transcribe() /
+#: transcribe_wav() can return. handle_voice() used to check only a few
+#: of them, so e.g. "recording timed out…", "recording produced no valid
+#: WAV audio" or "wav file too large…" were printed AS THE TRANSCRIPT.
+_ERROR_PREFIXES = (
+    "recording failed", "recording timed out", "recording produced",
+    "transcription failed", "no speech detected", "invalid wav_path",
+    "wav_path is not a file", "wav file too large", "cannot stat wav",
+    "not a WAV file", "could not load", "seconds must be",
+)
+
+
+def is_error_result(result: str) -> bool:
+    """True when *result* is a failure message, not a transcript."""
+    return (result in (WHISPER_NOT_INSTALLED, NO_CAPTURE_TOOL)
+            or result.startswith(_ERROR_PREFIXES))
+
+
 def handle_voice(ui: Any, arg: str) -> None:
     """Dispatch ``/voice [seconds]``; prints via ``ui``.
 
@@ -331,10 +359,7 @@ def handle_voice(ui: Any, arg: str) -> None:
         return
     ui.print_info(f"🎙 recording {seconds}s from microphone… speak now")
     result = record_and_transcribe(seconds)
-    if result in (WHISPER_NOT_INSTALLED, NO_CAPTURE_TOOL) or \
-            result.startswith(("recording failed", "transcription failed",
-                               "no speech detected", "invalid wav_path",
-                               "could not load")):
+    if is_error_result(result):
         ui.print_error(result)
         return
     ui.print_info("transcript (copy/paste — buffer insert not supported "
@@ -511,6 +536,19 @@ if __name__ == "__main__":
         "openai-whisper dict segments work",
         segments_to_text([{"text": "hi there", "avg_logprob": -0.1}])
         == "hi there")
+
+    # 5b. every failure message is classified as an error, not a transcript
+    passed &= _selftest_check(
+        "failure messages are never shown as transcripts",
+        all(is_error_result(m) for m in (
+            "recording timed out after 3s",
+            "recording produced no valid WAV audio",
+            "wav file too large (200 MiB > 100 MiB)", NO_SPEECH,
+            WHISPER_NOT_INSTALLED, NO_CAPTURE_TOOL))
+        and not is_error_result("hello world"))
+    passed &= _selftest_check(
+        "ffmpeg never reads the terminal (-nostdin)",
+        "-nostdin" in _capture_cmd("ffmpeg", 1, "/tmp/x.wav"))
 
     # 6. register() wires tools onto a duck-typed agent without importing
     #    the real Agent class.

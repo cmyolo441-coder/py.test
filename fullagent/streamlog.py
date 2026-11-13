@@ -35,6 +35,11 @@ from .tools import Tool
 
 LOG_DIR = os.path.join(os.environ.get("FULLAGENT_HOME") or os.path.join(os.path.expanduser("~"), ".fullagent"), "logs")
 DEFAULT_MAX_BYTES = 50 * 1024 * 1024  # 50MB rotation threshold
+# Upper bounds for the read helpers (all reachable from model tool calls):
+TAIL_MAX_LINES = 10_000               # LogTail lines=10**9 must not mean "all"
+TAIL_MAX_BYTES = 16 * 1024 * 1024     # tail never scans more than this
+FOLLOW_MAX_BYTES = 4 * 1024 * 1024    # one follow() returns at most this
+FOLLOW_MAX_TIMEOUT = 300.0            # LogFollow cannot pin a worker forever
 
 _SAFE_RE = re.compile(r"[^A-Za-z0-9_.-]")
 
@@ -67,30 +72,58 @@ class StreamLogger:
         self.path = _log_path(self.stream_id)
         os.makedirs(LOG_DIR, exist_ok=True)
         self._lock = threading.Lock()
-        self._fh = open(self.path, "a", encoding="utf-8", errors="replace")
+        self._open_locked()
+
+    def _open_locked(self) -> None:
+        # newline="": write "\n" verbatim (no "\r\n" translation on
+        # Windows), so the byte accounting below matches the file exactly
+        self._fh = open(self.path, "a", encoding="utf-8", errors="replace",
+                        newline="")
+        try:
+            self._size = os.fstat(self._fh.fileno()).st_size
+        except OSError:
+            self._size = 0
 
     def write(self, line: str) -> None:
-        """Append one line (newline added if missing) and flush immediately."""
+        """Append one line (newline added if missing) and flush immediately.
+
+        PERF: the file size is tracked in memory (one stat per WRITE used
+        to hit the filesystem for every line), and the per-line fsync is
+        gone — flush() already hands the bytes to the OS, which is all a
+        concurrent reader (tail/follow) or a crashed *process* needs; an
+        fsync per line made 100k-line outputs take tens of seconds. The
+        file is fsync'd on rotation and close.
+        """
+        line = str(line)
         if not line.endswith("\n"):
             line += "\n"
         data = line.encode("utf-8", errors="replace")
         with self._lock:
-            try:
-                if (os.path.getsize(self.path) + len(data)
-                        >= self.max_bytes):
+            if self._fh.closed:
+                raise ValueError(f"StreamLogger {self.stream_id!r} is closed")
+            if self._size > 0 and self._size + len(data) >= self.max_bytes:
+                try:
                     self._rotate_locked()
-            except OSError:
-                pass
+                except OSError:
+                    pass
             self._fh.write(line)
             self._fh.flush()
-            try:
-                os.fsync(self._fh.fileno())
-            except OSError:
-                pass
+            self._size += len(data)
+
+    def _sync_close_locked(self) -> None:
+        try:
+            self._fh.flush()
+            os.fsync(self._fh.fileno())
+        except (OSError, ValueError):
+            pass
+        try:
+            self._fh.close()
+        except OSError:
+            pass
 
     def _rotate_locked(self) -> None:
         """Rotate current log to ``.1``, keeping one backup."""
-        self._fh.close()
+        self._sync_close_locked()
         backup = self.path + ".1"
         try:
             if os.path.exists(backup):
@@ -98,14 +131,12 @@ class StreamLogger:
             os.replace(self.path, backup)
         except OSError:
             pass
-        self._fh = open(self.path, "a", encoding="utf-8", errors="replace")
+        self._open_locked()
 
     def close(self) -> None:
         with self._lock:
-            try:
-                self._fh.close()
-            except OSError:
-                pass
+            if not self._fh.closed:
+                self._sync_close_locked()
 
     def __enter__(self) -> "StreamLogger":
         return self
@@ -123,27 +154,44 @@ def tail_lines(stream_id: str, n: int = 50) -> List[str]:
     Never reads the whole file: walks backwards in blocks until ``n``
     newlines are found. Fast even for multi-hundred-MB logs.
     """
-    n = max(1, int(n))
+    try:
+        n = int(n)
+    except (TypeError, ValueError, OverflowError):
+        n = 50
+    n = max(1, min(TAIL_MAX_LINES, n))
     path = _log_path(stream_id)
     if not os.path.exists(path):
         return []
     lines: List[str] = []
-    with open(path, "rb") as fh:
-        fh.seek(0, os.SEEK_END)
-        size = fh.tell()
-        buf = b""
-        block = 64 * 1024
-        pos = size
-        newlines = 0
-        while pos > 0 and newlines <= n:
-            step = min(block, pos)
-            pos -= step
-            fh.seek(pos)
-            chunk = fh.read(step)
-            buf = chunk + buf
-            newlines = buf.count(b"\n")
-        lines = buf.split(b"\n")
-    text = [ln.decode("utf-8", errors="replace") for ln in lines]
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            chunks: List[bytes] = []
+            block = 64 * 1024
+            pos = size
+            newlines = 0
+            scanned = 0
+            # count newlines per CHUNK (the old loop re-counted the whole
+            # growing buffer every block — quadratic) and stop at a hard
+            # byte cap: a log that is one giant line used to be read into
+            # RAM in full, despite the "never reads the whole file" promise
+            while pos > 0 and newlines <= n and scanned < TAIL_MAX_BYTES:
+                step = min(block, pos, TAIL_MAX_BYTES - scanned)
+                pos -= step
+                fh.seek(pos)
+                chunk = fh.read(step)
+                chunks.append(chunk)
+                newlines += chunk.count(b"\n")
+                scanned += len(chunk)
+            buf = b"".join(reversed(chunks))
+    except OSError:
+        return []
+    lines = buf.split(b"\n")
+    if pos > 0 and len(lines) > 1:
+        lines = lines[1:]   # first piece is a partial line — drop it
+    text = [ln.decode("utf-8", errors="replace").rstrip("\r")
+            for ln in lines]
     if text and text[-1] == "":
         text.pop()  # trailing newline of last line
     return text[-n:]
@@ -175,7 +223,16 @@ def list_logs() -> List[Dict[str, Any]]:
 
 # Per-stream read offsets for follow(): stream_id -> byte offset.
 _follow_offsets: Dict[str, int] = {}
+# stream_id -> inode the offset belongs to (rotation detection)
+_follow_inodes: Dict[str, int] = {}
 _follow_lock = threading.Lock()
+
+
+def _inode(path: str) -> Optional[int]:
+    try:
+        return os.stat(path).st_ino
+    except OSError:
+        return None
 
 
 def follow(stream_id: str, timeout: float = 5.0) -> List[str]:
@@ -191,40 +248,76 @@ def follow(stream_id: str, timeout: float = 5.0) -> List[str]:
         return []
     with _follow_lock:
         start = _follow_offsets.get(sid)
+        known_ino = _follow_inodes.get(sid)
         if start is None:
             try:
                 start = os.path.getsize(path)
             except OSError:
                 start = 0
-    deadline = time.monotonic() + max(0.0, float(timeout))
+    try:
+        timeout = float(timeout)
+    except (TypeError, ValueError):
+        timeout = 5.0
+    if timeout != timeout:      # NaN
+        timeout = 0.0
+    timeout = max(0.0, min(FOLLOW_MAX_TIMEOUT, timeout))
+    deadline = time.monotonic() + timeout
     result: List[str] = []
     while True:
+        ino = _inode(path)
         try:
             size = os.path.getsize(path)
         except OSError:
             size = 0
-        if size < start:
-            start = 0  # rotated / truncated
+        if size < start or (known_ino is not None and ino is not None
+                            and ino != known_ino):
+            # rotated / truncated. The inode check also catches a rotation
+            # after which the NEW file already grew past the old offset —
+            # size-only detection silently skipped its first lines.
+            start = 0
+        known_ino = ino
         if size > start:
-            with open(path, "rb") as fh:
-                fh.seek(start)
-                chunk = fh.read(size - start)
-            result.extend(chunk.decode("utf-8",
-                                       errors="replace").splitlines())
-            start = size
-            break
+            want = min(size - start, FOLLOW_MAX_BYTES)
+            try:
+                with open(path, "rb") as fh:
+                    fh.seek(start)
+                    chunk = fh.read(want)
+            except OSError:
+                chunk = b""
+            # consume only COMPLETE lines: a writer caught mid-line used
+            # to have its line returned in two halves (two "lines") and,
+            # cut inside a multi-byte char, decoded as U+FFFD garbage.
+            # (A single line longer than the cap is returned in pieces.)
+            cut = chunk.rfind(b"\n")
+            if cut >= 0:
+                chunk = chunk[:cut + 1]
+            elif len(chunk) < FOLLOW_MAX_BYTES:
+                chunk = b""                       # partial line: wait
+            if chunk:
+                text = chunk.decode("utf-8", errors="replace")
+                if cut >= 0:
+                    pieces = text.split("\n")[:-1]   # drop after last \n
+                else:
+                    pieces = [text]
+                result.extend(ln.rstrip("\r") for ln in pieces)
+                start += len(chunk)
+                break
         if time.monotonic() >= deadline:
             break
         time.sleep(0.05)
     with _follow_lock:
         _follow_offsets[sid] = start
+        if known_ino is not None:
+            _follow_inodes[sid] = known_ino
     return result
 
 
 def reset_follow_offset(stream_id: str, offset: int = 0) -> None:
     """Reset a stream's follow offset (useful for tests / re-follow)."""
+    sid = _safe_stream_id(stream_id)
     with _follow_lock:
-        _follow_offsets[_safe_stream_id(stream_id)] = offset
+        _follow_offsets[sid] = offset
+        _follow_inodes.pop(sid, None)
 
 
 # ---------------------------------------------------------------------------

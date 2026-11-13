@@ -55,7 +55,9 @@ def test_parallel_batch_really_runs_concurrently(tmp_path):
     rendezvous = threading.Barrier(2)
 
     def chat(*_args, **_kwargs):
-        rendezvous.wait(timeout=2)
+        # generous: under heavy CPU load a 2s barrier broke before the
+        # second worker started, failing the batch (timing flake only)
+        rendezvous.wait(timeout=15)
         return result("independent result")
 
     manager, _log = make_manager(tmp_path, chat, max_workers=2)
@@ -63,7 +65,7 @@ def test_parallel_batch_really_runs_concurrently(tmp_path):
         workers = manager.spawn_many(["inspect module A", "inspect module B"])
         assert len(workers) == 2
         assert manager.active_count() == 2
-        assert manager.wait([w.id for w in workers], timeout=3) == {
+        assert manager.wait([w.id for w in workers], timeout=20) == {
             workers[0].id: "done", workers[1].id: "done"}
         assert manager.active_count() == 0
     finally:

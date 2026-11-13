@@ -84,6 +84,8 @@ class Stage:
     ALL = (INGEST, PRE_CALL, POST_CALL, TOOL, FINAL, AUDIT)
 
 
+_MAX_TRACKED_KEYS = 10_000     # bound on per-(rule, session) state
+
 ACTION_FOR_MODE: Dict[str, str] = {
     Mode.ALLOW: "allow",
     Mode.LOG: "log",
@@ -116,7 +118,11 @@ def parse_mode(value: Any, default: str = Mode.WARN) -> str:
 def _to_float(value: Any, default: float, lo: float, hi: float) -> float:
     try:
         f = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: a huge JSON integer (float(10**400)) used to
+        # escape and make Policy()/from_file crash on a bad config.
+        return default
+    if f != f:                      # NaN: clamping silently gave `hi`
         return default
     return max(lo, min(hi, f))
 
@@ -124,7 +130,8 @@ def _to_float(value: Any, default: float, lo: float, hi: float) -> float:
 def _to_int(value: Any, default: int, lo: int = 0) -> int:
     try:
         n = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: int(float("inf")) / JSON Infinity
         return default
     return max(lo, n)
 
@@ -184,7 +191,7 @@ class PolicyRule:
             r.downgrade_mode, default=r.mode) if r.downgrade_mode else ""
         try:
             r.precedence = int(r.precedence)  # type: ignore[arg-type]
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             # A non-numeric precedence from from_dict/JSON must not make
             # normalized() (and hence Policy()) raise; fall back to the
             # default precedence instead of crashing on malformed input.
@@ -198,8 +205,13 @@ class PolicyRule:
         r.rate_limit = _to_int(r.rate_limit, 0)
         r.window_s = _to_float(r.window_s, 60.0, 1.0, 86400 * 30)
         r.ttl_s = _to_float(r.ttl_s, 0.0, 0.0, 86400 * 365)
+        # created_at was never coerced: a string/None from JSON made
+        # is_expired() raise TypeError inside every decide().
+        r.created_at = _to_float(r.created_at, 0.0, 0.0, 1e12)
         if not r.created_at:
             r.created_at = time.time()
+        if not isinstance(r.reason, str):
+            r.reason = "" if r.reason is None else str(r.reason)
         if not isinstance(r.meta, dict):
             r.meta = {}
         return r
@@ -320,11 +332,14 @@ class PolicySet:
     description: str = ""
 
     def normalized(self) -> "PolicySet":
+        raw_rules = self.rules if isinstance(self.rules, (list, tuple)) else []
         ps = PolicySet(
             name=str(self.name or "default"),
+            # junk entries (not a rule, not a dict) are dropped: they used
+            # to become a default "*" catch-all rule
             rules=[r.normalized() if isinstance(r, PolicyRule) else
                    PolicyRule.from_dict(r).normalized()
-                   for r in (self.rules or [])],
+                   for r in raw_rules if isinstance(r, (PolicyRule, dict))],
             default_mode=parse_mode(self.default_mode),
             version=str(self.version or ""),
             description=str(self.description or ""),
@@ -427,9 +442,16 @@ class Policy:
                  auto_reload: bool = False,
                  reload_poll_s: float = 5.0) -> None:
         self._lock = threading.RLock()
+        if isinstance(policy_set, dict):
+            policy_set = PolicySet.from_dict(policy_set)
         self._set = (policy_set or PolicySet()).normalized()
         self.path = os.fspath(path) if path else ""
         self._mtime = self._path_mtime()
+        self._sig = self._path_sig()
+        # True once self._set reflects the file at self._sig (set by
+        # from_file); without it the first poll re-read the unchanged
+        # file and wiped every cooldown/rate-limit/escalation counter.
+        self._file_loaded = False
         self.auto_reload = bool(auto_reload)
         self.reload_poll_s = _to_float(reload_poll_s, 5.0, 0.5, 3600.0)
         self._last_reload_check = 0.0
@@ -450,8 +472,10 @@ class Policy:
             with open(path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
             ps = PolicySet.from_dict(data).normalized()
-            return cls(ps, path=path, auto_reload=auto_reload,
-                       reload_poll_s=reload_poll_s)
+            pol = cls(ps, path=path, auto_reload=auto_reload,
+                      reload_poll_s=reload_poll_s)
+            pol._file_loaded = True
+            return pol
         except Exception as exc:
             if strict:
                 raise PolicyError(f"cannot load policy {path}: {exc}") from exc
@@ -464,6 +488,15 @@ class Policy:
         except OSError:
             return 0.0
 
+    def _path_sig(self) -> Tuple[int, int]:
+        """(mtime_ns, size): a rewrite within the same coarse mtime tick
+        still changes the size or ns stamp."""
+        try:
+            st = os.stat(self.path) if self.path else None
+        except OSError:
+            return (0, -1)
+        return (st.st_mtime_ns, st.st_size) if st else (0, -1)
+
     def maybe_reload(self, force: bool = False) -> bool:
         """Hot-reload from disk if the file changed. Returns True when a
         new policy generation was installed. Never raises."""
@@ -475,8 +508,9 @@ class Policy:
                 if now - self._last_reload_check < self.reload_poll_s:
                     return False
             self._last_reload_check = now
-            mtime = self._path_mtime()
-            if not force and mtime == self._mtime and self._generations > 0:
+            sig = self._path_sig()
+            if not force and sig == self._sig and \
+                    (self._generations > 0 or self._file_loaded):
                 return False
             try:
                 with open(self.path, "r", encoding="utf-8") as fh:
@@ -486,6 +520,8 @@ class Policy:
                 return False   # keep old policy; file may be mid-write
             self._set = candidate
             self._mtime = self._path_mtime()
+            self._sig = sig
+            self._file_loaded = True
             self._generations += 1
             self._hits.clear()
             self._last_action_ts.clear()
@@ -561,6 +597,34 @@ class Policy:
     def _record_hit(self, key: Tuple[str, str], now: float) -> None:
         self._hits.setdefault(key, []).append(now)
         del self._hits[key][:-1000]      # hard bound per key
+        if len(self._hits) > _MAX_TRACKED_KEYS or \
+                len(self._last_action_ts) > _MAX_TRACKED_KEYS:
+            self._gc_keys(now)
+
+    def _gc_keys(self, now: float) -> None:
+        """Drop per-(rule, session) bookkeeping that can no longer affect
+        a decision: one entry per session id used to live forever."""
+        horizon = 0.0
+        for r in self._set.rules:
+            horizon = max(horizon, r.window_s, r.cooldown_s)
+        horizon = max(horizon, 60.0)
+        for k in [k for k, v in self._hits.items()
+                  if not v or now - v[-1] > horizon]:
+            self._hits.pop(k, None)
+        for k in [k for k, t in self._last_action_ts.items()
+                  if now - t > horizon]:
+            self._last_action_ts.pop(k, None)
+        # still too many live keys: keep the most recently used half
+        for table in (self._hits, self._last_action_ts):
+            if len(table) > _MAX_TRACKED_KEYS:
+                def _last(k):
+                    v = table[k]
+                    return v[-1] if isinstance(v, list) and v else (
+                        v if isinstance(v, float) else 0.0)
+                keep = sorted(table, key=_last)[-(_MAX_TRACKED_KEYS // 2):]
+                keep_set = set(keep)
+                for k in [k for k in table if k not in keep_set]:
+                    table.pop(k, None)
 
     # -- main entry ----------------------------------------------------------
 

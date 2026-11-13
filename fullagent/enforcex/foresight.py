@@ -104,6 +104,22 @@ _SEVERITY_RISK = {"ok": 0.0, "low": 0.15, "medium": 0.4,
                   "high": 0.7, "critical": 1.0}
 
 
+def _num(value: Any, default: float = 0.0) -> float:
+    """float(value) that never raises and never returns NaN/inf."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return f if math.isfinite(f) else default
+
+
+def _int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
 def _clean_state_part(s: Any, allowed: Sequence[str], default: str) -> str:
     s = str(s or "").strip().lower().replace(" ", "_")
     return s if s in allowed else default
@@ -204,7 +220,7 @@ class Event:
         if not isinstance(d, dict):
             return cls()
         return cls(state=str(d.get("state", OK_STATE) or OK_STATE),
-                   ts=float(d.get("ts", 0.0) or 0.0))
+                   ts=_num(d.get("ts", 0.0) or 0.0))
 
 
 @dataclass
@@ -233,17 +249,20 @@ class RiskForecast:
         if not isinstance(d, dict):
             return cls()
         dist = d.get("distribution")
+        path = d.get("path")
         return cls(
-            horizon=int(d.get("horizon", 1) or 1),
+            horizon=_int(d.get("horizon", 1) or 1, 1),
             top_state=str(d.get("top_state", OK_STATE) or OK_STATE),
-            probability=float(d.get("probability", 0.0) or 0.0),
-            risk=float(d.get("risk", 0.0) or 0.0),
-            distribution={str(k): float(v)
-                          for k, v in (dist or {}).items()
+            probability=_num(d.get("probability", 0.0) or 0.0),
+            risk=_num(d.get("risk", 0.0) or 0.0),
+            distribution={str(k): _num(v)
+                          for k, v in (dist.items() if isinstance(dist, dict)
+                                       else ())
                           if isinstance(v, (int, float))},
-            path=tuple(str(x) for x in (d.get("path") or ())),
+            path=tuple(str(x) for x in path)
+            if isinstance(path, (list, tuple)) else (),
             escalation=bool(d.get("escalation", False)),
-            confidence=float(d.get("confidence", 0.0) or 0.0),
+            confidence=_num(d.get("confidence", 0.0) or 0.0),
         )
 
 
@@ -262,7 +281,10 @@ class RiskModel:
 
     def __init__(self, *, alpha: float = 0.5, decay: float = 1.0,
                  max_states: int = 256, seed: int = 0) -> None:
-        self.alpha = alpha if alpha and alpha > 0 else 0.5
+        alpha = _num(alpha, 0.5)
+        decay = _num(decay, 1.0)
+        max_states = _int(max_states, 256)
+        self.alpha = alpha if 0 < alpha <= 1e6 else 0.5
         self.decay = decay if 0.0 < decay <= 1.0 else 1.0
         self.max_states = max_states if max_states and max_states > 4 \
             else 256
@@ -294,6 +316,8 @@ class RiskModel:
         self._state_visits[state] = self._state_visits.get(state, 0.0) + 1.0
         self._n_obs += 1
         self._current = state
+        if len(self._counts) > self.max_states:
+            self._prune()          # was defined but never called
         return ev
 
     def observe_seq(self, events: Any) -> int:
@@ -575,31 +599,28 @@ class RiskModel:
     def from_dict(cls, d: Any) -> "RiskModel":
         if not isinstance(d, dict):
             return cls()
-        m = cls(alpha=float(d.get("alpha", 0.5) or 0.5),
-                decay=float(d.get("decay", 1.0) or 1.0),
-                max_states=int(d.get("max_states", 256) or 256))
+        m = cls(alpha=_num(d.get("alpha", 0.5) or 0.5, 0.5),
+                decay=_num(d.get("decay", 1.0) or 1.0, 1.0),
+                max_states=_int(d.get("max_states", 256) or 256, 256))
         counts = d.get("counts")
         if isinstance(counts, dict):
             for frm, row in counts.items():
                 if isinstance(row, dict):
                     for to, w in row.items():
                         try:
-                            m._bump(m._counts, str(frm), str(to),
-                                    float(w))
+                            m._bump(m._counts, str(frm), str(to), _num(w))
                         except Exception:
                             continue
         visits = d.get("state_visits")
         if isinstance(visits, dict):
             for s, w in visits.items():
-                try:
-                    m._state_visits[str(s)] = float(w)
-                except Exception:
-                    continue
+                m._state_visits[str(s)] = _num(w)
         m._current = str(d.get("current", START_STATE) or START_STATE)
-        m._n_obs = int(d.get("n_obs", 0) or 0)
-        m._created = float(d.get("created", 0.0) or 0.0)
+        m._n_obs = max(0, _int(d.get("n_obs", 0) or 0))
+        m._created = _num(d.get("created", 0.0) or 0.0)
         # rebuild transitions as a copy of counts (same weights)
         m._transitions = {k: dict(v) for k, v in m._counts.items()}
+        m._prune()
         return m
 
 

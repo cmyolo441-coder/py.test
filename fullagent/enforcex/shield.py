@@ -60,6 +60,7 @@ import hashlib
 import json
 import random
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -195,14 +196,14 @@ def _sha(text: str) -> str:
 def _shield_int(value: Any, default: int = 0) -> int:
     try:
         return int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
 def _shield_float(value: Any, default: float = 0.0) -> float:
     try:
         return float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
@@ -227,6 +228,10 @@ def _field(rule: Any, name: str, default: Any = "") -> Any:
 
 def _rule_keywords(rule: Any) -> Tuple[str, ...]:
     kws = _field(rule, "keywords", ()) or ()
+    if isinstance(kws, str):
+        kws = (kws,)
+    elif not isinstance(kws, (list, tuple, set, frozenset)):
+        kws = ()        # an int/dict here used to abort the whole compile
     out: List[str] = []
     for k in kws:
         s = _clean(k, 40).lower()
@@ -254,6 +259,24 @@ def _fingerprint(rules: Any) -> str:
     return _sha("\n".join(items))[:16]
 
 
+def _content_key(rules: Any) -> str:
+    """Cache key over every field the compiler reads. The id+text
+    fingerprint alone let a rule whose severity/category/keywords/
+    immutability changed hit the cache and get a stale shield."""
+    items = sorted(
+        "|".join((
+            _clean(_field(r, "id", ""), 32),
+            _clean(_field(r, "text", ""), _MAX_RULE_TEXT),
+            _category_of(r),
+            _clean(_field(r, "severity", "low"), 16).lower(),
+            ",".join(_rule_keywords(r)),
+            "1" if _field(r, "immutable", False) else "0",
+            _clean(_field(r, "priority", 0.0), 24),
+        ))
+        for r in _rules_iter(rules))
+    return _sha("\n".join(items))
+
+
 # ── dataclasses ──────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -271,7 +294,7 @@ class ShieldConfig:
         def _int(value: Any, default: int) -> int:
             try:
                 return int(value)  # type: ignore[arg-type]
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return default
         return ShieldConfig(
             max_examples=max(1, min(_int(self.max_examples, 8), 32)),
@@ -482,13 +505,14 @@ class ShieldCompiler:
     def __init__(self, config: Optional[ShieldConfig] = None,
                  *, cache_size: int = 16) -> None:
         self.config = (config or ShieldConfig()).sanitized()
-        self._cache: Dict[Tuple[str, str], Shield] = {}
+        self._cache: Dict[Tuple[str, ...], Shield] = {}
         try:
             self._cache_size = max(1, int(cache_size or 16))  # type: ignore[arg-type]
         except (TypeError, ValueError):
             self._cache_size = 16
         self._hits = 0
         self._misses = 0
+        self._lock = threading.RLock()
 
     # -- public API ------------------------------------------------------
 
@@ -496,7 +520,8 @@ class ShieldCompiler:
                 config: Optional[ShieldConfig] = None) -> Shield:
         """Compile rules into a Shield. Never raises."""
         try:
-            return self._compile(rules, config)
+            with self._lock:
+                return self._compile(rules, config)
         except Exception:
             return _empty_shield(self.config)
 
@@ -512,15 +537,17 @@ class ShieldCompiler:
 
     def invalidate(self, rules: Any = None) -> int:
         """Drop cache entries; with rules, drop only that fingerprint."""
-        if rules is None:
-            n = len(self._cache)
-            self._cache.clear()
-            return n
-        fp = _fingerprint(rules)
-        keys = [k for k in self._cache if k[0] == fp]
-        for k in keys:
-            self._cache.pop(k, None)
-        return len(keys)
+        with self._lock:
+            if rules is None:
+                n = len(self._cache)
+                self._cache.clear()
+                return n
+            fp = _fingerprint([r for r in _rules_iter(rules)
+                               if _clean(_field(r, "text", ""), 8)])
+            keys = [k for k in self._cache if k[0] == fp]
+            for k in keys:
+                self._cache.pop(k, None)
+            return len(keys)
 
     def cache_info(self) -> Dict[str, Any]:
         return {"size": len(self._cache), "capacity": self._cache_size,
@@ -534,10 +561,15 @@ class ShieldCompiler:
         rule_list = [r for r in _rules_iter(rules)
                      if _clean(_field(r, "text", ""), 8)]
         fp = _fingerprint(rule_list)
-        key = (fp, _sha(json.dumps(cfg.to_dict(), sort_keys=True)))
+        key = (fp, _sha(json.dumps(cfg.to_dict(), sort_keys=True,
+                                   default=str)), _content_key(rule_list))
         if key in self._cache:
             self._hits += 1
-            return self._cache[key]
+            # true LRU: refresh recency on a hit (eviction pops the
+            # oldest insertion, which used to evict hot entries first)
+            shield = self._cache.pop(key)
+            self._cache[key] = shield
+            return shield
         self._misses += 1
 
         ranked = self._rank_rules(rule_list, cfg)

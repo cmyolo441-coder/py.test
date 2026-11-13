@@ -11,7 +11,12 @@ enforcex pipeline:
 
 Design
   * Sliding window: only the last `window` characters are scanned so
-    cost stays O(window) even for very long generations.
+    cost stays O(window) even for very long generations. Within that
+    window each check scans only the text added since the previous
+    check plus `scan_overlap` chars of context (enough for any phrase a
+    detector looks for to straddle the boundary), so each character is
+    scanned a bounded number of times instead of ~window/token-size
+    times.
   * Rolling hash: a polynomial hash of the window is kept; when the
     hash has not changed in a meaningful way the detector can be
     skipped (cheap duplicate-window suppression).
@@ -92,6 +97,9 @@ _DEFAULT_ABORT_THRESHOLD = 40.0
 _DEFAULT_CHECK_EVERY = 4
 _ROLLING_BASE = 91138233
 _ROLLING_MOD = 10_000_000_007
+_DEFAULT_SCAN_OVERLAP = 512    # context chars re-scanned before new text
+_MAX_NOTES = 64                # bounded diagnostics per stream
+_MAX_VIOLATIONS = 256          # bounded accumulated findings per stream
 _WS_RE = re.compile(r"\s+")
 _LEAK_TAG_RE = re.compile(
     r"(<\s*/?\s*(system|system_prompt|prompt|instructions|SYS|INST)\s*>"
@@ -122,6 +130,7 @@ class StreamConfig:
     check_every_n: int = _DEFAULT_CHECK_EVERY          # run detectors every N tokens
     max_buffer: int = _MAX_BUFFER
     enable_rolling_hash_skip: bool = True
+    scan_overlap: int = _DEFAULT_SCAN_OVERLAP  # context kept per check
 
     def __post_init__(self) -> None:
         try:
@@ -140,6 +149,10 @@ class StreamConfig:
             self.max_buffer = max(1024, int(self.max_buffer))
         except Exception:
             self.max_buffer = _MAX_BUFFER
+        try:
+            self.scan_overlap = max(0, min(self.window, int(self.scan_overlap)))
+        except Exception:
+            self.scan_overlap = min(self.window, _DEFAULT_SCAN_OVERLAP)
 
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, Any]]) -> "StreamConfig":
@@ -151,6 +164,7 @@ class StreamConfig:
             check_every_n=d.get("check_every_n", _DEFAULT_CHECK_EVERY),
             max_buffer=d.get("max_buffer", _MAX_BUFFER),
             enable_rolling_hash_skip=bool(d.get("enable_rolling_hash_skip", True)),
+            scan_overlap=d.get("scan_overlap", _DEFAULT_SCAN_OVERLAP),
         )
 
 
@@ -190,6 +204,12 @@ def _rolling_hash(text: str) -> int:
 def _window_hash(buffer: str, window: int) -> int:
     w = buffer[-window:] if window and len(buffer) > window else buffer
     return _rolling_hash(w)
+
+
+def _fast_hash(text: str) -> int:
+    """C-speed content hash for duplicate-window suppression (the pure
+    Python polynomial loop above cost ~1ms per 2 KB window per check)."""
+    return hash(text) & 0xFFFFFFFFFFFF
 
 
 # ── fallback detectors ───────────────────────────────────────────────────
@@ -271,6 +291,21 @@ def _collect_violations(text: str, rules: Any, system_text: str,
     return normed
 
 
+def _conf(v: Any) -> float:
+    try:
+        c = float(v.get("confidence", 1.0) or 1.0)
+    except Exception:
+        return 1.0
+    return c if c == c else 1.0
+
+
+def _vkey(v: Any) -> Tuple[str, str, str]:
+    if not isinstance(v, dict):
+        return ("", str(v), "")
+    return (str(v.get("category", "")), str(v.get("evidence", "")),
+            str(v.get("rule_id", "")))
+
+
 def _should_abort(violations: List[Dict[str, Any]],
                   abort_threshold: float,
                   notes: List[str]) -> Tuple[bool, str]:
@@ -279,10 +314,16 @@ def _should_abort(violations: List[Dict[str, Any]],
         return False, ""
     # critical/high injection or leak -> immediate abort
     for v in violations:
+        if not isinstance(v, dict):
+            continue
         cat = str(v.get("category", "")).lower()
         sev = str(v.get("severity", "")).lower()
         if cat in ("injection", "leak") and sev in ("critical", "high"):
-            return True, f"early abort: {cat}/{sev} ({v.get('evidence','')[:40]})"
+            # str(): a None/non-str evidence used to raise TypeError here,
+            # which feed() swallowed -- so the hostile stream was never
+            # aborted at all.
+            ev = str(v.get("evidence") or "")[:40]
+            return True, f"early abort: {cat}/{sev} ({ev})"
     # score-based abort: total score below threshold
     if _score_violations is not None:
         try:
@@ -297,10 +338,12 @@ def _should_abort(violations: List[Dict[str, Any]],
         penalty = 0.0
         mult = {"critical": 30.0, "high": 18.0, "medium": 10.0, "low": 5.0, "info": 1.0}
         for v in violations:
+            if not isinstance(v, dict):
+                continue
             cat = str(v.get("category", "")).lower()
             sev = str(v.get("severity", "medium")).lower()
             weight = 2.0 if cat in ("injection", "leak", "security", "identity") else 1.0
-            penalty += mult.get(sev, 10.0) * weight * float(v.get("confidence", 1.0) or 1.0)
+            penalty += mult.get(sev, 10.0) * weight * _conf(v)
         total = max(0.0, 100.0 - penalty)
         if total < float(abort_threshold):
             return True, f"early abort: fallback score {total:.1f} < {abort_threshold:.1f}"
@@ -335,7 +378,14 @@ class StreamGate:
         self.config = config or StreamConfig()
         self.session_id = str(session_id or "default")
         self._lock = threading.RLock()
-        self._buffer: str = ""
+        # The buffer is kept as a list of chunks: ``str += token`` on an
+        # attribute copies the whole (up to max_buffer) string on every
+        # token, i.e. O(n^2) bytes over a long response.
+        self._chunks: List[str] = []
+        self._buflen: int = 0
+        self._unscanned: int = 0          # chars appended since last scan
+        self._seen_content: bool = False
+        self._vkeys: set = set()
         self._tokens_seen: int = 0
         self._violations: List[Dict[str, Any]] = []
         self._aborted: bool = False
@@ -345,6 +395,70 @@ class StreamGate:
         self._last_window_hash: int = 0
         self._notes: List[str] = []
         self._closed: bool = False
+
+    # -- buffer helpers (caller holds the lock) ----------------------------
+
+    @property
+    def _buffer(self) -> str:
+        """Materialized buffer (bounded to max_buffer)."""
+        if len(self._chunks) != 1:
+            joined = "".join(self._chunks)
+            self._chunks = [joined] if joined else []
+        buf = self._chunks[0] if self._chunks else ""
+        cap = self.config.max_buffer
+        if len(buf) > cap:
+            buf = buf[-cap:]
+            self._chunks = [buf]
+            self._buflen = len(buf)
+        return buf
+
+    def _append(self, token: str) -> None:
+        self._chunks.append(token)
+        self._buflen += len(token)
+        if token.strip():
+            self._seen_content = True
+        # amortized compaction (every 64 tokens, or when well over the
+        # cap): keeps _tail() cheap and memory bounded while costing only
+        # O(max_buffer / 64) copied chars per token.
+        cap = self.config.max_buffer
+        if len(self._chunks) > 64 or self._buflen > 2 * cap:
+            buf = "".join(self._chunks)
+            if len(buf) > cap:
+                buf = buf[-cap:]
+            self._chunks = [buf] if buf else []
+            self._buflen = len(buf)
+
+    def _tail(self, n: int) -> str:
+        """Last n chars of the buffer without joining all of it."""
+        if n <= 0:
+            return ""
+        parts: List[str] = []
+        got = 0
+        for ch in reversed(self._chunks):
+            parts.append(ch)
+            got += len(ch)
+            if got >= n:
+                break
+        out = "".join(reversed(parts))
+        return out[-n:] if len(out) > n else out
+
+    def _has_content(self) -> bool:
+        return self._seen_content
+
+    def _merge(self, found: List[Dict[str, Any]]) -> None:
+        for v in found:
+            if len(self._violations) >= _MAX_VIOLATIONS:
+                break
+            key = _vkey(v)
+            if key not in self._vkeys:
+                self._vkeys.add(key)
+                self._violations.append(v)
+
+    def _note(self, notes: List[str]) -> None:
+        if notes:
+            self._notes.extend(notes)
+            if len(self._notes) > _MAX_NOTES:
+                del self._notes[:-_MAX_NOTES]
 
     # -- core -------------------------------------------------------------
 
@@ -380,12 +494,10 @@ class StreamGate:
                 # content, not on the raw token counter — a leading
                 # empty token used to make the first real token miss
                 # the immediate scan.
-                buffer_had_content = bool(self._buffer.strip())
+                buffer_had_content = self._has_content()
                 if token:
-                    self._buffer += token
-                    # memory bound: keep only the tail
-                    if len(self._buffer) > self.config.max_buffer:
-                        self._buffer = self._buffer[-self.config.max_buffer:]
+                    self._append(token)
+                    self._unscanned += len(token)
                 # throttling: only scan every check_every_n tokens
                 # always scan the very first non-empty token so hostile
                 # single-token payloads are caught immediately
@@ -394,31 +506,30 @@ class StreamGate:
                     return None
                 # rolling-hash duplicate suppression: if the window hash
                 # hasn't changed since the last scan, skip
-                if self.config.enable_rolling_hash_skip and self.config.window:
-                    cur_hash = _window_hash(self._buffer, self.config.window)
+                if self._unscanned <= 0 and self._last_check_at > 0:
+                    return None          # nothing new since the last scan
+                window = self.config.window
+                if self.config.enable_rolling_hash_skip and window:
+                    cur_hash = _fast_hash(self._tail(window))
                     if cur_hash == self._last_window_hash and self._last_check_at > 0:
+                        self._unscanned = 0
                         return None
                     self._last_window_hash = cur_hash
                     self._rolling_hash = cur_hash
-                # build scan window
-                window_text = self._buffer[-self.config.window:] \
-                    if self.config.window and len(self._buffer) > self.config.window \
-                    else self._buffer
+                # scan region: new text + overlap context, capped at window
+                span = min(window, self._unscanned + self.config.scan_overlap) \
+                    if self._last_check_at > 0 else window
+                window_text = self._tail(max(1, span))
                 if not window_text.strip():
                     return None
                 self._last_check_at = self._tokens_seen
+                self._unscanned = 0
                 notes: List[str] = []
                 new_violations = _collect_violations(window_text, self.rules,
                                                      self.system_text, notes)
-                self._notes.extend(notes)
+                self._note(notes)
                 # merge new violations into accumulated set (dedupe)
-                existing_keys = {(v.get("category",""), v.get("evidence",""), v.get("rule_id",""))
-                                 for v in self._violations}
-                for v in new_violations:
-                    key = (v.get("category",""), v.get("evidence",""), v.get("rule_id",""))
-                    if key not in existing_keys:
-                        self._violations.append(v)
-                        existing_keys.add(key)
+                self._merge(new_violations)
                 # early abort check
                 should, reason = _should_abort(self._violations,
                                                self.config.abort_threshold,
@@ -432,7 +543,7 @@ class StreamGate:
             # never raise from feed()
             return None
 
-    def snapshot(self) -> StreamState:
+    def snapshot(self) -> StreamState:  # noqa: D401
         """Thread-safe snapshot of current gate state."""
         with self._lock:
             return StreamState(
@@ -452,7 +563,11 @@ class StreamGate:
     def reset(self) -> None:
         """Clear all state so the gate can be reused for a new stream."""
         with self._lock:
-            self._buffer = ""
+            self._chunks = []
+            self._buflen = 0
+            self._unscanned = 0
+            self._seen_content = False
+            self._vkeys = set()
             self._tokens_seen = 0
             self._violations = []
             self._aborted = False
@@ -477,13 +592,7 @@ class StreamGate:
                 final_violations = _collect_violations(self._buffer, self.rules,
                                                        self.system_text, notes)
                 # merge into accumulated
-                existing_keys = {(v.get("category",""), v.get("evidence",""), v.get("rule_id",""))
-                                 for v in self._violations}
-                for v in final_violations:
-                    key = (v.get("category",""), v.get("evidence",""), v.get("rule_id",""))
-                    if key not in existing_keys:
-                        self._violations.append(v)
-                        existing_keys.add(key)
+                self._merge(final_violations)
             # score
             score = None
             total = 100.0
@@ -499,10 +608,12 @@ class StreamGate:
                 penalty = 0.0
                 mult = {"critical": 30.0, "high": 18.0, "medium": 10.0, "low": 5.0, "info": 1.0}
                 for v in self._violations:
+                    if not isinstance(v, dict):
+                        continue
                     cat = str(v.get("category","")).lower()
                     sev = str(v.get("severity","medium")).lower()
                     weight = 2.0 if cat in ("injection","leak","security","identity") else 1.0
-                    penalty += mult.get(sev, 10.0) * weight * float(v.get("confidence", 1.0) or 1.0)
+                    penalty += mult.get(sev, 10.0) * weight * _conf(v)
                 total = max(0.0, 100.0 - penalty)
                 score = {"total": total, "grade": "F" if total < 40 else ("C" if total < 75 else "A"),
                          "verdict": "fail" if total < 40 else ("warn" if total < 75 else "pass")}
@@ -515,6 +626,7 @@ class StreamGate:
             elif self._violations:
                 # any hostile high-severity without abort yet -> warn/block
                 hostile = any(
+                    isinstance(v, dict) and
                     str(v.get("category","")).lower() in ("injection","leak")
                     and str(v.get("severity","")).lower() in ("critical","high")
                     for v in self._violations)
@@ -564,10 +676,13 @@ class StreamGate:
                 score_d = {"total": total}
         else:
             penalty = 0.0
-            mult = {"critical": 30.0, "high": 18.0, "medium": 10.0, "low": 5.0}
+            mult = {"critical": 30.0, "high": 18.0, "medium": 10.0, "low": 5.0,
+                    "info": 1.0}
             for v in self._violations:
+                if not isinstance(v, dict):
+                    continue
                 sev = str(v.get("severity","medium")).lower()
-                penalty += mult.get(sev, 10.0) * float(v.get("confidence", 1.0) or 1.0)
+                penalty += mult.get(sev, 10.0) * _conf(v)
             total = max(0.0, 100.0 - penalty)
             score_d = {"total": total}
         return {

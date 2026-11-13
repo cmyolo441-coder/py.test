@@ -57,6 +57,20 @@ try:                                   # optional canon for hardening
 except Exception:                      # pragma: no cover
     _canon = None
 
+try:                                   # shared evasion folding
+    from .detect import fold_text as _fold_text
+except Exception:                      # pragma: no cover
+    import unicodedata as _ud
+
+    def _fold_text(text: str) -> str:
+        try:
+            return _ud.normalize("NFKC", re.sub(
+                "[\u200b-\u200f\u2060-\u2064\ufeff\u00ad]", "", text))
+        except Exception:
+            return text
+
+_WS_COLLAPSE_RE = re.compile(r"\s+")
+
 __all__ = [
     "ATTACK_CLASSES", "EXTRACTION_PATTERNS",
     "MetaReport", "MetaConfig", "MetaGuard",
@@ -91,10 +105,15 @@ def _c(pattern: str) -> re.Pattern:
 
 EXTRACTION_PATTERNS: Tuple[Tuple[str, re.Pattern, float, str], ...] = (
     # -- direct prompt extraction (10) --
+    # "instructions" alone needs "your": "show me the instructions for
+    # installing numpy" used to score 0.95 (block).
     ("verbatim_prompt", _c(r"\b(?:print|show|reveal|output|display|paste|"
-                           r"repeat|copy)\b[^.?!]{0,60}\b(?:your )?"
-                           r"(?:system prompt|system message|instructions|"
-                           r"initial prompt|original prompt|hidden prompt)\b"),
+                           r"repeat|copy)\b[^.?!]{0,60}\b"
+                           r"(?:your\s+(?:system prompt|system message|"
+                           r"instructions|initial prompt|original prompt|"
+                           r"hidden prompt|prompt)|(?:the\s+)?(?:system prompt|"
+                           r"system message|initial prompt|original prompt|"
+                           r"hidden prompt))\b"),
      0.95, ATTACK_CLASSES.PROMPT_EXTRACT),
     ("prompt_verbatim_kw", _c(r"\bsystem prompt\b[^.?!]{0,40}\b"
                               r"(?:verbatim|exactly|word for word|fully|"
@@ -110,9 +129,12 @@ EXTRACTION_PATTERNS: Tuple[Tuple[str, re.Pattern, float, str], ...] = (
                        r"(?:you (?:were|are) (?:told|given|instructed)|"
                        r"of your (?:prompt|instructions))\b"),
      0.8, ATTACK_CLASSES.PROMPT_EXTRACT),
+    # "export the config to JSON" is ordinary dev talk: require "your"
+    # (or the system prompt itself).
     ("config_dump", _c(r"\b(?:dump|export|leak|exfiltrate)\b[^.?!]{0,40}\b"
-                       r"(?:your )?(?:config|configuration|prompt|"
-                       r"instructions|settings)\b"),
+                       r"(?:your\s+(?:config|configuration|prompt|"
+                       r"instructions|settings|system prompt|rules)|"
+                       r"(?:the\s+)?system\s+(?:prompt|message))\b"),
      0.85, ATTACK_CLASSES.PROMPT_EXTRACT),
     ("quote_prompt", _c(r"\b(?:quote|reproduce|restate|recite|echo)\b"
                         r"[^.?!]{0,50}\b(?:system|initial|hidden|original|"
@@ -335,8 +357,12 @@ EXTRACTION_PATTERNS: Tuple[Tuple[str, re.Pattern, float, str], ...] = (
      0.6, ATTACK_CLASSES.ENFORCEMENT_PROBE),
 
     # -- role rewrite (5) --
+    # bare "free"/"allowed" matched "You are now free to merge the PR".
     ("you_are_now", _c(r"\byou are now\b[^.?!]{0,60}\b(?:unrestricted|"
-                       r"uncensored|free|allowed|without (?:rules|filters|"
+                       r"uncensored|free (?:of|from) (?:all |any )?(?:rules|"
+                       r"restrictions|limits|filters|guidelines)|allowed to "
+                       r"(?:do anything|say anything|ignore|break|bypass)|"
+                       r"without (?:rules|filters|"
                        r"limits)|dan|a different ai)\b"),
      0.9, ATTACK_CLASSES.ROLE_REWRITE),
     ("pretend_no_rules", _c(r"\b(?:pretend|act as if|imagine|behave as "
@@ -364,6 +390,13 @@ EXTRACTION_PATTERNS: Tuple[Tuple[str, re.Pattern, float, str], ...] = (
 )
 
 assert len(EXTRACTION_PATTERNS) >= 40, "taxonomy must hold ~40 patterns"
+
+# Per-pattern exclusions for common benign phrasings: "please ignore my
+# previous message" is a user correcting themselves, not an attack.
+_PATTERN_EXCLUSIONS: Dict[str, re.Pattern] = {
+    "ignore_previous": _c(r"\b(?:my|our)\s+(?:own\s+)?(?:previous|prior|"
+                          r"earlier|above|original)\s+(?:messages?|prompts?)\b"),
+}
 
 
 # ── report + config ──────────────────────────────────────────────────────
@@ -437,6 +470,24 @@ def recommended_action_for(confidence: float, spoofed: bool = False) -> str:
     return "allow"
 
 
+def _action_for(confidence: float, spoofed: bool, cfg: "MetaConfig") -> str:
+    try:
+        c = min(1.0, max(0.0, float(confidence)))
+    except (TypeError, ValueError):
+        c = 0.0
+    if spoofed and c >= 0.5:
+        return "block"
+    for floor, action in ((cfg.block_threshold, "block"),
+                          (cfg.refuse_threshold, "refuse"),
+                          (cfg.harden_threshold, "harden")):
+        try:
+            if c >= float(floor):
+                return action
+        except (TypeError, ValueError):
+            continue
+    return "allow"
+
+
 @dataclass
 class MetaConfig:
     """Knobs for MetaGuard."""
@@ -450,26 +501,36 @@ class MetaConfig:
 
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, Any]]) -> "MetaConfig":
-        d = d or {}
+        d = d if isinstance(d, dict) else {}
         cfg = cls()
+        _bad = (TypeError, ValueError, OverflowError)
         for f in ("block_threshold", "refuse_threshold", "harden_threshold",
                   "max_text"):
             if f in d:
                 try:
-                    setattr(cfg, f, float(d[f]) if f != "max_text"
-                            else max(1000, int(d[f])))
-                except (TypeError, ValueError):
+                    if f == "max_text":
+                        setattr(cfg, f, max(1000, int(d[f])))
+                    else:
+                        v = float(d[f])
+                        if v == v:              # NaN keeps the default
+                            setattr(cfg, f, min(1.0, max(0.0, v)))
+                except _bad:
                     pass
         if "max_matches" in d:
             try:
                 cfg.max_matches = max(1, int(d["max_matches"]))
-            except (TypeError, ValueError):
+            except _bad:
                 pass
         if "run_injection_scan" in d:
             cfg.run_injection_scan = bool(d["run_injection_scan"])
         if isinstance(d.get("pattern_weights"), dict):
-            cfg.pattern_weights = {str(k): float(v)
-                                   for k, v in d["pattern_weights"].items()}
+            weights: Dict[str, float] = {}
+            for k, v in d["pattern_weights"].items():
+                try:                     # one bad weight no longer
+                    weights[str(k)] = float(v)   # aborts the whole config
+                except _bad:
+                    continue
+            cfg.pattern_weights = weights
         return cfg
 
 
@@ -561,14 +622,37 @@ class MetaGuard:
 
         # 2. taxonomy layer
         matches: List[Tuple[str, float, str, str]] = []  # name,w,cls,ev
-        low = text.lower()
+        # Also scan an evasion-folded copy: zero-width chars, fullwidth
+        # forms, Cyrillic look-alikes and doubled spaces/CRLF used to slip
+        # "ign\u200bore previous instructions" past every pattern.
+        variants = [text]
+        try:
+            folded = _WS_COLLAPSE_RE.sub(" ", _fold_text(text))
+            if folded != text:
+                variants.append(folded)
+        except Exception:
+            pass
+        excluded = 0
         for name, pat, weight, cls in EXTRACTION_PATTERNS:
             w = self._pattern_weight(name, weight)
-            m = pat.search(text)
-            if not m:
+            hit = None
+            for variant in variants:
+                for m in pat.finditer(variant):
+                    excl = _PATTERN_EXCLUSIONS.get(name)
+                    if excl is not None and excl.search(m.group(0)):
+                        excluded += 1
+                        continue
+                    hit = (variant, m)
+                    break
+                if hit:
+                    break
+            if not hit:
                 continue
-            ev = text[max(0, m.start() - 20): m.end() + 40]
+            src, m = hit
+            ev = src[max(0, m.start() - 20): m.end() + 40]
             matches.append((name, w, cls, ev.strip()[:160]))
+        if excluded:
+            report.notes.append(f"{excluded} benign phrasing(s) excluded")
         matches.sort(key=lambda x: (-x[1], x[0]))
 
         # 3. aggregate per class
@@ -607,8 +691,9 @@ class MetaGuard:
             cls == ATTACK_CLASSES.AUTHORITY_SPOOF and w >= 0.6
             for _, w, cls, _ in matches)
 
-        # 7. action
-        action = recommended_action_for(best_conf, spoofed)
+        # 7. action (honours the configured thresholds; they used to be
+        # ignored in favour of hard-coded constants)
+        action = _action_for(best_conf, spoofed, cfg)
         if action == "allow" and risk >= cfg.harden_threshold:
             action = "harden"
         if action in ("refuse", "block") and risk >= cfg.refuse_threshold and \

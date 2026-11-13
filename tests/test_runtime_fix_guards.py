@@ -457,6 +457,10 @@ def test_cloud_concurrent_first_requests_share_one_token(tmp_path,
 def test_cloud_idle_connection_is_dropped(tmp_path, monkeypatch):
     cs = _load_cloudserve(tmp_path, monkeypatch)
     cs.get_token()
+    # the shipped handler must carry a finite socket timeout (the stdlib
+    # default is None = wait forever); shrink it to keep the test fast
+    assert isinstance(cs.Handler.timeout, (int, float))
+    assert 0 < cs.Handler.timeout <= 300
     monkeypatch.setattr(cs.Handler, "timeout", 0.5)
     srv = cs.ThreadedServer(("127.0.0.1", 0), cs.Handler)
     th = threading.Thread(target=srv.serve_forever, daemon=True)

@@ -31,14 +31,25 @@ def detect_256color(env: Dict[str, str] | None = None) -> bool:
     return "256color" in (env.get("TERM", "") or "").lower()
 
 
-def detect_unicode(env: Dict[str, str] | None = None) -> bool:
-    """True when LC_ALL/LC_CTYPE/LANG advertises a UTF-8 locale."""
-    env = os.environ if env is None else env
+def _effective_locale(env: Dict[str, str]) -> str:
+    """The locale value that actually governs LC_CTYPE.
+
+    POSIX precedence: the FIRST non-empty of LC_ALL, LC_CTYPE, LANG wins.
+    The old check accepted a UTF-8 value from ANY of them, so the common
+    broken setup ``LC_ALL=C`` + ``LANG=en_US.UTF-8`` (where the terminal
+    really runs in the C locale) was reported as fine."""
     for key in ("LC_ALL", "LC_CTYPE", "LANG"):
-        val = (env.get(key, "") or "").lower().replace("-", "")
-        if "utf8" in val or "utf-8" in val:
-            return True
-    return False
+        val = (env.get(key, "") or "").strip()
+        if val:
+            return val
+    return ""
+
+
+def detect_unicode(env: Dict[str, str] | None = None) -> bool:
+    """True when the effective locale (LC_ALL > LC_CTYPE > LANG) is UTF-8."""
+    env = os.environ if env is None else env
+    val = _effective_locale(env).lower().replace("-", "")
+    return "utf8" in val
 
 
 def terminal_size() -> Tuple[int, int]:
@@ -95,9 +106,7 @@ def diagnose() -> List[Dict[str, Any]]:
         "fix": "export TERM=xterm-256color (inside tmux/screen use tmux-256color)",
     })
 
-    locale = (os.environ.get("LC_ALL")
-              or os.environ.get("LC_CTYPE")
-              or os.environ.get("LANG") or "(unset)")
+    locale = _effective_locale(os.environ) or "(unset)"
     results.append({
         "name": "unicode locale",
         "ok": detect_unicode(),
@@ -114,27 +123,43 @@ def diagnose() -> List[Dict[str, Any]]:
         "fix": "enlarge the terminal to at least 80x24 columns/rows",
     })
 
+    emoji_ok = emoji_width_ok()  # once: ok and detail must agree
     results.append({
         "name": "emoji width",
-        "ok": emoji_width_ok(),
-        "detail": ("wcwidth reports emoji width 2"
-                   if emoji_width_ok() else "cannot confirm 2-cell emoji width"),
+        "ok": emoji_ok,
+        "detail": ("emoji measures 2 cells wide"
+                   if emoji_ok else "cannot confirm 2-cell emoji width"),
         "fix": ("pip install wcwidth for accurate detection; use a font "
                 "with emoji glyphs (Nerd Fonts / Noto Color Emoji)"),
     })
     return results
 
 
+def _printable(text: str) -> str:
+    """Neutralise control characters before echoing env values.
+
+    TERM / COLORTERM / LANG are printed back to the terminal; an ESC or
+    other C0/C1 control byte in one of them (a mangled profile, a value
+    pasted from elsewhere) was emitted raw and could reconfigure or garble
+    the very terminal being diagnosed."""
+    return "".join(ch if ch.isprintable() else f"\\x{ord(ch):02x}"
+                   for ch in str(text))
+
+
 def handle_terminal_setup(ui, arg: str) -> None:
     """TUI handler: print the diagnostics report. Diagnose only, changes nothing."""
     _ = arg  # accepted for signature parity; no subcommands yet
     ui.print_info("terminal diagnostics (read-only — nothing was changed):")
-    for r in diagnose():
+    # diagnose ONCE: the summary used to come from a second, independent
+    # run (terminal resized in between → "some checks failed" under an
+    # all-✓ report, or vice versa)
+    results = diagnose()
+    for r in results:
         mark = "\u2713" if r["ok"] else "\u2717"  # ✓ / ✗
-        ui.print_info(f"  {mark} {r['name']}: {r['detail']}")
+        ui.print_info(f"  {mark} {r['name']}: {_printable(r['detail'])}")
         if not r["ok"]:
             ui.print_info(f"    fix: {r['fix']}")
-    if not all(r["ok"] for r in diagnose()):
+    if not all(r["ok"] for r in results):
         ui.print_error("some checks failed — apply the 'fix:' hints above "
                        "and re-run /terminal-setup")
 
@@ -177,6 +202,10 @@ def _selftest() -> None:
     assert detect_unicode({"LC_ALL": "C.utf8"}) is True
     assert detect_unicode({"LANG": "C"}) is False
     assert detect_unicode({}) is False
+    # POSIX precedence: LC_ALL=C overrides a UTF-8 LANG
+    assert detect_unicode({"LC_ALL": "C", "LANG": "en_US.UTF-8"}) is False
+    assert detect_unicode({"LC_ALL": "", "LANG": "en_US.UTF-8"}) is True
+    assert _printable("xterm\x1b[2J") == "xterm\\x1b[2J"
 
     # default env (None) delegates to os.environ and never raises
     assert isinstance(detect_truecolor(), bool)

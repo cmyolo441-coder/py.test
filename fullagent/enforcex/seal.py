@@ -142,13 +142,15 @@ class SealEnvelope:
         def _int(key: str, default: int = 0) -> int:
             try:
                 return int(d.get(key, default))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return default
         def _float(key: str, default: float = 0.0) -> float:
             try:
-                return float(d.get(key, default))
-            except (TypeError, ValueError):
+                f = float(d.get(key, default))
+            except (TypeError, ValueError, OverflowError):
                 return default
+            return f if f == f and f not in (float("inf"), float("-inf")) \
+                else default
         meta = d.get("meta")
         return cls(
             seal_version=_int("seal_version", SEAL_VERSION),
@@ -182,6 +184,25 @@ class SealResult:
 
 
 # ── key material ─────────────────────────────────────────────────────────
+
+def _ct_equal(a: Any, b: Any) -> bool:
+    """Constant-time equality that never raises: hmac.compare_digest
+    raises TypeError on str with non-ASCII chars, which made verify()
+    throw on a crafted envelope despite its never-raises contract."""
+    try:
+        ab = a if isinstance(a, bytes) else str(a).encode("utf-8", "replace")
+        bb = b if isinstance(b, bytes) else str(b).encode("utf-8", "replace")
+        return hmac.compare_digest(ab, bb)
+    except Exception:
+        return False
+
+
+def _mac_hex(subkey: bytes, env: "SealEnvelope") -> Optional[str]:
+    try:
+        return hmac.new(subkey, env.signed_bytes(), hashlib.sha256).hexdigest()
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        return None
+
 
 def derive_key(secret: bytes, key_id: str) -> bytes:
     """HMAC-derive a signing subkey from the master secret."""
@@ -341,19 +362,27 @@ class Sealer:
         # restore rotated keys if present
         kp = self._keys_path()
         if self.persist_keys and os.path.exists(kp):
-            try:
-                with open(kp, "r", encoding="utf-8") as fh:
-                    data = json.load(fh)
-                self._ring.load(data if isinstance(data, dict) else {})
-            except (OSError, json.JSONDecodeError):
-                pass
+            # The keys file holds verification subkeys: anyone who can
+            # write it can plant a key_id/key pair and forge seals that
+            # verify. Refuse a group/world-accessible file like the
+            # secret itself.
+            perm = _check_secret_permissions(kp)
+            if perm:
+                self._note = f"ignored keys file: {perm}"
+            else:
+                try:
+                    with open(kp, "r", encoding="utf-8") as fh:
+                        data = json.load(fh)
+                    self._ring.load(data if isinstance(data, dict) else {})
+                except (OSError, ValueError, UnicodeDecodeError):
+                    pass
         # (re)derive the live key from the secret for today's key_id,
         # unless the ring already knows a current key for this secret.
         kid = self._key_id_for_now()
         if kid not in self._ring.ids():
             self._ring.add(kid, derive_key(secret, kid))
             self._save_keys()
-        if note:
+        if note and not self._note:
             self._note = note
 
     def _key_id_for_now(self) -> str:
@@ -368,7 +397,16 @@ class Sealer:
             parent = os.path.dirname(kp) or "."
             os.makedirs(parent, exist_ok=True)
             tmp = kp + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
+            # create the temp file 0600 up front: the old open()+chmod
+            # left subkeys world-readable (umask perms) until the chmod,
+            # and followed a planted symlink at the tmp path.
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                         | getattr(os, "O_NOFOLLOW", 0), KEY_FILE_PERMISSIONS)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(self._ring.export(), fh, sort_keys=True)
                 fh.flush()
                 os.fsync(fh.fileno())
@@ -423,16 +461,24 @@ class Sealer:
             meta_d = dict(meta) if meta is not None else {}
         except (TypeError, ValueError):
             meta_d = {}
-        digest = payload_digest(payload)
+        raw = canonical_bytes(payload)
+        digest = hashlib.sha256(raw).hexdigest()
         with self._lock:
-            kid = self._ring.current_id or "none"
-            subkey = self._ring.get(kid) or b"\x00" * KEY_BYTES
+            kid = self._ring.current_id
+            subkey = self._ring.get(kid) if kid else None
+            if subkey is None:
+                # never sign with a well-known all-zero key (anyone could
+                # forge it): fall back to a fresh ephemeral key, untrusted
+                kid = "ephemeral-" + secrets.token_hex(4)
+                subkey = secrets.token_bytes(KEY_BYTES)
+                self._ring.add(kid, subkey)
+                self._trusted = False
             env = SealEnvelope(
                 key_id=kid,
                 seq=self._seq,
                 ts=time.time(),
                 payload_sha256=digest,
-                payload_len=len(canonical_bytes(payload)),
+                payload_len=len(raw),
                 prev_seal=self._last_seal,
                 note=str(note or ""),
                 meta=meta_d,
@@ -470,14 +516,16 @@ class Sealer:
             # JSON rejects) cannot be proven intact: fail verification
             # instead of raising out of a "never raises" path.
             return SealResult(False, "payload not canonicalizable")
-        if not hmac.compare_digest(digest, env.payload_sha256):
+        if not _ct_equal(digest, env.payload_sha256):
             return SealResult(False, "payload digest mismatch")
         with self._lock:
             subkey = self._ring.get(env.key_id)
         if subkey is None:
             return SealResult(False, f"unknown key_id {env.key_id!r}")
-        expect = hmac.new(subkey, env.signed_bytes(), hashlib.sha256)
-        if not hmac.compare_digest(expect.hexdigest(), env.hmac):
+        expect = _mac_hex(subkey, env)
+        if expect is None:
+            return SealResult(False, "envelope not canonicalizable")
+        if not _ct_equal(expect, env.hmac):
             return SealResult(False, "hmac mismatch")
         return SealResult(True, "ok", env)
 
@@ -486,19 +534,24 @@ class Sealer:
         env = SealEnvelope.from_dict(envelope)
         if not env.hmac or not env.key_id:
             return SealResult(False, "envelope missing hmac/key_id")
+        if env.alg != ALG:
+            return SealResult(False, f"unsupported alg {env.alg!r}")
+        if env.seal_version != SEAL_VERSION:
+            return SealResult(False, f"unsupported seal_version "
+                                     f"{env.seal_version}")
         if not isinstance(raw, (bytes, bytearray, memoryview)):
             return SealResult(False, "raw payload is not bytes")
-        if hashlib.sha256(raw).hexdigest() != env.payload_sha256:
+        if not _ct_equal(hashlib.sha256(raw).hexdigest(), env.payload_sha256):
             return SealResult(False, "payload digest mismatch")
         with self._lock:
             subkey = self._ring.get(env.key_id)
         if subkey is None:
             return SealResult(False, f"unknown key_id {env.key_id!r}")
-        expect = hmac.new(subkey, env.signed_bytes(), hashlib.sha256)
-        return SealResult(hmac.compare_digest(expect.hexdigest(), env.hmac),
-                          "ok" if hmac.compare_digest(
-                              expect.hexdigest(), env.hmac) else "hmac mismatch",
-                          env)
+        expect = _mac_hex(subkey, env)
+        if expect is None:
+            return SealResult(False, "envelope not canonicalizable")
+        ok = _ct_equal(expect, env.hmac)
+        return SealResult(ok, "ok" if ok else "hmac mismatch", env)
 
     def verify_chain(self, pairs: Sequence[Tuple[Any, Any]]) -> SealResult:
         """Verify a sequence of (payload, envelope) as a chain: each
