@@ -562,7 +562,12 @@ class Policy:
         rules = self._set.active_rules(now)
         for idx, rule in enumerate(rules):
             spec = rule.matches_target(rule_id, category, severity)
-            if spec == 0:
+            # a pure catch-all ("*" with no category/severity) matches
+            # everything at specificity 0; it used to be skipped as a
+            # non-match, so a declared "*" rule never applied.
+            catch_all = (rule.rule_id == "*" and not rule.category
+                         and not rule.severity)
+            if spec == 0 and not catch_all:
                 continue
             if not rule.applies_in_stage(stage):
                 chain.append(f"skip(stage) {rule.rule_id}")

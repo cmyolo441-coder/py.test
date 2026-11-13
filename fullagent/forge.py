@@ -117,7 +117,8 @@ class Forge:
         }
         payload = json.dumps(record, sort_keys=True, ensure_ascii=False,
                              default=str)
-        record["digest"] = hashlib.sha256(payload.encode()).hexdigest()[:16]
+        record["digest"] = hashlib.sha256(
+            payload.encode("utf-8", "surrogatepass")).hexdigest()[:16]
         return record
 
     def probe(self) -> dict:

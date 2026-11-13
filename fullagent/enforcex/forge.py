@@ -272,7 +272,7 @@ def _to_priority(v: Any) -> float:
         return 0.25
     if f != f or f in (float("inf"), float("-inf")):
         return 0.25
-    return max(0.0, min(1.0, f)) if f else 0.25
+    return max(0.0, min(1.0, f))
 
 
 def _coerce_policy(policy: Any, notes: List[str]) -> Dict[str, Any]:
@@ -288,7 +288,7 @@ def _coerce_policy(policy: Any, notes: List[str]) -> Dict[str, Any]:
                     out[key] = max(0, int(policy[key]))
                 elif isinstance(_POLICY_DEFAULTS[key], float):
                     out[key] = float(policy[key])
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 notes.append(f"policy.{key} invalid; kept default")
     return out
 
@@ -480,7 +480,14 @@ def validate_pack(pack: Any, strict: bool = False) -> PackValidation:
         ids.add(rid)
         if not str(r.get("text", "")).strip():
             warnings.append(f"rule {rid}: empty text")
-        for src in (r.get("patterns") or ()):
+        pats = r.get("patterns") or ()
+        if not isinstance(pats, (list, tuple)):
+            errors.append(f"rule {rid}: patterns is not a list")
+            pats = ()
+        kws = r.get("keywords") or ()
+        if not isinstance(kws, (list, tuple)):
+            errors.append(f"rule {rid}: keywords is not a list")
+        for src in pats:
             try:
                 re.compile(str(src))
                 patterns_count += 1
