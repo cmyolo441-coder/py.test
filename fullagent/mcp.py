@@ -123,6 +123,15 @@ class _MCPClient:
         # Bytes read past the first newline, stashed per-connection
         # (was a class attribute shared across clients).
         self._rest: bytes = b""
+        # One request at a time per connection: a tool call abandoned by
+        # the agent's per-tool timeout keeps reading in its worker thread,
+        # and a second call on the same pipe interleaved reads/writes and
+        # corrupted _rest (lost or mis-routed responses).
+        self._io_lock = threading.Lock()
+
+    def is_alive(self) -> bool:
+        proc = self._proc
+        return bool(self.alive and proc is not None and proc.poll() is None)
 
     # -- lifecycle ------------------------------------------------------
     def connect(self, timeout: Optional[float] = None) -> None:
@@ -136,7 +145,11 @@ class _MCPClient:
             proc = subprocess.Popen(
                 [self.cfg["command"]] + [str(a) for a in self.cfg["args"]],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, env=env)
+                stderr=subprocess.DEVNULL, env=env,
+                # own group: `npx`/`uvx` launchers fork the real server;
+                # terminating only the launcher orphaned it
+                **({"start_new_session": True} if os.name == "posix"
+                   else {}))
         except (OSError, ValueError) as e:
             raise MCPError(f"cannot spawn MCP server '{self.name}': {e}")
         self._proc = proc
@@ -159,13 +172,24 @@ class _MCPClient:
     def close(self) -> None:
         proc, self._proc = self._proc, None
         self.alive = False
+        self._rest = b""
         if proc is not None:
+            import signal as _signal
+            from .cancelguard import kill_process_group
             try:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=2.0)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+                if proc.stdin is not None:
+                    proc.stdin.close()  # polite: most servers exit on EOF
+            except Exception:
+                pass
+            try:
+                kill_process_group(proc, _signal.SIGTERM, wait=2.0)
+                if proc.poll() is None:
+                    kill_process_group(proc, wait=2.0)  # SIGKILL + reap
+            except Exception:
+                pass
+            try:
+                if proc.stdout is not None:
+                    proc.stdout.close()
             except Exception:
                 pass
 
@@ -227,6 +251,24 @@ class _MCPClient:
     def _request(self, method: str, params: Dict[str, Any],
                  timeout: Optional[float] = None) -> Any:
         timeout = self.timeout if timeout is None else timeout
+        if not self._io_lock.acquire(timeout=timeout):
+            raise MCPError(
+                f"MCP server '{self.name}' busy (timed out on '{method}')")
+        try:
+            return self._request_locked(method, params, timeout)
+        except MCPError as e:
+            # A timed-out / dead connection is unusable (a late reply would
+            # stay in the pipe); drop it so the next call reconnects
+            # instead of failing forever with alive=True on a dead process.
+            if "timed out" in str(e) or "exited" in str(e) \
+                    or "failed" in str(e):
+                self.alive = False
+            raise
+        finally:
+            self._io_lock.release()
+
+    def _request_locked(self, method: str, params: Dict[str, Any],
+                        timeout: float) -> Any:
         if self._proc is None or self._proc.poll() is not None:
             raise MCPError(f"MCP server '{self.name}' process exited")
         self._next_id += 1
@@ -280,6 +322,23 @@ class _MCPClient:
 # manager (attached to the agent as agent.mcp)
 # ---------------------------------------------------------------------------
 
+import weakref as _weakref
+import atexit as _atexit
+
+_MANAGERS: "_weakref.WeakSet[MCPManager]" = _weakref.WeakSet()
+
+
+def _shutdown_all() -> None:
+    """atexit: never leave MCP server processes behind the agent."""
+    for mgr in list(_MANAGERS):
+        try:
+            mgr.shutdown()
+        except Exception:
+            pass
+
+
+_atexit.register(_shutdown_all)
+
 class MCPManager:
     """Owns configs + cached stdio clients for all MCP servers."""
 
@@ -291,6 +350,11 @@ class MCPManager:
         self._discovered: Dict[str, List[Dict[str, Any]]] = {}
         self._errors: Dict[str, str] = {}
         self._lock = threading.Lock()
+        # per-server connect locks: a slow server's handshake (up to its
+        # timeout) no longer blocks status()/is_connected() for every
+        # other server, nor the TUI.
+        self._connect_locks: Dict[str, threading.Lock] = {}
+        _MANAGERS.add(self)
 
     def server_names(self) -> List[str]:
         return sorted(self.servers)
@@ -303,16 +367,27 @@ class MCPManager:
             if cfg is None:
                 raise MCPError(f"unknown MCP server '{name}'")
             client = self._clients.get(name)
-            if client is not None and client.alive:
+            if client is not None and client.is_alive():
                 return client
+            clock = self._connect_locks.setdefault(name, threading.Lock())
+        with clock:
+            with self._lock:
+                client = self._clients.get(name)
+                if client is not None and client.is_alive():
+                    return client
+                stale = self._clients.pop(name, None)
+            if stale is not None:
+                stale.close()  # reap the dead/hung process (no zombies)
             client = _MCPClient(name, cfg)
             try:
                 client.connect(timeout=timeout)
             except Exception as e:
-                self._errors[name] = str(e)[:200]
+                with self._lock:
+                    self._errors[name] = str(e)[:200]
                 raise MCPError(str(e))
-            self._errors.pop(name, None)
-            self._clients[name] = client
+            with self._lock:
+                self._errors.pop(name, None)
+                self._clients[name] = client
             return client
 
     def discover(self, name: str) -> List[Dict[str, Any]]:
@@ -334,7 +409,7 @@ class MCPManager:
     def is_connected(self, name: str) -> bool:
         with self._lock:
             client = self._clients.get(name)
-            return bool(client is not None and client.alive)
+            return bool(client is not None and client.is_alive())
 
     def status(self, name: str) -> str:
         if self.is_connected(name):

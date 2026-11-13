@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 import zlib
 from pathlib import Path
 
@@ -56,6 +57,10 @@ class SnapshotStore:
         self.root = Path(root)
         self.objects = self.root / "objects"
         self.objects.mkdir(parents=True, exist_ok=True)
+        # PERF: path -> (st_mtime_ns, st_size, st_ino, blob hash). take()
+        # runs before every mutating tool (run_command snapshots up to
+        # 200 cwd files); an unchanged file is not re-read and re-hashed.
+        self._stat_cache: dict[str, tuple[int, int, int, str]] = {}
 
     # -- blobs ---------------------------------------------------------------
 
@@ -116,7 +121,7 @@ class SnapshotStore:
             key = str(p)
             if p.is_file():
                 try:
-                    manifest[key] = self.put_blob(p.read_bytes())
+                    manifest[key] = self._put_file(p, key)
                 except OSError:
                     manifest[key] = None
             else:
@@ -125,6 +130,29 @@ class SnapshotStore:
                                 ensure_ascii=False).encode("utf-8")
         tree_hash = self.put_blob(tree_bytes)
         return {"tree": tree_hash, "paths": manifest}
+
+    def _put_file(self, p: Path, key: str) -> str:
+        """put_blob(p.read_bytes()), skipping the read + hash when the
+        file's (mtime, size, inode) match the last snapshot and its blob
+        is still in the store."""
+        st = p.stat()
+        sig = (st.st_mtime_ns, st.st_size, st.st_ino)
+        hit = self._stat_cache.get(key)
+        # "racy" guard (as in git): a file modified within the last 2s
+        # could be rewritten again inside the same coarse mtime tick with
+        # the same size, so it is always re-read.
+        settled = time.time_ns() - st.st_mtime_ns > 2_000_000_000
+        if hit is not None and settled and hit[:3] == sig:
+            try:
+                if self._obj_path(hit[3]).exists():
+                    return hit[3]
+            except ValueError:
+                pass
+        h = self.put_blob(p.read_bytes())
+        if len(self._stat_cache) >= 4096:
+            self._stat_cache.clear()  # bounded; refills on demand
+        self._stat_cache[key] = sig + (h,)
+        return h
 
     def load_tree(self, tree_hash: str) -> dict[str, str | None] | None:
         """Load a tree manifest by its hash. None if it does not resolve."""

@@ -43,6 +43,24 @@ def _validate_db(db_path: str) -> tuple[Path, str | None]:
     return p, None
 
 
+# Wall-clock budget for one tool call's SQL work. A runaway query (an
+# accidental cartesian join, a recursive CTE without a LIMIT) used to run
+# forever with no way out: the tool — and the whole turn — hung.
+QUERY_TIME_LIMIT = 30.0
+# One cell's rendered text is capped so a 50 MB BLOB/TEXT value cannot
+# flood the model's context (or memory, via str(bytes)).
+_CELL_MAX = 2000
+
+
+def _arm_deadline(conn: sqlite3.Connection,
+                  seconds: float | None = None) -> None:
+    import time as _time
+    deadline = _time.monotonic() + (QUERY_TIME_LIMIT if seconds is None
+                                    else seconds)
+    conn.set_progress_handler(
+        lambda: 1 if _time.monotonic() > deadline else 0, 10_000)
+
+
 def _connect_readonly(p: Path) -> sqlite3.Connection:
     """Open the database read-only via URI mode=ro.
 
@@ -51,13 +69,28 @@ def _connect_readonly(p: Path) -> sqlite3.Connection:
     tools can never accidentally modify data.
     """
     uri = "file:" + quote(p.as_posix(), safe="/") + "?mode=ro"
-    return sqlite3.connect(uri, uri=True, timeout=5.0)
+    conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+    _arm_deadline(conn)
+    return conn
+
+
+def _cell(v) -> str:
+    if v is None:
+        return "NULL"
+    if isinstance(v, (bytes, bytearray, memoryview)):
+        b = bytes(v[:_CELL_MAX // 2]) if not isinstance(v, memoryview) \
+            else v[:_CELL_MAX // 2].tobytes()
+        more = len(v) - len(b)
+        return repr(b) + (f"… (+{more} bytes)" if more > 0 else "")
+    t = str(v)
+    if len(t) > _CELL_MAX:
+        t = t[:_CELL_MAX] + f"… (+{len(t) - _CELL_MAX} chars)"
+    return t
 
 
 def _format_table(columns: list[str], rows: list[tuple]) -> str:
     """Render rows as a plain-text table with column headers."""
-    strs = [[str(v) if v is not None else "NULL" for v in r]
-            for r in rows]
+    strs = [[_cell(v) for v in r] for r in rows]
     widths = [len(c) for c in columns]
     for row in strs:
         for i, cell in enumerate(row):
@@ -211,21 +244,27 @@ def db_query(db_path: str, sql: str, confirm: bool = False) -> str:
             conn = _connect_readonly(p)
         else:
             conn = sqlite3.connect(os.fspath(p), timeout=10.0)
+            _arm_deadline(conn)
     except sqlite3.Error as e:
         return f"ERROR: could not open database {p}: {e}"
     try:
         try:
             cur = conn.execute(text)
+            if cur.description is not None:
+                columns = [d[0] for d in cur.description]
+                rows = cur.fetchmany(100)
+                extra = cur.fetchone()
         except sqlite3.Error as e:
+            if "interrupt" in str(e).lower():
+                return (f"ERROR: SQL aborted after {QUERY_TIME_LIMIT:g}s "
+                        "time limit — add a LIMIT / narrower WHERE")
             return f"ERROR: SQL failed: {e}"
         if cur.description is not None:
-            columns = [d[0] for d in cur.description]
-            rows = cur.fetchmany(100)
             out = f"Database: {p}\n\n{_format_table(columns, rows)}"
-            extra = cur.fetchone()
             if extra is not None:
                 out += "\n\n… 100 rows shown (limit reached)"
-            return out
+            from .tools import _clip
+            return _clip(out)
         affected = cur.rowcount
         if not read_only:
             conn.commit()

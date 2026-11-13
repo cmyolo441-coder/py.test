@@ -94,8 +94,19 @@ def _best_guess_context(text: str, old_string: str) -> str:
     first = norm_old.split("\n")[0] if norm_old else ""
     best_i, best_r = 0, -1.0
     if first:
+        # seq1 (the needle line) is fixed and SequenceMatcher caches its
+        # index on seq2 — so put the needle in seq2 once and vary seq1.
+        # Building a fresh matcher per file line re-indexed every line and
+        # made each failed edit on a big file cost seconds. ratio() is
+        # symmetric enough for "best guess"; quick_ratio() prunes lines
+        # that cannot beat the current best.
+        sm = difflib.SequenceMatcher(None)
+        sm.set_seq2(first)
         for i, ln in enumerate(lines):
-            r = difflib.SequenceMatcher(None, first, _normalize_ws(ln)).ratio()
+            sm.set_seq1(_normalize_ws(ln))
+            if sm.real_quick_ratio() <= best_r or sm.quick_ratio() <= best_r:
+                continue
+            r = sm.ratio()
             if r > best_r:
                 best_r, best_i = r, i
     else:
@@ -168,11 +179,23 @@ def find_edit_span(text: str, old_string: str,
         e = end_line if end_line is not None else s
         if 1 <= s <= e <= n and n > 0:
             region = "".join(lines[s - 1:e])
+            ostart = sum(len(ln) for ln in lines[:s - 1])
+            # The anchor DISAMBIGUATES an ambiguous exact match: when
+            # old_string occurs exactly once inside the anchored lines,
+            # replace exactly that occurrence. Replacing the whole line
+            # span instead dropped everything else on those lines — the
+            # indentation of "    x = 1" anchored as "x = 1", trailing
+            # comments, neighbouring statements.
+            if count > 1 and region.count(old_string) == 1:
+                k = ostart + region.index(old_string)
+                return {"ok": True, "strategy": "exact", "start": k,
+                        "end": k + len(old_string),
+                        "tried": tried + [f"exact (disambiguated by line "
+                                          f"anchor {s}-{e})"]}
             sim = difflib.SequenceMatcher(
                 None, _normalize_ws(old_string),
                 _normalize_ws(region)).ratio()
             if sim >= _LINE_ANCHOR_MIN_SIMILARITY:
-                ostart = sum(len(ln) for ln in lines[:s - 1])
                 return {"ok": True, "strategy": "line-anchored",
                         "start": ostart, "end": ostart + len(region),
                         "tried": tried + [f"line-anchored (similarity "
@@ -244,7 +267,7 @@ def _atomic_write(p: Path, text: str) -> None:
     fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=".editfb-",
                                suffix=".tmp")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
             fh.write(text)
         if mode is not None:
             os.chmod(tmp, mode)
@@ -273,7 +296,8 @@ def apply_edit_with_fallbacks(path: str, old_string: str, new_string: str,
                 "context": f"path does not exist: {p}",
                 "hint": "check the file path and retry"}
     try:
-        text = p.read_text(encoding="utf-8")
+        from .tools import _read_text_exact
+        text = _read_text_exact(p)  # no CRLF -> LF translation
     except UnicodeDecodeError:
         return {"ok": False, "tried": ["read file"],
                 "context": f"{p} is not valid UTF-8 text",
@@ -284,6 +308,8 @@ def apply_edit_with_fallbacks(path: str, old_string: str, new_string: str,
                 "context": f"cannot read {p}: {exc}",
                 "hint": "check permissions and retry"}
 
+    from .tools import _match_eol
+    old_string, new_string = _match_eol(text, old_string, new_string)
     ok, new_text, res = apply_edit_to_text(text, old_string, new_string,
                                            start_line, end_line)
     if not ok:

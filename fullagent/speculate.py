@@ -32,6 +32,12 @@ SPECULATIVE_TOOLS = ("read_file", "list_dir", "file_info",
 
 MAX_PREFETCH = 4          # predictions executed per speculation round
 CACHE_TTL_TURNS = 6       # a prefetched result expires after this many turns
+# Hard cap on prefetch threads alive at once, across ALL rounds. Without
+# it a slow prefetch (search_files over a huge tree) from turn N was still
+# running when turn N+1, N+2 ... launched more, so GIL-heavy background
+# walks piled up and the agent got slower every turn.
+MAX_INFLIGHT = MAX_PREFETCH
+MAX_CACHE_ENTRIES = 64    # bound the cache independent of turn count
 # a path: starts with ./~ OR contains a slash OR ends with a file extension
 _PATH_RE = re.compile(
     r"(?:^|[\s'\"`(])"
@@ -129,6 +135,24 @@ class CacheEntry:
     args: dict
     result: str
     born_turn: int
+    fingerprint: tuple | None = None
+
+
+def _path_fingerprint(tool: str, args: dict) -> tuple | None:
+    """(mtime_ns, size, ino) of the path a path-based read looks at, or
+    None when the tool has no single path (search/glob). Used to refuse a
+    cache hit when the file/dir changed after it was prefetched."""
+    if tool not in ("read_file", "file_info", "list_dir"):
+        return None
+    path = args.get("path")
+    if not isinstance(path, str) or not path:
+        return None
+    import os
+    try:
+        st = os.stat(os.path.expanduser(path))
+    except OSError:
+        return ("missing",)
+    return (st.st_mtime_ns, st.st_size, st.st_ino)
 
 
 class Speculator:
@@ -152,6 +176,10 @@ class Speculator:
         # are reserved here between selection and completion so each
         # prediction is prefetched at most once per round.
         self._inflight: set[str] = set()
+        # Bumped whenever a non-read-only tool is about to run (see
+        # serve()): prefetches launched before a write must not land in
+        # the cache afterwards and be served as current content.
+        self._generation = 0
 
     # -- speculation round ---------------------------------------------------
 
@@ -182,8 +210,12 @@ class Speculator:
                      if p.tool in SPECULATIVE_TOOLS
                      and p.key() not in self._cache
                      and p.key() not in self._inflight]
+            # never let prefetch threads accumulate across turns
+            room = max(0, MAX_INFLIGHT - len(self._inflight))
+            fresh = fresh[:room] if self.runner is not None else fresh
             for p in fresh:
                 self._inflight.add(p.key())
+            generation = self._generation
         if not fresh or self.runner is None:
             with self._lock:
                 for p in fresh:
@@ -191,25 +223,35 @@ class Speculator:
             return 0
         for p in fresh:
             t = threading.Thread(target=self._prefetch_one,
-                                 args=(p, turn),
+                                 args=(p, turn, generation),
                                  daemon=True,
                                  name=f"speculate:{p.tool}")
             t.start()
         return len(fresh)
 
-    def _prefetch_one(self, p: Prediction, turn: int) -> None:
+    def _prefetch_one(self, p: Prediction, turn: int,
+                      generation: int | None = None) -> None:
         """Run one prefetch on a daemon thread; cache + audit on success.
         Never raises — speculation must never surface errors."""
         try:
+            # fingerprint BEFORE reading: a write racing the read then
+            # changes the stat and the entry is refused at serve time.
+            fp = _path_fingerprint(p.tool, p.args)
             try:
                 result = self.runner(p.tool, dict(p.args))
             except Exception as e:  # noqa: BLE001
                 result = f"ERROR: {type(e).__name__}: {e}"
+            if not isinstance(result, str):
+                result = "" if result is None else str(result)
             with self._lock:
                 self._inflight.discard(p.key())
-                if not result.startswith("ERROR:"):
+                stale = (generation is not None
+                         and generation != self._generation)
+                if not result.startswith("ERROR:") and not stale:
                     self._cache[p.key()] = CacheEntry(
-                        p.tool, p.args, result, turn)
+                        p.tool, p.args, result, turn, fp)
+                    while len(self._cache) > MAX_CACHE_ENTRIES:
+                        self._cache.pop(next(iter(self._cache)))
                     cached = True
                 else:
                     cached = False
@@ -232,6 +274,15 @@ class Speculator:
         """If this exact call was prefetched and is fresh, return the cached
         result (a hit). Otherwise None — the caller runs it for real."""
         if tool not in SPECULATIVE_TOOLS:
+            # A non-read-only tool is about to run (the agent asks serve()
+            # before executing every call). Anything prefetched so far may
+            # describe the pre-write world: drop it, and make in-flight
+            # prefetches discard their results. Previously a prefetched
+            # read_file was served for up to CACHE_TTL_TURNS turns even
+            # after write_file/edit_file changed the file — stale reads.
+            with self._lock:
+                self._generation += 1
+                self._cache.clear()
             return None
         try:
             key = f"{tool}:{sorted(args.items())}"
@@ -244,18 +295,26 @@ class Speculator:
         # and the audit log would record spec.miss before spec.hit for
         # what was actually a single legitimate cache hit.
         with self._lock:
-            entry = self._cache.get(key)
+            entry = self._cache.pop(key, None)
+            if entry is not None and entry.fingerprint is not None \
+                    and _path_fingerprint(tool, args) != entry.fingerprint:
+                entry = None  # file/dir changed since the prefetch
             if entry is None:
                 self.misses += 1
                 self.log.append("spec.miss", {"tool": tool, "args": args},
                                 actor="speculator")
                 return None
-            del self._cache[key]
             self.hits += 1
             self.log.append("spec.hit", {"tool": tool, "args": args,
                                          "chars": len(entry.result)},
                             actor="speculator")
         return entry.result
+
+    def invalidate(self) -> None:
+        """Drop every cached prefetch (call after any mutation)."""
+        with self._lock:
+            self._generation += 1
+            self._cache.clear()
 
     # -- housekeeping ------------------------------------------------------------
 

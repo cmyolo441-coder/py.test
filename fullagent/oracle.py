@@ -155,8 +155,10 @@ class Oracle:
             lines.append(f"- [{f.get('kind', 'project')}] {f.get('fact', '')}")
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text("\n".join(lines) + "\n")
-        except OSError:
+            # UTF-8 explicitly: facts are free text; the Windows locale
+            # codec raised UnicodeEncodeError (uncaught) on e.g. "→"
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except (OSError, UnicodeError):
             return None
         return path
 
@@ -173,7 +175,10 @@ class Oracle:
         p = self.constitution_path()
         if p and p.exists():
             try:
-                return p.read_text()
+                # explicit UTF-8: the platform default (cp1252 on Windows)
+                # raised UnicodeDecodeError — uncaught — on any non-ASCII
+                # constitution, killing every turn's context build
+                return p.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 return ""
         return ""
@@ -230,7 +235,7 @@ if __name__ == "__main__":
         oracle.learn_fact("FLAKE: test_x is intermittent", "flake")
         path = oracle.write_facts_md()
         assert path and path.exists()
-        content = path.read_text()
+        content = path.read_text(encoding="utf-8")
         assert "tests live in tests/" in content
         assert "[flake]" in content
 

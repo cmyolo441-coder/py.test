@@ -94,15 +94,26 @@ def save(agent: Any, session_id: Optional[str] = None,
         dest = Path(path) if path else store_dir() / f"{sid}.json"
         _ensure_dir(dest.parent)
         # atomic write: never leave a torn/truncated session file
-        with tempfile.NamedTemporaryFile(
-            "w", dir=str(dest.parent), suffix=".tmp", delete=False,
-            encoding="utf-8",
-        ) as fh:
-            json.dump(payload, fh, indent=1)
-            fh.flush()
-            os.fsync(fh.fileno())
-            tmp = fh.name
-        os.replace(tmp, dest)
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w", dir=str(dest.parent), suffix=".tmp", delete=False,
+                encoding="utf-8",
+            ) as fh:
+                tmp = fh.name
+                json.dump(payload, fh, indent=1)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, dest)
+            tmp = None
+        finally:
+            if tmp is not None:
+                # a non-serializable message used to strand one .tmp file
+                # in the session dir per failed save, forever
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
         return dest
     except (OSError, ValueError, TypeError, RuntimeError):
         return None

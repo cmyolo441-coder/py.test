@@ -57,7 +57,7 @@ class Hippocampus:
         # -> text. context_block() runs every turn for prompt injection;
         # rebuilding the strings from the fold each time is pure waste
         # when the log has not advanced.
-        self._ctx_cache: tuple[str, int, int, str] | None = None
+        self._ctx_cache: tuple | None = None
 
     # -- writes ------------------------------------------------------------
 
@@ -200,17 +200,35 @@ class Hippocampus:
         The rendering is cached per (branch, log head): the block is
         rebuilt only when the log actually advanced.
         """
-        branch = self.log.branch
-        head = self.log.head()
+        # PERF: keyed on the memory CONTENT, not the log head. The head
+        # moves on every event (tool results, dispatches, cost records),
+        # so the old head key re-rendered — re-walking every episode,
+        # fact and dead end — on every model call. The block only depends
+        # on the fold's episode/fact/dead-end lists, which grow at the end
+        # of one cached State object; identity of the State plus each
+        # list's length and newest record pins the content exactly.
+        st = fold(self.log)
+        lists = (st.episodes, st.facts, st.dead_ends)
+        key = (self.log.branch, max_episodes,
+               tuple(len(lst) for lst in lists))
+        # the newest records themselves are held (compared by identity),
+        # so a recycled id() can never fake a cache hit
+        tails = tuple(lst[-1] if lst else None for lst in lists)
         cached = self._ctx_cache
-        if cached is not None and cached[:3] == (branch, head, max_episodes):
+        if cached is not None and cached[0] == key and cached[1] is st \
+                and all(a is b for a, b in zip(cached[2], tails)):
             return cached[3]
-        text = self._render_context_block(max_episodes)
-        self._ctx_cache = (branch, head, max_episodes, text)
+        text = self._render_context_block(max_episodes, st)
+        self._ctx_cache = (key, st, tails, text)
         return text
 
-    def _render_context_block(self, max_episodes: int = 3) -> str:
-        st = fold(self.log)
+    # newest unique dead ends rendered into the prompt block
+    _MAX_DEAD_ENDS = 12
+
+    def _render_context_block(self, max_episodes: int = 3,
+                              st: State | None = None) -> str:
+        if st is None:
+            st = fold(self.log)
         lines: list[str] = ["MEMORY"]
 
         episodes = st.episodes[-max_episodes:] if max_episodes > 0 else []
@@ -236,9 +254,18 @@ class Hippocampus:
             lines.append("DEAD ENDS (do not retry):")
             seen_sigs: set[str] = set()
             for d in reversed(st.dead_ends):
+                if not isinstance(d, dict):
+                    continue
                 sig = str(d.get("signature", ""))
                 if sig in seen_sigs:
                     continue
+                if len(seen_sigs) >= self._MAX_DEAD_ENDS:
+                    # PROMPT GROWTH FIX: every distinct failure became a
+                    # permanent line of the system prompt, so the prompt
+                    # (and every request) grew for the whole session.
+                    # Only the newest unique dead ends are injected;
+                    # is_dead_end() still checks the full ledger.
+                    break
                 seen_sigs.add(sig)
                 lines.append(
                     f"- {sig} — {_clip(d.get('reason', ''))} "

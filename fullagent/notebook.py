@@ -25,7 +25,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .tools import Tool, RISK_CONFIRM, RISK_SAFE
+from .tools import Tool, RISK_CONFIRM, RISK_SAFE, _atomic_write_text, _checked, _clip
 
 CELL_TYPES = {"code", "markdown", "raw"}
 
@@ -36,7 +36,11 @@ CELL_TYPES = {"code", "markdown", "raw"}
 
 def _load(path: str) -> dict:
     """Load and validate a notebook. Returns the raw JSON dict."""
-    p = Path(path)
+    # Same path policy as every other file tool (no "..", no NUL): the
+    # notebook tools used to take the raw model-supplied path.
+    p, err = _checked(path)
+    if err:
+        raise ValueError(err[len("ERROR: "):])
     if not p.is_file():
         raise FileNotFoundError(f"Notebook not found: {path}")
     if p.suffix.lower() != ".ipynb":
@@ -60,11 +64,14 @@ def _save(path: str, nb: dict) -> None:
     for cell in nb["cells"]:
         if isinstance(cell.get("source"), str):
             cell["source"] = cell["source"].splitlines(keepends=True)
-    p = Path(path)
-    tmp = p.with_suffix(".ipynb.tmp")
-    tmp.write_text(json.dumps(nb, indent=1, ensure_ascii=False) + "\n",
-                   encoding="utf-8")
-    tmp.replace(p)
+    p, err = _checked(path)
+    if err:
+        raise ValueError(err[len("ERROR: "):])
+    # Shared atomic writer: a unique temp name per writer (the fixed
+    # "<name>.ipynb.tmp" let two concurrent saves clobber each other) and
+    # the notebook's permission bits preserved.
+    _atomic_write_text(p, json.dumps(nb, indent=1, ensure_ascii=False)
+                       + "\n")
 
 
 def _source_text(cell: dict) -> str:
@@ -83,7 +90,9 @@ def _source_lines(source: str | list[str]) -> list[str]:
     raise TypeError("source must be str or list[str]")
 
 
-def _check_index(nb: dict, index: int, allow_end: bool = False) -> None:
+def _check_index(nb: dict, index: int, allow_end: bool = False) -> int:
+    if isinstance(index, str) and index.strip().lstrip("-").isdigit():
+        index = int(index.strip())  # models often send "2"
     if not isinstance(index, int) or isinstance(index, bool):
         raise TypeError(f"cell index must be int, got {type(index).__name__}")
     n = len(nb["cells"])
@@ -91,6 +100,7 @@ def _check_index(nb: dict, index: int, allow_end: bool = False) -> None:
     if index < 0 or index > hi:
         raise IndexError(f"cell index {index} out of range (0..{hi}, "
                          f"{n} cells)")
+    return index
 
 
 def _new_cell(cell_type: str, source: str | list[str]) -> dict:
@@ -119,13 +129,13 @@ def read_notebook(path: str) -> str:
     for i, cell in enumerate(nb["cells"]):
         ctype = cell.get("cell_type", "code")
         parts.append(f"Cell {i} [{ctype}]:\n{_source_text(cell)}")
-    return "\n---\n".join(parts)
+    return _clip("\n---\n".join(parts))
 
 
 def edit_cell(path: str, index: int, new_source: str | list[str]) -> str:
     """Replace the source of cell ``index``. Metadata preserved."""
     nb = _load(path)
-    _check_index(nb, index)
+    index = _check_index(nb, index)
     cell = nb["cells"][index]
     cell["source"] = _source_lines(new_source)
     if cell.get("cell_type") == "code":
@@ -139,7 +149,7 @@ def insert_cell(path: str, index: int, cell_type: str,
                 source: str | list[str]) -> str:
     """Insert a new cell before ``index`` (``index`` may equal len(cells))."""
     nb = _load(path)
-    _check_index(nb, index, allow_end=True)
+    index = _check_index(nb, index, allow_end=True)
     nb["cells"].insert(index, _new_cell(cell_type, source))
     _save(path, nb)
     return f"Inserted {cell_type} cell at index {index}"
@@ -148,7 +158,7 @@ def insert_cell(path: str, index: int, cell_type: str,
 def delete_cell(path: str, index: int) -> str:
     """Delete cell ``index``."""
     nb = _load(path)
-    _check_index(nb, index)
+    index = _check_index(nb, index)
     nb["cells"].pop(index)
     _save(path, nb)
     return f"Deleted cell {index}"
@@ -227,7 +237,8 @@ def register(agent) -> None:
 def _safe(fn) -> str:
     try:
         return fn()
-    except (OSError, ValueError, IndexError, TypeError) as e:
+    except (OSError, ValueError, IndexError, TypeError, KeyError,
+            AttributeError, RecursionError) as e:
         return f"ERROR: {e}"
 
 

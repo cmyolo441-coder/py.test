@@ -313,7 +313,10 @@ class Config:
     def load(cls) -> "Config":
         cfg = cls()
         try:
-            data = json.loads(CONFIG_FILE.read_text())
+            # explicit UTF-8: save() writes UTF-8, but read_text() used the
+            # platform locale (cp1252 on Windows) — any non-ASCII value
+            # made the load raise and silently reset the WHOLE config
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 data = {}
             for k in ("model_id", "effort", "auto_approve", "show_reasoning",
@@ -332,7 +335,10 @@ class Config:
                         setattr(cfg, k, max(0, int(data[k])))
                     except (TypeError, ValueError):
                         pass
-                else:
+                elif isinstance(data[k], str):
+                    # model_id/effort/theme/prompt are names — a drifted
+                    # non-string (null, number, list) must not replace
+                    # the default and crash the UI/lookups later
                     setattr(cfg, k, data[k])
             cfg.extra = {k: v for k, v in data.items()
                          if k not in ("model_id", "effort", "auto_approve",
@@ -372,12 +378,22 @@ class Config:
             import threading as _th
             tmp = CONFIG_FILE.with_name(
                 f".{os.getpid()}.{_th.get_ident()}.json.tmp")
-            with open(tmp, "w", encoding="utf-8") as fh:
-                fh.write(json.dumps(data, indent=2))
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, CONFIG_FILE)
-        except OSError:
+            # serialize BEFORE touching disk: a non-JSON value in extra
+            # used to raise TypeError straight out of save()
+            payload = json.dumps(data, indent=2, default=str)
+            try:
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    fh.write(payload)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp, CONFIG_FILE)
+            except OSError:
+                try:
+                    os.unlink(tmp)  # never leave a stray tmp file behind
+                except OSError:
+                    pass
+                raise
+        except (OSError, TypeError, ValueError):
             pass  # config persistence is a convenience, never a crash path
 
 

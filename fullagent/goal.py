@@ -162,6 +162,54 @@ class GoalContract:
     def __init__(self, log: EventLog, judge=None) -> None:
         self.log = log
         self.judge = judge  # fullagent.judge.Judge — required for proofs
+        # incremental contract scan: (branch, log cursor, last goal.set
+        # seq, goal-relevant events since it, latest goal.closed state)
+        self._scan_cache: tuple | None = None
+
+    _RELEVANT = frozenset({"clause.proven", "clause.regressed",
+                           "clause.waived", "goal.focus"})
+
+    def _contract_scan(self) -> tuple[int, tuple[Event, ...], str | None]:
+        """(last goal.set seq, goal-relevant events after it, latest
+        goal.closed state after it) for the current branch.
+
+        PERF: status() runs several times per tool iteration (goal tick,
+        measure, reaim, gravity, cost attribution) and each call used to
+        walk the entire retained log — 2-4 full walks of up to thousands
+        of events, per call, so a goal-mode session slowed down turn
+        after turn. The scan is now extended incrementally from the
+        previous cursor (O(new events)); a rewind/checkout, or more than
+        a window of appends between calls, rebuilds it from scratch."""
+        log = self.log
+        with log._lock:
+            br = log.branch
+            sc = self._scan_cache
+            delta = None
+            if sc is not None and sc[0] == br:
+                delta = log.delta_since(sc[1], br)
+            if delta is None:
+                last_set, relevant, closed = -1, [], None
+                evs = log.events(br)
+            else:
+                _, _, last_set, relevant, closed = sc
+                evs = delta
+            rel = self._RELEVANT
+            for ev in evs:
+                t = ev.type
+                if t == "goal.set":
+                    last_set = ev.seq
+                    relevant = []
+                    closed = None
+                elif t in rel:
+                    relevant.append(ev)
+                elif t == "goal.closed":
+                    d = ev.data if isinstance(ev.data, dict) else {}
+                    closed = d.get("state")
+            self._scan_cache = (br, log.cursor(br), last_set, relevant,
+                                closed)
+            # a snapshot: the cached list keeps growing under later calls
+            # (the TUI polls status() from a background thread)
+            return last_set, tuple(relevant), closed
 
     # -- contract construction (§37) -----------------------------------------
 
@@ -351,11 +399,7 @@ class GoalContract:
         after every write event — without this, a persistent violation
         seals a duplicate regressed event per write (pure log spam; the
         fold only ever reads the latest one)."""
-        evs = self.log.events()
-        last_set = -1
-        for ev in evs:
-            if ev.type == "goal.set":
-                last_set = ev.seq
+        last_set, evs, _ = self._contract_scan()
         for ev in reversed(evs):
             if ev.seq <= last_set:
                 break
@@ -430,19 +474,30 @@ class GoalContract:
         st = self.status()
         if not st.active:
             return {"distance": 1.0, "velocity": 0.0}
-        last_set_seq = -1
-        for ev in self.log.events():
-            if ev.type == "goal.set":
-                last_set_seq = ev.seq
-        measures = [m for m in fold(self.log).distance_measures
-                    if (m.get("seq", 0) if isinstance(m, dict) else 0)
-                    > last_set_seq]
+        last_set_seq = self._contract_scan()[0]
+        # newest measure of THIS contract. Measures are sealed in log
+        # order with a non-decreasing "seq", so walk back from the end and
+        # stop at the first older one — O(1) instead of filtering the
+        # whole (session-long) measure history on every tick.
+        last = None
+        for m in reversed(fold(self.log).distance_measures):
+            if not isinstance(m, dict):
+                continue  # corrupt record — never crash the goal tick
+            m_seq = m.get("seq", 0)
+            if isinstance(m_seq, bool) or not isinstance(m_seq, (int, float)):
+                m_seq = 0
+            if m_seq > last_set_seq:
+                last = m
+            break
         velocity = 0.0
-        if measures:
-            last = measures[-1]
-            steps = max(1, st_head_delta(self.log, last.get("seq", 0)))
-            velocity = (float(last.get("distance", 1.0)) - st.distance) \
-                / steps * 10.0
+        if last is not None:
+            try:
+                steps = max(1, st_head_delta(self.log,
+                                             int(last.get("seq", 0))))
+                velocity = (float(last.get("distance", 1.0)) - st.distance) \
+                    / steps * 10.0
+            except (TypeError, ValueError):
+                velocity = 0.0
         record = {"distance": st.distance, "velocity": velocity,
                   "seq": self.log.head(), "focus": st.focus}
         self.log.append("goal.distance", record)
@@ -455,12 +510,9 @@ class GoalContract:
         clause becomes the focus; everything re-aims at it."""
         st = self.status()
         # SPEED: the fold ran once per clause (inside the loop) — hoisted.
-        last_set_seq = -1
-        for ev in self.log.events():
-            if ev.type == "goal.set":
-                last_set_seq = ev.seq
+        last_set_seq, relevant, _ = self._contract_scan()
         regressed_ids = set()
-        for ev in self.log.events():
+        for ev in relevant:
             if ev.type != "clause.regressed":
                 continue
             if ev.seq <= last_set_seq:
@@ -648,14 +700,7 @@ class GoalContract:
         # SPEED: one log walk collects last_set_seq + buffers the small
         # set of goal-relevant events; the filter then runs over the
         # buffer, not the log (was: three full log walks).
-        last_set_seq = -1
-        relevant: list[Event] = []
-        for ev in self.log.events():
-            if ev.type == "goal.set":
-                last_set_seq = ev.seq
-            elif ev.type in ("clause.proven", "clause.regressed",
-                             "clause.waived", "goal.focus"):
-                relevant.append(ev)
+        last_set_seq, relevant, scanned_closed = self._contract_scan()
         proven: dict[str, tuple[int, dict]] = {}
         regressed_after: dict[str, int] = {}
         waived: set[str] = set()
@@ -705,7 +750,11 @@ class GoalContract:
 
         # velocity + ETA from sealed goal.distance measures
         measures = st.distance_measures
-        velocity = measures[-1].get("velocity", 0.0) if measures else 0.0
+        velocity = (measures[-1].get("velocity", 0.0)
+                    if measures and isinstance(measures[-1], dict) else 0.0)
+        if isinstance(velocity, bool) or \
+                not isinstance(velocity, (int, float)):
+            velocity = 0.0
         eta = None
         if isinstance(velocity, (int, float)) and velocity > 1e-6:
             eta = int(distance / (velocity / 10.0))
@@ -734,7 +783,7 @@ class GoalContract:
         # contract can't leak through. _last_closed_state is the fallback
         # for older logs folded before the kernel tracked it.
         closed_state = (str(st.goal_closed.get("state", ""))
-                        if st.goal_closed else _last_closed_state(self.log))
+                        if st.goal_closed else scanned_closed)
 
         return GoalStatus(
             active=True,

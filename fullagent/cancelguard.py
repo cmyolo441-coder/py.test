@@ -22,10 +22,14 @@ Design rules:
 
 from __future__ import annotations
 
+import os
 import queue
+import signal
+import subprocess
 import threading
 import time
-from typing import Any, Callable
+from contextlib import contextmanager
+from typing import Any, Callable, Iterator
 
 
 class TurnCancelled(Exception):
@@ -156,6 +160,160 @@ def run_cancellable(fn: Callable[[], Any],
             return value
         raise kind
 
+
+
+# ---------------------------------------------------------------------------
+# Subprocess hygiene helpers (shared by hooks / webhook / plugins / mcp ...)
+# ---------------------------------------------------------------------------
+
+def kill_process_group(proc: "subprocess.Popen", sig: int | None = None,
+                       wait: float | None = 5.0) -> None:
+    """Kill ``proc`` and, when it leads its own process group, the whole
+    group. Never raises.
+
+    SAFETY: ``os.killpg(os.getpgid(pid))`` on a child that was NOT started
+    with ``start_new_session`` resolves to the *agent's own* process group
+    and would SIGKILL the agent (and its terminal job). The group is only
+    signalled when the child really is its own group leader.
+    """
+    if sig is None:
+        sig = getattr(signal, "SIGKILL", signal.SIGTERM)
+    try:
+        if proc.poll() is None or os.name == "posix":
+            done = False
+            if os.name == "posix":
+                try:
+                    pgid = os.getpgid(proc.pid)
+                    if pgid == proc.pid and pgid != os.getpgrp():
+                        os.killpg(pgid, sig)
+                        done = True
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+            if not done and proc.poll() is None:
+                try:
+                    proc.send_signal(sig)
+                except (ProcessLookupError, OSError):
+                    pass
+    except Exception:
+        pass
+    if wait is not None:
+        try:
+            proc.wait(timeout=wait)
+        except Exception:
+            pass
+
+
+def run_in_group(args: Any, *, timeout: float, input: Any = None,
+                 shell: bool = False, env: dict | None = None,
+                 cwd: str | None = None, text: bool = False,
+                 stdout: Any = subprocess.PIPE,
+                 stderr: Any = subprocess.PIPE) -> "subprocess.CompletedProcess":
+    """``subprocess.run`` replacement that cannot leak or hang.
+
+    * the child gets its own session/process group, so a timeout (or any
+      exception, incl. KeyboardInterrupt) kills the WHOLE tree — not just
+      the ``sh -c`` wrapper, which used to leave grandchildren running
+      forever (and holding our pipes open);
+    * the child is always reaped (no zombies);
+    * raises ``subprocess.TimeoutExpired`` on timeout, like ``run``.
+    """
+    kw: dict[str, Any] = {
+        "stdin": subprocess.PIPE if input is not None else subprocess.DEVNULL,
+        "stdout": stdout, "stderr": stderr, "shell": shell,
+        "env": env, "cwd": cwd,
+    }
+    if text:
+        kw.update(text=True, encoding="utf-8", errors="replace")
+    if os.name == "posix":
+        kw["start_new_session"] = True
+    proc = subprocess.Popen(args, **kw)
+    try:
+        out, err = proc.communicate(input, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_process_group(proc, wait=None)
+        try:
+            proc.communicate(timeout=2.0)
+        except Exception:
+            # something outside the group still holds a pipe: stop
+            # reading, close our ends and reap the child.
+            for stream in (proc.stdout, proc.stderr, proc.stdin):
+                try:
+                    if stream is not None:
+                        stream.close()
+                except Exception:
+                    pass
+        try:
+            proc.wait(timeout=2.0)
+        except Exception:
+            pass
+        raise subprocess.TimeoutExpired(args, timeout)
+    except BaseException:
+        kill_process_group(proc, wait=2.0)
+        raise
+    return subprocess.CompletedProcess(args, proc.returncode, out, err)
+
+
+# -- process tracking without monkeypatch nesting ---------------------------
+#
+# Agent._run_tool_with_timeout used to swap ``subprocess.Popen`` for a
+# per-call closure and restore "the original" afterwards. With parallel
+# tool calls the save/restore pairs interleave (A saves real, B saves A's
+# wrapper, A restores real, B restores A's wrapper) and Popen ends up
+# permanently wrapped — measured: 50 parallel batches of 4 calls left a
+# 61-deep wrapper chain, every later Popen walked all of them and kept
+# every Popen object alive in dead lists (and eventually RecursionError).
+# ``track_popen()`` installs ONE subclass, refcounted, under a lock.
+
+_TRACK_LOCK = threading.Lock()
+_TRACKERS: dict[int, tuple] = {}   # key -> (spawned list, thread id|None)
+_TRACK_SEQ = 0
+_ORIG_POPEN: Any = None
+_TrackedPopen: Any = None
+
+
+def _make_tracked_class(base: Any) -> Any:
+    class TrackedPopen(base):  # type: ignore[misc, valid-type]
+        def __init__(self, *a: Any, **k: Any) -> None:
+            super().__init__(*a, **k)
+            me = threading.get_ident()
+            with _TRACK_LOCK:
+                for lst, owner in _TRACKERS.values():
+                    if owner is None or owner == me:
+                        lst.append(self)
+    TrackedPopen.__name__ = "Popen"
+    TrackedPopen.__qualname__ = "Popen"
+    return TrackedPopen
+
+
+@contextmanager
+def track_popen(thread_only: bool = False) -> Iterator[list]:
+    """Collect every ``subprocess.Popen`` created (by any thread) while the
+    context is open. Safe to nest and to use from many threads at once:
+    ``subprocess.Popen`` is restored exactly when the last tracker exits.
+
+    ``thread_only=True`` records only processes spawned by the thread that
+    opened the context — so a timeout in one parallel tool call never
+    kills the processes of another call running at the same time."""
+    global _TRACK_SEQ, _ORIG_POPEN, _TrackedPopen
+    spawned: list = []
+    with _TRACK_LOCK:
+        _TRACK_SEQ += 1
+        key = _TRACK_SEQ
+        if not _TRACKERS:
+            current = subprocess.Popen
+            if _TrackedPopen is None or current is not _TrackedPopen:
+                _ORIG_POPEN = current
+                _TrackedPopen = _make_tracked_class(current)
+            subprocess.Popen = _TrackedPopen
+        _TRACKERS[key] = (spawned,
+                          threading.get_ident() if thread_only else None)
+    try:
+        yield spawned
+    finally:
+        with _TRACK_LOCK:
+            _TRACKERS.pop(key, None)
+            if not _TRACKERS and subprocess.Popen is _TrackedPopen:
+                subprocess.Popen = _ORIG_POPEN
 
 if __name__ == "__main__":
     import socket

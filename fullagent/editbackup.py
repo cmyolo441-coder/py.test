@@ -36,9 +36,9 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:  # pragma: no cover - exercised through the package path
-    from .tools import Tool, _resolve
+    from .tools import RISK_CONFIRM, Tool, _resolve
 except ImportError:  # running the file directly (dev convenience)
-    from fullagent.tools import Tool, _resolve
+    from fullagent.tools import RISK_CONFIRM, Tool, _resolve
 
 SNAPSHOT_BASE = os.path.join(os.environ.get("FULLAGENT_HOME") or os.path.join(os.path.expanduser("~"), ".fullagent"), "snapshots")
 
@@ -47,6 +47,7 @@ KEEP_SNAPSHOTS = 20
 
 _WRAPPED_ATTR = "_editbackup_wrapped"
 _FILENAME_RE = re.compile(r"[^A-Za-z0-9_.-]")
+_TS_RE = re.compile(r"^\d{8}T\d{12}$")
 
 _lock = threading.Lock()
 
@@ -107,7 +108,14 @@ def _iter_snapshots(session_id: Optional[str], rel: str,
         if not parent.is_dir():
             continue
         for f in parent.glob(os.path.basename(rel) + ".*.bak"):
-            found.append((_parse_ts(f.name, os.path.basename(rel)), f))
+            ts = _parse_ts(f.name, os.path.basename(rel))
+            # "a.py.*.bak" also globs the snapshots of "a.py.orig" /
+            # "a.py.bak": their "timestamp" is "orig.<ts>", which sorts
+            # AFTER every real timestamp — rollback of a.py restored
+            # another file's bytes (and pruning deleted its history).
+            if not _TS_RE.match(ts):
+                continue
+            found.append((ts, f))
     found.sort(key=lambda t: t[0])
     return found
 
@@ -126,6 +134,21 @@ def snapshot_file(path: str, session_id: Optional[str] = None) -> Optional[str]:
         if not p.is_file():
             return None  # new files / dirs: nothing to restore
         rel = _safe_relpath(p)
+        # A failing edit retried in a loop snapshotted the SAME bytes on
+        # every attempt; with bounded retention that pushed every useful
+        # older snapshot out. Skip identical consecutive snapshots.
+        # (Only when the file was not written since that snapshot: a
+        # rollback that restored identical bytes is a new event.)
+        prev = _iter_snapshots(session_id, rel)
+        if prev:
+            import filecmp
+            try:
+                last = prev[-1][1]
+                if (p.stat().st_mtime_ns <= last.stat().st_mtime_ns
+                        and filecmp.cmp(last, p, shallow=False)):
+                    return str(last)
+            except OSError:
+                pass
         ts = _timestamp()
         dest = _session_dir(session_id) / (rel + "." + ts + ".bak")
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -244,6 +267,10 @@ def make_edit_rollback_tool(session_id: Optional[str] = None) -> "Tool":
                                           "(default: most recent)"}},
          "required": ["path"]},
         edit_rollback,
+        # Overwrites a file on disk: must go through approval / be blocked
+        # in plan mode like every other file-writing tool (the default
+        # RISK_SAFE let it run unprompted).
+        risk=RISK_CONFIRM,
     )
 
 

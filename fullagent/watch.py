@@ -52,6 +52,20 @@ _log = logging.getLogger(__name__)
 POLL_INTERVAL_S = 2.0
 _MIN_POLL_INTERVAL_S = 0.5  # hard floor: the poll loop can never spin faster
 DEBOUNCE_S = 5.0
+# CPU/GIL budget for the poller. A watch on a big tree (a repo with
+# node_modules/.git, or ~) used to be fully os.walk()ed every 2s on a
+# thread that competes with the turn thread for the GIL — the agent got
+# sluggish the moment such a watch existed (and watches persist across
+# sessions). Now: heavy tool/VCS dirs are skipped, a scan is capped, and
+# the poll interval stretches so scanning uses at most ~1/_SCAN_DUTY of
+# wall time.
+_SKIP_DIRS = frozenset({".git", ".hg", ".svn", "node_modules", "__pycache__",
+                        ".venv", "venv", ".mypy_cache", ".pytest_cache",
+                        ".tox", ".cache"})
+MAX_FILES_PER_WATCH = 50_000
+_SCAN_DUTY = 8.0
+MAX_RUNNING_ACTIONS = 8          # concurrent action subprocesses
+_ACTION_SLOT_WAIT_S = 30.0
 DEFAULT_CONFIG_PATH = (
     Path(os.environ["FULLAGENT_HOME"]).expanduser() / "watches.json"
     if os.environ.get("FULLAGENT_HOME")
@@ -98,6 +112,8 @@ class WatchManager:
         self._stop = threading.Event()
         self._wake = threading.Event()  # poke: instant wake when work arrives
         self._thread: threading.Thread | None = None
+        self._running: list[subprocess.Popen] = []  # live action processes
+        self._dirty = False
         self._load()
 
     # -- persistence -----------------------------------------------------
@@ -173,6 +189,7 @@ class WatchManager:
                                       added_at=time.time())
             self._save()
         _log.info("watch: added %s -> %s (%s)", wid, p, pattern or "*")
+        self.start()  # idempotent; lazily started on first watch
         self.poke()  # pick the new watch up on the next instant tick
         return wid
 
@@ -220,12 +237,15 @@ class WatchManager:
         # Sleeps on _wake: at most one wake per poll_interval when idle,
         # instantly when poke()d (new watch) or when stop() is requested.
         while not self._stop.is_set():
+            t0 = time.monotonic()
             try:
                 self.poll_once()
             except Exception:  # noqa: BLE001 — the loop must never die
                 _log.exception("watch: unexpected error in poll loop")
+            spent = time.monotonic() - t0
             self._wake.clear()
-            self._wake.wait(self.poll_interval)
+            # adaptive: an expensive scan buys a proportionally longer rest
+            self._wake.wait(max(self.poll_interval, spent * _SCAN_DUTY))
 
     def poll_once(self) -> int:
         """Run one poll cycle. Returns the number of actions fired."""
@@ -235,7 +255,17 @@ class WatchManager:
                 watches = list(self.watches.values())
             for w in watches:
                 fired += self._poll_watch(w)
+            self._reap()
+            if self._dirty:
+                # one JSON write per poll, not one per fired event
+                with self._lock:
+                    self._dirty = False
+                    self._save()
             return fired
+
+    def _reap(self) -> None:
+        """Collect finished action processes (no zombies)."""
+        self._running = [p for p in self._running if p.poll() is None]
 
     def _poll_watch(self, w: Watch) -> int:
         root = Path(w.path)
@@ -244,11 +274,23 @@ class WatchManager:
             if root.is_file():
                 current = {str(root): self._stat(root)}
             elif root.is_dir():
-                for dirpath, _dirnames, filenames in os.walk(root):
+                budget = MAX_FILES_PER_WATCH
+                for dirpath, dirnames, filenames in os.walk(root):
+                    dirnames[:] = [d for d in dirnames
+                                   if d not in _SKIP_DIRS]
                     for name in filenames:
                         f = Path(dirpath) / name
                         if self._matches(w, f, root):
-                            current[str(f)] = self._stat(f)
+                            try:
+                                current[str(f)] = self._stat(f)
+                            except OSError:
+                                continue  # vanished mid-scan: not fatal
+                            budget -= 1
+                    if budget <= 0:
+                        with self._lock:
+                            w.last_error = (f"watch truncated at "
+                                            f"{MAX_FILES_PER_WATCH} files")
+                        break
             else:
                 # Deleted (or not-yet-created) watch path: stay alive,
                 # treat previously-seen files as deleted, then resync.
@@ -334,18 +376,31 @@ class WatchManager:
         env["WATCH_PATH"] = f
         env["WATCH_ID"] = w.id
         env["WATCH_PATTERN"] = w.pattern or "*"
+        # Throttle: a burst (git checkout touching 5000 files) used to
+        # spawn 5000 shells at once. Wait for a free slot instead.
+        deadline = time.monotonic() + _ACTION_SLOT_WAIT_S
+        while True:
+            self._reap()
+            if len(self._running) < MAX_RUNNING_ACTIONS:
+                break
+            if self._stop.is_set() or time.monotonic() >= deadline:
+                w.last_error = "action skipped: too many actions running"
+                return 0
+            time.sleep(0.05)
         try:
             # REAL subprocess: fire-and-forget, detached from this process.
-            subprocess.Popen(w.action, shell=True, env=env,
-                             stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL,
-                             start_new_session=True)
+            proc = subprocess.Popen(w.action, shell=True, env=env,
+                                    stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL,
+                                    start_new_session=True)
         except Exception as e:  # noqa: BLE001 — spawn failure must not kill loop
             _log.warning("watch: failed to spawn action for %s: %s", f, e)
             w.last_error = f"spawn error: {e}"
             return 0
+        self._running.append(proc)
         w.events_fired += 1
-        self._save()
+        self._dirty = True
         _log.info("watch: %s %s -> action fired (%s)", event, f, w.id)
         return 1
 
@@ -429,7 +484,9 @@ def register(agent) -> None:
                                       _REMOVE_PARAMS, watch_remove,
                                       risk="safe")
     agent.watch_manager = mgr  # host hook: mgr.stop() on shutdown
-    mgr.start()
+    # no watches -> no poll thread; WatchAdd starts it on demand
+    if mgr.watches:
+        mgr.start()
 
 
 # -- self-test --------------------------------------------------------------

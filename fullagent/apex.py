@@ -38,11 +38,37 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 
 from . import enforce
 
 __all__ = ["ApexEngine", "ApexReport", "build_engine"]
+
+
+# PERF: the expensive layers (hierarchy compile, semantic rule ledger with
+# its O(n^2) near-duplicate pass, the contract wrap) are pure functions of
+# the directive text. A 49k master prompt took ~2.4s to rebuild, and the
+# agent rebuilds the engine whenever its cache key misses — so these
+# products are memoized per document (small LRU, keyed by the text
+# itself). Every product is treated as read-only by the engine.
+_STATIC_CACHE: "OrderedDict[str, dict]" = OrderedDict()
+_STATIC_CACHE_MAX = 4
+_STATIC_LOCK = threading.Lock()
+
+
+def _static_layers(doc: str) -> dict:
+    """Per-document memo slot (created empty on a miss)."""
+    with _STATIC_LOCK:
+        slot = _STATIC_CACHE.get(doc)
+        if slot is None:
+            slot = {}
+            _STATIC_CACHE[doc] = slot
+            while len(_STATIC_CACHE) > _STATIC_CACHE_MAX:
+                _STATIC_CACHE.popitem(last=False)
+        else:
+            _STATIC_CACHE.move_to_end(doc)
+        return slot
 
 
 @dataclass
@@ -99,15 +125,20 @@ class ApexEngine:
         return eng
 
     def _build_layers(self) -> None:
-        r = self.report
+        # a rebuild starts from a clean health card — otherwise every
+        # rebuild() appended the previous build's degradations again
+        self.report = r = ApexReport()
         doc = self.doc_text
+        memo = _static_layers(doc)
 
         # 1. hierarchy — compile directives into the precedence graph
         try:
             from .hierarchy import RuleGraph, SourceLevel, \
                 compile_directives, HierarchyResolver
-            self.directives, _ = compile_directives(
-                doc, SourceLevel.DEVELOPER_CONFIG)
+            if "directives" not in memo:
+                memo["directives"] = tuple(compile_directives(
+                    doc, SourceLevel.DEVELOPER_CONFIG)[0])
+            self.directives = list(memo["directives"])
             self.graph = RuleGraph()
             for d in self.directives:
                 self.graph.add(d)
@@ -120,7 +151,9 @@ class ApexEngine:
         # 2. ledger — budget-fitted semantic rule ledger
         try:
             from .ledger import build_ledger
-            self.ledger = build_ledger(doc)
+            if "ledger" not in memo:
+                memo["ledger"] = build_ledger(doc)
+            self.ledger = memo["ledger"]
             r.layers["ledger"] = True
         except Exception as exc:
             r.layers["ledger"] = False
@@ -129,7 +162,9 @@ class ApexEngine:
         # 3. contract — enforce.protocol_wrap (v2, filter-safe)
         self.sealed = doc
         try:
-            self.sealed = enforce.protocol_wrap(doc)
+            if "sealed" not in memo:
+                memo["sealed"] = enforce.protocol_wrap(doc)
+            self.sealed = memo["sealed"]
             r.layers["contract"] = True
         except Exception as exc:
             r.layers["contract"] = False

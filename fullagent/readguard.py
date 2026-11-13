@@ -116,10 +116,32 @@ def _auto_read(agent: Any, orig_reader: Callable | None, path: str) -> None:
     """Bounded grounding read before an edit. Never raises, never fails."""
     if orig_reader is None:
         return
+    # The read's text is discarded — the MODEL never sees it — so it must
+    # not count as "the agent read this file": read_file records a
+    # filestat baseline, and refreshing that baseline here silently
+    # defeated filestat's "file changed since you read it" warning (an
+    # external change between the model's real read and its edit went
+    # undetected, and the edit was applied against stale assumptions).
+    try:
+        from . import filestat as _fs
+        store = _fs._store_for(None)
+        key = _fs._key(path)
+        had = key in store
+        before = store.get(key)
+    except Exception:
+        _fs = None
     try:
         orig_reader(path, 1, _AUTO_READ_LIMIT)
     except Exception:
         pass
+    if _fs is not None:
+        try:
+            if had:
+                store[key] = before
+            else:
+                store.pop(key, None)
+        except Exception:
+            pass
 
 
 def _wrap_editor(agent: Any, tool, orig_reader: Callable | None):

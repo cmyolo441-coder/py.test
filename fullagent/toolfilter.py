@@ -46,7 +46,7 @@ import re
 DESC_MAX = 150       # max chars kept of a tool's description
 PROP_DESC_MAX = 60   # max chars kept of a parameter's description
 
-_compressed_cache: dict[str, dict] = {}
+_compressed_cache: dict[str, tuple] = {}
 
 
 def _first_sentence(text: str, limit: int) -> str:
@@ -95,9 +95,15 @@ def _compress_params(params: object, _in_properties: bool = False) -> object:
 
 def compressed_schema(tool) -> dict:
     """Compact OpenAI function schema for one Tool (cached by name)."""
-    cached = _compressed_cache.get(tool.name)
-    if cached is not None:
-        return cached
+    entry = _compressed_cache.get(tool.name)
+    # Keyed by name, but validated against the tool's CURRENT description
+    # and parameters: a tool re-registered under the same name (plugin
+    # reload, synthesized/updated tool) used to keep being advertised with
+    # its OLD schema for the rest of the process, so the model called it
+    # with stale arguments.
+    if (entry is not None and entry[0] is tool.description
+            and entry[1] is tool.parameters):
+        return entry[2]
     schema = {
         "type": "function",
         "function": {
@@ -106,7 +112,8 @@ def compressed_schema(tool) -> dict:
             "parameters": _compress_params(tool.parameters),
         },
     }
-    _compressed_cache[tool.name] = schema
+    _compressed_cache[tool.name] = (tool.description, tool.parameters,
+                                    schema)
     return schema
 
 

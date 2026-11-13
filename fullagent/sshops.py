@@ -95,8 +95,9 @@ def _is_auth_failure(exit_code: int, stderr: str) -> bool:
 
 
 def _format_result(host: str, command: str, completed: subprocess.CompletedProcess) -> str:
-    out = completed.stdout.strip()
-    err = completed.stderr.strip()
+    from .tools import _clip
+    out = _clip((completed.stdout or "").strip())
+    err = _clip((completed.stderr or "").strip(), 4000)
     code = completed.returncode
     if code == 0:
         return (f"[{host}] exit 0\n"
@@ -112,22 +113,21 @@ def _format_result(host: str, command: str, completed: subprocess.CompletedProce
 
 def _run_ssh(host: str, user: Any, port: Any, remote_command: List[str],
              connect_timeout: int, total_timeout: int) -> str:
-    binary = _ssh_binary()
-    if binary is None:
-        return ("ERROR: no ssh client found on PATH — "
-                "install OpenSSH to use the Ssh tools.")
     try:
         target, port_n = _validate_target(host, user, port)
     except ValueError as e:
         return f"ERROR: {e}"
+    binary = _ssh_binary()
+    if binary is None:
+        return ("ERROR: no ssh client found on PATH — "
+                "install OpenSSH to use the Ssh tools.")
     argv = [binary, *_base_args(connect_timeout)]
     if port_n is not None:
         argv += ["-p", str(port_n)]
     argv += ["--", target, *remote_command]
     try:
-        completed = subprocess.run(
-            argv, capture_output=True, text=True,
-            timeout=total_timeout)
+        from .tools import _run_capture
+        completed = _run_capture(argv, total_timeout)
     except subprocess.TimeoutExpired:
         return (f"[{host}] ERROR: ssh timed out after {total_timeout}s — "
                 f"host unreachable or remote command hung.")

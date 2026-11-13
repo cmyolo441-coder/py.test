@@ -143,18 +143,29 @@ def sandbox_info() -> dict[str, Any]:
 def _make_preexec(cpu_limit: int | None,
                   mem_limit_mb: int | None,
                   fsize_limit_mb: int | None):
-    """Build a preexec_fn applying real rlimits in the child process."""
+    """Build a preexec_fn applying real rlimits in the child process.
+
+    Everything that can take a lock (the ``import``, int() conversion of
+    model-supplied values) happens HERE, in the parent. preexec_fn runs
+    in the forked child of a multi-threaded process: importing there
+    needs the import lock, and if another thread held it at fork time the
+    child deadlocked forever (the sandboxed command then "hung" until the
+    wall-clock timeout).
+    """
+    import resource  # absent on non-POSIX; callers only use this on POSIX
+    limits: list[tuple[int, int]] = []
+    if cpu_limit:
+        limits.append((resource.RLIMIT_CPU, int(cpu_limit)))
+    if mem_limit_mb:
+        limits.append((resource.RLIMIT_AS, int(mem_limit_mb) * 1024 * 1024))
+    if fsize_limit_mb:
+        limits.append((resource.RLIMIT_FSIZE,
+                       int(fsize_limit_mb) * 1024 * 1024))
+    setrlimit = resource.setrlimit
+
     def _preexec() -> None:
-        import resource  # local import: absent on non-POSIX
-        if cpu_limit:
-            v = int(cpu_limit)
-            resource.setrlimit(resource.RLIMIT_CPU, (v, v))
-        if mem_limit_mb:
-            v = int(mem_limit_mb) * 1024 * 1024
-            resource.setrlimit(resource.RLIMIT_AS, (v, v))
-        if fsize_limit_mb:
-            v = int(fsize_limit_mb) * 1024 * 1024
-            resource.setrlimit(resource.RLIMIT_FSIZE, (v, v))
+        for which, v in limits:
+            setrlimit(which, (v, v))
     return _preexec
 
 
@@ -255,11 +266,19 @@ def run_sandboxed(command: str,
 
     preexec = None
     if os.name == "posix":
-        preexec = _make_preexec(cpu_limit, mem_limit_mb, fsize_limit_mb)
+        try:
+            preexec = _make_preexec(cpu_limit, mem_limit_mb, fsize_limit_mb)
+        except (TypeError, ValueError) as e:
+            result["error"] = f"invalid resource limit: {e}"
+            return result
 
     try:
         proc = subprocess.Popen(
             argv,
+            # no stdin: a command that reads it (python, cat, an editor,
+            # a y/N prompt) used to grab the agent's TERMINAL — stealing
+            # the user's keystrokes and hanging until the timeout.
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -275,8 +294,10 @@ def run_sandboxed(command: str,
             # subprocess.run() only kills the direct child; backgrounded
             # grandchildren (`cmd &`, shell wrappers) kept running.
             try:
-                if os.name == "posix":
-                    os.killpg(proc.pid, signal.SIGKILL)
+                from .tools import _own_group_pgid
+                pgid = _own_group_pgid(proc.pid)
+                if pgid is not None:
+                    os.killpg(pgid, signal.SIGKILL)
                 else:
                     proc.kill()
             except OSError:
@@ -332,7 +353,9 @@ def _format_result(res: dict[str, Any]) -> str:
     if res["stderr"]:
         lines.append("--- stderr ---")
         lines.append(res["stderr"].rstrip("\n"))
-    return "\n".join(lines)
+    # A chatty command must not flood the model's context window.
+    from .tools import _clip
+    return _clip("\n".join(lines))
 
 
 def _handle_sandboxed_run(command: str = "",

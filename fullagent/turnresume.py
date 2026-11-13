@@ -39,6 +39,7 @@ import functools
 import json
 import os
 from datetime import datetime, timezone
+import time
 from pathlib import Path
 from typing import Any
 
@@ -253,10 +254,19 @@ def mark_status(session_id: str, status: str) -> None:
 class _TurnTracker:
     """Holds the live state of the current turn; writes it incrementally."""
 
+    # PERF (progressive slowdown): record_tool used to re-snapshot up to
+    # 200 messages (including the ~50k-char sealed system prompt), dump
+    # them and fsync() after EVERY tool call. Mid-turn writes are now
+    # coalesced to at most one per interval; begin() and end() still
+    # always write, so a crash loses at most the last interval of tool
+    # bookkeeping, never the turn itself.
+    WRITE_INTERVAL_S = 2.0
+
     def __init__(self, agent: Any) -> None:
         self.agent = agent
         self.active = False
         self.state: dict = {}
+        self._last_write = 0.0
 
     def begin(self, user_text: str) -> None:
         sid = str(getattr(self.agent, "session_id", "unknown"))
@@ -279,6 +289,8 @@ class _TurnTracker:
             return
         try:
             self.state["tool_calls_done"].append(_snapshot_tool_call(ev))
+            if time.monotonic() - self._last_write < self.WRITE_INTERVAL_S:
+                return
             self.state["messages_so_far"] = _snapshot_messages(
                 list(getattr(self.agent, "messages", []) or []))
             self._write()
@@ -299,6 +311,7 @@ class _TurnTracker:
             pass
 
     def _write(self) -> None:
+        self._last_write = time.monotonic()
         try:
             atomic_write_json(turn_path(str(self.state.get("session_id"))),
                               self.state)

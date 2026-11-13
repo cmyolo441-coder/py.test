@@ -71,11 +71,46 @@ def key(tool_name: str, args: dict) -> tuple:
     return (tool_name, digest)
 
 
+# Tools whose result depends only on workspace state that THIS agent's
+# mutating tools change. Their results may be replayed until something
+# mutates state (see store(): any other tool invalidates the cache).
+_PURE_READ_TOOLS = frozenset({
+    "read_file", "Read", "list_dir", "file_info", "search_files",
+    "glob_files", "NotebookRead", "DbSchema", "DbTables", "GitDiff",
+    "GitLog", "GitStatus", "code_symbols", "TodoRead", "ImageRead",
+})
+
+# File-edit tools: a FAILED call changed nothing, so an identical retry
+# fails identically until something else changes state (the 512s
+# incident). A SUCCESSFUL call mutated state: never replay it, and drop
+# every cached read.
+_EDIT_TOOLS = frozenset({
+    "edit_file", "MultiEdit", "multiedit", "write_file", "Write",
+    "apply_patch", "NotebookEdit", "NotebookInsert", "NotebookDelete",
+})
+
+
+def _cacheable(tool_name, status) -> bool:
+    if tool_name in _PURE_READ_TOOLS:
+        return status in ("done", "error")
+    if tool_name in _EDIT_TOOLS:
+        return status == "error"
+    # Everything else (shell commands, BashOutput/TaskOutput polling,
+    # web fetches, git commit/push, DB writes, unknown plugins...) is
+    # time-varying or side-effecting: replaying a cached result returns
+    # stale data -- e.g. "pytest" re-run after a fix reported the OLD
+    # failure, and a BashOutput poll never saw new output, so the agent
+    # looped forever waiting.
+    return False
+
+
 def check(agent, tool_name, args):
     """Return (result_with_note, status) if this exact call already ran
     this turn, else None. Never mutates the cached entry."""
     c = getattr(agent, _CACHE_ATTR, None)
     if not c:
+        return None
+    if tool_name not in _PURE_READ_TOOLS and tool_name not in _EDIT_TOOLS:
         return None
     hit = c.get(key(tool_name, args))
     if hit is None:
@@ -88,6 +123,12 @@ def store(agent, tool_name, args, result, status="done"):
     """Store a completed execution result (deep-copied, so later
     mutation of the caller's result object can't corrupt the cache)."""
     c = _cache(agent)
+    if not _cacheable(tool_name, status):
+        if tool_name not in _PURE_READ_TOOLS:
+            # Possibly state-changing: every cached read/failed edit may
+            # now be stale.
+            c.clear()
+        return
     if len(c) >= _MAX_ENTRIES:
         c.pop(next(iter(c)))  # evict oldest
     c[key(tool_name, args)] = (copy.deepcopy(result), status)
@@ -114,12 +155,12 @@ if __name__ == "__main__":
 
     # 2. Store, then an identical call is a hit carrying the note.
     args1 = {"edits": [{"path": "x.py", "old": "a", "new": "b"}]}
-    store(a, "MultiEdit", args1, "applied 3 edits", "done")
+    store(a, "MultiEdit", args1, "applied 3 edits", "error")
     hit = check(a, "MultiEdit",
                 {"edits": [{"path": "x.py", "old": "a", "new": "b"}]})
     assert hit is not None, "expected a dedup hit"
     assert DEDUP_NOTE in hit[0], "hit must carry the dedup note"
-    assert hit[1] == "done"
+    assert hit[1] == "error"
     assert "applied 3 edits" in hit[0]
 
     # 3. Canonicalization: different dict key ORDER is still the same call.
@@ -148,12 +189,22 @@ if __name__ == "__main__":
     # 7. store() copies: mutating the original afterwards, or mutating a
     #    returned hit, must not corrupt the cached entry.
     orig = {"edits": [{"path": "w.py"}]}
-    store(a, "MultiEdit", orig, ["r1"])
+    store(a, "MultiEdit", orig, ["r1"], "error")
     orig["edits"].append({"path": "MUTATED"})
     r1 = check(a, "MultiEdit", {"edits": [{"path": "w.py"}]})
     assert r1 is not None and r1[0] == "['r1']\n" + DEDUP_NOTE, r1
     r2 = check(a, "MultiEdit", {"edits": [{"path": "w.py"}]})
     assert r2[0] == r1[0], "second hit must equal the first"
+
+    # 7b. Side-effecting / polling tools are never replayed, and they
+    #     invalidate cached reads (state may have changed).
+    store(a, "run_command", {"command": "pytest"}, "1 failed", "done")
+    assert check(a, "run_command", {"command": "pytest"}) is None
+    store(a, "read_file", {"path": "f"}, "old", "done")
+    assert check(a, "read_file", {"path": "f"}) is not None
+    store(a, "edit_file", {"path": "f"}, "Updated f", "done")
+    assert check(a, "read_file", {"path": "f"}) is None
+    assert check(a, "edit_file", {"path": "f"}) is None
 
     # 8. reset() clears everything -> miss again.
     reset(a)

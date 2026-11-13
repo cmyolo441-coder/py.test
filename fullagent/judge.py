@@ -117,10 +117,47 @@ def _run_shell(command: str, timeout: int):
     argv = _shell_command()
     if argv is None:
         return None
-    proc = subprocess.run(argv + [command], capture_output=True,
-                          text=True, timeout=timeout)
-    output = (proc.stdout or "") + (proc.stderr or "")
+    # Own process group (POSIX): on timeout the WHOLE tree is killed.
+    # subprocess.run(timeout=) only kills the shell itself, so the real
+    # work it forked (`pytest`, `sleep 30; …`, a build) kept running as an
+    # orphan — every timed-out predicate leaked a CPU-burning process tree
+    # for the rest of the session. errors="replace": a checker printing
+    # non-UTF-8 bytes must not turn into a UnicodeDecodeError verdict.
+    popen_kw: dict = {}
+    if os.name != "nt":
+        popen_kw["start_new_session"] = True
+    proc = subprocess.Popen(argv + [command], stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True,
+                            encoding="utf-8", errors="replace", **popen_kw)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc)
+        try:
+            proc.communicate(timeout=5)
+        except Exception:
+            pass
+        raise
+    except BaseException:
+        _kill_tree(proc)
+        raise
+    output = (out or "") + (err or "")
     return proc.returncode, output
+
+
+def _kill_tree(proc) -> None:
+    """Kill a predicate command and everything it spawned."""
+    try:
+        if os.name != "nt":
+            import signal
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
+    except (OSError, ProcessLookupError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
 
 
 def _clip(text: str, limit: int = EVIDENCE_LIMIT) -> str:

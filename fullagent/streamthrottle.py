@@ -6,6 +6,7 @@ throttle without prompt_toolkit. Re-exported as ``tui._StreamThrottle``
 """
 from __future__ import annotations
 
+import threading
 import time
 from typing import Callable
 
@@ -34,6 +35,14 @@ class StreamThrottle:
     throttle can only ever delay a frame by `interval`.
 
     `frames` / `suppressed` counters make the before/after measurable.
+
+    TRAILING EDGE: a frame absorbed by the throttle used to stay hidden
+    until the NEXT token arrived — when the model paused mid-line (or
+    switched to streaming tool arguments) the preview froze up to a
+    whole pause behind the real text. ``take_due()`` lets a periodic
+    ticker (the TUI spinner) surface that pending frame once it is due.
+    All methods are thread-safe for that reason (worker thread feeds,
+    ticker thread drains).
     """
 
     def __init__(self, interval: float = 0.1,
@@ -45,6 +54,7 @@ class StreamThrottle:
         self._first = True  # first update() always flushes immediately
         self.frames = 0       # frames actually emitted
         self.suppressed = 0   # updates absorbed without emitting a frame
+        self._lock = threading.Lock()
 
     def update(self, text: str) -> None:
         """Buffer the latest text. Never blocks, never drops text."""
@@ -60,17 +70,36 @@ class StreamThrottle:
         The very first update is ALWAYS flushed immediately — the
         throttle must not delay the first visible token.
         """
-        if self._pending is None:
-            return None
-        if self._first:
-            return self.flush()
-        if not self.due():
-            self.suppressed += 1
-            return None
-        return self.flush()
+        with self._lock:
+            if self._pending is None:
+                return None
+            if self._first:
+                return self._flush_locked()
+            if not self.due():
+                self.suppressed += 1
+                return None
+            return self._flush_locked()
+
+    def take_due(self) -> str | None:
+        """Trailing-edge drain for a periodic ticker: the pending frame if
+        one is waiting AND due, else None. Never counts as suppressed."""
+        with self._lock:
+            if self._pending is None or not self.due():
+                return None
+            return self._flush_locked()
+
+    def discard(self) -> None:
+        """Drop the pending frame (its text was superseded, e.g. printed
+        to the transcript before a tool call)."""
+        with self._lock:
+            self._pending = None
 
     def flush(self) -> str | None:
         """Force the buffered frame out (stream end / final render)."""
+        with self._lock:
+            return self._flush_locked()
+
+    def _flush_locked(self) -> str | None:
         if self._pending is None:
             return None
         text = self._pending
@@ -124,5 +153,21 @@ if __name__ == "__main__":
     th3.update("first")
     _expect(th3.maybe_flush() == "first",
             "first frame immediate on the default clock too")
+
+    # 4. trailing edge: an absorbed frame surfaces via take_due() once due
+    now4 = [10.0]
+    th4 = StreamThrottle(0.1, clock=lambda: now4[0])
+    th4.update("a")
+    _expect(th4.maybe_flush() == "a", "first frame immediate")
+    th4.update("ab")
+    _expect(th4.maybe_flush() is None, "absorbed inside the interval")
+    _expect(th4.take_due() is None, "take_due waits for the interval")
+    now4[0] += 0.15
+    _expect(th4.take_due() == "ab", "take_due surfaces the stalled frame")
+    _expect(th4.take_due() is None, "nothing left after the drain")
+    th4.update("abc")
+    th4.discard()
+    now4[0] += 1.0
+    _expect(th4.take_due() is None, "discarded frames never surface")
 
     print("ALL STREAMTHROTTLE SELF-TESTS PASS")

@@ -34,6 +34,7 @@ Design constraints (deliberate):
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 import re
 import unicodedata
@@ -186,7 +187,25 @@ def is_long(prompt: str, threshold: int = DEFAULT_THRESHOLD) -> bool:
     return len(prompt) >= threshold
 
 
+# PERF: header_for / footer_for are pure functions of the prompt (plus the
+# section manifest) and run several times per model call — compose(),
+# intact_prefix() in dispatch AND in every per-iteration seal_wire(),
+# tail_for(), intact_suffix() — each re-splitting and regex-scanning the
+# whole 49k sealed prompt. They are memoized (small LRU; the sealed
+# prompt object is the same on every call, so its hash is cached too).
 def header_for(prompt: str) -> str:
+    return _header_for(prompt) if isinstance(prompt, str) \
+        else _header_for.__wrapped__(prompt)
+
+
+def footer_for(prompt: str, section_manifest: str = "") -> str:
+    if isinstance(prompt, str) and isinstance(section_manifest, str):
+        return _footer_for(prompt, section_manifest)
+    return _footer_for.__wrapped__(prompt, section_manifest)
+
+
+@functools.lru_cache(maxsize=8)
+def _header_for(prompt: str) -> str:
     """DOCUMENT MAP — placed BEFORE the sealed prompt for long documents.
 
     States the two-layer structure and indexes the contract's own
@@ -228,7 +247,8 @@ def section_digests(sections: dict[str, str]) -> str:
     return ";".join(lines)
 
 
-def footer_for(prompt: str, section_manifest: str = "") -> str:
+@functools.lru_cache(maxsize=32)
+def _footer_for(prompt: str, section_manifest: str = "") -> str:
     """CRITICAL RECAP + END OF CONTEXT — placed AFTER the sealed prompt.
 
     The recap re-states the prompt's own binding rules at the strongest

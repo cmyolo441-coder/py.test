@@ -143,7 +143,7 @@ class WorldModel:
                 continue
         for f in files:
             try:
-                text = f.read_text(errors="replace")
+                text = f.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
             try:
@@ -201,7 +201,10 @@ class WorldModel:
 
     def _static_dependants(self, path: str) -> list[str]:
         """Files that depend on `path` — the dst side of impact edges."""
-        return [dst for (src, dst) in self.edges if src == path]
+        # adjacency lists keep the edge-dict insertion order, so this is
+        # the same list as filtering every edge — without the O(edges)
+        # scan per changed file
+        return [dst for dst, _ in self._adjacency().get(path, ())]
 
     def learn_from_log(self) -> int:
         """Rebuild learned stats from kernel history: turns where files

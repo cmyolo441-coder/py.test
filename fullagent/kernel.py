@@ -296,6 +296,9 @@ class EventLog:
         # entries stop being protected the moment they are no longer a
         # branch head, and are reaped by _prune_if_needed.
         self._extra: set[str] = set()
+        # extra id -> id of a retained event whose parent it is (see
+        # _prune_if_needed); lets the reap check skip the full scan
+        self._extra_ref: dict[str, str] = {}
         self.branch = branch
         self.session = session
         # SPEED: per-branch chain cache (extended incrementally, O(1) per
@@ -305,6 +308,9 @@ class EventLog:
         # O(1) and every append a buffered write.
         self._chains: dict[str, list[Event]] = {}
         self._fold_cache: dict[str, tuple[str | None, object]] = {}
+        # events applied to each cached fold since its list fields were
+        # last trimmed (see _fold_cached)
+        self._fold_growth: dict[str, int] = {}
         self._fh = None
         self._writes_since_sync = 0
         self._load()
@@ -736,39 +742,77 @@ class EventLog:
         was already persisted to the archive file by _persist() before it
         entered memory, so nothing is lost. Current branch heads are never
         dropped (a branch must stay addressable even when dormant); the
-        per-branch chain caches are cleared because they may reference
-        dropped events and rebuild lazily on next access.
+        per-branch chain caches are trimmed to what a rebuild would give.
         """
         max_e = self._max_events
         if max_e is None:
             return
+        # PERF (per-append cost grew with the window): the old code built
+        # the `referenced` set over EVERY retained event, rebuilt the whole
+        # _events list and threw away every chain cache on EVERY append
+        # once the window was full — so each append cost O(window) and the
+        # next events()/fold() paid another O(window) chain rebuild. The
+        # result is identical below, but the steady state is O(1)-ish:
+        # `referenced` is only computed when window-external events exist,
+        # the common "oldest event is unprotected" case is a slice delete,
+        # and chain caches are trimmed instead of cleared.
         protected = {h for h in self._heads.values() if h}
-        referenced = {ev.parent for ev in self._by_id.values() if ev.parent}
-        # reap window-external events that are no longer a branch head
-        # nor referenced as a parent by any retained event.
-        stale = [eid for eid in self._extra
-                 if eid not in protected and eid not in referenced]
-        for eid in stale:
-            self._by_id.pop(eid, None)
-            self._extra.discard(eid)
+        removed: list[Event] = []
+        # dormant branch heads live in _extra for good; only an extra that
+        # is NOT a head can be reaped. Pinned fork/rewind bases stay
+        # referenced by their marker for a whole window of appends, so the
+        # child that referenced each one is remembered and the O(window)
+        # `referenced` scan only re-runs once that child was pruned.
+        by_id = self._by_id
+        candidates = [eid for eid in self._extra if eid not in protected
+                      and self._extra_ref.get(eid) not in by_id]
+        if candidates:
+            referenced: dict[str, str] = {}
+            for ev in by_id.values():
+                if ev.parent:
+                    referenced[ev.parent] = ev.id
+            # reap window-external events that are no longer a branch head
+            # nor referenced as a parent by any retained event.
+            for eid in candidates:
+                child = referenced.get(eid)
+                if child is not None:
+                    self._extra_ref[eid] = child
+                    continue
+                ev = by_id.pop(eid, None)
+                if ev is not None:
+                    removed.append(ev)
+                self._extra.discard(eid)
+                self._extra_ref.pop(eid, None)
         over = len(self._events) - max_e
-        if over <= 0:
-            return
-        drop: set[str] = set()
-        for ev in self._events:
-            if len(drop) >= over:
-                break
-            if ev.id not in protected:
-                drop.add(ev.id)
-        if not drop:
-            return
-        self._events = [ev for ev in self._events if ev.id not in drop]
-        for eid in drop:
-            del self._by_id[eid]
-        self._pruned_total += len(drop)
-        # chain caches hold direct Event references — some now dangle.
-        # Rebuild is lazy and incremental afterwards, so a clear is O(1).
-        self._chains.clear()
+        if over > 0:
+            head_slice = self._events[:over]
+            if not any(ev.id in protected for ev in head_slice):
+                # fast path: the oldest `over` events are all droppable
+                del self._events[:over]
+                for ev in head_slice:
+                    del self._by_id[ev.id]
+                removed.extend(head_slice)
+                self._pruned_total += over
+            else:
+                drop: set[str] = set()
+                for ev in self._events:
+                    if len(drop) >= over:
+                        break
+                    if ev.id not in protected:
+                        drop.add(ev.id)
+                if drop:
+                    keep: list[Event] = []
+                    for ev in self._events:
+                        if ev.id in drop:
+                            removed.append(ev)
+                        else:
+                            keep.append(ev)
+                    self._events = keep
+                    for eid in drop:
+                        del self._by_id[eid]
+                    self._pruned_total += len(drop)
+        if removed:
+            self._trim_chain_caches(removed)
         # NOTE: _fold_cache is deliberately left alone. Its incremental
         # extension walks _by_id from the current head back to the cached
         # head; pruned events are always OLDER than any live cached head in
@@ -776,6 +820,31 @@ class EventLog:
         # If a branch went 2000+ appends without a fold, the cache misses
         # and rebuilds from the retained window — the documented window
         # semantic, not silent corruption.
+
+    def _trim_chain_caches(self, removed: list[Event]) -> None:
+        """Drop pruned events from the cached per-branch chains.
+
+        A full _chain() rebuild walks back from the head while the parent
+        is still in _by_id, i.e. it yields the suffix after the LAST
+        missing event. Pruning only ever removes events, so trimming each
+        cached chain to that same suffix gives exactly what a rebuild
+        would — without the O(window) walk on the next events()/fold().
+        Removed events are the oldest ones, so the scan stops early: every
+        removed event has seq <= max_seq, and the chain is seq-ascending.
+        """
+        if not self._chains:
+            return
+        max_seq = max(ev.seq for ev in removed)
+        by_id = self._by_id
+        for br, chain in list(self._chains.items()):
+            cut = -1
+            for i, ev in enumerate(chain):
+                if ev.seq > max_seq:
+                    break
+                if ev.id not in by_id:
+                    cut = i
+            if cut >= 0:
+                self._chains[br] = chain[cut + 1:]
 
     # -- archive access ----------------------------------------------------
 
@@ -961,6 +1030,42 @@ class EventLog:
         if upto_seq is None:
             return evs
         return [e for e in evs if e.seq <= upto_seq]
+
+    def cursor(self, branch: str | None = None) -> tuple[str | None, int]:
+        """(head id, head seq) of a branch — a resumable position for
+        incremental readers (see delta_since())."""
+        with self._lock:
+            head_id = self._heads.get(branch or self.branch)
+            ev = self._by_id.get(head_id) if head_id else None
+            return (head_id, ev.seq if ev else -1)
+
+    def delta_since(self, cursor: tuple[str | None, int] | None,
+                    branch: str | None = None) -> list[Event] | None:
+        """Events appended to the branch's chain after `cursor`, in causal
+        order — or None when the cursor is no longer on the chain (rewind,
+        checkout, or more than a window's worth of appends since), in
+        which case the caller must rebuild from events().
+
+        PERF: lets per-turn readers (goal status, budget spend, semantic
+        index) process only the handful of events appended since their
+        last call instead of re-walking the whole retained window — the
+        cost is O(delta), not O(session)."""
+        if cursor is None:
+            return None
+        hid, hseq = cursor
+        br = branch or self.branch
+        with self._lock:
+            chain = self._chain(br)
+            i = len(chain)
+            while i > 0 and chain[i - 1].seq > hseq:
+                i -= 1
+            if hid is None:
+                ok = i == 0 and (not chain or chain[0].parent is None)
+            else:
+                ok = i > 0 and chain[i - 1].id == hid
+            if not ok:
+                return None
+            return chain[i:]
 
     def head(self, branch: str | None = None) -> int:
         """Seq of the branch's head event (-1 for an empty branch)."""
@@ -1369,13 +1474,51 @@ def _fold_cached(log: EventLog, br: str) -> State:
             for ev in reversed(new_evs):
                 _fold_apply(st, ev)
             log._fold_cache[br] = (head_id, st)
+            _bound_fold_lists(log, br, st, len(new_evs))
             return st
     # first fold on this branch, or the chain diverged (rewind) — rebuild
     st = State(branch=br)
     for ev in log._chain(br):
         _fold_apply(st, ev)
     log._fold_cache[br] = (head_id, st)
+    log._fold_growth[br] = 0
     return st
+
+
+# list-valued State fields (history buckets) — bounded by _bound_fold_lists
+_STATE_LIST_FIELDS = tuple(
+    f.name for f in __import__("dataclasses").fields(State)
+    if f.default_factory is list)
+
+
+def _bound_fold_lists(log: EventLog, br: str, st: State, added: int) -> None:
+    """Keep the incrementally-extended cached State bounded.
+
+    MEMORY/PERF LEAK FIX: the cached fold is extended forever and never
+    rebuilt in steady state, so every history list (messages, prompt
+    dispatches, goal.distance measures, …) grew by one entry per event for
+    the whole process lifetime — and every per-turn reader that walks one
+    of those lists got slower the longer the session ran. A freshly
+    loaded log folds only the retained window, so no list can hold more
+    than `max_events` window-derived entries; trimming each list to its
+    newest `max_events` entries (amortised: only once the fold has grown
+    by a full window) keeps a superset of exactly what a window fold
+    contains. Scalars, the goal, plan nodes and file sets are untouched.
+    """
+    max_e = log._max_events
+    if max_e is None:
+        return
+    grown = log._fold_growth.get(br, 0) + added
+    if grown < max_e:
+        log._fold_growth[br] = grown
+        return
+    log._fold_growth[br] = 0
+    for name in _STATE_LIST_FIELDS:
+        lst = getattr(st, name)
+        if len(lst) > max_e:
+            # rebind instead of deleting in place: a reader on another
+            # thread (the TUI polls folds) may be iterating the old list
+            setattr(st, name, lst[-max_e:])
 
 
 # ---------------------------------------------------------------------------

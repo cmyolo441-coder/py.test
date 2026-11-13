@@ -48,8 +48,11 @@ class Tool:
 
     # Module-level cache: schemas are identical for every call, so build
     # once per tool name instead of re-serializing on every turn.
+    # init=False: dataclasses.replace() (used to swap handlers) must give
+    # the new Tool its OWN cache — sharing the old one served the old
+    # description/parameters after a replace(description=...).
     _schema_cache: dict = field(default_factory=dict, repr=False,
-                                compare=False)
+                                compare=False, init=False)
 
     def openai_schema(self) -> dict:
         cached = self._schema_cache.get(self.name)
@@ -292,6 +295,30 @@ def _rich_edit_miss_error(p: Path, text: str, old_string: str,
 # File tools
 # ---------------------------------------------------------------------------
 
+def _read_text_exact(p: "Path | str") -> str:
+    """Read UTF-8 text WITHOUT universal-newline translation.
+
+    Path.read_text() turns every "\r\n" into "\n"; any edit tool that
+    read that way and wrote the result back silently converted a whole
+    CRLF file to LF (a diff on every line). Raises UnicodeDecodeError /
+    OSError like read_text."""
+    return Path(p).read_bytes().decode("utf-8")
+
+
+def _match_eol(text: str, old: str, new: str) -> tuple[str, str]:
+    """Adapt an LF-only old/new pair to a CRLF file (models practically
+    never emit "\r"), so the match and the inserted text both use the
+    file's own line endings."""
+    if ("\r\n" in text and isinstance(old, str) and isinstance(new, str)
+            and "\n" in old and "\r" not in old
+            and text.count(old) == 0):
+        crlf_old = old.replace("\n", "\r\n")
+        if crlf_old in text:
+            return crlf_old, new.replace("\r\n", "\n").replace(
+                "\n", "\r\n")
+    return old, new
+
+
 def _atomic_write_text(p: Path, text: str) -> None:
     """Write UTF-8 atomically: a crash mid-write can never leave a
     truncated/corrupt file behind. The temp name carries pid+thread so two
@@ -306,7 +333,10 @@ def _atomic_write_text(p: Path, text: str) -> None:
     tmp = p.with_name(
         f"{p.name}.tmp-{os.getpid()}-{threading.get_ident()}")
     try:
-        tmp.write_text(text, encoding="utf-8")
+        # newline="": write the text EXACTLY (no "\n" -> os.linesep
+        # translation; on Windows that turned "\r\n" into "\r\r\n").
+        with open(tmp, "w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
         if mode is not None:
             os.chmod(tmp, mode)
     except BaseException:
@@ -317,6 +347,51 @@ def _atomic_write_text(p: Path, text: str) -> None:
             pass
         raise
     os.replace(tmp, p)
+
+
+_READ_WHOLE_MAX_BYTES = 2_000_000
+_READ_MAX_LINE_CHARS = 4000
+
+
+def _read_window_streaming(p: Path, offset: int, limit: int,
+                           size: int) -> str:
+    """read_file for files too big to load whole: stream to the window,
+    then count the remaining newlines in raw chunks (no decode)."""
+    import itertools
+    chunk: list[str] = []
+    try:
+        with open(p, "rb") as fh:
+            for raw in itertools.islice(fh, offset - 1, offset - 1 + limit):
+                line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                if len(line) > _READ_MAX_LINE_CHARS:
+                    line = (line[:_READ_MAX_LINE_CHARS]
+                            + f"… [+{len(line) - _READ_MAX_LINE_CHARS} chars]")
+                chunk.append(line)
+            # total line count from here on, cheaply
+            rest = 0
+            last = b""
+            while True:
+                buf = fh.read(1 << 20)
+                if not buf:
+                    break
+                rest += buf.count(b"\n")
+                last = buf[-1:]
+            pos_lines = offset - 1 + len(chunk)
+    except OSError as e:
+        return f"ERROR: {e}"
+    total = pos_lines + rest + (1 if last and last != b"\n" else 0)
+    if not chunk:
+        return (f"[{p} — {total} lines total ({size} bytes); offset "
+                f"{offset} is past the end of file]")
+    end = offset + len(chunk) - 1
+    header = (f"[{p} — {total} lines total ({size} bytes, large file: "
+              f"streamed), showing {offset}..{end}]")
+    body = _line_numbered("\n".join(chunk), offset)
+    remaining = total - end
+    if remaining > 0:
+        body += (f"\n… ({remaining} more lines, total {total} lines). "
+                 "Use offset/limit to read more.")
+    return _clip(f"{header}\n{body}")
 
 
 def read_file(path: str, offset: int = 1, limit: int = 200) -> str:
@@ -342,9 +417,11 @@ def read_file(path: str, offset: int = 1, limit: int = 200) -> str:
         return f"ERROR: file not found: {p}"
     if stat.S_ISDIR(st.st_mode):
         return f"ERROR: {p} is a directory (use list_dir)"
-    if st.st_size > 2_000_000:
-        return (f"ERROR: file is very large ({st.st_size} bytes); "
-                "use offset/limit")
+    if st.st_size > _READ_WHOLE_MAX_BYTES:
+        # Big file: stream just the requested window. This used to return
+        # "file is very large; use offset/limit" — but offset/limit were
+        # refused just the same, so a big log could never be read at all.
+        return _read_window_streaming(p, offset, limit, st.st_size)
     try:
         text = p.read_text(encoding="utf-8", errors="replace")
     except OSError as e:
@@ -360,6 +437,12 @@ def read_file(path: str, offset: int = 1, limit: int = 200) -> str:
         return (f"[{p} — {total} lines total; offset {offset} is past the "
                 f"end of file]")
     chunk = lines[offset - 1: offset - 1 + limit]
+    # A minified bundle / data file can be ONE 2 MB line: without a
+    # per-line cap a 200-line window still dumped megabytes into context.
+    chunk = [ln if len(ln) <= _READ_MAX_LINE_CHARS else
+             ln[:_READ_MAX_LINE_CHARS]
+             + f"… [+{len(ln) - _READ_MAX_LINE_CHARS} chars]"
+             for ln in chunk]
     end = offset + len(chunk) - 1
     header = f"[{p} — {total} lines total, showing {offset}..{end}]"
     body = _line_numbered(chr(10).join(chunk), offset)
@@ -367,7 +450,7 @@ def read_file(path: str, offset: int = 1, limit: int = 200) -> str:
     if remaining > 0:
         body += (f"\n… ({remaining} more lines, total {total} lines). "
                  "Use offset/limit to read more.")
-    return f"{header}\n{body}"
+    return _clip(f"{header}\n{body}", 200_000)
 
 
 def read_region(path: str, start_line: int, end_line: int) -> str:
@@ -406,7 +489,7 @@ def write_file(path: str, content: str) -> str:
     existed = p.exists()
     if existed:
         try:
-            old = p.read_text(encoding="utf-8")
+            old = _read_text_exact(p)
         except (OSError, UnicodeDecodeError):
             old = ""
     try:
@@ -476,16 +559,28 @@ def edit_file(path: str, old_string: str, new_string: str,
     # read it, say so plainly instead of failing with a cryptic
     # "old_string not found".
     warn = filestat.check_stale(None, str(p))
-    if warn:
-        return warn
     try:
-        text = p.read_text(encoding="utf-8")
+        text = _read_text_exact(p)
     except UnicodeDecodeError:
         return ("ERROR: file is not valid UTF-8 text; refusing to edit "
                 "(lossy rewrite would corrupt unrelated bytes)")
     except OSError as e:
         return f"ERROR: {e}"
+    # CRLF file, LF old_string: match with the file's own line endings
+    # (and write new_string with them) instead of failing "not found".
+    old_string, new_string = _match_eol(text, old_string, new_string)
     count = text.count(old_string)
+    if warn and (count == 0 or (count > 1 and not replace_all)):
+        # The file changed under the agent AND its old_string no longer
+        # resolves: the stale read is the real cause — say so.
+        return warn
+    stale_note = ""
+    if warn:
+        # Changed on disk, but old_string still matches the CURRENT
+        # content unambiguously: apply it, and tell the caller.
+        stale_note = (" (note: the file had changed on disk since your "
+                      "last read; the edit was matched against its "
+                      "current content)")
     if count == 0:
         return _rich_edit_miss_error(p, text, old_string)
     if count > 1 and not replace_all:
@@ -513,7 +608,7 @@ def edit_file(path: str, old_string: str, new_string: str,
     adds, removes = _diff_summary(text, new_text)
     n = count if replace_all else 1
     return (f"Updated {p} — {n} occurrence(s) replaced, "
-            f"{adds} addition(s), {removes} removal(s)")
+            f"{adds} addition(s), {removes} removal(s){stale_note}")
 
 
 def list_dir(path: str = ".") -> str:
@@ -713,6 +808,24 @@ def glob_files(pattern: str, path: str = ".") -> str:
 # Shell
 # ---------------------------------------------------------------------------
 
+def _own_group_pgid(pid: int) -> "int | None":
+    """pgid of `pid` if it is safe to killpg: the child leads (or sits in)
+    a process group that is NOT the agent's own. None otherwise."""
+    if os.name != "posix":
+        return None
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        return None
+    try:
+        own = os.getpgrp()
+    except OSError:
+        return None
+    if pgid <= 0 or pgid == own:
+        return None
+    return pgid
+
+
 def _kill_process_tree(proc: "subprocess.Popen") -> None:
     """Kill proc AND its children.
 
@@ -724,9 +837,15 @@ def _kill_process_tree(proc: "subprocess.Popen") -> None:
     process group (see _popen_kwargs), so killpg takes the whole tree.
     """
     try:
-        if os.name == "posix":
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        else:  # Windows: no process groups — best effort on the wrapper
+        pgid = _own_group_pgid(proc.pid)
+        if pgid is not None:
+            os.killpg(pgid, signal.SIGKILL)
+        else:
+            # Windows, an already-reaped child, or a child that SHARES the
+            # agent's process group (spawned without start_new_session,
+            # e.g. a plain subprocess.run in some tool handler): killpg
+            # there would SIGKILL the agent itself (exit 137). Kill the
+            # child alone.
             proc.kill()
     except Exception:
         try:
@@ -746,38 +865,176 @@ _popen_kwargs: dict = {"start_new_session": True} if os.name == "posix" \
     else {}
 
 
+# Output retention bounds for one shell command. A command that prints
+# gigabytes (``yes``, a runaway log, ``cat`` of a binary) must not grow the
+# agent's RAM without bound: the head and the tail are kept (the tail is
+# where test summaries, exit reasons and live_shell's bookkeeping markers
+# live) and the middle is dropped with a marker.
+_PUMP_HEAD_CHARS = 512_000
+_PUMP_TAIL_CHARS = 2_000_000
+# A single "line" with no newline (progress bars without \n, binary
+# garbage) is relayed in pieces of at most this size.
+_PUMP_MAX_LINE = 64_000
+# After the shell itself exited, keep reading for at most this long. A
+# backgrounded child (``server &``) inherits the pipes and keeps them open
+# for as long as it lives — waiting for EOF used to hang the tool until
+# the full timeout and then kill the very server the user started.
+_PUMP_EXIT_GRACE = 0.5
+_PUMP_READ_SIZE = 65536
+
+
+class _StreamBuf:
+    """Bounded head+tail accumulator for one output stream."""
+
+    __slots__ = ("head", "head_n", "tail", "tail_n", "dropped")
+
+    def __init__(self) -> None:
+        self.head: list[str] = []
+        self.head_n = 0
+        self.tail: "list[str]" = []
+        self.tail_n = 0
+        self.dropped = 0
+
+    def add(self, piece: str) -> None:
+        if not piece:
+            return
+        if self.head_n < _PUMP_HEAD_CHARS:
+            room = _PUMP_HEAD_CHARS - self.head_n
+            self.head.append(piece[:room])
+            self.head_n += min(room, len(piece))
+            piece = piece[room:]
+            if not piece:
+                return
+        self.tail.append(piece)
+        self.tail_n += len(piece)
+        if self.tail_n > _PUMP_TAIL_CHARS * 2:
+            joined = "".join(self.tail)
+            cut = len(joined) - _PUMP_TAIL_CHARS
+            self.dropped += cut
+            self.tail = [joined[cut:]]
+            self.tail_n = len(self.tail[0])
+
+    def lines(self) -> list[str]:
+        tail = "".join(self.tail)
+        if len(tail) > _PUMP_TAIL_CHARS:
+            cut = len(tail) - _PUMP_TAIL_CHARS
+            self.dropped += cut
+            tail = tail[cut:]
+        out = list(self.head)
+        if self.dropped:
+            out.append(f"\n… [{self.dropped} chars of output dropped] …\n")
+        if tail:
+            out.append(tail)
+        return out
+
+
+def _start_reader(stream, tag: str, q: "queue.Queue",
+                  discard: threading.Event) -> None:
+    """Read raw chunks from `stream` on a daemon thread until EOF.
+
+    Chunked os.read() instead of readline(): a command printing millions
+    of short lines used to cost one queue round-trip per line (``yes |
+    head -c 200M`` took over a minute). Once `discard` is set (the caller
+    stopped listening), data is thrown away instead of queued so a
+    long-lived background child cannot grow memory; the thread owns the
+    stream and closes it at EOF, so no pipe fd leaks per command.
+    """
+    def run() -> None:
+        try:
+            fd = stream.fileno()
+            while True:
+                try:
+                    chunk = os.read(fd, _PUMP_READ_SIZE)
+                except InterruptedError:
+                    continue
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                if not discard.is_set():
+                    q.put((tag, chunk))
+        except Exception:  # noqa: BLE001 — never kill the process
+            pass
+        finally:
+            try:
+                stream.close()
+            except Exception:  # noqa: BLE001
+                pass
+            q.put((tag, None))  # sentinel: this stream is done
+
+    threading.Thread(target=run, name=f"fa-pump-{tag}",
+                     daemon=True).start()
+
+
 def _pump_process(proc: "subprocess.Popen", timeout: float,
                   on_output: "Callable[[str, str], None] | None" = None,
                   should_cancel: "Callable[[], bool] | None" = None,
+                  partial: "dict | None" = None,
                   ) -> tuple[list, list] | None:
-    """Read stdout/stderr of `proc` line-by-line until it exits or the
-    timeout elapses. Returns (stdout_lines, stderr_lines), or None on
-    timeout (the process is killed). Every line is relayed to
-    on_output(line, "out"|"err") the moment it is produced — this is what
-    lets the TUI stream shell output live, like watching a real terminal.
-    If `should_cancel` is set and returns True, the process is killed
-    immediately and partial output is returned (Esc/Ctrl+C support)."""
+    """Read stdout/stderr of `proc` until it exits or the timeout elapses.
+
+    Returns (stdout_chunks, stderr_chunks) — join them for the text —
+    or None on timeout (the whole process group is killed; what was
+    captured so far is stored in `partial` as {"out": str, "err": str}
+    when a dict is passed). Every complete line is relayed to
+    on_output(line, "out"|"err") as it is produced, so the TUI can
+    stream output live. If `should_cancel` returns True the process
+    tree is killed immediately and partial output is returned.
+    Retained output is bounded (head + tail, see _PUMP_*_CHARS)."""
+    import codecs
     q: "queue.Queue" = queue.Queue()
+    discard = threading.Event()
+    bufs = {"out": _StreamBuf(), "err": _StreamBuf()}
+    decoders = {t: codecs.getincrementaldecoder("utf-8")(errors="replace")
+                for t in bufs}
+    pending = {"out": "", "err": ""}  # partial line awaiting its newline
+    held_cr = {"out": False, "err": False}
+    open_streams = 0
+    for stream, tag in ((proc.stdout, "out"), (proc.stderr, "err")):
+        if stream is not None:
+            _start_reader(stream, tag, q, discard)
+            open_streams += 1
 
-    def pump(stream, tag: str) -> None:
+    def relay(line: str, tag: str) -> None:
+        if on_output is None:
+            return
         try:
-            for line in iter(stream.readline, ""):
-                if not line:
-                    break
-                q.put((tag, line))
-        finally:
-            q.put((tag, None))  # sentinel: this stream is done
+            on_output(line, tag)
+        except Exception:  # noqa: BLE001 — never break the tool
+            pass
 
-    threading.Thread(target=pump, args=(proc.stdout, "out"),
-                     daemon=True).start()
-    threading.Thread(target=pump, args=(proc.stderr, "err"),
-                     daemon=True).start()
+    def feed(tag: str, text: str, final: bool = False) -> None:
+        # universal newlines, like the old text-mode pipes: \r\n and a
+        # lone \r both become \n. A trailing \r may be the first half of
+        # a \r\n split across two chunks — hold it back.
+        if held_cr[tag]:
+            text = "\r" + text
+            held_cr[tag] = False
+        if text.endswith("\r") and not final:
+            text = text[:-1]
+            held_cr[tag] = True
+        if "\r" in text:
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
+        if not text:
+            return
+        bufs[tag].add(text)
+        if on_output is None:
+            return
+        data = pending[tag] + text
+        parts = data.split("\n")
+        pending[tag] = parts.pop()
+        for line in parts:
+            relay(line, tag)
+        while len(pending[tag]) > _PUMP_MAX_LINE:
+            relay(pending[tag][:_PUMP_MAX_LINE], tag)
+            pending[tag] = pending[tag][_PUMP_MAX_LINE:]
 
-    out_lines: list = []
-    err_lines: list = []
-    open_streams = 2
-    deadline = time.monotonic() + timeout
-    cancelled = False
+    def flush() -> None:
+        for tag in bufs:
+            feed(tag, decoders[tag].decode(b"", final=True), final=True)
+            if pending[tag]:
+                relay(pending[tag], tag)
+                pending[tag] = ""
 
     def _cancel_requested() -> bool:
         # A raising should_cancel must never take down the tool — treat
@@ -790,38 +1047,101 @@ def _pump_process(proc: "subprocess.Popen", timeout: float,
             _log.warning("should_cancel callback raised; ignoring")
             return False
 
-    while open_streams > 0:
-        # Esc/Ctrl+C: kill the process immediately
-        if _cancel_requested():
-            cancelled = True
-            break
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            _kill_process_tree(proc)
-            return None
-        try:
-            tag, line = q.get(timeout=min(0.25, max(0.01, remaining)))
-        except queue.Empty:
-            if proc.poll() is not None:
-                # process exited; drain whatever is left briefly
-                continue
-            continue
-        if line is None:
-            open_streams -= 1
-            continue
-        (out_lines if tag == "out" else err_lines).append(line)
-        if on_output is not None:
+    deadline = time.monotonic() + timeout
+    exit_deadline: float | None = None
+    cancelled = timed_out = False
+    try:
+        while open_streams > 0:
+            if _cancel_requested():
+                cancelled = True
+                break
+            now = time.monotonic()
+            if now >= deadline:
+                timed_out = True
+                break
+            if exit_deadline is None and proc.poll() is not None:
+                exit_deadline = now + _PUMP_EXIT_GRACE
+            if exit_deadline is not None and now >= exit_deadline:
+                # The shell is gone but a background child still holds
+                # the pipes open: stop listening (the reader threads keep
+                # draining-and-discarding so that child never blocks).
+                break
+            limit = deadline if exit_deadline is None \
+                else min(deadline, exit_deadline)
             try:
-                on_output(line.rstrip("\n"), tag)
-            except Exception:  # noqa: BLE001 — never break the tool
-                pass
-    if cancelled:
+                tag, chunk = q.get(timeout=min(0.1, max(0.01, limit - now)))
+            except queue.Empty:
+                continue
+            if chunk is None:
+                open_streams -= 1
+                continue
+            feed(tag, decoders[tag].decode(chunk))
+        # drain whatever is already queued (non-blocking)
+        while True:
+            try:
+                tag, chunk = q.get_nowait()
+            except queue.Empty:
+                break
+            if chunk is not None:
+                feed(tag, decoders[tag].decode(chunk))
+    finally:
+        discard.set()
+    if cancelled or timed_out:
         _kill_process_tree(proc)
+    flush()
+    out_lines = bufs["out"].lines()
+    err_lines = bufs["err"].lines()
+    if timed_out:
+        if partial is not None:
+            partial["out"] = "".join(out_lines)
+            partial["err"] = "".join(err_lines)
+        return None
+    if cancelled:
         # Mark as cancelled so the caller can report it properly
         out_lines.append("\n[CANCELLED by user (Esc/Ctrl+C)]\n")
         return out_lines, err_lines
-    proc.wait()
+    try:
+        proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(proc)
     return out_lines, err_lines
+
+
+def _run_capture(argv: list[str], timeout: float, cwd: "str | None" = None,
+                 env: "dict | None" = None,
+                 ) -> "subprocess.CompletedProcess":
+    """subprocess.run(capture_output=True, text=True, timeout=...) that
+    cannot hang and never leaks children.
+
+    subprocess.run() on timeout kills only the direct child and then
+    waits for the pipes to reach EOF — if a grandchild (git's ssh/
+    credential helper/hook, ssh's ProxyCommand, ...) still holds them,
+    that wait is UNBOUNDED and the tool (and turn) hangs forever. Here
+    the child runs in its own session, a timeout kills the whole group,
+    stdin is /dev/null (nothing may prompt on the agent's terminal and
+    steal the user's keystrokes) and the post-kill drain is bounded.
+    Raises subprocess.TimeoutExpired / OSError like subprocess.run."""
+    proc = subprocess.Popen(
+        argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, encoding="utf-8",
+        errors="replace", cwd=cwd, env=env, **_popen_kwargs)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(proc)
+        try:
+            proc.communicate(timeout=2)
+        except Exception:  # noqa: BLE001
+            for st in (proc.stdout, proc.stderr):
+                try:
+                    st.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        raise
+    except BaseException:
+        _kill_process_tree(proc)
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
 
 def _validate_shell_args(command: str, timeout: int,
@@ -878,6 +1198,10 @@ def run_command(command: str, timeout: int = 120,
     try:
         proc = subprocess.Popen(
             argv + [command],
+            # no stdin: a command that reads it (python, cat, an editor,
+            # a y/N prompt) used to grab the agent's TERMINAL — stealing
+            # the user's keystrokes and hanging until the timeout.
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace",
             cwd=os.getcwd(),
@@ -885,9 +1209,16 @@ def run_command(command: str, timeout: int = 120,
         )
     except OSError as e:
         return f"ERROR: {e}"
-    pumped = _pump_process(proc, secs, on_output, should_cancel)
+    partial: dict = {}
+    pumped = _pump_process(proc, secs, on_output, should_cancel,
+                           partial=partial)
     if pumped is None:
-        return f"ERROR: command timed out after {secs:g}s"
+        msg = f"ERROR: command timed out after {secs:g}s (process killed)"
+        if partial.get("out"):
+            msg += "\n--- stdout (partial) ---\n" + partial["out"]
+        if partial.get("err"):
+            msg += "\n--- stderr (partial) ---\n" + partial["err"]
+        return _clip(msg)
     out_lines, err_lines = pumped
     stdout = "".join(out_lines)
     stderr = "".join(err_lines)
@@ -1003,6 +1334,10 @@ def _live_shell_locked(argv: list[str], command: str, timeout: float,
     try:
         proc = subprocess.Popen(
             argv + [wrapped],
+            # no stdin: a command that reads it (python, cat, an editor,
+            # a y/N prompt) used to grab the agent's TERMINAL — stealing
+            # the user's keystrokes and hanging until the timeout.
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace",
             cwd=cwd, env=extra_env,
@@ -1010,9 +1345,21 @@ def _live_shell_locked(argv: list[str], command: str, timeout: float,
         )
     except OSError as e:
         return f"ERROR: {e}"
-    pumped = _pump_process(proc, timeout, relay, should_cancel)
+    partial: dict = {}
+    pumped = _pump_process(proc, timeout, relay, should_cancel,
+                           partial=partial)
     if pumped is None:
-        return f"ERROR: command timed out after {timeout:g}s (cwd={cwd})"
+        msg = (f"ERROR: command timed out after {timeout:g}s (cwd={cwd}; "
+               "process killed)")
+        out_part = partial.get("out", "")
+        k = out_part.find(_cwd_mark)
+        if k >= 0:
+            out_part = out_part[:k]
+        if out_part.strip():
+            msg += "\n--- stdout (partial) ---\n" + out_part
+        if partial.get("err"):
+            msg += "\n--- stderr (partial) ---\n" + partial["err"]
+        return _clip(msg)
     out_lines, err_lines = pumped
     stdout = "".join(out_lines)
     stderr = "".join(err_lines)
@@ -1172,21 +1519,27 @@ def apply_patch(patch: str) -> str:
             return err  # path traversal / absolute escape blocked here
         targets.append((s, p, new_null and not old_null))
     # -- apply ---------------------------------------------------------------
-    reports: list[str] = []
+    # Phase 1 computes EVERY file's new content; phase 2 writes. Applying
+    # file-by-file meant a hunk mismatch in the 3rd file returned an ERROR
+    # after files 1-2 had already been rewritten — a half-applied patch
+    # the caller was told had failed (and a retry then double-applied).
+    planned: list[tuple[Path, str, "str | None"]] = []  # (path, old, new)
     for s, p, deleted in targets:
         if deleted:
-            if p.exists():
-                try:
-                    p.unlink()
-                except OSError as e:
-                    return f"ERROR: cannot delete {p}: {e}"
-                reports.append(f"Deleted {p}")
-            else:
-                reports.append(f"Skipped delete of missing {p}")
+            planned.append((p, "", None))
             continue
         try:
-            old_text = p.read_text(encoding="utf-8",
-                                   errors="replace") if p.exists() else ""
+            if p.exists():
+                raw = p.read_bytes()
+                try:
+                    old_text = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    # errors="replace" + rewrite would silently corrupt
+                    # every non-UTF-8 byte in the file
+                    return (f"ERROR: {p} is not valid UTF-8 text; refusing "
+                            "to patch (lossy rewrite would corrupt it)")
+            else:
+                old_text = ""
         except OSError as e:
             return f"ERROR: cannot read {p}: {e}"
         old_lines = old_text.splitlines()
@@ -1228,12 +1581,30 @@ def apply_patch(patch: str) -> str:
         # that did not end with "\n" must not gain one from the patch
         # (the old code added "\n" whenever new_lines was non-empty).
         # A brand-new file (old_text == "") still gets a trailing "\n".
-        new_text = "\n".join(new_lines) + ("\n" if (not old_text
+        # Keep a CRLF file CRLF: splitlines() dropped every "\r" and the
+        # "\n".join silently converted the WHOLE file to LF (a diff that
+        # touches every line, and broken Windows-only files).
+        eol = "\r\n" if "\r\n" in old_text else "\n"
+        new_text = eol.join(new_lines) + (eol if (not old_text
             or old_text.endswith("\n")) and new_lines else "")
+        planned.append((p, old_text, new_text))
+    reports: list[str] = []
+    for p, old_text, new_text in planned:
+        if new_text is None:
+            if p.exists():
+                try:
+                    p.unlink()
+                except OSError as e:
+                    return f"ERROR: cannot delete {p}: {e}"
+                reports.append(f"Deleted {p}")
+            else:
+                reports.append(f"Skipped delete of missing {p}")
+            continue
         try:
             _atomic_write_text(p, new_text)
         except OSError as e:
             return f"ERROR: writing {p}: {e}"
+        filestat.note_written(None, str(p))
         reports.append(_edit_report(p, old_text, new_text))
     return "\n".join(reports)
 
@@ -1241,6 +1612,9 @@ def apply_patch(patch: str) -> str:
 # ---------------------------------------------------------------------------
 # Web
 # ---------------------------------------------------------------------------
+
+_WEB_FETCH_MAX_BYTES = 5_000_000
+
 
 def web_fetch(url: str,
               should_cancel: "Callable[[], bool] | None" = None) -> str:
@@ -1278,6 +1652,7 @@ def web_fetch(url: str,
                 if blocked:
                     raise ValueError(f"blocked URL: {blocked}")
                 r = shared_session().get(current, timeout=30, allow_redirects=False,
+                                         stream=True,
                                          headers={
                     "User-Agent":
                         "Mozilla/5.0 (X11; Linux x86_64) FullAgent/1.0"})
@@ -1289,18 +1664,34 @@ def web_fetch(url: str,
                             f"HTTP {r.status_code} redirect without Location")
                     current = urljoin(current, location)
                     continue
-                r.raise_for_status()
-                return r
+                try:
+                    r.raise_for_status()
+                    # Bounded body: resp.text used to pull the WHOLE body
+                    # into memory — a multi-GB download (or an endless
+                    # stream) would exhaust RAM / hang the turn.
+                    body = bytearray()
+                    for chunk in r.iter_content(65536):
+                        body += chunk
+                        if len(body) >= _WEB_FETCH_MAX_BYTES:
+                            del body[_WEB_FETCH_MAX_BYTES:]
+                            break
+                    enc = r.encoding or "utf-8"
+                    ctype_ = r.headers.get("content-type", "")
+                finally:
+                    r.close()
+                try:
+                    txt = bytes(body).decode(enc, errors="replace")
+                except LookupError:
+                    txt = bytes(body).decode("utf-8", errors="replace")
+                return ctype_, txt
             raise ValueError("too many redirects")
-        resp = run_cancellable(_get, should_cancel, name="web fetch")
+        ctype, text = run_cancellable(_get, should_cancel, name="web fetch")
     except TurnCancelled:
         # Never swallow a cancel into an ERROR string — _execute_tool
         # re-raises it so the turn actually stops.
         raise
     except Exception as e:
         return f"ERROR: {e}"
-    ctype = resp.headers.get("content-type", "")
-    text = resp.text
     if "html" in ctype:
         text = re.sub(r"<script[\s\S]*?</script>|<style[\s\S]*?</style>",
                       "", text, flags=re.I)
@@ -1413,7 +1804,15 @@ def build_registry() -> dict[str, Tool]:
     on every agent turn is pure waste."""
     global _REGISTRY
     if _REGISTRY is not None:
-        return _REGISTRY
+        # A fresh dict per caller: the Tool objects are immutable and
+        # shared, but the MAPPING is not. Agents (and sub-agents) mutate
+        # their registry — readguard/editbackup/webfetch swap handlers
+        # bound to THAT agent, feature modules add tools. Handing every
+        # agent the same singleton dict let those mutations leak across
+        # agents (a sub-agent ran the parent's readguard wrapper; a second
+        # agent saw "already wrapped" and got no guard of its own) and
+        # grow the shared registry for the whole process.
+        return dict(_REGISTRY)
     tools: list[Tool] = [
         Tool("read_file",
              "Read a text file with line numbers. Defaults to the first 200 lines; "
@@ -1519,7 +1918,7 @@ def build_registry() -> dict[str, Tool]:
              web_search),
     ]
     _REGISTRY = {t.name: t for t in tools}
-    return _REGISTRY
+    return dict(_REGISTRY)
 
 
 def parse_tool_arguments(raw: Any) -> dict:

@@ -38,6 +38,9 @@ from .tools import Tool
 from ._foundation import validate_path, ValidationError
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MiB
+# Largest image whose base64 data URI is inlined into the (text) ImageRead
+# result. Bigger images are described without the URI.
+MAX_INLINE_URI_BYTES = 16 * 1024
 
 SUPPORTED_MIMES = ("image/png", "image/jpeg", "image/gif", "image/webp")
 
@@ -227,8 +230,18 @@ def describe_image(path: Any) -> str:
         f"Format: {mime}",
         f"Dimensions: {dim_str}",
         f"Size: {len(data):,} bytes",
-        f"Data URI: {data_uri(mime, data)}",
     ]
+    if len(data) <= MAX_INLINE_URI_BYTES:
+        lines.append(f"Data URI: {data_uri(mime, data)}")
+    else:
+        # The tool result is plain TEXT that stays in the conversation and
+        # is re-sent with every later request: a 10 MiB image inlined as
+        # ~14 MB of base64 made each subsequent turn slower (and blew the
+        # context window) while giving the model nothing it can "see".
+        lines.append(
+            f"Data URI: (omitted — {len(data):,} bytes is too large to "
+            f"inline as text; attach the image to a message with "
+            f"@image {path} instead)")
     return "\n".join(lines)
 
 
@@ -269,7 +282,8 @@ def make_image_read_tool() -> Tool:
         name="ImageRead",
         description=(
             "Read an image file (png/jpeg/gif/webp, max 10 MiB) and return "
-            "a compact descriptor: dimensions, byte size, and a base64 data "
+            "a compact descriptor: dimensions, byte size, and (for small "
+            "images, up to 16 KiB) a base64 data "
             "URI you can pass back to the user message as an image_url "
             "content part. Use to inspect screenshots, diagrams, or photos "
             "the user references."

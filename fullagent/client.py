@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
+import operator
 import queue
 import random
 import re
@@ -1001,8 +1003,8 @@ def build_payload(model: Model, effort: Effort, messages: list[dict],
 # while changing JSON-escapable characters mid-string could shift the true
 # serialized length by a few chars (< 1 token); the 8K+ context margins
 # dwarf that, and any length-changing edit recounts exactly.
-_TOKEN_CACHE_MAX = 1024          # tier-2 digest entries
-_ID_CACHE_MAX = 128             # tier-1 identity entries
+_TOKEN_CACHE_MAX = 16384         # content-keyed raw counts
+_ID_CACHE_MAX = 8192            # per-message identity entries
 _token_cache: "OrderedDict[tuple, int]" = OrderedDict()
 _id_cache: "OrderedDict[int, tuple]" = OrderedDict()
 _token_cache_lock = threading.Lock()
@@ -1103,6 +1105,37 @@ def _tiktoken_count(text: str) -> int | None:
 _WORD_RE = re.compile(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?")
 
 
+def _word_tokens_uncached(w: str) -> float:
+    """Token estimate for one whitespace-free run. Short runs are usually
+    a single BPE token (~1.32 with the trailing space); hash/base64/uuid-
+    like runs (mixed digits+uppercase) tokenize ~2 chars/token; other
+    long runs (URLs, paths) ~3 chars/token past the first 8.
+
+    PERF: the old version walked every character in Python; the counts
+    are now taken with C-level str methods (same results)."""
+    n = len(w)
+    alnum = n - w.count("'")
+    if alnum >= 4:
+        mixed = n - len(w.translate(_STRIP_UPPER_DIGITS))
+        if mixed / alnum >= 0.4:
+            return max(2.0, n / 2.0)
+    if n <= 8:
+        return 1.32
+    return 1.32 + (n - 8) / 3.0
+
+
+# Words repeat heavily in code and prose (identifiers, keywords, English
+# words), so memoizing the per-word estimate turns the hot loop into a
+# C-level map over an lru_cache.
+_STRIP_UPPER_DIGITS = {ord(c): None for c in
+                       "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"}
+_word_tokens = functools.lru_cache(maxsize=65_536)(_word_tokens_uncached)
+
+_CJK_RE = re.compile("[一-鿿㐀-䶿぀-ヿ"
+                     "豈-﫿가-힯＀-￯]")
+_SPACE_RE = re.compile(r"\s")
+
+
 def _is_cjk(ch: str) -> bool:
     o = ord(ch)
     return (0x4E00 <= o <= 0x9FFF or 0x3400 <= o <= 0x4DBF
@@ -1110,23 +1143,28 @@ def _is_cjk(ch: str) -> bool:
             or 0xAC00 <= o <= 0xD7AF or 0xFF00 <= o <= 0xFFEF)
 
 
-def _word_tokens(w: str) -> float:
-    """Token estimate for one whitespace-free run. Short runs are usually
-    a single BPE token (~1.32 with the trailing space); hash/base64/uuid-
-    like runs (mixed digits+uppercase) tokenize ~2 chars/token; other
-    long runs (URLs, paths) ~3 chars/token past the first 8."""
-    alnum = 0
-    mixed = 0
-    for ch in w:
-        if ch.isalnum():
-            alnum += 1
-            if ch.isdigit() or "A" <= ch <= "Z":
-                mixed += 1
-    if alnum >= 4 and mixed / alnum >= 0.4:
-        return max(2.0, len(w) / 2.0)
-    if len(w) <= 8:
-        return 1.32
-    return 1.32 + (len(w) - 8) / 3.0
+def _heuristic_raw(text: str) -> float:
+    """Unfloored heuristic estimate (see _heuristic_token_count).
+
+    PERF: the old implementation ran a Python loop over EVERY character
+    and every character of every word (~20M Python calls for a long
+    session's history). Counting is now done with compiled regexes and
+    C-level string methods; the result is identical."""
+    if not text:
+        return 0.0
+    words = _WORD_RE.findall(text)
+    word_chars = sum(map(len, words))
+    # plain left-to-right float addition (builtin sum() uses compensated
+    # summation since 3.12 and would differ from the old loop by a hair)
+    word_tokens = functools.reduce(operator.add, map(_word_tokens, words),
+                                   0.0)
+    cjk = _CJK_RE.subn("", text)[1]
+    # whitespace that is not CJK (the two classes are disjoint)
+    spaces = _SPACE_RE.subn("", text)[1]
+    # Punctuation / JSON framing (~1 tok per 2.5 chars); whitespace mostly
+    # merges into neighbouring BPE tokens, so it counts far less.
+    punct = len(text) - word_chars - cjk - spaces
+    return word_tokens + cjk * 1.0 + punct / 2.5 + spaces / 8.0
 
 
 def _heuristic_token_count(text: str) -> int:
@@ -1136,140 +1174,136 @@ def _heuristic_token_count(text: str) -> int:
     for invalid_request_error)."""
     if not text:
         return 0
-    words = _WORD_RE.findall(text)
-    word_chars = 0
-    word_tokens = 0.0
-    for w in words:
-        word_chars += len(w)
-        word_tokens += _word_tokens(w)
-    cjk = 0
-    spaces = 0
-    for ch in text:
-        if _is_cjk(ch):
-            cjk += 1
-        elif ch.isspace():
-            spaces += 1
-    # Punctuation / JSON framing (~1 tok per 2.5 chars); whitespace mostly
-    # merges into neighbouring BPE tokens, so it counts far less.
-    punct = len(text) - word_chars - cjk - spaces
-    return max(1, int(word_tokens + cjk * 1.0 + punct / 2.5 + spaces / 8.0))
+    return max(1, int(_heuristic_raw(text)))
 
 
 def _raw_token_estimate(text: str) -> int:
     """Best raw token estimate for a string, before per-model correction."""
-    n = _tiktoken_count(text)
-    if n is not None:
-        return max(1, n)
-    return _heuristic_token_count(text)
+    return max(1, int(_raw_float(text))) if text else 0
 
 
-def _token_cache_key(payload: str, model_id: str) -> tuple[str, str, int]:
-    digest = hashlib.blake2b(payload.encode("utf-8"),
-                             digest_size=16).hexdigest()
-    return (digest, _cal_key(model_id), _calibration_epoch)
+def _raw_float(text: str) -> float:
+    """Raw (uncorrected, model-independent) estimate for a string, cached
+    by CONTENT.
 
-
-def _count_payload(payload: str, model_id: str = "") -> int:
-    """Token count for an already-serialized payload, via the content cache.
-
-    Cache hit: O(1) dict lookup. Miss: one cheap blake2b + the raw
-    estimate (tiktoken if available, else the BPE-aware heuristic) times
-    the per-model learned correction, so displayed counts track the
-    backend's real tokenizer after the first few responses.
+    ROOT-CAUSE FIX (progressive slowdown): the old caches were keyed on
+    the calibration epoch, and the epoch was bumped after EVERY model
+    response (learn_token_correction). So every response threw away every
+    cached count and the next call re-tokenized the WHOLE conversation in
+    pure Python — several times per tool iteration (compaction check,
+    prompt budget, prewarm thread, usage learning). Cost grew with the
+    session until the agent stopped responding. Raw counts do not depend
+    on calibration at all, so they are cached forever (bounded LRU) and
+    the learned correction is applied on read.
     """
-    key = _token_cache_key(payload, model_id)
+    if not text:
+        return 0.0
+    key = (hash(text), len(text))
     with _token_cache_lock:
         hit = _token_cache.get(key)
         if hit is not None:
             _token_cache.move_to_end(key)
             return hit
-    count = max(1, int(_raw_token_estimate(payload)
-                       * _correction_factor(model_id)))
+    n = _tiktoken_count(text)
+    raw = float(max(1, n)) if n is not None else _heuristic_raw(text)
     with _token_cache_lock:
-        _token_cache[key] = count
+        _token_cache[key] = raw
         _token_cache.move_to_end(key)
         while len(_token_cache) > _TOKEN_CACHE_MAX:
             _token_cache.popitem(last=False)  # evict oldest
-    return count
+    return raw
 
 
-def _count_uncached(obj: Any, model_id: str,
-                    fingerprint: tuple | None) -> int:
-    """Serialize, count via the digest tier, and populate tier 1."""
+def _serialize(obj: Any) -> str:
     try:
-        payload = json.dumps(obj, ensure_ascii=False, default=str)
+        return json.dumps(obj, ensure_ascii=False, default=str)
     except (TypeError, ValueError):
-        payload = str(obj)
-        fingerprint = None  # not the object we fingerprinted; stay safe
-    count = _count_payload(payload, model_id)
-    if fingerprint is not None:
-        # NOTE: plain lists do not support weakref; id() keying is safe
-        # here because the fingerprint is re-validated on every lookup
-        # (see the tier-1 comment above).
+        return str(obj)
+
+
+def _message_raw(m: dict) -> float:
+    """Raw estimate of one message dict. Tier 1: the same dict, verified
+    unmutated by an O(#fields) fingerprint -> no serialization at all.
+    Otherwise serialize this ONE message and use the content cache."""
+    fp = _message_fingerprint([m])
+    if fp is not None:
+        key = id(m)
         with _token_cache_lock:
-            _id_cache[id(obj)] = (fingerprint, _calibration_epoch, count)
-            _id_cache.move_to_end(id(obj))
+            entry = _id_cache.get(key)
+            if entry is not None and entry[0] == fp:
+                _id_cache.move_to_end(key)
+                return entry[1]
+    raw = _raw_float(_serialize(m))
+    if fp is not None:
+        with _token_cache_lock:
+            _id_cache[id(m)] = (fp, raw)
+            _id_cache.move_to_end(id(m))
             while len(_id_cache) > _ID_CACHE_MAX:
                 _id_cache.popitem(last=False)
-    return count
+    return raw
+
+
+def _raw_estimate_obj(obj: Any) -> float:
+    """Raw estimate of any JSON-able object.
+
+    A list of message dicts is counted PER MESSAGE (+ the list framing),
+    so appending one message costs one message, not a re-count of the
+    whole history. Everything else is serialized once and content-cached.
+    """
+    if isinstance(obj, list) and obj and all(isinstance(m, dict)
+                                             for m in obj):
+        total = 0.0
+        for m in obj:
+            total += _message_raw(m)
+        n = len(obj)
+        # "[" "]" and the ", " separators json.dumps puts between items
+        return total + (n + 1) / 2.5 + (n - 1) / 8.0
+    return _raw_float(_serialize(obj))
+
+
+def _count_payload(payload: str, model_id: str = "") -> int:
+    """Token count for an already-serialized payload (cached raw estimate
+    times the learned per-model correction)."""
+    return max(1, int(_raw_float(payload) * _correction_factor(model_id)))
 
 
 def estimate_tokens_fast(text: str, model_id: str = "") -> int:
     """Hot-path token estimate for plain text (raw estimate x per-model
-    correction, cached).
+    correction, cached by content).
 
-    Strings are immutable and the count depends only on ``len(text)`` for
-    a given calibration, so the key ``(id, len, model bucket, epoch)``
-    is exact with no hashing at all: repeated counts of the same string
-    are ~microseconds. Non-string input falls back to
-    :func:`estimate_tokens`.
+    The old key was ``(id(text), len(text))``: after the string was
+    garbage-collected, a DIFFERENT string of the same length reusing the
+    address got the old count. The content key (hash is cached on the str
+    object, so repeat lookups are O(1)) cannot confuse two strings.
+    Non-string input falls back to :func:`estimate_tokens`.
     """
     if not isinstance(text, str):
         return estimate_tokens(text, model_id)
-    key = (id(text), len(text), _cal_key(model_id), _calibration_epoch)
-    with _token_cache_lock:
-        hit = _token_cache.get(key)
-        if hit is not None:
-            _token_cache.move_to_end(key)
-            return hit
-    count = max(1, int(_raw_token_estimate(text)
-                       * _correction_factor(model_id)))
-    with _token_cache_lock:
-        _token_cache[key] = count
-        _token_cache.move_to_end(key)
-        while len(_token_cache) > _TOKEN_CACHE_MAX:
-            _token_cache.popitem(last=False)
-    return count
+    return max(1, int(_raw_float(text) * _correction_factor(model_id)))
+
+
+def prompt_raw_tokens(messages: Any, tools: Any = None) -> float:
+    """Raw (uncorrected) estimate of a request body {messages, tools},
+    computed from the per-message caches — no full-payload dump."""
+    raw = _raw_estimate_obj(messages) if messages else 0.0
+    if tools:
+        raw += _raw_estimate_obj(tools)
+    return raw + 8.0  # {"messages": ..., "tools": ...} wrapper
+
 
 def estimate_tokens(obj: Any, model_id: str = "") -> int:
     """Deterministic token estimate for any JSON-serialisable object.
 
-    Starts from a conservative ~3.2 chars/token baseline, then corrects
-    itself with the REAL chars/token ratio learned from every backend
-    response (usage.prompt_tokens vs the prompt we actually sent). The
-    backend's own tokenizer is the ground truth — once a few responses
-    have landed, this estimate tracks reality instead of a fixed guess,
-    which is what keeps long sessions from ever overflowing the window.
+    Starts from the raw estimate (tiktoken when installed, else the
+    BPE-aware heuristic), then corrects itself with the REAL ratio learned
+    from every backend response (usage.prompt_tokens vs the prompt we
+    actually sent). Calibration is PER MODEL and persisted to disk.
 
-    Calibration is PER MODEL (tokenizers differ between models) and is
-    persisted to disk, so the very first request of a fresh process on a
-    big project already uses the learned ratio.
-
-    Speed: the count for an unchanged object is served from the identity
-    cache (~microseconds, no serialization); mutated or new content pays
-    one serialization and is then cached by content digest."""
-    # Tier 1: same object, verified unmutated -> free.
-    fingerprint = _message_fingerprint(obj)
-    if fingerprint is not None:
-        with _token_cache_lock:
-            entry = _id_cache.get(id(obj))
-            if entry is not None:
-                fp, epoch, count = entry
-                if epoch == _calibration_epoch and fp == fingerprint:
-                    _id_cache.move_to_end(id(obj))
-                    return count
-    # Tier 2 (inside _count_uncached): serialize once, digest-cache.
-    return _count_uncached(obj, model_id, fingerprint)
+    Speed: raw counts are cached per message (identity + fingerprint) and
+    per content (hash), independent of calibration, so a growing
+    conversation only ever pays for its NEW messages; the correction is a
+    multiply on read."""
+    return max(1, int(_raw_estimate_obj(obj) * _correction_factor(model_id)))
 
 
 # -- learned tokenizer calibration (schema 2: correction multipliers) ---------
@@ -1546,7 +1580,8 @@ def _iter_sse_events(resp: requests.Response) -> Iterator[dict]:
             return None
         return parsed
 
-    for raw in resp.iter_lines():
+    lines = resp.iter_lines()
+    for raw in lines:
         line = raw.decode("utf-8", errors="replace")
         if line.startswith("\ufeff"):
             line = line.lstrip("\ufeff")
@@ -1554,6 +1589,7 @@ def _iter_sse_events(resp: requests.Response) -> Iterator[dict]:
             # blank line: end of event — dispatch what accumulated
             ev = _dispatch()
             if ev == "done":
+                _drain_after_done(resp, lines)
                 return
             if ev is not None:
                 yield ev
@@ -1567,6 +1603,33 @@ def _iter_sse_events(resp: requests.Response) -> Iterator[dict]:
     ev = _dispatch()
     if ev is not None and ev != "done":
         yield ev
+
+
+_DONE_DRAIN_TIMEOUT = 0.5
+
+
+def _drain_after_done(resp, lines) -> None:
+    """After [DONE], read the (tiny) rest of the body — normally just the
+    chunked terminator — so requests marks the content consumed and
+    resp.close() RETURNS the keep-alive connection to the pool instead of
+    closing it. Bounded by a short socket timeout so a server that keeps
+    the stream open after [DONE] costs at most _DONE_DRAIN_TIMEOUT."""
+    sock = _response_socket(resp)
+    old = None
+    try:
+        if sock is not None:
+            old = sock.gettimeout()
+            sock.settimeout(_DONE_DRAIN_TIMEOUT)
+        for _ in lines:
+            pass
+    except Exception:  # noqa: BLE001 — best effort; close() handles it
+        pass
+    finally:
+        if sock is not None:
+            try:
+                sock.settimeout(old)
+            except OSError:
+                pass
 
 
 def _response_socket(resp: requests.Response):
@@ -1654,55 +1717,18 @@ def _iter_sse_events_cancellable(
     _END = object()
 
     def _produce() -> None:
-        batch: list[Any] = []
-        error: Exception | None = None
-        batch_lock = threading.Lock()
-        timer_token = None
-        timer_handle = None
-
-        def _flush_due(token) -> None:
-            nonlocal batch, timer_token, timer_handle
-            with batch_lock:
-                if token is not timer_token:
-                    return
-                timer_token = None
-                timer_handle = None
-                if batch:
-                    q.put(batch)
-                    batch = []
-
+        # PERF/LEAK FIX: the old producer batched events behind a 2ms
+        # threading.Timer — one NEW THREAD per event whenever tokens
+        # arrived more than 2ms apart (the normal case for a streaming
+        # model: 300 tokens -> 300 threads per call). queue.Queue.put is
+        # already cheap and thread-safe, so events go straight through.
         try:
             for event in _iter_sse_events(resp):
-                with batch_lock:
-                    batch.append(event)
-                    if len(batch) >= _SSE_QUEUE_BATCH_SIZE:
-                        if timer_handle is not None:
-                            timer_handle.cancel()
-                        timer_token = None
-                        timer_handle = None
-                        q.put(batch)
-                        batch = []
-                    elif timer_handle is None:
-                        token = object()
-                        timer_token = token
-                        timer_handle = threading.Timer(
-                            0.002, _flush_due, args=(token,))
-                        timer_handle.daemon = True
-                        timer_handle.start()
+                q.put(event)
         except Exception as e:  # noqa: BLE001 — re-raised in the consumer
-            error = e
+            q.put(e)
         finally:
-            with batch_lock:
-                if timer_handle is not None:
-                    timer_handle.cancel()
-                timer_token = None
-                timer_handle = None
-                if batch:
-                    q.put(batch)
-                    batch = []
-                if error is not None:
-                    q.put(error)
-                q.put(_END)
+            q.put(_END)
 
     thread = threading.Thread(target=_produce, daemon=True,
                               name="sse-producer")
@@ -1943,9 +1969,10 @@ def _fit_max_tokens_from_actual(model: Model, info: dict,
     return min(requested, headroom)
 
 
-def _learn_from_usage(usage: Any, sent_text: str | int | None = None,
+def _learn_from_usage(usage: Any, sent_text: str | int | float | None = None,
                      model_id: str = "", *,
-                     sent_chars: int | None = None) -> None:
+                     sent_chars: int | None = None,
+                     raw_tokens: float | None = None) -> None:
     """Calibrate from provider usage without trusting either input shape.
 
     Production callers pass the serialized prompt text. Older callers may
@@ -1956,7 +1983,17 @@ def _learn_from_usage(usage: Any, sent_text: str | int | None = None,
     prompt_tokens, _ = safe_token_counts(usage)
     if prompt_tokens <= 0:
         return
-    if isinstance(sent_text, str):
+    if raw_tokens is not None:
+        # PERF: callers pass the raw estimate computed from the
+        # per-message caches (prompt_raw_tokens) — no full-payload dump
+        # and re-tokenization after every response.
+        try:
+            raw_tokens = float(raw_tokens)
+        except (TypeError, ValueError):
+            return
+        if raw_tokens <= 0:
+            return
+    elif isinstance(sent_text, str):
         raw_tokens = _raw_token_estimate(sent_text)
     else:
         char_count = _coerce_token_count(
@@ -2093,7 +2130,7 @@ def chat_stream(provider: Provider, model: Model, effort: Effort,
     on_tool_args_w = _mark_emitted_args(on_tool_args)
 
     for overflow_attempt in range(OVERFLOW_RETRIES + OVERFLOW_SHRINKS + 1):
-        sent_text = _prompt_payload_text(messages, tools)
+        sent_raw = prompt_raw_tokens(messages, tools)
         try:
             payload = build_payload(model, current_effort, messages, tools,
                                     stream=True)
@@ -2110,7 +2147,8 @@ def chat_stream(provider: Provider, model: Model, effort: Effort,
                 url, headers, payload, on_token_w, on_reasoning_w,
                 on_tool_start, on_tool_args_w, should_cancel, timeout,
                 on_status=on_status)
-            _learn_from_usage(result.usage, sent_text, model.id)
+            _learn_from_usage(result.usage, model_id=model.id,
+                              raw_tokens=sent_raw)
             return result
         except APIError as e:
             # reasoning_content validation — heal history and retry once,
@@ -2146,7 +2184,7 @@ def chat_stream(provider: Provider, model: Model, effort: Effort,
                 invalid_retried = True
                 continue
             healed = _heal_overflow(model, current_effort, e,
-                                    overflow_attempt, sent_text)
+                                    overflow_attempt, sent_raw)
             if healed is not None:
                 current_effort = healed
                 continue
@@ -2169,7 +2207,7 @@ OVERFLOW_SHRINKS = 2   # shrink-the-conversation-and-retry attempts
 
 
 def _heal_overflow(model: Model, effort: Effort, error: APIError,
-                   attempt: int, sent_text: str = "") -> Effort | None:
+                   attempt: int, sent_text: "str | float" = "") -> Effort | None:
     """Turn a backend overflow error into a tighter Effort, or None when
     the input itself no longer fits (nothing a clamp can fix)."""
     if not is_context_overflow(str(error)):
@@ -2180,7 +2218,9 @@ def _heal_overflow(model: Model, effort: Effort, error: APIError,
     # the backend just told us the real input size — calibrate the
     # per-model estimator with it so every later clamp is accurate
     if info.get("input_tokens") and sent_text:
-        learn_token_correction(_raw_token_estimate(sent_text),
+        learn_token_correction((_raw_token_estimate(sent_text)
+                                if isinstance(sent_text, str)
+                                else float(sent_text)),
                                info["input_tokens"], model.id)
     fitted = _fit_max_tokens_from_actual(model, info, effort)
     if fitted is None:
@@ -2371,6 +2411,7 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
     # stream every 5s.
     import threading as _th
     _stall_stop = _th.Event()
+    _clean_exit = False
 
     try:
         ctype = (resp.headers.get("Content-Type") or "").lower()
@@ -2399,6 +2440,7 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
             # provider returning a JSON array/string here used to escape
             # as a raw AttributeError instead of a clean APIError.
             model_id = data.get("model") if isinstance(data, dict) else None
+            _clean_exit = True
             return _result_from_json(data, str(model_id or ""))
         # Every stream goes through the cancellable iterator: it honours
         # Esc/Ctrl+C mid-stall AND aborts the stream when no data arrives
@@ -2594,13 +2636,20 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
                     stall.token_received()  # visible activity
                     if on_tool_args:
                         on_tool_args(acc.name, _args)
+        _clean_exit = True
     finally:
         # Stop the stall timer on EVERY exit path (normal return, error
         # event, cancel, stall timeout, disconnect) — without this an
         # exception out of the loop leaked the daemon thread, which kept
         # firing on_status/on_reasoning callbacks on a dead stream.
         _stall_stop.set()
-        resp.close()
+        if _clean_exit:
+            resp.close()
+        else:
+            # error event / in-loop cancel / callback exception: the SSE
+            # producer may still be blocked in recv() holding the read
+            # lock — a plain close() would wait out the full read timeout
+            _abort_response(resp)
 
     result.content = "".join(content_parts)
     result.reasoning = "".join(reasoning_parts)
@@ -2914,7 +2963,7 @@ def chat_blocking(provider: Provider, model: Model, effort: Effort,
     shrinks_used = 0
 
     for overflow_attempt in range(OVERFLOW_RETRIES + OVERFLOW_SHRINKS + 1):
-        sent_text = _prompt_payload_text(messages, tools)
+        sent_raw = prompt_raw_tokens(messages, tools)
         try:
             payload = build_payload(model, current_effort, messages, tools,
                                     stream=False)
@@ -2938,7 +2987,7 @@ def chat_blocking(provider: Provider, model: Model, effort: Effort,
                     f"{err} — history was sanitized but provider still "
                     f"rejects. Try /new or /rewind.") from err
             healed = _heal_overflow(model, current_effort, err,
-                                    overflow_attempt, sent_text)
+                                    overflow_attempt, sent_raw)
             if healed is not None:
                 current_effort = healed
                 continue
@@ -2948,7 +2997,8 @@ def chat_blocking(provider: Provider, model: Model, effort: Effort,
                 continue
             raise
         result = _result_from_json(data, model.id)
-        _learn_from_usage(result.usage, sent_text, model.id)
+        _learn_from_usage(result.usage, model_id=model.id,
+                              raw_tokens=sent_raw)
         return result
 
     raise APIError(
@@ -3204,10 +3254,17 @@ if __name__ == "__main__":
         return (_t.perf_counter() - t0) / iters * 1000.0
 
     # -- 1. identical results with/without cache -------------------------
-    check("count == raw path (100KB)",
-          estimate_tokens(prompt100k, MID) == _raw_path(prompt100k))
-    check("count == raw path (1MB)",
-          estimate_tokens(hist1m, MID) == _raw_path(hist1m))
+    # Lists of messages are counted per message (+ list framing), so the
+    # result matches the whole-payload count to within ~1 token/message.
+    def _close(a, b, n):
+        return abs(a - b) <= n + 2
+
+    check("count ~= raw path (100KB)",
+          _close(estimate_tokens(prompt100k, MID), _raw_path(prompt100k),
+                 len(prompt100k)))
+    check("count ~= raw path (1MB)",
+          _close(estimate_tokens(hist1m, MID), _raw_path(hist1m),
+                 len(hist1m)))
 
     # -- 2. speed: uncached path vs identity-tier repeated counts ---------
     t_old_100k = _bench(lambda: _raw_path(prompt100k))
@@ -3245,7 +3302,8 @@ if __name__ == "__main__":
     msgs[0]["content"] = "hello world, this is a much longer message now"
     n3 = estimate_tokens(msgs, MID)
     check("in-place content edit changes count", n3 > n0)
-    check("in-place edit count is exact", n3 == _raw_path(msgs))
+    check("in-place edit count tracks raw path",
+          _close(n3, _raw_path(msgs), len(msgs)))
     msgs2 = [{"role": "assistant", "content": "",
               "tool_calls": [{"id": "1", "type": "function",
                               "function": {"name": "read",
@@ -3254,7 +3312,8 @@ if __name__ == "__main__":
     msgs2[0]["tool_calls"][0]["function"]["arguments"] = '{"p": "x' * 500
     b = estimate_tokens(msgs2, MID)
     check("tool-call arg growth changes count", b > a)
-    check("tool-call count exact", b == _raw_path(msgs2))
+    check("tool-call count tracks raw path",
+          _close(b, _raw_path(msgs2), len(msgs2)))
 
     # -- 4. calibration learn invalidates the cache -------------------------
     before = estimate_tokens(prompt100k, MID)
@@ -3262,7 +3321,7 @@ if __name__ == "__main__":
     learn_token_correction(raw_tokens=raw, actual_tokens=raw // 2,
                            model_id=MID)  # backend says: half the raw guess
     after = estimate_tokens(prompt100k, MID)
-    check("learned correction changes the count (epoch bump)",
+    check("learned correction changes the count (applied on read)",
           after < before)
     check("learned count ~= half of raw", abs(after - before // 2) <= 2)
     check("learned count still sane", after > 0)
@@ -3300,7 +3359,7 @@ if __name__ == "__main__":
     # -- 7. caches stay bounded ----------------------------------------------
     for i in range(_TOKEN_CACHE_MAX + 200):
         estimate_tokens_fast(f"unique-content-{i}", MID)
-    check("digest cache evicts oldest (bounded)",
+    check("content cache evicts oldest (bounded)",
           len(_token_cache) <= _TOKEN_CACHE_MAX)
     for i in range(_ID_CACHE_MAX + 20):
         estimate_tokens([{"role": "user", "content": f"m{i}"}], MID)

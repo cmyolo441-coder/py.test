@@ -125,15 +125,47 @@ def _indentation_insensitive_match(
     return start, end
 
 
+# Bounds for the suggestion pass: a failing 40-line needle against a
+# 5000-line file used to run ~200k full SequenceMatcher comparisons
+# (~9 s per failed edit — and failed edits are retried).
+_SUGGEST_MAX_NEEDLE_LINES = 6
+_SUGGEST_RATIO_CANDIDATES = 40
+
+
+def _rank_lines(key: str, stripped: list[str], exclude: set[int],
+                top: int) -> list[tuple[float, int]]:
+    """Best-`top` (ratio, idx) for `key` among `stripped`, cheaply:
+    seq2 is fixed once (SequenceMatcher caches its index), and the exact
+    ratio is only computed for lines whose quick_ratio upper bound can
+    still make the cut."""
+    sm = difflib.SequenceMatcher(None)
+    sm.set_seq2(key)
+    bounds: list[tuple[float, int]] = []
+    for idx, text in enumerate(stripped):
+        if not text or idx in exclude:
+            continue
+        sm.set_seq1(text)
+        if sm.real_quick_ratio() <= 0.0:
+            continue
+        bounds.append((sm.quick_ratio(), idx))
+    bounds.sort(key=lambda p: p[0], reverse=True)
+    scored: list[tuple[float, int]] = []
+    for qr, idx in bounds[:max(top, _SUGGEST_RATIO_CANDIDATES)]:
+        sm.set_seq1(stripped[idx])
+        scored.append((sm.ratio(), idx))
+    scored.sort(key=lambda p: p[0], reverse=True)
+    return scored[:top]
+
+
 def _suggestions(
     content: str, old: str, max_suggestions: int = 6
 ) -> list[str]:
     """Strategy (d): closest real snippets with line numbers.
 
-    Always returns something actionable: proper difflib close matches
-    first, then a best-effort pass of the highest-similarity lines so a
-    totally-off needle still gets "line N: ..." hints instead of a bare
-    "not found" that invites a blind retry loop.
+    Always returns something actionable: proper close matches first
+    (ratio >= 0.55), then a best-effort pass of the highest-similarity
+    lines so a totally-off needle still gets "line N: ..." hints instead
+    of a bare "not found" that invites a blind retry loop.
     """
     lines = content.splitlines()
     stripped = [line.strip() for line in lines]
@@ -145,33 +177,28 @@ def _suggestions(
             seen.add(idx)
             out.append(f"line {idx + 1}: {lines[idx].strip()[:120]}")
 
-    # Pass 1: proper close matches.
+    keys: list[str] = []
     for needle_line in old.splitlines():
         key = needle_line.strip()
-        if not key:
-            continue
-        for match in difflib.get_close_matches(
-            key, stripped, n=2, cutoff=0.55
-        ):
-            for idx, text in enumerate(stripped):
-                if text == match:
-                    add(idx)
-                    break
+        if key and key not in keys:
+            keys.append(key)
+        if len(keys) >= _SUGGEST_MAX_NEEDLE_LINES:
+            break
+
+    # Pass 1: proper close matches.
+    ranked: dict[str, list[tuple[float, int]]] = {}
+    for key in keys:
+        ranked[key] = _rank_lines(key, stripped, set(), 8)
+        for ratio, idx in ranked[key][:2]:
+            if ratio >= 0.55:
+                add(idx)
         if len(out) >= max_suggestions:
             return out[:max_suggestions]
 
     # Pass 2: best-effort — highest similarity lines regardless of cutoff.
     if len(out) < 3:
-        scored: list[tuple[float, int]] = []
-        for needle_line in old.splitlines():
-            key = needle_line.strip()
-            if not key:
-                continue
-            for idx, text in enumerate(stripped):
-                if text and idx not in seen:
-                    ratio = difflib.SequenceMatcher(
-                        None, key, text).ratio()
-                    scored.append((ratio, idx))
+        scored = [pair for key in keys for pair in ranked[key]
+                  if pair[1] not in seen]
         scored.sort(key=lambda pair: pair[0], reverse=True)
         for _, idx in scored:
             add(idx)
@@ -198,7 +225,21 @@ def find_best_match(
     # (a) exact match
     idx = content.find(old_string)
     if idx >= 0:
-        return idx, idx + len(old_string), []
+        nxt = content.find(old_string, idx + 1)
+        if nxt < 0:
+            return idx, idx + len(old_string), []
+        # Ambiguous exact match: returning the FIRST occurrence as a
+        # confident match made a caller edit whichever copy came first.
+        # Not confident -- list the occurrences instead.
+        out: list[str] = []
+        pos = idx
+        lines = content.splitlines()
+        while pos >= 0 and len(out) < 6:
+            ln = content.count("\n", 0, pos)
+            text = lines[ln].strip()[:120] if ln < len(lines) else ""
+            out.append(f"line {ln + 1}: {text}")
+            pos = content.find(old_string, pos + 1)
+        return None, None, out
 
     # (b) whitespace-normalized match
     res = _whitespace_normalized_match(content, old_string)

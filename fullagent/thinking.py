@@ -212,11 +212,19 @@ class ReasoningStream:
     matter how long the stream grows.
     """
 
+    # PERF: preview() runs on every reasoning chunk. It used to join ALL
+    # accumulated parts each time — O(n) per chunk, O(n^2) per thinking
+    # phase — so a long reasoning stream got slower with every chunk. A
+    # bounded rolling tail is kept instead; preview cost is O(window).
+    _TAIL_WINDOW = 4096
+
     def __init__(self, tail_chars: int = 90):
         self._parts: list[str] = []
         self._chars = 0             # total reasoning chars fed
         self.chunks = 0             # total reasoning chunks fed
         self._tail_chars = max(1, tail_chars)
+        self._tail = ""             # last <= _TAIL_WINDOW chars
+        self._nonblank = False      # any non-whitespace seen yet
 
     def feed(self, piece: Any) -> None:
         """Accumulate one reasoning chunk. Never raises; ignores empties."""
@@ -229,6 +237,12 @@ class ReasoningStream:
             self._parts.append(text)
             self._chars += len(text)
             self.chunks += 1
+            if not self._nonblank and text.strip():
+                self._nonblank = True
+            tail = self._tail + text
+            if len(tail) > 2 * self._TAIL_WINDOW:
+                tail = tail[-self._TAIL_WINDOW:]
+            self._tail = tail
         except Exception:
             pass
 
@@ -253,12 +267,13 @@ class ReasoningStream:
         try:
             limit = (self._tail_chars if tail_chars is None
                      else max(1, tail_chars))
-            if self._chars == 0:
+            if self._chars == 0 or not self._nonblank:
                 return ""
-            raw = "".join(self._parts)
-            if not raw.strip():
-                return ""
-            truncated = len(raw) > limit
+            if limit <= len(self._tail) or len(self._tail) == self._chars:
+                raw = self._tail
+            else:  # caller asked for more than the rolling window holds
+                raw = "".join(self._parts)
+            truncated = self._chars > limit
             tail = raw[-limit:] if truncated else raw
             single = " ".join(tail.split())
             if not single:

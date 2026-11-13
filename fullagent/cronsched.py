@@ -38,6 +38,9 @@ POLL_SECONDS = 30
 RUN_TIMEOUT = 120
 # Bytes of subprocess output kept per run.
 OUTPUT_TAIL_LIMIT = 8 * 1024
+# Run-history rows kept per cron (a */1 cron used to add 1440 rows/day
+# forever).
+RUNS_KEEP_PER_CRON = 200
 # Default location of the cron database.
 DB_PATH = config.APP_DIR / "cron.db"
 
@@ -170,20 +173,37 @@ def next_run_after(expr: str, after: datetime) -> datetime:
      dom_restricted, dow_restricted) = _parse(expr)
     t = after.replace(second=0, microsecond=0) + timedelta(minutes=1)
     limit = t + timedelta(days=366)
+    # PERF: skip whole months / days / hours that cannot match instead of
+    # stepping minute by minute. The old loop did up to ~527k iterations
+    # for rare or impossible expressions ("0 0 29 2 *", "0 0 30 2 *") —
+    # under the scheduler lock, on every add/recompute/run.
     while t <= limit:
-        if (t.minute in mins and t.hour in hours and t.month in months):
-            cron_dow = t.isoweekday() % 7  # Sunday == 0
-            if dom_restricted and dow_restricted:
-                day_ok = (t.day in doms) or (cron_dow in dows)
-            elif dom_restricted:
-                day_ok = t.day in doms
-            elif dow_restricted:
-                day_ok = cron_dow in dows
+        if t.month not in months:
+            if t.month == 12:
+                t = t.replace(year=t.year + 1, month=1, day=1,
+                              hour=0, minute=0)
             else:
-                day_ok = True
-            if day_ok:
-                return t
-        t += timedelta(minutes=1)
+                t = t.replace(month=t.month + 1, day=1, hour=0, minute=0)
+            continue
+        cron_dow = t.isoweekday() % 7  # Sunday == 0
+        if dom_restricted and dow_restricted:
+            day_ok = (t.day in doms) or (cron_dow in dows)
+        elif dom_restricted:
+            day_ok = t.day in doms
+        elif dow_restricted:
+            day_ok = cron_dow in dows
+        else:
+            day_ok = True
+        if not day_ok:
+            t = (t + timedelta(days=1)).replace(hour=0, minute=0)
+            continue
+        if t.hour not in hours:
+            t = (t + timedelta(hours=1)).replace(minute=0)
+            continue
+        if t.minute not in mins:
+            t += timedelta(minutes=1)
+            continue
+        return t
     raise ValueError(f"no run of {expr!r} within a year")
 
 
@@ -305,11 +325,20 @@ class CronScheduler:
     def _record_run(self, cron_id: int, started_at: float,
                     exit_code: int, output_tail: str) -> None:
         with self._lock:
+            # the cron may have been removed while it ran (the lock is no
+            # longer held across the subprocess): don't leave orphan rows
+            if self._row(cron_id) is None:
+                return
             self._conn.execute(
                 "INSERT INTO runs (cron_id, started_at, exit_code,"
                 " output_tail) VALUES (?, ?, ?, ?)",
                 (cron_id, started_at, exit_code,
                  output_tail[-OUTPUT_TAIL_LIMIT:]))
+            self._conn.execute(
+                "DELETE FROM runs WHERE cron_id = ? AND id NOT IN ("
+                " SELECT id FROM runs WHERE cron_id = ?"
+                " ORDER BY started_at DESC, id DESC LIMIT ?)",
+                (cron_id, cron_id, RUNS_KEEP_PER_CRON))
             self._conn.commit()
 
     def _run_cron(self, cron: dict) -> None:
@@ -357,37 +386,60 @@ class CronScheduler:
         except Exception as e:  # noqa: BLE001 — never let cron die silently
             exit_code = 125
             out = f"[failed to launch: {e}]"
-        self._record_run(cron["id"], started_at, exit_code, out)
         # Advance to the next slot strictly after now.
         try:
             nxt = next_run_after(cron["cron_expr"],
                                  datetime.now()).timestamp()
         except ValueError:
             nxt = started_at + 365 * 24 * 3600
-        with self._lock:
-            self._conn.execute(
-                "UPDATE crons SET last_run = ?, next_run = ? WHERE id = ?",
-                (started_at, nxt, cron["id"]))
-            self._conn.commit()
+        try:
+            self._record_run(cron["id"], started_at, exit_code, out)
+            with self._lock:
+                self._conn.execute(
+                    "UPDATE crons SET last_run = ?, next_run = ? WHERE id = ?",
+                    (started_at, nxt, cron["id"]))
+                self._conn.commit()
+        except sqlite3.ProgrammingError:
+            pass  # scheduler closed while this cron was running
 
     def run_due(self, now: Optional[float] = None) -> int:
         """Run every due cron once. Returns number of crons executed.
 
-        The whole sweep holds the lock: a concurrent run_due() (background
-        thread racing a manual call) blocks instead of double-firing the
-        same cron slot.
+        Due crons are CLAIMED under the lock (next_run advanced atomically)
+        and then run with the lock released. The old sweep held the lock
+        across every subprocess (up to RUN_TIMEOUT=120s each), so CronList /
+        CronAdd / CronRemove called from the turn thread froze for minutes
+        whenever a cron was running. Claiming keeps the no-double-fire
+        guarantee: a concurrent run_due() no longer sees the claimed slot.
         """
         now = time.time() if now is None else now
+        claim_until = time.time() + RUN_TIMEOUT + 60
         with self._lock:
             cur = self._conn.execute(
                 "SELECT * FROM crons WHERE enabled = 1 AND next_run <= ?",
                 (now,))
             due = [dict(r) for r in cur.fetchall()]
             for cron in due:
-                try:
-                    self._run_cron(cron)
-                except Exception:  # noqa: BLE001 — one cron must not kill others
-                    traceback.print_exc()
+                self._conn.execute(
+                    "UPDATE crons SET next_run = ? WHERE id = ?",
+                    (max(claim_until, (cron.get("next_run") or 0) + 1),
+                     cron["id"]))
+            if due:
+                self._conn.commit()
+        for cron in due:
+            if self._stop.is_set() and threading.current_thread() is \
+                    self._thread:
+                # shutting down: release the claim so it fires next start
+                with self._lock:
+                    self._conn.execute(
+                        "UPDATE crons SET next_run = ? WHERE id = ?",
+                        (cron.get("next_run"), cron["id"]))
+                    self._conn.commit()
+                continue
+            try:
+                self._run_cron(cron)
+            except Exception:  # noqa: BLE001 — one cron must not kill others
+                traceback.print_exc()
         return len(due)
 
     # -- background thread ---------------------------------------------------

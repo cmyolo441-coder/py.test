@@ -27,6 +27,7 @@ Pure text-in/text-out (headless-safe, stdlib only, never raises).
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import re
@@ -185,6 +186,16 @@ def protocol_wrap(text: str) -> str:
         text = str(text)
     if is_sovereign(text):
         return text
+    return _protocol_wrap_cached(text)
+
+
+# PERF: the vault calls protocol_wrap on the raw master text on EVERY
+# resolve() (each dispatch and each per-iteration seal_wire) just to
+# compare it with the sealed copy — a sha256 + full rule-ledger pass over
+# a 49k document per model call. The wrap is a pure function of the
+# text, so it is memoized (tiny LRU: there are only a few prompts).
+@functools.lru_cache(maxsize=8)
+def _protocol_wrap_cached(text: str) -> str:
     body = text.strip()
     doc_id = directive_id(body)
     return (
@@ -288,14 +299,49 @@ def audit_prompt(ledger_or_text: str, reply: str, *, is_ledger: bool = False
     return AUDIT_PROMPT.format(ledger=ledger, reply=(reply or "")[:4000])
 
 
+def extract_json_object(raw: str, require: str | None = None):
+    """First JSON object embedded in model output, or None.
+
+    The old greedy brace regex spanned from the first "{" to the LAST "}"
+    in the reply, so any prose after the JSON that contained a brace
+    ("…note: use {x}") made json.loads fail and the verdict silently
+    became UNKNOWN. Tries the greedy span first (fast path), then decodes
+    from each "{" with raw_decode. `require` keeps only objects carrying
+    that key, so a nested object is never mistaken for the verdict."""
+    if not isinstance(raw, str) or "{" not in raw:
+        return None
+    m = re.search(r"\{.*\}", raw, re.S)
+    if m:
+        try:
+            data = json.loads(m.group(0))
+            if isinstance(data, dict) and (require is None
+                                           or require in data):
+                return data
+        except ValueError:
+            pass
+    dec = json.JSONDecoder()
+    start = raw.find("{")
+    tries = 0
+    while start >= 0 and tries < 64:
+        tries += 1
+        try:
+            data, _end = dec.raw_decode(raw, start)
+            if isinstance(data, dict) and (require is None
+                                           or require in data):
+                return data
+        except ValueError:
+            pass
+        start = raw.find("{", start + 1)
+    return None
+
+
 def parse_audit(raw: str) -> dict:
     """Parse an audit reply into {"verdict": ..., "violations": [...]}.
     Never raises; malformed output becomes verdict "UNKNOWN"."""
     try:
-        m = re.search(r"\{.*\}", raw or "", re.S)
-        if not m:
+        data = extract_json_object(raw or "", require="verdict")
+        if data is None:
             return {"verdict": "UNKNOWN", "violations": []}
-        data = json.loads(m.group(0))
         verdict = str(data.get("verdict", "UNKNOWN")).upper()
         violations = data.get("violations") or []
         if not isinstance(violations, list):

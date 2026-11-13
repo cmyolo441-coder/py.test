@@ -20,6 +20,7 @@ directory and returns a clear error if this is not a git repository.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from typing import Any
 
@@ -28,6 +29,8 @@ from .tools import (
     RISK_SAFE,
     Tool,
     _coerce_int,
+    _clip,
+    _run_capture,
 )
 
 _GIT_TIMEOUT = 30.0
@@ -42,14 +45,17 @@ def _run_git(args: list[str], cwd: str | None = None
     git tool; a hung git used to raise TimeoutExpired after the tool layer
     had already reported progress. Both now surface as ordinary errors.
     """
+    # GIT_TERMINAL_PROMPT=0: a push/fetch needing credentials must fail
+    # fast instead of prompting on the agent's terminal (it used to sit
+    # there until the timeout, eating the user's keystrokes).
+    env = dict(os.environ)
+    env.setdefault("GIT_TERMINAL_PROMPT", "0")
+    env.setdefault("GIT_ASKPASS", "")
+    env.setdefault("SSH_ASKPASS", "")
+    env.setdefault("GCM_INTERACTIVE", "never")
     try:
-        proc = subprocess.run(
-            ["git", *args],
-            capture_output=True,
-            text=True,
-            timeout=_GIT_TIMEOUT,
-            cwd=cwd or None,
-        )
+        proc = _run_capture(["git", *args], _GIT_TIMEOUT,
+                            cwd=cwd or None, env=env)
     except subprocess.TimeoutExpired:
         return 124, "", f"git timed out after {_GIT_TIMEOUT:g}s"
     except (OSError, ValueError) as e:
@@ -186,6 +192,9 @@ def git_branch(name: str = "", cwd: str = "") -> str:
     if err:
         return err
     name = (name or "").strip() if isinstance(name, str) else ""
+    if name.startswith("-"):
+        # would be parsed by git as an option, not a branch name
+        return f"ERROR: invalid branch name {name!r} (must not start with '-')"
     if not name:
         rc, out, err_out = _run_git(["branch"], cwdd)
         if rc != 0:
@@ -265,7 +274,7 @@ def git_diff(file: str = "", cwd: str = "") -> str:
         rc, out, err_out = _run_git(["diff", "--stat"], cwdd)
     if rc != 0:
         return f"ERROR: git diff failed: {err_out[:300]}"
-    return out or "(no changes)"
+    return _clip(out) if out else "(no changes)"
 
 
 # ---------------------------------------------------------------------------

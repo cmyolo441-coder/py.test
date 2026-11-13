@@ -64,7 +64,7 @@ def expand_arguments(template, args):
         # Positional $1, $2, ...
         idx = int(token[1:]) - 1
         if 0 <= idx < len(args):
-            return args[idx]
+            return str(args[idx])
         return token  # missing positional: leave as-is
 
     try:

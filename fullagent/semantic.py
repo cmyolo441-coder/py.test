@@ -118,23 +118,63 @@ class SemanticMemory:
         # (kind, text) of every item already embedded — the incremental
         # index only embeds NEW records instead of re-hashing the corpus
         self._seen: set[tuple[str, str]] = set()
+        self._indexed_head_seq = -1
+        # (State object, (episodes, facts, dead_ends) lengths) consumed by
+        # the last _collect_new — lets the next call skip old records
+        self._consumed: tuple | None = None
+
+    @staticmethod
+    def _on_chain(chain, event_id: str, seq: int) -> bool:
+        """Is `event_id` (sealed at `seq`) on the seq-ascending chain?"""
+        for e in reversed(chain):
+            if e.seq < seq:
+                return False
+            if e.id == event_id:
+                return True
+        return False
 
     def _collect_new(self, st: State) -> list[MemoryItem]:
-        """Embed only records not seen before. Returns the new items."""
+        """Embed only records not seen before. Returns the new items.
+
+        PERF: the fold's record lists only ever grow at the end while the
+        cached State object is the same one, so records already consumed
+        are skipped by position instead of re-rendering and re-hashing
+        the whole corpus on every recall. A different State object (fold
+        rebuilt) or a shrunken list (history trimmed) re-walks every
+        record; the _seen set keeps that idempotent."""
+        lists = (st.episodes, st.facts, st.dead_ends)
+        prev = self._consumed
+        start = (0, 0, 0)
+        if prev is not None and prev[0] is st:
+            # resume only if every list still holds the exact record we
+            # last consumed at the same position (no trim, no rebuild)
+            ok = True
+            for lst, (n, last) in zip(lists, prev[1]):
+                if n and (len(lst) < n or lst[n - 1] is not last):
+                    ok = False
+                    break
+            if ok:
+                start = tuple(n for n, _ in prev[1])
+        self._consumed = (st, tuple(
+            (len(lst), lst[-1] if lst else None) for lst in lists))
         new: list[MemoryItem] = []
-        for ep in st.episodes:
+        for ep in st.episodes[start[0]:]:
             text = _episode_text(ep)
             key = ("episode", text)
             if text.strip() and key not in self._seen:
                 self._seen.add(key)
                 new.append(MemoryItem("episode", text, ep, embed(text)))
-        for f in st.facts:
+        for f in st.facts[start[1]:]:
+            if not isinstance(f, dict):
+                continue
             text = str(f.get("fact", ""))
             key = ("fact", text)
             if text.strip() and key not in self._seen:
                 self._seen.add(key)
                 new.append(MemoryItem("fact", text, f, embed(text)))
-        for d in st.dead_ends:
+        for d in st.dead_ends[start[2]:]:
+            if not isinstance(d, dict):
+                continue
             text = f"{d.get('signature', '')} {d.get('reason', '')}"
             key = ("dead_end", text)
             if text.strip() and key not in self._seen:
@@ -160,17 +200,23 @@ class SemanticMemory:
         # Parent links are immutable, so if the old head id IS on the
         # current chain the prefix is intact and incremental collection of
         # the delta is still correct.
+        # PERF: the old check scanned the whole chain FROM THE OLDEST
+        # event for the previous head (O(window) per recall, i.e. per
+        # turn); the chain is seq-ascending, so the previous head can only
+        # sit just before the events appended since — check from the end.
         chain = self.log.events()
         head_id = chain[-1].id if chain else None
         if (self._indexed_head_id is not None
                 and head_id != self._indexed_head_id
-                and not any(e.id == self._indexed_head_id
-                            for e in chain)):
+                and not self._on_chain(chain, self._indexed_head_id,
+                                       self._indexed_head_seq)):
             _log.info("semantic: chain diverged since last index "
                       "(rewind/checkout) — rebuilding from the fold")
             self._items.clear()
             self._seen.clear()
+            self._consumed = None
         self._indexed_head_id = head_id
+        self._indexed_head_seq = chain[-1].seq if chain else -1
         new = self._collect_new(st)
         if new:
             self._items.extend(new)

@@ -240,9 +240,8 @@ def parse_verdicts(raw: str, checks: list[Check]) -> ComplianceScore:
     """S4: parse the verifier's JSON, weight failures by rule weight."""
     data: dict = {}
     try:
-        m = re.search(r"\{.*\}", raw or "", re.S)
-        if m:
-            data = json.loads(m.group(0))
+        from .enforce import extract_json_object
+        data = extract_json_object(raw or "", require="checks") or {}
     except Exception:
         data = {}
     rows = data.get("checks")
@@ -258,14 +257,8 @@ def parse_verdicts(raw: str, checks: list[Check]) -> ComplianceScore:
     for row in rows:
         if not isinstance(row, dict):
             continue
-        rid = str(row.get("rule_id", ""))
-        c = by_id.get(rid)
-        if c is None:
-            # tolerate renumbered/alias ids by prefix match
-            for cid, cc in by_id.items():
-                if rid.startswith(cid) or cid.startswith(rid):
-                    c = cc
-                    break
+        rid = str(row.get("rule_id", "") or "").strip()
+        c = _resolve_check(rid, by_id)
         if c is None:
             continue
         w = c.weight
@@ -295,6 +288,31 @@ def parse_verdicts(raw: str, checks: list[Check]) -> ComplianceScore:
     else:
         score.verdict = "PASS"
     return score
+
+
+def _rule_num(rule_id: str) -> int | None:
+    m = re.fullmatch(r"\[?\s*R?0*(\d+)\s*\]?", rule_id, re.I)
+    return int(m.group(1)) if m else None
+
+
+def _resolve_check(rid: str, by_id: dict) -> "Check | None":
+    """Map a verifier's rule id to a rubric check.
+
+    Exact id first, then the same rule NUMBER ("R1" / "r01" / "[R01]" →
+    R01). The old bidirectional prefix match attributed an EMPTY id to
+    the first check ("R01".startswith("") is True) and "R1" to whichever
+    of R10..R16 came first — a verdict landed on the wrong rule and
+    could fail a reply for a rule it never broke."""
+    if not rid:
+        return None
+    c = by_id.get(rid)
+    if c is not None:
+        return c
+    num = _rule_num(rid)
+    if num is None:
+        return None
+    hits = [cc for cid, cc in by_id.items() if _rule_num(cid) == num]
+    return hits[0] if len(hits) == 1 else None
 
 
 # ── S5: decision policy ──────────────────────────────────────────────────

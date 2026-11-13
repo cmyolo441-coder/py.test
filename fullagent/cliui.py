@@ -342,8 +342,9 @@ def _compact_number(value: int) -> str:
     except (TypeError, ValueError):
         return "?"
     if n >= 1_000_000:
-        # %g keeps 1M as "1M", 1.5M as "1.5M" — no rounding up to 2M
-        return f"{n / 1_000_000:g}M"
+        # one decimal, truncated: 1M → "1M", 1.5M → "1.5M", and a binary
+        # 1_048_576 window → "1M" (bare %g printed "1.04858M")
+        return f"{(n // 100_000) / 10:g}M"
     if n >= 1000:
         return f"{n // 1000}k"
     return str(n)
@@ -379,30 +380,35 @@ def status_fragments(
     agents_queued: int = 0,
 ) -> List[Fragment]:
     """The footer under the prompt: identity, context meter, agent badge."""
-    right: List[Fragment] = []
-    if branch:
-        right.append((f"bold {colors.get('accent', '')}",
-                      f" ◎ {truncate(branch, 24)} "))
     # Agent badge is live state only: it counts the workers that are
     # running or queued right now — never retained history from an earlier
     # batch — and it disappears the moment nothing is live.
     running = max(0, int(agents_running))
     queued = max(0, int(agents_queued))
     live = running + queued
-    if live:
-        if right:
-            right.append((colors.get("dim", ""), "· "))
-        noun = "agent" if live == 1 else "agents"
-        right.append((f"bold {colors.get('pink', '')}",
-                      f"◎ {live} {noun}"))
-        right.append((colors.get("dim", ""), f" | {running} running "))
-        if queued:
-            right.append((colors.get("dim", ""), f"· {queued} queued "))
-    right_pad = _pad(right)
+
+    def build_right(branch_cols: int) -> List[Fragment]:
+        out: List[Fragment] = []
+        if branch:
+            out.append((f"bold {colors.get('accent', '')}",
+                        f" ◎ {truncate(branch, branch_cols)} "))
+        if live:
+            if out:
+                out.append((colors.get("dim", ""), "· "))
+            noun = "agent" if live == 1 else "agents"
+            out.append((f"bold {colors.get('pink', '')}",
+                        f"◎ {live} {noun}"))
+            out.append((colors.get("dim", ""), f" | {running} running "))
+            if queued:
+                out.append((colors.get("dim", ""), f"· {queued} queued "))
+        return out
 
     # Left side is assembled by priority: identity + context meter are
-    # always shown; the context-window label and the cwd are dropped (in
-    # that order) when the terminal is too narrow for everything.
+    # always shown, then the context-window label, then the cwd; each is
+    # dropped when the terminal is too narrow for it. The git branch is
+    # cosmetic: a long branch name (CI / bot branches easily exceed 24
+    # columns) is shortened first, down to 10 columns, before it may push
+    # the context-window label out of the footer.
     head: List[Fragment] = [
         (f"bold {colors.get('cyan', '')}", f" ● {model_label} "),
         (colors.get("dim", ""), "· "),
@@ -414,7 +420,12 @@ def status_fragments(
     cwd_seg: Fragment = (colors.get("dim", ""),
                          f" · {truncate(cwd, 28)}")
 
-    budget = max(0, int(width) - right_pad - 1)
+    for branch_cols in (24, 20, 16, 12, 10):
+        right = build_right(branch_cols)
+        budget = max(0, int(width) - _pad(right) - 1)
+        if (not branch or display_width(branch) <= branch_cols
+                or _pad(head + [window_seg] + meter) <= budget):
+            break
     left: List[Fragment] = list(head)
     if _pad(left + [window_seg] + meter) <= budget:
         left.append(window_seg)

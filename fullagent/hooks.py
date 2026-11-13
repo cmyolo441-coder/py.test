@@ -44,6 +44,12 @@ from pathlib import Path
 _log = logging.getLogger(__name__)
 
 HOOK_TIMEOUT_S = 10
+# Linux refuses any single env string over 128 KiB (MAX_ARG_STRLEN) with
+# E2BIG. A write_file with >128 KiB of content therefore made the hook
+# FAIL TO SPAWN — and spawn failures fail open, so a PreToolUse safety hook
+# was silently bypassed by any large tool call. Big JSON now goes to a temp
+# file (HOOK_ARGS_FILE / HOOK_RESULT_FILE) and the env copy is truncated.
+MAX_ENV_JSON = 64 * 1024
 DEFAULT_CONFIG_PATH = (Path(os.environ["FULLAGENT_HOME"]).expanduser() / "hooks.json") if os.environ.get("FULLAGENT_HOME") else Path("~/.fullagent/hooks.json").expanduser()
 
 
@@ -106,17 +112,15 @@ def _run_hook_command(command: str, env: dict) -> tuple[int | None, str, str]:
     not be run at all (timeout, spawn failure) — that is an infrastructure
     error and must fail OPEN, never count as a block.
     """
+    from .cancelguard import run_in_group
     try:
         with tempfile.TemporaryFile(mode="w+") as out_f, \
                 tempfile.TemporaryFile(mode="w+") as err_f:
-            proc = subprocess.run(
-                command,
-                shell=True,
-                env=env,
-                stdout=out_f,
-                stderr=err_f,
-                timeout=HOOK_TIMEOUT_S,
-            )
+            # own process group: a timed-out hook's children die with it
+            # (subprocess.run killed only the sh wrapper)
+            proc = run_in_group(command, shell=True, env=env,
+                                stdout=out_f, stderr=err_f,
+                                timeout=HOOK_TIMEOUT_S)
             out_f.seek(0)
             err_f.seek(0)
             return proc.returncode, out_f.read(), err_f.read()
@@ -129,19 +133,53 @@ def _run_hook_command(command: str, env: dict) -> tuple[int | None, str, str]:
         return None, "", f"hook failed to run: {e}"
 
 
-def _hook_env(tool_name: str, args: dict, result: object = None) -> dict:
+def _put_json(env: dict, name: str, text: str, files: list) -> None:
+    """Set env[name]=text, spilling oversized JSON to a temp file."""
+    # surrogates/NULs would also make the spawn fail (fail-open)
+    text = text.replace("\x00", "\\u0000")
+    if len(text.encode("utf-8", "replace")) <= MAX_ENV_JSON:
+        env[name] = text
+        return
+    base = name[:-len("_JSON")]
+    try:
+        fd, path = tempfile.mkstemp(prefix="fullagent-hook-",
+                                    suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as fh:
+            fh.write(text)
+        files.append(path)
+        env[base + "_FILE"] = path
+    except OSError:
+        pass
+    env[name] = text[:MAX_ENV_JSON // 2]
+    env[base + "_TRUNCATED"] = "1"
+
+
+def _hook_env(tool_name: str, args: dict, result: object = None,
+              files: list | None = None) -> dict:
+    files = files if files is not None else []
     env = dict(os.environ)
     env["HOOK_TOOL"] = tool_name or ""
     try:
-        env["HOOK_ARGS_JSON"] = json.dumps(args or {}, default=str)
+        _put_json(env, "HOOK_ARGS_JSON", json.dumps(args or {}, default=str),
+                  files)
     except Exception:  # noqa: BLE001
         env["HOOK_ARGS_JSON"] = "{}"
     if result is not None:
         try:
-            env["HOOK_RESULT_JSON"] = json.dumps(result, default=str)
+            _put_json(env, "HOOK_RESULT_JSON",
+                      json.dumps(result, default=str), files)
         except Exception:  # noqa: BLE001
             env["HOOK_RESULT_JSON"] = "null"
     return env
+
+
+def _cleanup(files: list) -> None:
+    for path in files:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    files.clear()
 
 
 def _parse_arg_patch(stdout: str) -> dict:
@@ -172,8 +210,12 @@ def run_pre_tool(tool_name: str, args: dict,
         entries = _iter_matching(hooks, "PreToolUse", tool_name)
         new_args = dict(args or {})
         for entry in entries:
-            env = _hook_env(tool_name, new_args)
-            rc, stdout, stderr = _run_hook_command(entry["command"], env)
+            spill: list = []
+            try:
+                env = _hook_env(tool_name, new_args, files=spill)
+                rc, stdout, stderr = _run_hook_command(entry["command"], env)
+            finally:
+                _cleanup(spill)
             if stdout.strip():
                 _log.info("hooks: PreToolUse[%s] stdout: %s",
                           tool_name, stdout.strip()[:2000])
@@ -204,8 +246,12 @@ def run_post_tool(tool_name: str, args: dict, result: object = None,
         hooks = load_hooks(path)
         entries = _iter_matching(hooks, "PostToolUse", tool_name)
         for entry in entries:
-            env = _hook_env(tool_name, args, result)
-            rc, stdout, stderr = _run_hook_command(entry["command"], env)
+            spill: list = []
+            try:
+                env = _hook_env(tool_name, args, result, files=spill)
+                rc, stdout, stderr = _run_hook_command(entry["command"], env)
+            finally:
+                _cleanup(spill)
             if stdout.strip():
                 _log.info("hooks: PostToolUse[%s] stdout: %s",
                           tool_name, stdout.strip()[:2000])

@@ -334,7 +334,30 @@ def cyclomatic(source: str) -> list[Complexity]:
             for c in _cyclomatic_cached(source)]
 
 
-@lru_cache(maxsize=512)
+_MAX_ANALYZE_BYTES = 2_000_000
+_SKIP_DIRS = frozenset({".git", "node_modules", "__pycache__", ".venv",
+                        "venv", ".tox", ".mypy_cache", ".ruff_cache",
+                        "site-packages", "dist", "build"})
+
+
+def _walk_limited(root: Path, glob_filter: str, max_files: int) -> list:
+    """Up to max_files matching files under root, skipping vendored/VCS
+    dirs. ``sorted(root.rglob(...))[:n]`` enumerated (and sorted) EVERY
+    file in the tree — a whole node_modules/.venv — before keeping n."""
+    import fnmatch
+    import os
+    out: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_DIRS)
+        for fn in sorted(filenames):
+            if fnmatch.fnmatch(fn, glob_filter):
+                out.append(Path(dirpath) / fn)
+                if len(out) >= max_files:
+                    return out
+    return out
+
+
+@lru_cache(maxsize=128)
 def _cyclomatic_cached(source: str) -> tuple:
     """Cached core: returns plain tuples so the cache stays picklable
     and free of mutable dataclass instances."""
@@ -436,11 +459,17 @@ class StaticAnalyzer:
         self.log = log
         self.taint = TaintAnalyzer()
 
-    def analyze_file(self, path: str) -> dict:
+    def analyze_file(self, path: str, source: str | None = None) -> dict:
         p = Path(path).expanduser()
         if not p.is_file():
             return {"error": f"not a file: {p}"}
-        source = p.read_text(errors="replace")
+        if source is None:
+            try:
+                if p.stat().st_size > _MAX_ANALYZE_BYTES:
+                    return {"error": f"file too large to analyze: {p}"}
+                source = p.read_text(errors="replace")
+            except OSError as e:
+                return {"error": f"cannot read {p}: {e}"}
         findings = self.taint.analyze(source)
         comp = cyclomatic(source)
         result = {
@@ -468,7 +497,7 @@ class StaticAnalyzer:
         # rglob, not glob: a tree scan must descend into subdirectories —
         # glob("*.py") only matched the top level and silently missed
         # every nested file's findings
-        files = sorted(rp.rglob(glob_filter))[:max_files] \
+        files = _walk_limited(rp, glob_filter, max_files) \
             if rp.is_dir() else [rp]
         sources: dict[str, str] = {}
         all_taint: list[dict] = []
@@ -477,10 +506,13 @@ class StaticAnalyzer:
             if not f.is_file():
                 continue
             try:
-                sources[f.stem] = f.read_text(errors="replace")
+                if f.stat().st_size > _MAX_ANALYZE_BYTES:
+                    continue
+                src = f.read_text(errors="replace")
             except OSError:
                 continue
-            r = self.analyze_file(str(f))
+            sources[f.stem] = src
+            r = self.analyze_file(str(f), src)  # no second read
             all_taint.extend(r.get("taint", []))
             for h in r.get("hotspots", []):
                 all_hotspots.append({"file": str(f), "function": h})

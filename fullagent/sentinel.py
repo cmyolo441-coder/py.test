@@ -48,6 +48,14 @@ __all__ = [
 SENTINEL_MARK = "cfg-inject:"
 
 
+def _is_sovereign(text: str) -> bool:
+    try:
+        from .enforce import is_sovereign
+        return is_sovereign(text)
+    except Exception:
+        return False
+
+
 def _fp(text: str) -> str:
     if not isinstance(text, str):
         text = "" if text is None else str(text)
@@ -181,8 +189,15 @@ class WireSentinel:
         # prepending again would only duplicate the header)
         if self.plan.has(Slot.SYSTEM_PREFIX):
             head = out[0].get("content", "")
-            already_contract = isinstance(head, str) and head.lstrip(
-                ).startswith("[CONFIG_LAYER")
+            # a long sealed prompt is composed behind the adherence
+            # DOCUMENT MAP, so the contract header is not at offset 0 —
+            # a prefix-only test re-prepended the head on every call,
+            # which broke the gate's intact_prefix check and forced a
+            # prompt restore (dropping the composed context sections)
+            # on every model call
+            already_contract = isinstance(head, str) and (
+                head.lstrip().startswith("[CONFIG_LAYER")
+                or _is_sovereign(head))
             if (isinstance(head, str) and not already_contract
                     and not self.payload.intact(head)):
                 out[0]["content"] = (self.payload.contract_head.rstrip()
@@ -193,8 +208,12 @@ class WireSentinel:
         # FIRST system message only, never to mid-history system hints
         if self.plan.has(Slot.SYSTEM_SUFFIX):
             head = out[0].get("content", "")
-            if isinstance(head, str) and _fp(
-                    self.payload.ledger_block) not in head:
+            block = self.payload.ledger_block
+            # idempotence test on the block itself: the old test looked
+            # for _fp(block) — a hash that is never written into the
+            # content — so the ledger was appended again on EVERY call
+            if (isinstance(head, str) and block
+                    and block.rstrip() not in head):
                 out[0]["content"] = (head.rstrip()
                                      + "\n\n" + self.payload.ledger_block)
                 self._mark(Slot.SYSTEM_SUFFIX)

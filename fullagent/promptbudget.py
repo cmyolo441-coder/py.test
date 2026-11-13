@@ -35,15 +35,20 @@ _TRUNC_NOTE = "\n…[truncated to budget — re-read the file or re-run the comm
 
 
 def _estimate_tokens(msgs: list, model_id: str = "") -> int:
-    from .client import estimate_tokens_fast
-    return estimate_tokens_fast(json.dumps(msgs, default=str), model_id)
+    # PERF: count per message through the client's caches. The old
+    # json.dumps(whole list) built a brand-new string on every call, so
+    # the identity-keyed cache never hit and the whole wire view was
+    # re-tokenized in pure Python on every budget check.
+    from .client import estimate_tokens
+    return estimate_tokens(msgs, model_id)
 
 
 def prompt_wire_tokens(model_msgs: list, schemas: list | None,
                        model_id: str = "") -> int:
     """Estimated tokens of the full request body (messages + tool schemas)."""
-    return _estimate_tokens({"messages": model_msgs, "tools": schemas or []},
-                            model_id)
+    from .client import _correction_factor, prompt_raw_tokens
+    return max(1, int(prompt_raw_tokens(model_msgs, schemas or [])
+                      * _correction_factor(model_id)))
 
 
 def schemas_tokens(schemas: list | None, model_id: str = "") -> int:

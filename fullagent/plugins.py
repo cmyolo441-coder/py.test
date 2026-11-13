@@ -283,13 +283,15 @@ def _make_handler(plugin: Dict[str, Any], tool: Dict[str, Any]):
             payload = json.dumps(kwargs)
         except (TypeError, ValueError) as exc:
             return f"ERROR: plugin '{label}' args not JSON-serializable: {exc}"
+        from .cancelguard import run_in_group
         try:
-            proc = subprocess.run(
+            # own process group: on timeout the plugin's children die too
+            # (subprocess.run killed only the interpreter, orphaning any
+            # helper processes the script had started)
+            proc = run_in_group(
                 [sys.executable, script_path],
                 input=payload,
-                capture_output=True,
                 text=True,
-                errors="replace",
                 timeout=timeout,
                 cwd=plugin["dir"],
             )

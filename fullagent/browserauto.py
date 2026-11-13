@@ -101,6 +101,43 @@ def browser_available() -> bool:
 # Persistent browser session (one per agent, lazy init)
 # ---------------------------------------------------------------------------
 
+def _metadata_block(url: str) -> str:
+    """Refuse cloud-metadata / link-local targets (169.254.169.254,
+    metadata.google.internal, fe80::/10 ...). BrowserOpen runs without
+    approval (RISK_SAFE), so it must not be an SSRF path to instance
+    credentials. Localhost/private hosts stay allowed on purpose: opening
+    the user's own dev server is the main use case."""
+    import ipaddress
+    import socket
+    import urllib.parse
+    try:
+        host = urllib.parse.urlparse(url).hostname or ""
+    except ValueError:
+        return "malformed URL"
+    h = host.strip("[]").rstrip(".").lower()
+    if not h:
+        return "URL has no host"
+    try:
+        from .webfetch import _METADATA_HOSTS
+    except Exception:  # pragma: no cover
+        _METADATA_HOSTS = frozenset({"metadata.google.internal"})
+    if h in _METADATA_HOSTS:
+        return f"blocked cloud-metadata host: {host}"
+    try:
+        infos = socket.getaddrinfo(h, None, proto=socket.IPPROTO_TCP)
+    except OSError:
+        return ""
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
+        except ValueError:
+            continue
+        mapped = getattr(ip, "ipv4_mapped", None)
+        if ip.is_link_local or (mapped is not None and mapped.is_link_local):
+            return f"blocked link-local/metadata address for {host}: {ip}"
+    return ""
+
+
 class _BrowserSession:
     """Lazy headless-Chromium session: playwright -> browser -> page.
 
@@ -191,6 +228,9 @@ class _BrowserSession:
         url = url.strip()
         if not url.lower().startswith(("http://", "https://")):
             return "ERROR: url must start with http:// or https://"
+        blocked = _metadata_block(url)
+        if blocked:
+            return f"ERROR: {blocked}"
         err, page = self._ensure()
         if err:
             return err

@@ -227,9 +227,26 @@ class SafeFileHistory(FileHistory):
     recreates the directory and swallows any persistence error — input
     history is a convenience, never a crash path."""
 
+    # PERF: AutoSuggestFromHistory walks EVERY loaded history string (and
+    # every line of each) on EVERY keystroke, on the event-loop thread,
+    # and history search does the same on ↑. The history file only grows
+    # (every submitted prompt, across all sessions — pasted logs
+    # included), so typing got laggier the longer FullAgent was used.
+    # Only the newest entries are loaded; the file itself is untouched.
+    MAX_LOADED = 1000
+    MAX_LOADED_CHARS = 400_000
+
     def load_history_strings(self):
+        loaded = 0
+        chars = 0
         try:
-            yield from super().load_history_strings()
+            # the base class yields newest first
+            for s in super().load_history_strings():
+                if loaded >= self.MAX_LOADED or chars >= self.MAX_LOADED_CHARS:
+                    return
+                loaded += 1
+                chars += len(s)
+                yield s
         except OSError:
             return
 
@@ -349,6 +366,24 @@ SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇",
 # ---------------------------------------------------------------------------
 
 _WIDE_CATS = ("W", "F")
+
+# Guards UI._bg_cached bookkeeping (module level: headless tests build UI
+# with __new__, so per-instance locks may not exist).
+_BG_LOCK = threading.Lock()
+# Orders status writes between the turn thread and the spinner's
+# trailing-edge throttle drain (see UI._start_spinner).
+_STATUS_LOCK = threading.Lock()
+
+# Slash commands that replace or rewrite agent.messages / the timeline;
+# refused while a turn is running (see UI._handle_slash).
+_HISTORY_MUTATING_CMDS = frozenset({
+    "/new", "/switch", "/undo", "/retry", "/reset", "/compact", "/resume",
+    "/resume-turn", "/rewind", "/revert", "/fork", "/merge",
+})
+
+# /diff keeps at most this many recorded edits (each holds full file
+# contents in its args — unbounded, it grew memory every write).
+_DIFF_HISTORY_MAX = 200
 
 
 def _disp_width(s: str) -> int:
@@ -773,6 +808,9 @@ class UI:
         self._turn_start_ts = 0.0
         self._cancel_flag = threading.Event()
         self._last_flush = 0.0
+        # goal status / context % / git branch / skills count for the
+        # chrome live in UI._bg_cached (refreshed off the render loop)
+        self._bg_store: dict = {}
         # SPEED: cached terminal size (queried at most twice a second)
         self._width_cache: int | None = None
         self._width_cache_ts = 0.0
@@ -787,16 +825,10 @@ class UI:
         self._flash_timer: threading.Timer | None = None
         self._flash_gen = 0
 
-        # goal-status cache for the border (fold is not free per frame)
-        self._goal_cache = None
-        self._goal_cache_ts = 0.0
 
         # focus mode (deep work): remaining auto-continuation turns
         self._focus_remaining = 0
 
-        # live context-usage cache for the border (est. tokens / window)
-        self._ctx_cache: int | None = None
-        self._ctx_cache_ts = 0.0
 
         # Next-Gen TUI telemetry: live token velocity & session diff history
         self._stream_tokens_count = 0
@@ -805,8 +837,6 @@ class UI:
         self._agents_cache: dict | None = None
         self._agents_cache_ts = 0.0
         self._agents_hooked = False
-        self._branch_cache: str | None = None
-        self._branch_cache_ts = 0.0
         self._auto_prev = 3
         self._detail_expanded = False
         # (payload, kind) — kind is "live" | "generic" | "thinking"
@@ -861,6 +891,96 @@ class UI:
         except Exception:
             pass
 
+    def _bg_cached(self, key: str, ttl: float, compute, default=None):
+        """Render-safe cached value for the chrome (border/HUD/footer).
+
+        prompt_toolkit calls the fragment builders on its event-loop thread
+        on every redraw (spinner: ~11/s, plus every printed line). Anything
+        that walks session-sized state there — the message list
+        (estimate_tokens), the event log (goal fold), a git subprocess, a
+        skills disk scan — made every frame slower as the session grew and
+        could stall the loop on the agent's locks until the UI stopped
+        answering keys.
+
+        The FIRST read computes synchronously (the first frame is real, not
+        a placeholder). After that a stale read returns the last value
+        instantly and refreshes it on ONE daemon thread (single flight per
+        key — refreshes never pile up), then redraws if the value changed.
+        A failing compute keeps the previous value and is retried after
+        ``ttl``.
+        """
+        now = time.time()
+        with _BG_LOCK:
+            store = self.__dict__.get("_bg_store")
+            if store is None:
+                store = self.__dict__["_bg_store"] = {}
+            ent = store.get(key)
+            if ent is None:
+                ent = store[key] = {"val": default, "have": False,
+                                    "ts": 0.0, "busy": False}
+            if ent["busy"] or now - ent["ts"] < ttl:
+                return ent["val"] if ent["have"] else default
+            ent["busy"] = True
+            first = not ent["have"]
+
+        def refresh() -> bool:
+            changed = False
+            try:
+                val = compute()
+                ok = True
+            except Exception:
+                val, ok = None, False
+            with _BG_LOCK:
+                if ok:
+                    changed = (not ent["have"]) or val != ent["val"]
+                    ent["val"] = val
+                    ent["have"] = True
+                ent["ts"] = time.time()
+                ent["busy"] = False
+            return changed
+
+        if first:
+            refresh()
+        else:
+            def worker():
+                if refresh():
+                    self._invalidate()
+            try:
+                threading.Thread(target=worker, daemon=True,
+                                 name=f"ui-refresh-{key}").start()
+            except Exception:
+                with _BG_LOCK:
+                    ent["busy"] = False
+        with _BG_LOCK:
+            return ent["val"] if ent["have"] else default
+
+    def _compute_ctx_pct(self) -> int:
+        """Context usage % (est. tokens / window). Runs off the render loop.
+
+        A cheap change key (list identity, length, last message identity)
+        skips the estimate entirely while the history is unchanged — the
+        common case during streaming — and a full re-estimate still runs
+        every 10s so recalibration and in-place edits show up.
+        """
+        msgs = self.agent.messages
+        model = self.agent.model
+        n = len(msgs)
+        last = msgs[-1] if n else None
+        key = (id(msgs), n, id(last), model.id, model.context_window,
+               len(last.get("content") or "") if isinstance(last, dict)
+               and isinstance(last.get("content"), str) else -1)
+        prev = self.__dict__.get("_ctx_pct_key")
+        now = time.time()
+        if (prev is not None and prev[0] == key
+                and now - prev[1] < 10.0):
+            return prev[2]
+        from .client import estimate_tokens
+        used = estimate_tokens(msgs, model.id)
+        window = max(1, int(model.context_window))
+        pct = max(0, min(100, int(used * 100 / window)))
+        self._ctx_pct_key = (key, now, pct)
+        return pct
+
     def _set_flash(self, text: str, color: str = C["yellow"]) -> None:
         self._flash_gen += 1
         gen = self._flash_gen
@@ -910,9 +1030,11 @@ class UI:
         segs.append((f" ⬢ L{auto} ", f"bold {auto_color}"))
         # Live parallel subagent swarm indicator in the top HUD border
         try:
-            mgr = self.agent.__dict__.get("subagents")
-            if mgr is not None:
-                snap = mgr.snapshot()
+            # PERF: the shared 0.25s-cached snapshot, not a fresh
+            # manager.snapshot() (lock + copy of every retained worker)
+            # on every single frame
+            snap = self._agents_snapshot()
+            if snap:
                 if snap.get("active", 0) > 0:
                     segs.append((
                         f" ⚡ Swarm {snap['active']}/{snap['max_active']} ",
@@ -921,19 +1043,10 @@ class UI:
         except Exception:
             pass
         # live goal distance — always on screen when a goal is active (§24).
-        # cached for 1s: the border re-renders every frame, and status()
-        # folds the whole log
-        now = time.time()
-        if self._goal_cache is None or now - self._goal_cache_ts > 1.0:
-            try:
-                self._goal_cache = self.agent.goal.status()
-            except Exception:
-                # a corrupt goal event (or a fold failure) must never break
-                # the render loop — keep the previous reading, or hide the
-                # segment when there isn't one yet
-                pass
-            self._goal_cache_ts = now
-        goal = self._goal_cache
+        # status() folds/walks the whole event log, which grows every
+        # turn: refreshed at most once a second OFF the render loop (a
+        # failure keeps the previous reading, or hides the segment).
+        goal = self._bg_cached("goal", 1.0, lambda: self.agent.goal.status())
         if goal is not None and goal.active:
             pct = max(0, min(100, (1 - goal.distance) * 100))
             filled = int(round(pct / 20))
@@ -943,26 +1056,23 @@ class UI:
         if self._focus_remaining > 0:
             segs.append((f" 🎯 focus×{self._focus_remaining} ",
                          "class:box.flash"))
-        # live context usage — cached 1s (the border redraws every frame)
-        if self._ctx_cache is None or now - self._ctx_cache_ts > 1.0:
-            try:
-                from .client import estimate_tokens
-                used = estimate_tokens(self.agent.messages,
-                                       self.agent.model.id)
-                window = max(1, self.agent.model.context_window)
-                self._ctx_cache = min(100, int(used * 100 / window))
-            except Exception:
-                self._ctx_cache = 0
-            self._ctx_cache_ts = now
+        # live context usage. estimate_tokens walks (and on change
+        # re-serializes) the WHOLE message list — doing that on the render
+        # loop every second is what made the border slower every turn.
+        # _context_percent() refreshes it off-loop; the meter here is pure.
+        pct = self._context_percent()
         # ctxmeter: visual context bar (falls back to text % on any error)
         try:
             from . import ctxmeter
-            segs.extend(ctxmeter.context_bar(self))
+            segs.append((f" ◉ ctx {pct}% ",
+                         f"bold {ctxmeter.meter_color(pct)}"))
+            segs.extend(ctxmeter.render_meter(pct, width=ctxmeter.DEFAULT_WIDTH // 2))
+            segs.append((" ", "class:box"))
         except Exception:
-            ctx_color = (C["green"] if self._ctx_cache < 60
-                         else C["yellow"] if self._ctx_cache < 85
+            ctx_color = (C["green"] if pct < 60
+                         else C["yellow"] if pct < 85
                          else C["red"])
-            segs.append((f" ◉ ctx {self._ctx_cache}% ",
+            segs.append((f" ◉ ctx {pct}% ",
                          f"bold {ctx_color}"))
         segs.append((f" ⌛ session: {self.agent.session_id} ", "class:box.session"))
 
@@ -1082,11 +1192,10 @@ class UI:
         SKILL.md directories plus the forge registry), cached for 5s — the
         footer re-renders every frame and both sources touch disk.
         """
-        now = time.time()
-        cached = getattr(self, "_skills_cache", None)
-        if (cached is not None
-                and now - getattr(self, "_skills_cache_ts", 0.0) < 5.0):
-            return cached
+        # The scan touches disk: refreshed off the render loop (5s TTL).
+        return int(self._bg_cached("skills", 5.0, self._scan_skills, 0) or 0)
+
+    def _scan_skills(self) -> int:
         names: set[str] = set()
         try:
             mgr = getattr(self.agent, "skill_manager", None)
@@ -1104,9 +1213,7 @@ class UI:
                           or {}))
         except Exception:
             pass
-        self._skills_cache = len(names)
-        self._skills_cache_ts = now
-        return self._skills_cache
+        return len(names)
 
     def _log_chrome_error(self, where: str, exc: Exception) -> None:
         """Record a chrome wiring failure once (never spam, never crash).
@@ -1279,10 +1386,11 @@ class UI:
         non-repo / detached HEAD shows the session id instead of inventing
         a branch name.
         """
-        now = time.time()
-        if (getattr(self, "_branch_cache", None) is not None
-                and now - getattr(self, "_branch_cache_ts", 0.0) < 5.0):
-            return self._branch_cache
+        # A subprocess with a 2s timeout must never run on the render loop
+        # (it used to, every 5s): refreshed off-loop after the first read.
+        return self._bg_cached("branch", 5.0, self._read_branch, "no git")
+
+    def _read_branch(self) -> str:
         name = ""
         try:
             import subprocess
@@ -1298,27 +1406,16 @@ class UI:
         if not name or name == "HEAD":
             sid = str(getattr(self.agent, "session_id", "") or "")
             name = f"session {sid[:8]}" if sid else "no git"
-        self._branch_cache = name
-        self._branch_cache_ts = now
         return name
 
     def _context_percent(self) -> int:
-        """Live context usage %, cached 1s (the border redraws every frame)."""
-        now = time.time()
-        cached = getattr(self, "_ctx_cache", None)
-        if cached is None or now - getattr(self, "_ctx_cache_ts", 0.0) > 1.0:
-            try:
-                from .client import estimate_tokens
-                used = estimate_tokens(self.agent.messages,
-                                       self.agent.model.id)
-                window = max(1, self.agent.model.context_window)
-                cached = min(100, int(used * 100 / window))
-            except Exception:
-                if cached is None:
-                    cached = 0
-            self._ctx_cache = cached
-            self._ctx_cache_ts = now
-        return int(cached or 0)
+        """Live context usage %, refreshed at most once a second OFF the
+        render loop (shared by the top border and the footer)."""
+        try:
+            return int(self._bg_cached("ctx", 1.0, self._compute_ctx_pct, 0)
+                       or 0)
+        except Exception:
+            return 0
 
     def _meta_fragments(self) -> list:
         """Footer under the prompt: model · effort · context · cwd · agents."""
@@ -1997,6 +2094,23 @@ class UI:
         parts = text.strip().split(None, 1)
         cmd = parts[0].lower()
         arg = parts[1].strip() if len(parts) > 1 else ""
+        # Slash commands run on the event-loop thread, concurrently with
+        # the turn thread. Commands that replace or rewrite the shared
+        # conversation history must never race a running agent.run_turn
+        # (a /compact or /switch mid-turn swapped agent.messages under the
+        # worker). _turn_alive also covers a worker the cancel watchdog
+        # released but that has not returned yet.
+        try:
+            from .help import resolve_alias
+            canonical = resolve_alias(cmd)
+        except Exception:
+            canonical = cmd
+        if canonical in _HISTORY_MUTATING_CMDS and (
+                self._busy or getattr(self, "_turn_alive", False)):
+            self.print_error(
+                f"{canonical} changes the conversation history — wait for the "
+                "running turn to finish (Esc cancels it)")
+            return
         # one typo or a transient OSError inside a command must never
         # unwind through prompt_toolkit and kill the whole session —
         # same policy as the guarded turn thread below
@@ -2779,11 +2893,20 @@ class UI:
         if action == "wait":
             selector = parts[1] if len(parts) > 1 else "all"
             ids = [selector] if selector.lower() != "all" else None
-            try:
-                manager.wait(ids, timeout=30)
-                self._print_agents_dashboard(manager)
-            except Exception as exc:
-                self.print_error(str(exc))
+
+            # Slash commands run on the event-loop thread: a blocking
+            # wait (up to 30s) froze the whole UI — no redraws, no keys,
+            # not even Esc. Wait on a daemon thread instead.
+            def _wait_then_show():
+                try:
+                    manager.wait(ids, timeout=30)
+                    self._print_agents_dashboard(manager)
+                except Exception as exc:
+                    self.print_error(str(exc))
+
+            self.print_info("⏳ waiting for subagents (up to 30s)…",
+                            C["dim"])
+            self._bg(_wait_then_show)
             return
         if action in ("errors", "failures"):
             # legacy agentscmd parity: full error messages for failed subagents
@@ -3928,16 +4051,22 @@ class UI:
             self.print_info(self.agent.council.format_status(), C["pink"])
             return
         self.print_info(f"⚖ convening council on: {question} …", C["dim"])
-        v = self.agent.council.convene(question)
-        if not v.ok:
-            self.print_error(f"council failed: {v.error}")
-            return
-        lines = [f"COUNCIL VERDICT — winner: {v.winner.upper()}  "
-                 f"(confidence {v.confidence:.0f}%)",
-                 f"  reason: {v.reason}"]
-        for role, text in v.positions.items():
-            lines.append(f"  [{role}] {text[:200]}")
-        self.print_info("\n".join(lines), C["pink"])
+
+        # model calls: never on the event-loop thread (the UI froze —
+        # no redraws, no keys — for the whole multi-call debate)
+        def run():
+            v = self.agent.council.convene(question)
+            if not v.ok:
+                self.print_error(f"council failed: {v.error}")
+                return
+            lines = [f"COUNCIL VERDICT — winner: {v.winner.upper()}  "
+                     f"(confidence {v.confidence:.0f}%)",
+                     f"  reason: {v.reason}"]
+            for role, text in v.positions.items():
+                lines.append(f"  [{role}] {text[:200]}")
+            self.print_info("\n".join(lines), C["pink"])
+
+        self._bg(run)
 
     # -- v4 professional subsystem commands ------------------------------------
 
@@ -4032,17 +4161,23 @@ class UI:
             self.print_error(f"not a file: {path}")
             return
         self.print_info(f"⚙ mutating {path} — suite: {suite} …", C["dim"])
-        tester = MutationTester(self.agent.log, suite)
-        report = tester.run(path)
-        self.agent.mutator = tester
-        lines = [f"MUTATION — {report.path}",
-                 f"  score {report.score:.0%}   killed {report.killed}   "
-                 f"survived {report.survived}   errors {report.errors}   "
-                 f"total {report.total}"]
-        for r in report.results:
-            if r.status == "survived":
-                lines.append(f"    ⚠ SURVIVED [{r.kind}] {r.description}")
-        self.print_info("\n".join(lines), C["yellow"])
+
+        # runs the test suite once per mutant (minutes): off the event
+        # loop, or the whole UI stops redrawing and answering keys
+        def run():
+            tester = MutationTester(self.agent.log, suite)
+            report = tester.run(path)
+            self.agent.mutator = tester
+            lines = [f"MUTATION — {report.path}",
+                     f"  score {report.score:.0%}   killed {report.killed}   "
+                     f"survived {report.survived}   errors {report.errors}   "
+                     f"total {report.total}"]
+            for r in report.results:
+                if r.status == "survived":
+                    lines.append(f"    ⚠ SURVIVED [{r.kind}] {r.description}")
+            self.print_info("\n".join(lines), C["yellow"])
+
+        self._bg(run)
 
     # -- turn execution (worker thread) ---------------------------------------------------------
 
@@ -4111,6 +4246,19 @@ class UI:
                 report(f"could not start queued message: {e}")
 
     def _run_turn(self, text: str) -> None:
+        """Run a turn plus any focus-mode continuations — iteratively.
+
+        Continuations used to recurse (_run_turn → _run_turn → …): every
+        auto-continued turn kept the previous turn's closures, stream
+        buffers and Turn alive on the stack until the whole focus run
+        ended, and a long run crept toward the recursion limit.
+        """
+        while text is not None:
+            text = self._run_turn_once(text)
+
+    def _run_turn_once(self, text: str) -> str | None:
+        """One agent turn. Returns the focus-mode continuation prompt when
+        another turn should run, else None."""
         self._turn_start_ts = time.time()
         self._stream_tokens_count = 0
         self._invalidate_agents()
@@ -4140,6 +4288,14 @@ class UI:
         def _stream_status(text: str) -> None:
             _throttle.update(text)
             frame = _throttle.maybe_flush()
+            if self.__dict__.get("_active_throttle") is not _throttle:
+                with _STATUS_LOCK:
+                    # content took over from the thinking phase: a pending
+                    # reasoning frame must not surface over the reply
+                    self._active_throttle = _throttle
+                    rt = self.__dict__.get("_reasoning_throttle")
+                    if rt is not None and rt is not _throttle:
+                        rt.discard()
             if frame is not None:
                 self._set_status(frame)
 
@@ -4209,6 +4365,9 @@ class UI:
                 reasoning_stream.preview() if _reasoning_visible
                 else "reasoning…")
             frame = _reasoning_throttle.maybe_flush()
+            if self.__dict__.get("_active_throttle") is not _reasoning_throttle:
+                with _STATUS_LOCK:
+                    self._active_throttle = _reasoning_throttle
             if frame is not None and frame:
                 self._set_status(frame)
 
@@ -4261,6 +4420,7 @@ class UI:
         }
 
         _LF_BATCH = 16
+        _args_throttle = _StreamThrottle(0.1)
 
         def _lf_flush():
             batch = live_f["batch"]
@@ -4337,12 +4497,29 @@ class UI:
                     _lf_render_diff_line(dl)
                 if diff_lines:
                     rel = self._rel_path(live_f["path"]) if live_f["path"] else "patch"
-                    self._set_status(
+                    # throttled like the token preview: the counter
+                    # changes on every streamed chunk, which used to be
+                    # one invalidate (full chrome redraw) per chunk
+                    _args_throttle.update(
                         f"Δ live diff {rel} · +{live_f['added']} -{live_f['removed']} lines…"
                     )
+                    frame = _args_throttle.maybe_flush()
+                    if self.__dict__.get("_active_throttle") is not _args_throttle:
+                        with _STATUS_LOCK:
+                            self._active_throttle = _args_throttle
+                    if frame is not None:
+                        self._set_status(frame)
 
         def on_tool_call(ev: ToolEvent):
             self._invalidate_agents()  # TaskGroup spawns must show immediately
+            # superseded previews: the partial line is printed below and
+            # the status switches to the tool — a stale throttled frame
+            # must never surface over it afterwards
+            with _STATUS_LOCK:
+                self._active_throttle = None
+                _throttle.discard()
+                _reasoning_throttle.discard()
+                _args_throttle.discard()
             rem = "".join(stream_tail["parts"]).strip("\n")
             stream_tail["parts"].clear()
             stream_tail["pv"] = ""
@@ -4373,6 +4550,9 @@ class UI:
 
         def on_tool_update(ev: ToolEvent):
             self._invalidate_agents()  # worker progress/finish is real state
+            with _STATUS_LOCK:
+                self._active_throttle = None
+                _args_throttle.discard()
             if ev.name in ("write_file", "edit_file", "MultiEdit", "multiedit", "apply_patch") \
                     and ev.status in ("done", "error"):
                 if hasattr(self, "_diff_history"):
@@ -4383,6 +4563,9 @@ class UI:
                         "args": dict(ev.args),
                         "status": ev.status,
                     })
+                    # bounded: each entry holds whole file contents
+                    if len(self._diff_history) > _DIFF_HISTORY_MAX:
+                        del self._diff_history[:-_DIFF_HISTORY_MAX]
             if ev.name in ("write_file", "edit_file", "MultiEdit", "multiedit", "apply_patch") \
                     and ev.status in ("done", "error") \
                     and live_f["count"] > 0:
@@ -4465,6 +4648,8 @@ class UI:
         except Exception as e:  # noqa: BLE001 — never kill the UI thread
             self.print_error(f"{type(e).__name__}: {e}")
         finally:
+            with _STATUS_LOCK:
+                self._active_throttle = None
             rem = "".join(stream_tail["parts"]).strip("\n")
             stream_tail["parts"].clear()
             # Final flush: apply any preview frame the throttle absorbed so
@@ -4486,8 +4671,15 @@ class UI:
                     and sys.stdout.isatty():
                 try:
                     from .fx import shimmer_flash
+                    # Under patch_stdout (the live app) the "\r" frames are
+                    # buffered until the final newline, so the animation is
+                    # never seen — its 6 sleeps only held the turn (and any
+                    # queued message) for ~0.2s every turn. Animate only
+                    # when writes reach the terminal directly.
+                    proxied = type(sys.stdout).__name__ == "StdoutProxy"
                     shimmer_flash(self.console, "✦ done",
-                                  steps=6, delay=0.03)
+                                  steps=1 if proxied else 6,
+                                  delay=0.0 if proxied else 0.03)
                 except Exception:
                     pass
 
@@ -4559,8 +4751,8 @@ class UI:
                         f"({self._focus_remaining} turn(s) left)…",
                         C["pink"])
                     self._emit_user("CONTINUE (focus mode)")
-                    self._run_turn(cont)
-                    return
+                    return cont
+        return None
 
     def _print_turn_stats(self, turn) -> None:
         parts = [f"{turn.duration:.1f}s"]
@@ -4581,6 +4773,17 @@ class UI:
         def tick():
             while self._spinner_on and gen == self._spinner_gen:
                 self._spinner_i = (self._spinner_i + 1) % len(SPINNER_FRAMES)
+                # trailing edge of the stream throttle: a preview frame
+                # absorbed just before the model paused shows up now
+                # instead of waiting for the next token
+                try:
+                    with _STATUS_LOCK:
+                        th = self.__dict__.get("_active_throttle")
+                        frame = th.take_due() if th is not None else None
+                        if frame:
+                            self._set_status(frame)
+                except Exception:
+                    pass
                 self._invalidate()
                 time.sleep(0.09)
         threading.Thread(target=tick, daemon=True).start()
@@ -4601,7 +4804,15 @@ class UI:
         preview = self._diff_preview(tool, args)
         if preview is not None:
             self.console.print(preview)
-        done.wait()
+        # Wake on cancel too: a turn cancelled (Esc/Ctrl+C before the bar
+        # got focus, the cancel watchdog, a programmatic cancel) used to
+        # leave this worker parked forever on done.wait(), holding the
+        # turn slot so every later message just queued behind it.
+        cancel = getattr(self, "_cancel_flag", None)
+        while not done.wait(0.25):
+            if cancel is not None and cancel.is_set():
+                self._approve_result = False
+                break
         self._approve_request = None
         self._invalidate()
         return self._approve_result

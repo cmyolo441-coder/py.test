@@ -96,6 +96,12 @@ class CheckpointManager:
         # Ordered ids of manual checkpoints (oldest first) — bounded by
         # MAX_MANUAL_CHECKPOINTS so snapshots can't grow RAM unboundedly.
         self._manual_ids: list[str] = []
+        # PERF (progressive slowdown): structural sharing between
+        # snapshots. id(live message) -> (live message, fingerprint,
+        # frozen deep copy). Holding the live message keeps its id stable;
+        # the memo is rebuilt from the CURRENT history on every create, so
+        # it never holds more than the history already does.
+        self._frozen: dict[int, tuple] = {}
 
     # ------------------------------------------------------------------ files
 
@@ -130,7 +136,7 @@ class CheckpointManager:
         cid = uuid.uuid4().hex[:8]
         messages = getattr(agent, "messages", []) or []
         snapshot = {
-            "messages": copy.deepcopy(messages),
+            "messages": self._freeze_messages(messages),
             "files": dict(self._before),  # before-contents, immutable from here
         }
         ts = time.time()
@@ -157,6 +163,36 @@ class CheckpointManager:
             while len(self._manual_ids) > MAX_MANUAL_CHECKPOINTS:
                 self.discard(self._manual_ids.pop(0))
         return cid
+
+    def _freeze_messages(self, messages: list) -> list:
+        """Immutable copy of ``messages`` for a snapshot.
+
+        The old code deep-copied the WHOLE history before every risky tool
+        call (run_command, write_file, ...): O(history) per call, so each
+        call got slower as the session grew, and the 10-entry auto ring
+        held 10 full copies. Messages are append-mostly, so a message that
+        is unchanged since the previous snapshot reuses its frozen copy;
+        only new or edited messages are deep-copied. Frozen copies are
+        never mutated (restore() deep-copies them back out)."""
+        try:
+            from .client import _message_fingerprint
+        except Exception:  # noqa: BLE001 — fall back to a plain deepcopy
+            return copy.deepcopy(messages)
+        memo: dict[int, tuple] = {}
+        out: list = []
+        for m in messages:
+            fp = _message_fingerprint([m]) if isinstance(m, dict) else None
+            ent = self._frozen.get(id(m))
+            if (fp is not None and ent is not None and ent[0] is m
+                    and ent[1] == fp):
+                frozen = ent[2]
+            else:
+                frozen = copy.deepcopy(m)
+            if fp is not None:
+                memo[id(m)] = (m, fp, frozen)
+            out.append(frozen)
+        self._frozen = memo
+        return out
 
     def _persist_meta(self, meta: dict) -> None:
         # Metadata only — file *contents* stay in memory.

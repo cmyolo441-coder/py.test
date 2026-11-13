@@ -110,6 +110,7 @@ def send_email(to: Any, subject: str, body: str,
     else:
         # list(to) on an int/None used to raise TypeError here.
         return "ERROR: 'to' must be an address string or a list of addresses"
+    skipped = [r for r in recipients if not _valid_email(r)]
     recipients = [r for r in recipients if _valid_email(r)]
     if not recipients:
         return "ERROR: no valid recipient address (each must contain @)"
@@ -160,7 +161,13 @@ def send_email(to: Any, subject: str, body: str,
     if refused:
         bad = ", ".join(sorted(refused))
         return f"ERROR: server refused recipients: {bad}"
-    return f"Email sent to {', '.join(recipients)} via {host}:{port}"
+    note = ""
+    if skipped:
+        # an invalid address used to be dropped silently: the caller
+        # believed everyone listed had been emailed
+        note = (" (NOT sent to invalid address(es): "
+                + ", ".join(repr(str(r))[:80] for r in skipped) + ")")
+    return f"Email sent to {', '.join(recipients)} via {host}:{port}{note}"
 
 
 def config_status() -> str:

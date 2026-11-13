@@ -33,6 +33,8 @@ Only stdlib + ``.tools`` are imported (``Tool`` for the registry).
 
 from __future__ import annotations
 
+import atexit
+import contextlib
 import os
 import shutil
 import signal
@@ -121,20 +123,42 @@ CREATE TABLE IF NOT EXISTS supervised (
 """
 
 
+_SCHEMA_READY: set[str] = set()
+
+
 def _connect() -> sqlite3.Connection:
     path = _db_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(str(path), timeout=10.0)
+    key = str(path)
+    if key not in _SCHEMA_READY:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(key, timeout=10.0)
     con.row_factory = sqlite3.Row
-    con.execute(_SCHEMA)
-    con.commit()
+    if key not in _SCHEMA_READY or not path.exists():
+        # PERF: the CREATE TABLE + commit (a write transaction + fsync)
+        # used to run on EVERY operation — several per 5s poll tick.
+        con.execute(_SCHEMA)
+        con.commit()
+        _SCHEMA_READY.add(key)
     return con
+
+
+@contextlib.contextmanager
+def _db():
+    """Connection that is committed AND closed. ``with sqlite3.connect()``
+    only commits — it never closes, so every op leaked a connection (and
+    its file descriptor) until the garbage collector got to it."""
+    con = _connect()
+    try:
+        with con:
+            yield con
+    finally:
+        con.close()
 
 
 def _db_insert(**fields: Any) -> None:
     cols = ", ".join(fields)
     placeholders = ", ".join("?" for _ in fields)
-    with _connect() as con:
+    with _db() as con:
         con.execute(f"INSERT INTO supervised ({cols}) VALUES ({placeholders})",
                     tuple(fields.values()))
         con.commit()
@@ -144,7 +168,7 @@ def _db_update(sid: str, **fields: Any) -> None:
     if not fields:
         return
     sets = ", ".join(f"{k} = ?" for k in fields)
-    with _connect() as con:
+    with _db() as con:
         con.execute(f"UPDATE supervised SET {sets} WHERE id = ?",
                     (*fields.values(), sid))
         con.commit()
@@ -160,7 +184,7 @@ def _db_update_guarded(sid: str, expect_status: str, **fields: Any) -> bool:
     if not fields:
         return False
     sets = ", ".join(f"{k} = ?" for k in fields)
-    with _connect() as con:
+    with _db() as con:
         cur = con.execute(
             f"UPDATE supervised SET {sets} WHERE id = ? AND status = ?",
             (*fields.values(), sid, expect_status))
@@ -169,7 +193,7 @@ def _db_update_guarded(sid: str, expect_status: str, **fields: Any) -> bool:
 
 
 def _db_delete(sid: str) -> None:
-    with _connect() as con:
+    with _db() as con:
         con.execute("DELETE FROM supervised WHERE id = ?", (sid,))
         con.commit()
 
@@ -177,14 +201,14 @@ def _db_delete(sid: str) -> None:
 def _row(sid: Any) -> dict | None:
     if not isinstance(sid, str):
         return None
-    with _connect() as con:
+    with _db() as con:
         cur = con.execute("SELECT * FROM supervised WHERE id = ?", (sid,))
         r = cur.fetchone()
     return dict(r) if r is not None else None
 
 
 def _all_rows() -> list[dict]:
-    with _connect() as con:
+    with _db() as con:
         cur = con.execute("SELECT * FROM supervised ORDER BY created_at")
         rows = [dict(r) for r in cur.fetchall()]
     return rows
@@ -195,15 +219,36 @@ def _all_rows() -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
+_LOG_TRIM_BYTES = 1_000_000      # trim a log once it grows past this
+_LOG_TAIL_BYTES = 256 * 1024     # bytes considered when keeping the tail
+
+
+def _read_tail(path: Path, max_bytes: int = _LOG_TAIL_BYTES) -> bytes:
+    """Last ``max_bytes`` of a file without reading the whole thing."""
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        f.seek(max(0, size - max_bytes))
+        data = f.read()
+    if size > max_bytes:
+        nl = data.find(b"\n")
+        data = data[nl + 1:] if nl >= 0 else data
+    return data
+
+
 def _trim_log(path: Path, keep: int = _LOG_KEEP_LINES) -> None:
-    """Keep only the last ``keep`` lines of an oversized log file."""
+    """Keep only the last ``keep`` lines of an oversized log file.
+
+    Reads only the tail (a multi-GB log used to be loaded whole). The
+    child writes with O_APPEND, so truncating under it is safe."""
     try:
-        if not path.exists() or path.stat().st_size < 1_000_000:
+        if not path.exists() or path.stat().st_size < _LOG_TRIM_BYTES:
             return
-        with open(path, "rb") as f:
-            lines = f.read().splitlines(keepends=True)
-        with open(path, "wb") as f:
+        lines = _read_tail(path).splitlines(keepends=True)
+        with open(path, "r+b") as f:
+            f.seek(0)
             f.writelines(lines[-keep:])
+            f.truncate()
     except OSError:
         pass
 
@@ -254,6 +299,33 @@ def _kill_group_proc(proc: subprocess.Popen) -> None:
         proc.wait(timeout=10)
     except (subprocess.TimeoutExpired, OSError):
         pass
+
+
+def _owned_group(pid: Any, command: str = "") -> bool:
+    """True when ``pid`` still looks like a process group WE started:
+    it leads its own group (start_new_session) that is not ours and, where
+    /proc is available, its command line contains ``command``. Guards every
+    kill by a stored pid against pid reuse (killing an unrelated program,
+    or — via getpgid() of a non-leader — the agent's own group)."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 1:
+        return False
+    try:
+        if os.getpgid(pid) != pid or pid == os.getpgrp():
+            return False
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+    cmdline = Path(f"/proc/{pid}/cmdline")
+    if command and cmdline.parent.exists():
+        try:
+            raw = cmdline.read_bytes().replace(b"\0", b" ")
+        except OSError:
+            return False
+        return command.strip()[:200].encode("utf-8", "replace") in raw
+    return True
 
 
 def _alive(pid: int) -> bool:
@@ -322,11 +394,46 @@ class _Supervisor:
     # -- main loop ------------------------------------------------------
 
     def _loop(self) -> None:
+        tick = 0
         while not self._stop_event.wait(_POLL_INTERVAL):
             try:
                 self._poll_once()
             except Exception:  # noqa: BLE001 — never kill the supervisor
                 pass
+            tick += 1
+            if tick % 12 == 0:
+                # logs used to be trimmed only on (re)start, so a chatty
+                # long-lived server grew its log without bound
+                with self._lock:
+                    sids = list(self._procs)
+                for sid in sids:
+                    _trim_log(_log_dir() / f"{sid}.log")
+
+    def kill_all(self) -> None:
+        """atexit: take every supervised process group down with us.
+
+        They run in their own sessions, so they did NOT die with the agent
+        (despite _rearm's assumption) — and _rearm then started a second
+        copy on the next launch (port clashes, crash loops, duplicates)."""
+        self._stop_event.set()
+        with self._lock:
+            procs = list(self._procs.items())
+            self._procs.clear()
+        for _sid, proc in procs:
+            try:
+                if proc.poll() is None:
+                    os.killpg(proc.pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        deadline = time.monotonic() + 1.0
+        for _sid, proc in procs:
+            try:
+                proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except (subprocess.TimeoutExpired, OSError):
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
 
     def _poll_once(self) -> None:
         now = time.time()
@@ -412,6 +519,13 @@ class _Supervisor:
         now = time.time()
         for row in _all_rows():
             if row["status"] == STATUS_RUNNING:
+                # an old instance that survived (own session) must not
+                # run twice next to its replacement
+                if row["pid"] and _owned_group(row["pid"], row["command"]):
+                    try:
+                        os.killpg(int(row["pid"]), signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError, OSError):
+                        pass
                 _db_update(row["id"], status=STATUS_PENDING, pid=None,
                            next_restart_at=now, backoff_s=0.0,
                            note="re-armed after supervisor restart")
@@ -420,6 +534,7 @@ class _Supervisor:
 
 
 _SUP = _Supervisor()
+atexit.register(_SUP.kill_all)
 
 
 def ensure_started() -> None:
@@ -495,10 +610,12 @@ def stop_supervised(sid: str) -> tuple[bool, str]:
     if proc is not None and proc.poll() is None:
         _kill_group_proc(proc)
         killed = True
-    elif row["pid"] and _alive(row["pid"]):
+    elif row["pid"] and _owned_group(row["pid"], row["command"]):
         # Belt and braces: a pid the DB knows but we lost the handle for.
+        # (ownership-checked: getpgid() of a reused pid could name an
+        # unrelated group — or our own.)
         try:
-            os.killpg(os.getpgid(row["pid"]), signal.SIGKILL)
+            os.killpg(int(row["pid"]), signal.SIGKILL)
             killed = True
         except (ProcessLookupError, PermissionError, OSError):
             pass
@@ -544,7 +661,9 @@ def logs(sid: str, tail: int = 50) -> str:
     if not path.exists():
         return "(no output logged yet)"
     try:
-        data = path.read_bytes().decode("utf-8", errors="replace")
+        # tail only: a long-running server's log can be huge
+        data = _read_tail(path, max(_LOG_TAIL_BYTES, n * 1024)).decode(
+            "utf-8", errors="replace")
     except OSError as e:
         return f"ERROR: could not read log: {e}"
     lines = data.splitlines()

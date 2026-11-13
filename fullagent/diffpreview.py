@@ -367,7 +367,10 @@ def _diff_edit_file(args: Dict[str, Any]) -> str:
     path = str(args.get("path", ""))
     old_s = args.get("old_string", "")
     new_s = args.get("new_string", "")
-    replace_all = bool(args.get("replace_all", False))
+    replace_all = args.get("replace_all", False)
+    if isinstance(replace_all, str):  # bool("false") is True
+        replace_all = replace_all.strip().lower() in ("1", "true", "yes")
+    replace_all = bool(replace_all)
     old = _read_current(path)
     if old is None:
         return f"--- {path}\n(cannot preview: file not readable)"
@@ -377,6 +380,14 @@ def _diff_edit_file(args: Dict[str, Any]) -> str:
         return (
             f"--- {path}\n(cannot preview: old_string NOT FOUND in "
             "file — this edit will fail)"
+        )
+    n = old.count(old_s)
+    if n > 1 and not replace_all:
+        # edit_file refuses an ambiguous old_string; previewing "replace
+        # the first one" showed the user a change that would never happen
+        return (
+            f"--- {path}\n(cannot preview: old_string matches {n} places "
+            "and replace_all is false — this edit will fail)"
         )
     new = old.replace(old_s, str(new_s), -1 if replace_all else 1)
     return _summarize(path, False) + "\n" + (
@@ -392,6 +403,26 @@ def _diff_multiedit(args: Dict[str, Any]) -> str:
         return f"--- {path}\n(cannot preview: file not readable)"
     if not isinstance(edits, list) or not edits:
         return f"--- {path}\n(cannot preview: edits list is empty)"
+    # Preview with MultiEdit's OWN matcher (all edits matched against the
+    # original text, fuzzy/line-anchored fallbacks, overlap checks). The
+    # old sequential str.replace simulation disagreed with what MultiEdit
+    # actually does: it reported "this MultiEdit will fail" for edits the
+    # fuzzy chain applies fine (so users declined good edits), and could
+    # show a diff for an ambiguous match MultiEdit would refuse.
+    try:
+        from .multiedit import _apply_edits
+        from .tools import _checked
+        p, err = _checked(path)
+        if err is None:
+            ok, message, _fi, new_text = _apply_edits(p, edits, old, True)
+            if not ok:
+                first = str(message).splitlines()[0] if message else ""
+                return (f"--- {path}\n(cannot preview: {first[:300]} — "
+                        "this MultiEdit will fail)")
+            return _summarize(path, False) + "\n" + (
+                _unified(old, new_text, path) or "(no changes)")
+    except Exception:  # fall back to the simple simulation below
+        pass
     new = old
     for i, edit in enumerate(edits):
         if not isinstance(edit, dict):

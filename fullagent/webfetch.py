@@ -29,6 +29,7 @@ import threading
 import re
 import socket
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
@@ -301,7 +302,41 @@ def _host_error(host: str | None) -> str:
         if not ip.is_global:
             # loopback / private / link-local (169.254.169.254) / CGNAT
             return f"blocked non-public address for {host}: {ip}"
+        if ip.version == 6:
+            # An IPv4 address embedded in IPv6 (IPv4-mapped, NAT64
+            # 64:ff9b::/96) reaches that IPv4 host: 64:ff9b::7f00:1 is
+            # "global" to ipaddress but lands on 127.0.0.1 via NAT64.
+            embedded = ip.ipv4_mapped
+            if embedded is None and ip in ipaddress.ip_network(
+                    "64:ff9b::/96"):
+                embedded = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+            if embedded is not None and not embedded.is_global:
+                return f"blocked non-public address for {host}: {ip}"
     return ""
+
+
+class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Validate every redirect hop BEFORE it is requested.
+
+    urllib follows redirects on its own; checking only the final URL
+    meant the request to an internal hop (http://127.0.0.1:8080/admin,
+    http://169.254.169.254/...) had already been SENT by the time we
+    noticed — a blind SSRF even though the body was never read.
+    """
+
+    max_redirections = 5
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        err = _validate_url(newurl)
+        if err:
+            raise urllib.error.URLError(f"redirect blocked: {err}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _open(req, timeout):
+    """urlopen with per-hop redirect validation."""
+    opener = urllib.request.build_opener(_ValidatingRedirectHandler())
+    return opener.open(req, timeout=timeout)
 
 
 def _validate_url(url: object) -> str:
@@ -349,7 +384,7 @@ def fetch_text(url: str, timeout: int = DEFAULT_TIMEOUT,
                            "application/xml;q=0.9,text/plain;q=0.8,"
                            "*/*;q=0.5"})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _open(req, timeout) as resp:
             status = getattr(resp, "status", 200)
             if status >= 400:
                 return {"error": f"HTTP {status}"}
@@ -507,8 +542,8 @@ if __name__ == "__main__":
         full = req.full_url if hasattr(req, "full_url") else str(req)
         return _FakeResp(payload, full + "/final")
 
-    real_urlopen = urllib.request.urlopen
-    urllib.request.urlopen = _fake_urlopen
+    real_open = _open
+    _open = _fake_urlopen
     try:
         with tempfile.TemporaryDirectory() as d:
             url = "http://example.test/page"
@@ -544,7 +579,7 @@ if __name__ == "__main__":
                   clear_cache(cache_dir=d) == 1
                   and list(Path(d).glob("*.json")) == [])
     finally:
-        urllib.request.urlopen = real_urlopen
+        _open = real_open
 
     # --- 3. JS-heavy detection ---------------------------------------------
     js_html = ("<html><head><title>App</title></head><body>"
@@ -579,14 +614,14 @@ if __name__ == "__main__":
     e2 = fetch_text("file:///etc/passwd")
     check("file scheme rejected",
           e2.get("error", "").startswith("only http(s) URLs are allowed"))
-    urllib.request.urlopen = lambda *a, **k: (_ for _ in ()).throw(
+    _open = lambda *a, **k: (_ for _ in ()).throw(
         OSError("boom"))
     try:
         e3 = fetch_text("http://example.test/", cache_dir=None)
         check("network failure -> error dict, no raise",
               "error" in e3 and "OSError" in e3["error"])
     finally:
-        urllib.request.urlopen = real_urlopen
+        _open = real_open
 
     print("PASS" if _fails == 0 else "FAIL",
           f"- {_fails} failure(s)")

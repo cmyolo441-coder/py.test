@@ -75,24 +75,36 @@ def _run_docker(*args: str) -> str:
 
     Non-zero exits surface the real stderr instead of raising.
     """
+    from .tools import _run_capture
     try:
-        proc = subprocess.run(
-            ["docker", *args],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=DOCKER_TIMEOUT_S,
-        )
+        proc = _run_capture(["docker", *args], DOCKER_TIMEOUT_S)
     except subprocess.TimeoutExpired:
         return f"error: docker {' '.join(args)} timed out after {DOCKER_TIMEOUT_S}s"
     except OSError as e:
         return f"error: failed to launch docker: {e}"
-    out = proc.stdout.strip()
-    err = proc.stderr.strip()
+    from .tools import _clip
+    out = _clip((proc.stdout or "").strip())
+    err = _clip((proc.stderr or "").strip(), 4000)
     if proc.returncode == 0:
         return out if out else "(no output)"
     detail = err or out or f"exit code {proc.returncode}"
     return f"error: docker {' '.join(args)} failed:\n{detail}"
+
+
+def _flag(value) -> bool:
+    """Model-supplied boolean: bool("false") is True, so parse strings."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "y", "on")
+    return bool(value)
+
+
+def _bad_operand(label: str, value: str) -> Optional[str]:
+    """A value that docker would parse as an OPTION (e.g. image
+    '--privileged' or '-v=/:/host') smuggles arbitrary flags into the
+    command line. Refuse it."""
+    if value.startswith("-"):
+        return f"error: invalid {label} {value!r} (must not start with '-')"
+    return None
 
 
 def _require_docker() -> Optional[str]:
@@ -109,7 +121,7 @@ def _docker_ps(**kwargs) -> str:
     msg = _require_docker()
     if msg:
         return msg
-    show_all = bool(kwargs.get("all", False))
+    show_all = _flag(kwargs.get("all", False))
     args = ["ps", "--format",
             "{{.ID}}\t{{.Image}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}"]
     if show_all:
@@ -142,7 +154,11 @@ def _docker_run(**kwargs) -> str:
         return "error: 'image' is required (e.g. docker_run(image='hello-world'))"
     command = str(kwargs.get("command", "")).strip()
     name = str(kwargs.get("name", "")).strip()
-    detach = bool(kwargs.get("detach", False))
+    detach = _flag(kwargs.get("detach", False))
+    bad = _bad_operand("image", image) or (
+        _bad_operand("name", name) if name else None)
+    if bad:
+        return bad
     argv = ["run"]
     if detach:
         argv.append("-d")
@@ -152,7 +168,10 @@ def _docker_run(**kwargs) -> str:
         argv += ["--name", name]
     argv.append(image)
     if command:
-        argv += shlex.split(command)
+        try:
+            argv += shlex.split(command)
+        except ValueError as e:  # unbalanced quotes used to crash the turn
+            return f"error: could not parse command: {e}"
     out = _run_docker(*argv)
     if out.startswith("error"):
         return out
@@ -170,6 +189,9 @@ def _docker_logs(**kwargs) -> str:
     container = str(kwargs.get("container", "")).strip()
     if not container:
         return "error: 'container' is required (name or id)"
+    bad = _bad_operand("container", container)
+    if bad:
+        return bad
     try:
         tail = int(kwargs.get("tail", 50))
     except (TypeError, ValueError):
@@ -192,6 +214,9 @@ def _docker_stop(**kwargs) -> str:
     container = str(kwargs.get("container", "")).strip()
     if not container:
         return "error: 'container' is required (name or id)"
+    bad = _bad_operand("container", container)
+    if bad:
+        return bad
     out = _run_docker("stop", container)
     if out.startswith("error"):
         return out

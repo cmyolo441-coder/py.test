@@ -52,6 +52,7 @@ STATUS_FAILED = "failed"
 STATUS_CANCELLED = "cancelled"
 
 KILL_GRACE_SECONDS = 5.0
+MAX_FINISHED_JOBS_KEPT = 500   # finished rows (+ logs) kept across restarts
 KILL_SIGNAL = signal.SIGTERM
 # Windows has no SIGKILL; importing this module must not depend on it.
 ESCALATE_SIGNAL = getattr(signal, "SIGKILL", signal.SIGTERM)
@@ -232,12 +233,37 @@ def _watch(job_id: str, proc: subprocess.Popen, entry: dict) -> None:
 
 def _kill_group(pid: int, sig: int) -> None:
     try:
-        os.killpg(os.getpgid(pid), sig)
+        pgid = os.getpgid(pid)
+        # never signal our own group (a child that is not a group leader
+        # resolves to the agent's own pgid)
+        if pgid == os.getpgrp():
+            raise OSError("refusing to signal own process group")
+        os.killpg(pgid, sig)
     except (ProcessLookupError, PermissionError, OSError):
         try:
             os.kill(pid, sig)
         except (ProcessLookupError, PermissionError, OSError):
             pass
+
+
+def _owned_group(pid: Any, command: str = "") -> bool:
+    """pid still leads its own process group and (where /proc exists)
+    runs ``command`` — i.e. it is still the job we started."""
+    try:
+        pid = int(pid)
+        if pid <= 1 or os.getpgid(pid) != pid or pid == os.getpgrp():
+            return False
+    except (TypeError, ValueError, ProcessLookupError, PermissionError,
+            OSError):
+        return False
+    proc_cmd = Path(f"/proc/{pid}/cmdline")
+    if command and proc_cmd.parent.exists():
+        try:
+            raw = proc_cmd.read_bytes().replace(b"\0", b" ")
+        except OSError:
+            return False
+        return command.strip()[:200].encode("utf-8", "replace") in raw
+    return True
 
 
 def _escalate(job_id: str, proc: subprocess.Popen) -> None:
@@ -349,9 +375,22 @@ def logs(job_id: str, n: int = 50) -> str:
         return f"ERROR: n must be an integer, got {n!r}"
     lines = max(0, min(lines, 5000))
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        # tail only: a long build/server log can be gigabytes and was read
+        # into memory whole on every JobLogs call
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            want = max(64 * 1024, lines * 1024)
+            fh.seek(max(0, size - want))
+            raw = fh.read()
+        if size > want:
+            nl = raw.find(b"\n")
+            raw = raw[nl + 1:] if nl >= 0 else raw
+        text = raw.decode("utf-8", errors="replace")
     except FileNotFoundError:
         return "(log file not found — job may not have started yet)"
+    except OSError as e:
+        return f"ERROR: could not read log: {e}"
     split = text.splitlines(keepends=True)
     body = "".join(split[-lines:]) if lines else ""
     return body if body else "(log is empty so far)"
@@ -373,11 +412,11 @@ def cancel_job(job_id: str) -> bool:
         # mark cancelled if the row still says running/pending.
         if row["status"] in (STATUS_RUNNING, STATUS_PENDING):
             pid = row["pid"]
-            if pid:
-                try:
-                    os.kill(pid, KILL_SIGNAL)
-                except (ProcessLookupError, PermissionError, OSError):
-                    pass
+            # only signal a pid that still leads the group we created
+            # (start_new_session): a stale pid from an earlier agent may
+            # have been reused by an unrelated process
+            if pid and _owned_group(pid, row["command"]):
+                _kill_group(pid, KILL_SIGNAL)
             _update(job_id, status=STATUS_CANCELLED,
                     finished_at=time.time(), note="cancelled")
             return True
@@ -420,6 +459,21 @@ def _recover() -> None:
                     "UPDATE jobs SET status = ?, finished_at = ?,"
                     " note = ? WHERE id = ?",
                     (STATUS_FAILED, now, "process died", jid))
+            # bound history: rows + log files used to accumulate forever
+            old_rows = conn.execute(
+                "SELECT id, log_path FROM jobs WHERE status IN (?, ?, ?)"
+                " ORDER BY COALESCE(finished_at, created_at) DESC"
+                " LIMIT -1 OFFSET ?",
+                (STATUS_DONE, STATUS_FAILED, STATUS_CANCELLED,
+                 MAX_FINISHED_JOBS_KEPT)).fetchall()
+            for jid, log_path in old_rows:
+                conn.execute("DELETE FROM jobs WHERE id = ?", (jid,))
+                try:
+                    lp = Path(log_path)
+                    if lp.parent.resolve() == _logs_dir().resolve():
+                        lp.unlink()
+                except OSError:
+                    pass
             conn.commit()
         finally:
             conn.close()

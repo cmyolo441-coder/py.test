@@ -22,7 +22,7 @@ import json
 import math
 from dataclasses import dataclass, field
 
-from .kernel import EventLog, fold
+from .kernel import EventLog, _fold_apply, fold
 from ._foundation import get_logger
 
 _log = get_logger("cortex")
@@ -192,6 +192,8 @@ class BudgetGovernor:
         self._last_reason = ""  # dedupe budget.event spam while paused
         # (branch, head, start): where the latest session.start scan ended
         self._session_cache: tuple[str, int, int] | None = None
+        # (branch, from_seq, log cursor, State): incremental spend fold
+        self._spend_cache: tuple | None = None
 
     def _session_start(self) -> int:
         """seq of the latest session.start (-1 if none) — where the current
@@ -241,8 +243,35 @@ class BudgetGovernor:
         return start
 
     def spend(self) -> dict:
-        st = fold(self.log,
-                  from_seq=max(self.baseline_seq, self._session_start()))
+        """Session-scoped spend.
+
+        PERF: enforce() runs at the top of EVERY tool iteration; the old
+        code re-folded the whole session (up to the full retained window,
+        thousands of events) on each call, so per-iteration cost grew
+        with session length. The projection is now kept incrementally:
+        only the events appended since the previous call are applied
+        (same _fold_apply reducer, so the numbers are identical). A
+        changed scope (new session/reset), a rewind or a branch switch
+        falls back to the full fold."""
+        from_seq = max(self.baseline_seq, self._session_start())
+        branch = self.log.branch
+        # the log lock (re-entrant) makes "apply delta + take cursor"
+        # atomic, so a concurrent append can never slip between them
+        with self.log._lock:
+            cache = self._spend_cache
+            st = None
+            if cache is not None and cache[0] == branch \
+                    and cache[1] == from_seq:
+                delta = self.log.delta_since(cache[2], branch)
+                if delta is not None:
+                    st = cache[3]
+                    for ev in delta:
+                        if ev.seq > from_seq:
+                            _fold_apply(st, ev)
+            if st is None:
+                st = fold(self.log, branch=branch, from_seq=from_seq)
+            self._spend_cache = (branch, from_seq,
+                                 self.log.cursor(branch), st)
         return {"usd": st.cost_usd, "steps": st.tool_calls,
                 "tokens": st.tokens_in + st.tokens_out,
                 "files": len(st.files_touched)}

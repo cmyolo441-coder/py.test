@@ -366,7 +366,11 @@ class ParallelSubagents:
         """Register a live progress listener ``callback(worker, event_kind)``."""
         if callable(callback):
             with self._lock:
-                self._progress_callbacks.append(callback)
+                # idempotent: re-registering the same listener (a UI that
+                # re-hooks each turn) must not multiply the per-event
+                # callback cost for the rest of the session
+                if callback not in self._progress_callbacks:
+                    self._progress_callbacks.append(callback)
 
     def _notify_listeners(self, worker: Subagent, kind: str) -> None:
         with self._lock:
@@ -1030,6 +1034,11 @@ class ParallelSubagents:
         return header + "\n\n" + "\n\n".join(reports)
 
     def stop(self, worker_id: str) -> Subagent:
+        # The audit append (disk I/O) and listener callbacks (UI) run
+        # AFTER the manager lock is released: holding it there stalled
+        # every worker thread and every snapshot()/TaskList on slow I/O,
+        # and re-entering a UI callback under our lock risks lock-order
+        # deadlocks.
         with self._lock:
             worker = self._workers.get(str(worker_id or "").strip())
             if worker is None:
@@ -1046,19 +1055,19 @@ class ParallelSubagents:
                 done_ev = self._done_events.get(worker.id)
                 if done_ev is not None:
                     done_ev.set()
-                self._emit("subagent.cancelled", worker.to_dict(), worker)
+                pending = ("subagent.cancelled", worker.to_dict())
             else:
                 worker.state = "cancelling"
-                self._emit(
+                pending = (
                     "subagent.progress",
                     {
                         "id": worker.id,
                         "state": "cancelling",
                         "action": worker.current_action,
                     },
-                    worker,
                 )
-            return worker
+        self._emit(pending[0], pending[1], worker)
+        return worker
 
     def wait(
         self,
@@ -1887,6 +1896,7 @@ class ParallelSubagents:
             }
 
     def shutdown(self, wait: bool = True) -> None:
+        cancelled: list = []
         with self._lock:
             self._closed = True
             for worker in self._workers.values():
@@ -1900,12 +1910,12 @@ class ParallelSubagents:
                         done_ev = self._done_events.get(worker.id)
                         if done_ev is not None:
                             done_ev.set()
-                        self._emit(
-                            "subagent.cancelled", worker.to_dict(), worker
-                        )
+                        cancelled.append((worker.to_dict(), worker))
                     else:
                         worker.state = "cancelling"
             draining = list(self._futures.values()) if wait else []
+        for data, worker in cancelled:
+            self._emit("subagent.cancelled", data, worker)
         if draining:
             concurrent.futures.wait(draining, timeout=DRAIN_TIMEOUT)
         self._pool.shutdown(wait=False, cancel_futures=True)

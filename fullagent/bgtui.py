@@ -81,6 +81,14 @@ def has_activity(agent=None) -> bool:
     return any(running for running, _ in _bg_shell_rows(time.time()))
 
 
+# The panel is pinned above the prompt and rebuilt on every redraw while a
+# job runs. bgsh retains up to 32 finished jobs; listing all of them made
+# the pinned panel (and every redraw) grow with the session until it
+# pushed the prompt off a small terminal. Running jobs are always shown;
+# finished ones are capped to the newest few.
+MAX_FINISHED_ROWS = 4
+
+
 class BackgroundPanel:
     """Render running shell jobs first and keep the last rendered lines."""
     def __init__(self) -> None:
@@ -94,7 +102,13 @@ class BackgroundPanel:
         if not rows:
             out.append("  (none)")
         else:
-            out.extend(f"  {row}" for row in running + finished)
+            out.extend(f"  {row}" for row in running)
+            # rows are oldest-first: keep the newest finished jobs
+            shown = finished[-MAX_FINISHED_ROWS:] if MAX_FINISHED_ROWS else []
+            out.extend(f"  {row}" for row in shown)
+            hidden = len(finished) - len(shown)
+            if hidden > 0:
+                out.append(f"  … +{hidden} older finished job(s)")
             out.append(f"  {_KILL_HINT}")
         self.lines = out
         return out

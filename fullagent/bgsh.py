@@ -89,6 +89,7 @@ class _BgTask:
         self._stdout_seen = 0
         self._stderr_seen = 0
         self._kill_requested = False
+        self._pumps: list[threading.Thread] = []
 
 
 def _append_capped(task: _BgTask, stream: str, text: str) -> None:
@@ -141,9 +142,17 @@ def _get(task_id: Any) -> _BgTask | None:
 
 
 def _pump_pipe(task: _BgTask, pipe, stream: str) -> None:
-    """Drain one pipe line-by-line into the task's capped buffer."""
+    """Drain one pipe into the task's capped buffer.
+
+    readline() is size-bounded: an unbounded readline() on a stream
+    with no newline at all (binary output, a progress bar) used to be
+    accumulated whole inside readline() — unbounded memory — and was
+    invisible to BashOutput until the newline that never came."""
     try:
-        for line in iter(pipe.readline, ""):
+        while True:
+            line = pipe.readline(8192)
+            if not line:
+                break
             with task._lock:
                 _append_capped(task, stream, line)
     finally:
@@ -158,11 +167,14 @@ def _kill_group(task: _BgTask) -> None:
     proc = task.proc
     if proc is None:
         return
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        return
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
+    from .tools import _own_group_pgid
+    pgid = _own_group_pgid(proc.pid)
+    if pgid is not None:  # never our own group: that would kill the agent
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
     try:
         proc.kill()
     except OSError:
@@ -179,6 +191,14 @@ def _watch(task: _BgTask) -> None:
         timed_out = True
         _kill_group(task)
         task.returncode = task.proc.wait()
+    # The process has exited, but its last output may still be sitting in
+    # the pipes. Settling the status first let a BashOutput poll report
+    # "done" with the tail of the output missing (it arrived after the
+    # agent had already moved on). Give the pumps a bounded moment to
+    # drain; a backgrounded grandchild holding the pipe open must not
+    # keep the task "running" forever, hence the timeout.
+    for t in list(task._pumps):
+        t.join(timeout=2.0)
     with task._lock:
         rc = task.returncode
         if timed_out:
@@ -224,6 +244,10 @@ def launch(command: str, description: str = "",
         try:
             task.proc = subprocess.Popen(
                 argv + [command],
+                # no stdin: a command that reads it (python, cat, an editor,
+                # a y/N prompt) used to grab the agent's TERMINAL — stealing
+                # the user's keystrokes and hanging until the timeout.
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, encoding="utf-8", errors="replace",
                 start_new_session=True,  # own process group -> killpg works
@@ -232,12 +256,16 @@ def launch(command: str, description: str = "",
             task.status = STATUS_ERROR
             task.spawn_error = f"failed to start process: {e}"
         else:
-            threading.Thread(target=_pump_pipe,
-                             args=(task, task.proc.stdout, "out"),
-                             daemon=True, name=f"bgsh-out-{task.id}").start()
-            threading.Thread(target=_pump_pipe,
-                             args=(task, task.proc.stderr, "err"),
-                             daemon=True, name=f"bgsh-err-{task.id}").start()
+            task._pumps = [
+                threading.Thread(target=_pump_pipe,
+                                 args=(task, task.proc.stdout, "out"),
+                                 daemon=True, name=f"bgsh-out-{task.id}"),
+                threading.Thread(target=_pump_pipe,
+                                 args=(task, task.proc.stderr, "err"),
+                                 daemon=True, name=f"bgsh-err-{task.id}"),
+            ]
+            for t in task._pumps:
+                t.start()
             threading.Thread(target=_watch, args=(task,),
                              daemon=True, name=f"bgsh-watch-{task.id}").start()
     with _TASKS_LOCK:
@@ -317,6 +345,20 @@ def kill(task_id: str) -> bool:
     return True
 
 
+def kill_all() -> int:
+    """Kill every still-running background task. Returns how many."""
+    with _TASKS_LOCK:
+        ids = [t.id for t in _TASKS.values() if t.status == STATUS_RUNNING]
+    return sum(1 for tid in ids if kill(tid))
+
+
+# Background tasks run in their own sessions (start_new_session), so they
+# do NOT die with the agent: every dev server / watcher started during a
+# session used to stay alive, holding ports and CPU, after the agent quit.
+import atexit as _atexit  # noqa: E402
+_atexit.register(kill_all)
+
+
 def list_background_tasks() -> list[dict]:
     """TUI contract — list of {id, description, status, started_at}.
 
@@ -385,6 +427,11 @@ def _handle_bash_output(**kwargs: Any) -> str:
         body = _render(new_out, new_err)
     if not body.strip():
         body = "(no new output)"
+    else:
+        # up to 2 x MAX_OUTPUT_CHARS of fresh output must not flood the
+        # model's context in one poll
+        from .tools import _clip
+        body = _clip(body)
     footer = f"\n[status: {status}"
     if rc is not None:
         footer += f", returncode: {rc}"

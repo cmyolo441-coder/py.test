@@ -28,12 +28,15 @@ audit trail (remembered/recalled/merged/consolidated/forgotten).
 
 from __future__ import annotations
 
+import atexit
+import functools
 import json
 import math
 import os
 import re
 import threading
 import time
+import weakref
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
@@ -57,8 +60,28 @@ MAX_PER_STORE = 512
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
-def _tokens(text: str) -> set[str]:
-    return set(_TOKEN_RE.findall(str(text).lower()))
+@functools.lru_cache(maxsize=8192)
+def _tokens_cached(text: str) -> frozenset[str]:
+    return frozenset(_TOKEN_RE.findall(text.lower()))
+
+
+def _tokens(text: str) -> frozenset[str]:
+    """Token set of a text (immutable, memoised).
+
+    PERF: recall() and remember() tokenised EVERY stored memory on every
+    call (up to 4 x 512 regex scans), and recall runs before every model
+    call — so each call got slower as the brain filled up. Memory texts
+    repeat across calls, so the token sets are cached by text."""
+    return _tokens_cached(str(text))
+
+
+def _flush_ref(ref) -> None:
+    brain = ref()
+    if brain is not None:
+        try:
+            brain.flush()
+        except Exception:
+            pass
 
 
 def jaccard(a: str, b: str) -> float:
@@ -130,8 +153,12 @@ class Brain:
         # read-modify-write and every persistence pass takes this lock.
         # Lock order is always brain -> log, never the reverse.
         self._lock = threading.RLock()
+        self._dirty = False
+        self._last_save = float("-inf")
         if self.path is not None:
             self._load()
+            # deferred recall bookkeeping must not be lost on a clean exit
+            atexit.register(_flush_ref, weakref.ref(self))
 
     # -- persistence ------------------------------------------------------------
 
@@ -200,10 +227,14 @@ class Brain:
             return None
         return m
 
+    _SAVE_INTERVAL = 5.0  # seconds between recall-driven saves
+
     def _save(self) -> None:
         if self.path is None:
             return
         with self._lock:
+            self._dirty = False
+            self._last_save = time.monotonic()
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 payload = json.dumps(
@@ -333,8 +364,22 @@ class Brain:
                 self.log.append("brain.recalled",
                                 {"query": query[:200],
                                  "ids": [m.id for m in top]})
-                self._save()
+                # PERF: recall runs before every model call; rewriting the
+                # whole brain.json (hundreds of KB once the stores fill)
+                # each time was pure I/O growth. Review bookkeeping is
+                # persisted at most once per _SAVE_INTERVAL; every write
+                # path (remember/sleep) and flush() persist immediately.
+                self._dirty = True
+                if time.monotonic() - self._last_save >= \
+                        self._SAVE_INTERVAL:
+                    self._save()
             return top
+
+    def flush(self) -> None:
+        """Persist any review bookkeeping deferred by recall()."""
+        with self._lock:
+            if self._dirty:
+                self._save()
 
     def context_block(self, query: str = "", k: int = 4) -> str:
         """A compact recall block for the model's context."""

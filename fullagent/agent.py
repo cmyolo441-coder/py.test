@@ -725,7 +725,11 @@ class Agent:
             doc = self.mastermind.gate.vault.resolve(self.cfg.prompt)
             model_label = self.cfg.model_id
             if eng is None or eng.model_label != model_label \
-                    or eng.doc_text != getattr(eng, "_src", doc):
+                    or getattr(eng, "_src", None) != doc:
+                # (the old test compared the engine's STRIPPED doc_text
+                # with the raw doc — always unequal, so the engine was
+                # rebuilt on every model call, and a changed doc was
+                # never what triggered the rebuild)
                 from .apex import ApexEngine
                 eng = ApexEngine.build(doc, model_label)
                 eng._src = doc
@@ -1124,6 +1128,20 @@ class Agent:
                                if _prewarmer is not None else None)
                 except Exception:
                     _flight = None
+                try:
+                    # ROOT-CAUSE FIX (progressive slowdown): keep the
+                    # canonical history bounded. Before, self.messages grew
+                    # forever (compaction only triggers near the model's
+                    # context window, which can be 1M tokens) while the
+                    # wire view only ever sends system + first user + the
+                    # last prune_window messages — so every per-iteration
+                    # pass over the history (checkpoint snapshots, token
+                    # estimates, turn-resume dumps, prewarm) grew without
+                    # limit for no benefit to the model.
+                    if self._bound_history():
+                        _flight = None  # snapshot no longer matches
+                except Exception:
+                    pass
                 try:
                     self._maybe_compact(_prewarmed=_flight)
                 except Exception:
@@ -1673,6 +1691,84 @@ class Agent:
                                               self.model.id)},
                             actor="kernel")
 
+    def _history_cap(self) -> tuple[int, int] | None:
+        """(cap, target) for the canonical history, or None when bounding
+        is disabled (prune_window <= 0 means "send the full history", or
+        config.json extra history_max_messages <= 0)."""
+        try:
+            window = int(getattr(self.cfg, "prune_window", 40) or 0)
+        except (TypeError, ValueError):
+            window = 40
+        if window <= 0:
+            return None
+        cap = max(window * 6, 240)
+        try:
+            extra = getattr(self.cfg, "extra", None) or {}
+            if "history_max_messages" in extra:
+                cap = int(extra["history_max_messages"])
+                if cap <= 0:
+                    return None
+                cap = max(cap, window + 8)
+        except (TypeError, ValueError):
+            pass
+        # hysteresis: trim well below the cap so this runs rarely
+        target = max(window + 8, int(cap * 0.75))
+        return cap, target
+
+    def _bound_history(self) -> int:
+        """Drop the oldest whole units (user messages, assistant messages
+        with their tool results, injected system notes) once the history
+        exceeds the cap. Never touches the system prompt, the first user
+        message (task framing) or the last prune_window messages (the wire
+        view), and never splits a tool_call from its results. The dropped
+        span is digested into _compact_digests, exactly like compaction.
+        Returns the number of messages removed."""
+        bounds = self._history_cap()
+        if bounds is None:
+            return 0
+        cap, target = bounds
+        msgs = self.messages
+        n = len(msgs)
+        if n <= cap:
+            return 0
+        start = 1 if msgs and msgs[0].get("role") == "system" else 0
+        fu = next((i for i in range(start, n)
+                   if msgs[i].get("role") == "user"), None)
+        if fu is None:
+            return 0
+        try:
+            window = int(getattr(self.cfg, "prune_window", 40) or 0)
+        except (TypeError, ValueError):
+            window = 40
+        keep_from = n - (window + 2)  # never drop into the wire tail
+        first = fu + 1
+        i = first
+        while i < n and n - (i - first) > target:
+            j = i + 1
+            if msgs[i].get("role") == "assistant":
+                while j < n and msgs[j].get("role") == "tool":
+                    j += 1
+            if j > keep_from:
+                break
+            i = j
+        if i == first:
+            return 0
+        digest = self._digest_messages(msgs[first:i])
+        if digest:
+            self._compact_digests.append(digest)
+            self._compact_digests = self._compact_digests[-20:]
+        removed = i - first
+        del msgs[first:i]
+        self._compact_check_chars = 0
+        try:
+            self.log.append("context.compacted",
+                            {"messages": len(msgs), "units": removed,
+                             "reason": "history bound"},
+                            actor="kernel")
+        except Exception:
+            pass
+        return removed
+
     def _messages_chars(self) -> int:
         """Cheap conversation size proxy (no JSON dump): sum of content
         lengths plus tool-call argument sizes. Gate for the expensive
@@ -2196,8 +2292,18 @@ class Agent:
             # commands can touch anything; snapshot the cwd tree shallowly.
             # Sorted for determinism — unsorted iterdir() made snapshot
             # contents order-dependent across runs.
-            paths = [str(p) for p in sorted(Path.cwd().iterdir())
-                     if p.is_file()][:200]
+            # Files over 8 MB are left out: reading, hashing and
+            # compressing a huge log/dataset before EVERY command made
+            # each run_command slower the bigger the workspace grew.
+            paths = []
+            for p in sorted(Path.cwd().iterdir()):
+                try:
+                    if p.is_file() and p.stat().st_size <= 8 * 1024 * 1024:
+                        paths.append(str(p))
+                except OSError:
+                    continue
+                if len(paths) >= 200:
+                    break
         return paths
 
     @staticmethod
@@ -2264,39 +2370,46 @@ class Agent:
         itself (including ``TurnCancelled``) are re-raised unchanged.
         """
         import threading
-        import subprocess as _sp
+        from contextlib import nullcontext
 
         limit = TOOL_TIMEOUTS.get(tool.name, TOOL_TIMEOUT_DEFAULT)
-        spawned: list = []
-        lock = threading.Lock()
-        orig_popen = _sp.Popen
+        # BUG FIX (leak + slowdown): this used to swap the GLOBAL
+        # subprocess.Popen for a per-call closure and "restore the
+        # original" afterwards. With parallel tool calls the save/restore
+        # pairs interleave and Popen stays wrapped forever — a chain that
+        # grows with every batch, keeps every Popen ever created alive in
+        # dead lists (fd leak), and makes isinstance(x, subprocess.Popen)
+        # raise TypeError. cancelguard.track_popen installs one refcounted
+        # subclass instead.
+        try:
+            from .cancelguard import track_popen
+        except Exception:  # noqa: BLE001
+            track_popen = None
 
-        def _tracking_popen(*a, **k):
-            # subprocess.run / check_output / call all go through
-            # subprocess.Popen, so every spawned child is captured.
-            p = orig_popen(*a, **k)
-            with lock:
-                spawned.append(p)
-            return p
+        def _tracker():
+            if track_popen is None:
+                return nullcontext([])
+            try:
+                return track_popen(thread_only=True)
+            except TypeError:
+                return track_popen()
 
         outcome: dict = {}
+        spawned: list = []
 
         def _target():
-            _sp.Popen = _tracking_popen
             try:
-                outcome["result"] = tool.handler(**args, **extra)
+                with _tracker() as _spawned:
+                    outcome["spawned"] = _spawned
+                    outcome["result"] = tool.handler(**args, **extra)
             except BaseException as e:  # noqa: BLE001 — re-raised below
                 outcome["error"] = e
-            finally:
-                _sp.Popen = orig_popen
 
         worker = threading.Thread(target=_target, daemon=True,
                                   name=f"tool-{tool.name}")
         worker.start()
         worker.join(limit)
-        # restore even if the thread is still running — it can only kill
-        # processes, so a still-running worker is harmless to the turn.
-        _sp.Popen = orig_popen
+        spawned = list(outcome.get("spawned") or [])
         if worker.is_alive():
             try:
                 from .tools import _kill_process_tree
@@ -3018,7 +3131,9 @@ class Agent:
         if tool is None:
             return f"ERROR: unknown tool {name}"
         try:
-            return tool.handler(**args)
+            # bounded like a real call: a hung prefetch must not pin a
+            # speculator slot (and its subprocesses) forever
+            return self._run_tool_with_timeout(tool, args, {})
         except Exception as e:
             return f"ERROR: {type(e).__name__}: {e}"
 

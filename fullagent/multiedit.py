@@ -24,6 +24,8 @@ from .tools import (
     RISK_SAFE,
     Tool,
     _atomic_write_text,
+    _match_eol,
+    _read_text_exact,
     _checked,
     _rich_edit_miss_error,
     _preview_edit,
@@ -324,7 +326,7 @@ def _smart_retry_multiedit(p: Path, edits: list[dict[str, Any]],
         # ALL edits against fresh disk content and apply atomically —
         # never a partial write.
         try:
-            fresh = Path(path).read_text(encoding="utf-8")
+            fresh = _read_text_exact(path)
         except (OSError, UnicodeDecodeError) as e:
             return f"ERROR: re-read failed during smart retry: {e}"
         trial = [dict(e) for e in edits]
@@ -376,13 +378,26 @@ def multi_edit(file_path: str, edits: list[dict[str, Any]],
     if warn:
         return warn
     try:
-        text = p.read_text(encoding="utf-8")
+        text = _read_text_exact(p)
     except UnicodeDecodeError:
         return ("ERROR: file is not valid UTF-8 text; refusing to edit "
                 "(lossy rewrite would corrupt unrelated bytes)")
     except OSError as e:
         return f"ERROR: {e}"
     read_sig = _stat_sig(p)  # Worker 19/20: stat gate for the smart retry
+    if "\r\n" in text:
+        # CRLF file: adapt LF-only old/new strings to the file's endings
+        # (otherwise they miss, or fuzzy-match and splice LF lines into a
+        # CRLF file).
+        adapted = []
+        for e in edits:
+            if isinstance(e, dict) and isinstance(e.get("old_string"), str) \
+                    and isinstance(e.get("new_string"), str):
+                o, n = _match_eol(text, e["old_string"], e["new_string"])
+                if o is not e["old_string"]:
+                    e = dict(e, old_string=o, new_string=n)
+            adapted.append(e)
+        edits = adapted
 
     ok, message, fail_index, _new_text = _apply_edits(p, edits, text,
                                                       preview_only)

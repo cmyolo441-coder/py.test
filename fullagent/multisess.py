@@ -343,25 +343,66 @@ def switch_session(agent: Any, sid: str) -> str:
     return full
 
 
+def _session_stats(log: Any) -> dict[str, tuple[int, str]]:
+    """ONE pass over the log -> {sid: (message_count, last_user_text)}.
+
+    PERF: list_sessions() used to call messages_for_session() twice per
+    session (count + preview), each a full scan of the event log —
+    O(sessions x events), so SessionList got slower with every message
+    and every session ever created."""
+    stats: dict[str, list] = {}
+    try:
+        events = log.events()
+    except Exception:
+        return {}
+    for ev in events:
+        try:
+            etype = getattr(ev, "type", "")
+            if etype not in _MESSAGE_TYPES:
+                continue
+            sid = getattr(ev, "session", "")
+            row = stats.setdefault(sid, [0, None])
+            row[0] += 1
+            if etype == "user.message":
+                row[1] = ev  # keep the event; render text only once
+        except Exception:
+            continue
+    out: dict[str, tuple[int, str]] = {}
+    for sid, (count, last_user) in stats.items():
+        text = ""
+        if last_user is not None:
+            data = getattr(last_user, "data", None) or {}
+            text = data.get("text", "") if isinstance(data, dict) else ""
+            text = text if isinstance(text, str) else str(text)
+        out[sid] = (count, text)
+    return out
+
+
 def list_sessions(agent: Any) -> list[dict[str, Any]]:
     """All known sessions: id, name, timestamps, message count, preview."""
     with _meta_lock:
         meta = load_meta()
     log = getattr(agent, "log", None)
+    stats = _session_stats(log) if log is not None else {}
     out: list[dict[str, Any]] = []
     for s in meta.get("sessions", []):
         if not isinstance(s, dict):
             continue
         sid = str(s.get("id", ""))
-        count = (len(messages_for_session(log, sid))
-                 if log is not None else int(s.get("msg_count", 0) or 0))
+        preview = ""
+        if log is not None:
+            count, last_user = stats.get(sid, (0, ""))
+            text = last_user.strip().replace("\n", " ")
+            preview = text[:90] + ("…" if len(text) > 90 else "")
+        else:
+            count = int(s.get("msg_count", 0) or 0)
         out.append({
             "id": sid,
             "name": s.get("name", f"session {sid}"),
             "created_at": s.get("created_at", ""),
             "updated_at": s.get("updated_at", ""),
             "msg_count": count,
-            "preview": _last_user_preview(log, sid) if log is not None else "",
+            "preview": preview,
             "current": sid == (getattr(agent, "session_id", "") or ""),
         })
     out.sort(key=lambda e: e.get("updated_at", ""), reverse=True)

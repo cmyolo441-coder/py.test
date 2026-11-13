@@ -143,7 +143,15 @@ def _tool_notify_test() -> str:
         f"  webhook: {ws}",
     ]
     if url:
-        lines.append(f"  webhook_url: {url}")
+        # webhook URLs embed secrets (Slack/Discord tokens live in the
+        # path): show only scheme+host to the model, never the full URL
+        try:
+            from urllib.parse import urlsplit
+            parts = urlsplit(url)
+            shown = f"{parts.scheme}://{parts.hostname or '?'}/…"
+        except Exception:  # noqa: BLE001
+            shown = "(configured)"
+        lines.append(f"  webhook_url: {shown}")
     return "\n".join(lines)
 
 
