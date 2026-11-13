@@ -129,6 +129,49 @@ stacks under the logo so nothing wraps or clips.*
 
 </details>
 
+## Non-blocking parallel swarm ◆
+
+The agent can fan a big job out to a **swarm** of up to eight specialist
+subagents (`Swarm`, `TaskGroup`, `Task`) and **keep working** — it never has to
+sit in `TaskCollect` waiting. Each worker's report is queued the moment it
+finishes and handed to the agent automatically as a `[SWARM NOTIFICATION]`
+on its next model step. If the agent's turn already ended, the TUI wakes it
+up once the swarm settles (`◆ swarm 4 reports ready — continuing…`), so the
+task continues on its own. Headless `--print` runs wait for the swarm and do
+the same follow-up turn.
+
+While a swarm runs, a live board sits above the prompt:
+
+```
+ ⠹ ≡ 4 Agents (3 running · 1 done) · Audit the repo ──── ⏱ 0:21 · Σ 18.2k tok · ↓ to manage
+ ◉ Security  auth-audit  ▕██████▌·····▏  54% ⠹ Read fullagent/auth.py     3.1k tok  0:21
+ ◉ Review    api-review  ▕███▎········▏  27% ⠼ Search 'retry'             1.5k tok  0:14
+ ✓ Optimize  perf-scan   ▕████████████▏ 100% ↳ 2 hot paths found           4.6k tok  0:12
+ ◉ Test      test-gaps   ▕█▋··········▏  13% ⠦ thinking (step 1/20) · …    0 tok  0:03
+   overall ▕████████··········▏  48% · 1/4 settled                          612 tok/s
+```
+
+Every number is live manager state: provider-reported tokens, wall-clock
+run time from each worker's real start, and progress as the share of the
+worker's step budget used (eased on screen, never backwards, 100% only once
+settled). The board is built to stay still: rows keep spawn order, finished
+workers turn into `✓` rows instead of vanishing, the height never shrinks
+mid-swarm, rows are clipped to the terminal width, it never takes more
+than a third of the screen, and the prompt box is anchored so it does not
+jump when the board closes. Typing, history and completion keep working
+the whole time.
+
+| Command | What it does |
+|---|---|
+| `/swarm demo [n]` | try the dashboard offline: real swarm engine + real read-only tools, simulated model, no API calls |
+| `/swarm` | full crew dashboard plus auto-wake state and undelivered reports |
+| `/swarm autowake on\|off` | let a finished swarm continue the task by itself (default on) |
+| `/swarm stop` | stop every running swarm agent (no auto-wake afterwards) |
+| `/agents …` | per-worker detail, DAG, diffs, blackboard, results |
+
+`Esc` on a running turn still stops its swarm too, and a cancelled swarm
+never wakes the agent behind your back.
+
 ## Install (binary — curl one-liner)
 
 Single-file binaries — no Python needed:

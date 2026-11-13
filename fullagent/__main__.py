@@ -187,6 +187,37 @@ def _headless(argv: list[str]) -> int:
     return 2
 
 
+def _headless_swarm_followups(agent, turn, noop, on_status,
+                              max_rounds: int = 4,
+                              max_wait_s: float = 900.0):
+    """Wait for background swarm workers, then let the agent use them."""
+    import time as _time
+    from .subagents import SWARM_WAKE_PROMPT
+
+    texts = [turn.assistant_text or ""]
+    rounds = 0
+    while rounds < max_rounds and agent.swarm_followup_needed():
+        manager = agent.subagents
+        deadline = _time.monotonic() + max_wait_s
+        while manager.active_count() and _time.monotonic() < deadline:
+            print(f"… waiting for {manager.active_count()} background "
+                  "subagent(s)", file=sys.stderr, flush=True)
+            manager.wait(None, timeout=30)
+        if not manager.pending_notifications():
+            break
+        rounds += 1
+        turn = agent.run_turn(
+            SWARM_WAKE_PROMPT,
+            on_token=noop, on_reasoning=noop,
+            on_tool_call=noop, on_tool_update=noop,
+            on_status=on_status, approve=lambda tool, args: True,
+        )
+        texts.append(turn.assistant_text or "")
+    if rounds:
+        turn.assistant_text = "\n\n".join(t for t in texts if t.strip())
+    return turn
+
+
 def _headless_print(prompt: str, ns) -> int:
     """Run one headless turn and print the result (text or JSON)."""
     from . import config
@@ -216,6 +247,11 @@ def _headless_print(prompt: str, ns) -> int:
             on_tool_call=_noop, on_tool_update=_noop,
             on_status=_on_status, approve=lambda tool, args: True,
         )
+        # Non-blocking swarms: the turn may end while background
+        # subagents are still working. A headless run cannot leave them
+        # behind, so it waits for them and runs follow-up turns that hand
+        # their reports back to the agent (bounded rounds).
+        turn = _headless_swarm_followups(agent, turn, _noop, _on_status)
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
         return 130

@@ -24,6 +24,7 @@ Capabilities:
 """
 from __future__ import annotations
 
+import collections
 import concurrent.futures
 import difflib
 import inspect
@@ -59,9 +60,23 @@ MAX_TOOL_OUTPUT_CHARS = 12_000
 MAX_CALLS_PER_STEP = 12
 MAX_TOTAL_TOOL_CALLS = 80
 MAX_STEPS = 20
-DEFAULT_ACTIVE_LIMIT = 8
 CALL_TIMEOUT = 120.0
 DRAIN_TIMEOUT = 5.0
+# Async result delivery (non-blocking hand-off). A finished worker's report
+# is queued in the manager's inbox and handed to the parent agent on its
+# next model call (or a follow-up "wake" turn) — the parent never has to
+# block in TaskCollect just to learn that a background worker finished.
+NOTIFY_PER_WORKER_CHARS = 1_800
+NOTIFY_TOTAL_CHARS = 9_000
+NOTIFICATION_HEADER = (
+    "[SWARM NOTIFICATION — background subagent results, delivered "
+    "automatically]"
+)
+SWARM_WAKE_PROMPT = (
+    "[SWARM RESULTS READY] The background subagents you launched have "
+    "finished; their reports are attached below. Continue the original "
+    "task: integrate and verify their findings, then finish the work."
+)
 
 ACTIVE_STATES = frozenset({"queued", "running", "cancelling"})
 TERMINAL_STATES = frozenset({"done", "blocked", "error", "cancelled"})
@@ -71,9 +86,43 @@ PARALLEL_SUBAGENT_READ_TOOLS = frozenset({
 })
 NEVER_DELEGATE = frozenset({
     "run_command", "live_shell", "live_shell_reset", "delete_path",
-    "copy_path", "move_path", "apply_patch", "Task", "TaskGroup",
+    "copy_path", "move_path", "apply_patch", "Task", "TaskGroup", "Swarm",
     "TaskWriteGroup", "TaskOutput", "TaskCollect", "TaskList", "TaskStop",
 })
+
+
+_CALL_VERBS = {
+    "read_file": "Read", "list_dir": "List", "file_info": "Inspect",
+    "search_files": "Search", "glob_files": "Glob", "write_file": "Write",
+    "edit_file": "Edit", "create_directory": "Create",
+    "web_search": "Web search", "web_fetch": "Fetch",
+    "blackboard_publish": "Publish", "blackboard_read": "Read board",
+}
+_CALL_KEYS = ("path", "pattern", "query", "url", "key", "glob", "prefix")
+
+
+def describe_call(name: str, args: Any) -> str:
+    """Human, one-line label for a worker's current tool call.
+
+    ``read_file {"path": "a.py"}`` becomes ``Read a.py`` — what the live
+    dashboard shows instead of a bare tool name.
+    """
+    name = str(name or "tool")
+    verb = _CALL_VERBS.get(name, name)
+    target = ""
+    if isinstance(args, dict):
+        for key in _CALL_KEYS:
+            value = args.get(key)
+            if isinstance(value, str) and value.strip():
+                target = " ".join(value.split())
+                break
+    if not target:
+        return verb
+    if len(target) > 80:
+        target = target[:77] + "…"
+    if name in ("search_files", "web_search"):
+        target = repr(target) if len(target) < 60 else target
+    return f"{verb} {target}"
 
 
 class SubagentError(ValueError):
@@ -257,6 +306,17 @@ class Subagent:
     diffs: list[dict[str, Any]] = field(default_factory=list)
     lines_added: int = 0
     lines_removed: int = 0
+    # Async delivery: True once the parent agent has received this
+    # worker's final report (notification, TaskCollect or TaskOutput).
+    delivered: bool = False
+    last_tool: str = ""
+
+    def run_ms(self) -> int:
+        """Wall time spent actually running (queue/dependency wait excluded)."""
+        if self.started_at <= 0:
+            return 0
+        end = self.finished_at or time.time()
+        return max(0, int((end - self.started_at) * 1000))
 
     def tokens_per_sec(self) -> float:
         if self.started_at <= 0:
@@ -306,6 +366,11 @@ class Subagent:
             "lines_added": int(self.lines_added),
             "lines_removed": int(self.lines_removed),
             "diffs_count": len(self.diffs),
+            "run_ms": self.run_ms(),
+            "started_at": float(self.started_at),
+            "finished_at": float(self.finished_at),
+            "last_tool": str(self.last_tool[:60]),
+            "delivered": bool(self.delivered),
         }
 
 
@@ -353,6 +418,10 @@ class ParallelSubagents:
         self._active_running = 0
         self._peak_concurrency = 0
         self._progress_callbacks: list[Callable[[Subagent, str], None]] = []
+        # Async delivery inbox: ids of settled workers whose final report the
+        # parent has not received yet (FIFO, completion order).
+        self._inbox: collections.deque[str] = collections.deque()
+        self._batch_meta: dict[str, dict[str, Any]] = {}
         self._closed = False
         self._transitioning = False
         self._pool = concurrent.futures.ThreadPoolExecutor(
@@ -380,6 +449,12 @@ class ParallelSubagents:
                 cb(worker, kind)
             except Exception:
                 pass
+
+    def _settled(self, worker: Subagent) -> None:
+        """Queue a settled worker for async delivery. Caller holds _lock."""
+        if worker.delivered or worker.id in self._inbox:
+            return
+        self._inbox.append(worker.id)
 
     def scale_workers(self, new_max_workers: int) -> int:
         """Dynamically adjust max_workers for future batches."""
@@ -627,6 +702,10 @@ class ParallelSubagents:
             removed = self._workers.pop(oldest, None)
             self._futures.pop(oldest, None)
             self._done_events.pop(oldest, None)
+            try:
+                self._inbox.remove(oldest)
+            except ValueError:
+                pass
             if removed is not None:
                 members = self._batch_members.get(removed.batch_id, [])
                 self._batch_members[removed.batch_id] = [
@@ -634,6 +713,7 @@ class ParallelSubagents:
                 ]
                 if not self._batch_members[removed.batch_id]:
                     self._batch_members.pop(removed.batch_id, None)
+                    self._batch_meta.pop(removed.batch_id, None)
                     if self._latest_batch_id == removed.batch_id:
                         self._latest_batch_id = next(
                             reversed(self._batch_members), ""
@@ -652,6 +732,7 @@ class ParallelSubagents:
         priority: int = 0,
         depends_on: tuple[str, ...] | list[str] = (),
         max_retries: int = 0,
+        goal: str = "",
     ) -> Subagent:
         return self.spawn_many(
             [
@@ -668,6 +749,7 @@ class ParallelSubagents:
                 }
             ],
             allow_writes=allow_writes,
+            goal=goal,
         )[0]
 
     def spawn_many(
@@ -678,6 +760,7 @@ class ParallelSubagents:
         context: str = "",
         model_id: str = "",
         allow_writes: bool = False,
+        goal: str = "",
     ) -> list[Subagent]:
         """Validate then atomically submit a bounded batch of concurrent or DAG-ordered tasks."""
         if not isinstance(tasks, (list, tuple)):
@@ -745,6 +828,11 @@ class ParallelSubagents:
             batch_id = f"batch-{self._batch_counter:04d}"
             self._latest_batch_id = batch_id
             self._batch_members[batch_id] = []
+            self._batch_meta[batch_id] = {
+                "goal": " ".join(str(goal or "").split())[:160],
+                "created_at": time.time(),
+                "writes": bool(allow_writes),
+            }
             from .systemprompt import subagent_prompt_sealed as \
                 _sealed_subagent_prompt
             try:
@@ -847,6 +935,7 @@ class ParallelSubagents:
                     worker.state = "error"
                     worker.error = f"could not schedule worker: {exc}"
                     worker.finished_at = time.time()
+                    self._settled(worker)
                     done_ev = self._done_events.get(worker.id)
                     if done_ev is not None:
                         done_ev.set()
@@ -985,6 +1074,138 @@ class ParallelSubagents:
                 for worker in self._workers.values()
             )
 
+    # -- async delivery (non-blocking hand-off) -------------------------------
+
+    def pending_notifications(self) -> int:
+        """Settled workers whose report the parent has not received yet."""
+        with self._lock:
+            return sum(
+                1 for aid in self._inbox
+                if aid in self._workers and not self._workers[aid].delivered
+            )
+
+    def mark_delivered(self, worker_ids) -> int:
+        """Mark settled workers as delivered (their report reached the parent).
+
+        Called by TaskCollect / TaskOutput so a report the model already
+        pulled is never pushed to it a second time as a notification.
+        Active workers are left alone: they still owe a final report.
+        """
+        marked = 0
+        with self._lock:
+            for aid in worker_ids or ():
+                worker = self._workers.get(str(aid))
+                if worker is None or worker.state not in TERMINAL_STATES:
+                    continue
+                if not worker.delivered:
+                    worker.delivered = True
+                    marked += 1
+                try:
+                    self._inbox.remove(worker.id)
+                except ValueError:
+                    pass
+        return marked
+
+    def discard_notifications(self) -> int:
+        """Drop every undelivered report (the user cancelled the work)."""
+        with self._lock:
+            ids = list(self._inbox)
+        return self.mark_delivered(ids)
+
+    def drain_notifications(
+        self,
+        *,
+        per_worker_chars: int = NOTIFY_PER_WORKER_CHARS,
+        total_chars: int = NOTIFY_TOTAL_CHARS,
+    ) -> str:
+        """Pop undelivered reports as one bounded message for the parent.
+
+        Returns ``""`` when nothing new has settled. Reports are clipped so
+        a large swarm can never flood the parent's context; the model can
+        still pull any full report with ``TaskOutput``. Workers whose report
+        does not fit stay queued for the next model call.
+        """
+        with self._lock:
+            ids = [aid for aid in self._inbox if aid in self._workers]
+            still_running = sum(
+                w.state in ACTIVE_STATES for w in self._workers.values()
+            )
+            sections: list[str] = []
+            delivered: list[str] = []
+            used = 0
+            for aid in ids:
+                worker = self._workers[aid]
+                if worker.delivered:
+                    delivered.append(aid)
+                    continue
+                block = self._notification_block(worker, per_worker_chars)
+                if sections and used + len(block) > total_chars:
+                    break
+                sections.append(block)
+                used += len(block)
+                delivered.append(aid)
+            for aid in delivered:
+                self._workers[aid].delivered = True
+                try:
+                    self._inbox.remove(aid)
+                except ValueError:
+                    pass
+            left = sum(
+                1 for aid in self._inbox
+                if aid in self._workers and not self._workers[aid].delivered
+            )
+        if not sections:
+            return ""
+        tail = []
+        if still_running:
+            tail.append(
+                f"{still_running} subagent(s) are still running in the "
+                "background; their reports will arrive the same way."
+            )
+        else:
+            tail.append("No subagents are still running.")
+        if left:
+            tail.append(f"{left} more finished report(s) arrive next step.")
+        tail.append(
+            "Integrate these results instead of redoing the work; use "
+            "TaskOutput <id> for a full report and verify key claims."
+        )
+        head = (
+            f"{NOTIFICATION_HEADER}\n{len(sections)} background subagent(s) "
+            "finished since your last step."
+        )
+        return head + "\n\n" + "\n\n".join(sections) + "\n\n" + " ".join(tail)
+
+    def _notification_block(self, worker: Subagent, limit: int) -> str:
+        meta = self._batch_meta.get(worker.batch_id, {})
+        goal = meta.get("goal") or ""
+        tokens = worker.tokens_in + worker.tokens_out
+        head = (
+            f"### {worker.id} · {worker.name} · {worker.role} · "
+            f"{worker.state.upper()} · {worker.steps} step(s) · "
+            f"{worker.tool_calls} tool call(s) · {tokens} tokens · "
+            f"{worker.run_ms() / 1000:.1f}s · batch {worker.batch_id}"
+            + (f" (goal: {goal})" if goal else "")
+        )
+        task = " ".join(worker.task.split())
+        if len(task) > 240:
+            task = task[:237] + "…"
+        body = (worker.summary or "").strip() or "(no report text)"
+        if worker.error:
+            body = f"{body}\nError: {worker.error}"
+        if worker.files_touched:
+            body += "\nFiles touched: " + ", ".join(worker.files_touched[:12])
+        if len(body) > limit:
+            body = body[: max(0, limit - 60)].rstrip() + (
+                f"\n… [clipped; TaskOutput {worker.id} has the full report]"
+            )
+        return f"{head}\nTask: {task}\n{body}"
+
+    def batch_goal(self, batch_id: str = "") -> str:
+        with self._lock:
+            key = batch_id or self._latest_batch_id
+            return str(self._batch_meta.get(key, {}).get("goal") or "")
+
     def collect(
         self,
         batch_id: str = "",
@@ -1020,6 +1241,7 @@ class ParallelSubagents:
         ids = [worker.id for worker in workers]
         states = self.wait(ids, timeout=timeout, should_cancel=should_cancel)
         reports = [self.format_worker(worker) for worker in workers]
+        self.mark_delivered(ids)
         still_active = [
             aid for aid, state in states.items() if state in ACTIVE_STATES
         ]
@@ -1052,6 +1274,7 @@ class ParallelSubagents:
                 worker.state = "cancelled"
                 worker.summary = "Cancelled before the worker started."
                 worker.finished_at = time.time()
+                self._settled(worker)
                 done_ev = self._done_events.get(worker.id)
                 if done_ev is not None:
                     done_ev.set()
@@ -1153,6 +1376,8 @@ class ParallelSubagents:
                 self._futures.clear()
                 self._done_events.clear()
                 self._batch_members.clear()
+                self._batch_meta.clear()
+                self._inbox.clear()
                 self.blackboard.clear()
                 self._latest_batch_id = ""
                 self._session_id = next_session
@@ -1420,8 +1645,10 @@ class ParallelSubagents:
                 ]
                 with self._lock:
                     worker.tool_calls += len(batch_calls)
+                    worker.last_tool = batch_calls[0]["function"]["name"]
                     worker.current_action = (
-                        f"parallel read x{len(batch_calls)}"
+                        f"parallel read x{len(batch_calls)} · "
+                        + describe_call(worker.last_tool, parsed_args[0])
                     )
                     for c in batch_calls:
                         cn = c["function"]["name"]
@@ -1503,7 +1730,8 @@ class ParallelSubagents:
             args = parse_tool_arguments(fn.get("arguments", "{}"))
             with self._lock:
                 worker.tool_calls += 1
-                worker.current_action = name
+                worker.last_tool = name
+                worker.current_action = describe_call(name, args)
                 worker.tool_breakdown[name] = (
                     worker.tool_breakdown.get(name, 0) + 1
                 )
@@ -1596,6 +1824,7 @@ class ParallelSubagents:
                     worker.summary = "Cancelled before the worker started."
                     worker.finished_at = time.time()
                     cancelled_before_start = True
+                    self._settled(worker)
                 return_after_lock = True
             else:
                 return_after_lock = False
@@ -1747,6 +1976,7 @@ class ParallelSubagents:
                     self._active_running = max(0, self._active_running - 1)
                 worker.finished_at = time.time()
                 worker.current_action = worker.state
+                self._settled(worker)
                 data = worker.to_dict()
                 done_ev = self._done_events.get(worker.id)
                 if done_ev is not None:
@@ -1893,6 +2123,15 @@ class ParallelSubagents:
                 "roles_used": sorted({row["role"] for row in workers}),
                 "files_touched": files_touched,
                 "blackboard_count": len(self.blackboard.read()),
+                "max_steps": self.max_steps,
+                "pending_notifications": sum(
+                    1 for aid in self._inbox
+                    if aid in self._workers
+                    and not self._workers[aid].delivered
+                ),
+                "batches": {
+                    bid: dict(meta) for bid, meta in self._batch_meta.items()
+                },
             }
 
     def shutdown(self, wait: bool = True) -> None:

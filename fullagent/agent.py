@@ -1122,6 +1122,11 @@ class Agent:
                                  f"with /budget (e.g. /budget steps 500 " \
                                  f"or /budget reset) or stop."
                     break
+                # NON-BLOCKING SWARM: reports from background subagents
+                # that settled since the last model call are handed to the
+                # model now, so the parent keeps working instead of
+                # blocking in TaskCollect to learn a worker finished.
+                _swarm_note = self._inject_swarm_notifications()
                 on_status("thinking")
                 # keep the context under the window — compact stale turns
                 # before asking the model (I9: input budget governor)
@@ -1137,6 +1142,8 @@ class Agent:
                                if _prewarmer is not None else None)
                 except Exception:
                     _flight = None
+                if _swarm_note:
+                    _flight = None  # history changed after the prewarm
                 try:
                     # ROOT-CAUSE FIX (progressive slowdown): keep the
                     # canonical history bounded. Before, self.messages grew
@@ -3317,6 +3324,51 @@ class Agent:
         return (f"WARNING: anti-clause {v['clause']} violated — {v['detail']}. "
                 "The run cannot close until this is repaired or rewound.")
 
+    def _inject_swarm_notifications(self) -> bool:
+        """Hand settled background-subagent reports to the model.
+
+        Pops the manager's async inbox (bounded, see
+        ``ParallelSubagents.drain_notifications``). When the newest history
+        entry is a plain user message (the first step of a turn) the note is
+        merged into it so the wire never carries two user messages in a
+        row; mid-turn (after tool results) it is appended as a subordinate
+        runtime note, the same channel the other harness hints use.
+        """
+        manager = self.__dict__.get("subagents")
+        if manager is None:
+            return False
+        try:
+            note = manager.drain_notifications()
+        except Exception:
+            return False
+        if not note:
+            return False
+        last = self.messages[-1] if self.messages else None
+        if (isinstance(last, dict) and last.get("role") == "user"
+                and isinstance(last.get("content"), str)):
+            last["content"] = last["content"] + "\n\n" + note
+        else:
+            self.messages.append({"role": "user", "content": note})
+        try:
+            self.log.append("subagent.delivered",
+                            {"chars": len(note),
+                             "session": getattr(self, "session_id", "")},
+                            actor="kernel")
+        except Exception:
+            pass
+        return True
+
+    def swarm_followup_needed(self) -> bool:
+        """True when background workers still owe the parent a report."""
+        manager = self.__dict__.get("subagents")
+        if manager is None:
+            return False
+        try:
+            return bool(manager.pending_notifications()
+                        or manager.active_count())
+        except Exception:
+            return False
+
     def _register_subagent_tools(self) -> None:
         """Add bounded background delegation and approved parallel coding."""
         _resolve_lazy("Tool", "RISK_CONFIRM")
@@ -3336,6 +3388,32 @@ class Agent:
             except (SubagentError, TypeError, ValueError) as exc:
                 return f"ERROR: {exc}"
 
+        _NONBLOCKING = (
+            " Non-blocking: keep working on other steps — each report is "
+            "delivered to you automatically as a [SWARM NOTIFICATION] when "
+            "its worker finishes; call TaskCollect only when your very next "
+            "step cannot proceed without these results.")
+
+        def swarm(goal: str, tasks: list, context: str = "",
+                  role: str = "researcher", model_id: str = "") -> str:
+            """Fan a goal out to a parallel read-only swarm; return at once."""
+            def start():
+                if not tasks:
+                    raise SubagentError("tasks must be a non-empty list")
+                workers = manager.spawn_many(
+                    tasks, role=role, context=context, model_id=model_id,
+                    allow_writes=False, goal=goal)
+                batch_id = workers[0].batch_id if workers else "none"
+                waves = 1 + max((w.wave for w in workers), default=0)
+                roster = ", ".join(
+                    f"{w.id} {w.name} ({w.role})" for w in workers)
+                return (f"◆ Swarm {batch_id} launched: {len(workers)} "
+                        f"specialist(s) in {waves} wave(s) working in "
+                        f"parallel in the background — {roster}."
+                        + _NONBLOCKING
+                        + " The user sees them live on the swarm dashboard.")
+            return _task_error(start)
+
         def task(task: str, subagent_type: str = "researcher",
                  context: str = "", name: str = "",
                  model_id: str = "") -> str:
@@ -3347,7 +3425,8 @@ class Agent:
                 return (f"Started batch {worker.batch_id}: {worker.id} "
                         f"({worker.role}, model {worker.model_id}). "
                         "Use TaskCollect with this batch_id to collect its "
-                        "result or TaskList to inspect all workers.")
+                        "result or TaskList to inspect all workers."
+                        + _NONBLOCKING)
             return _task_error(start)
 
         def task_group(tasks: list, context: str = "",
@@ -3364,7 +3443,7 @@ class Agent:
                         "parallel read-only subagent(s): "
                         + ", ".join(w.id for w in workers)
                         + ". Use TaskCollect with batch_id for all reports; "
-                        "TaskList shows live status.")
+                        "TaskList shows live status." + _NONBLOCKING)
             return _task_error(start)
 
         def task_write_group(tasks: list, context: str = "",
@@ -3383,7 +3462,8 @@ class Agent:
                             f"{w.id} ({w.role}) [{', '.join(w.write_scope)}]"
                             for w in workers)
                         + ". Their writes are snapshot-backed; use TaskOutput "
-                        "or TaskCollect with batch_id to collect reports.")
+                        "or TaskCollect with batch_id to collect reports."
+                        + _NONBLOCKING)
             return _task_error(start)
 
         def task_output(task_id: str, wait_seconds: float = 30.0,
@@ -3394,7 +3474,9 @@ class Agent:
                     return f"ERROR: unknown subagent: {task_id}"
                 manager.wait([task_id], timeout=wait_seconds,
                              should_cancel=should_cancel)
-                return manager.format_worker(worker)
+                report = manager.format_worker(worker)
+                manager.mark_delivered([worker.id])
+                return report
             return _task_error(collect)
 
         def task_collect(batch_id: str = "", task_ids: list | None = None,
@@ -3475,7 +3557,7 @@ class Agent:
         self.tools["TaskGroup"] = Tool(
             "TaskGroup",
             "Submit up to eight independent, individually scoped read-only specialists as one "
-            "parallel batch; up to four model calls run at once and excess work "
+            "parallel batch; up to eight run at once and excess work "
             "queues. Use for reviews, exploration, design, or test analysis; "
             "each task can select its own role and explicit configured model; "
             "all tasks are validated before any are started. Collect the whole "
@@ -3489,7 +3571,7 @@ class Agent:
              "required": ["tasks"]}, task_group)
         self.tools["TaskWriteGroup"] = Tool(
             "TaskWriteGroup",
-            "Launch up to eight scoped implementation specialists (four model calls at once) with "
+            "Launch up to eight scoped implementation specialists (all running at once) with "
             "distinct, explicit workspace write_scope paths. This operation "
             "requires the existing permission gate; "
             "writers cannot use shell, delete, move, copy, or arbitrary patch tools, "
@@ -3501,6 +3583,26 @@ class Agent:
                 "context": {"type": "string"},
                 "model_id": {"type": "string"}},
              "required": ["tasks"]}, task_write_group, risk=RISK_CONFIRM)
+        self.tools["Swarm"] = Tool(
+            "Swarm",
+            "Launch a parallel SWARM of up to eight read-only specialists for "
+            "one goal and RETURN IMMEDIATELY. Break the goal into independent "
+            "slices (each with the best role; use depends_on for a later wave "
+            "that needs earlier results — upstream reports are piped in). "
+            "The swarm runs in the background while you keep working; every "
+            "finished report is delivered to you automatically as a "
+            "[SWARM NOTIFICATION] message, so never block just to wait. Use "
+            "TaskWriteGroup instead for scoped file edits.",
+            {"type": "object", "properties": {
+                "goal": {"type": "string",
+                         "description": "One line: what the swarm achieves together."},
+                "tasks": {"type": "array", "items": task_item,
+                          "minItems": 1, "maxItems": 8},
+                "context": {"type": "string",
+                            "description": "Shared context every worker needs."},
+                "role": {"type": "string", "enum": read_roles},
+                "model_id": {"type": "string"}},
+             "required": ["goal", "tasks"]}, swarm)
         self.tools["TaskOutput"] = Tool(
             "TaskOutput",
             "Wait briefly for one subagent and return its state, findings, "

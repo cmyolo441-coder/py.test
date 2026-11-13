@@ -1282,26 +1282,240 @@ class UI:
             self._invalidate()
         except Exception:
             pass
+        if _kind in ("subagent.done", "subagent.cancelled"):
+            self._schedule_swarm_wake()
+
+    # -- live swarm board (session-stable, see fullagent.swarmboard) --------
+
+    def _swarm_view(self):
+        view = self.__dict__.get("_swarm_view_obj")
+        if view is None:
+            from .swarmboard import SwarmView
+            view = self._swarm_view_obj = SwarmView()
+        return view
+
+    def _board_snapshot(self) -> dict:
+        """The real crew's snapshot, plus the /swarm demo crew if running."""
+        snap = self._agents_snapshot()
+        demo = self.__dict__.get("_demo_swarm")
+        if demo is None:
+            return snap
+        try:
+            from .swarmboard import merge_snapshots
+            return merge_snapshots(snap, demo.snapshot())
+        except Exception:
+            return snap
+
+    def _swarm_rows(self):
+        """Rows of the open swarm session (or None), at most once a frame."""
+        now = time.time()
+        cached = self.__dict__.get("_swarm_rows_cache")
+        if cached is not None and now - cached[0] < 0.02:
+            return cached[1], cached[2]
+        snap = self._board_snapshot()
+        view = self._swarm_view()
+        try:
+            rows = view.update(snap, now)
+        except Exception as exc:  # noqa: BLE001 — chrome must never crash
+            self._log_chrome_error("swarm_view", exc)
+            rows = None
+        self._swarm_rows_cache = (now, rows, snap)
+        if rows:
+            self._ensure_swarm_ticker()
+        return rows, snap
+
+    def _board_max_rows(self) -> int:
+        """Worker rows the board may use: never more than a third of the
+        terminal, so the prompt box always keeps its place on screen."""
+        try:
+            height = get_app().output.get_size().rows
+        except Exception:
+            height = shutil.get_terminal_size((100, 30)).lines
+        return max(3, min(8, height // 3 - 2))
+
+    def _ensure_swarm_ticker(self) -> None:
+        """Animate the board (~8 fps) while a swarm session is open.
+
+        The board must keep moving while the agent is idle too — swarms
+        are non-blocking, so a turn can end with workers still running.
+        One daemon thread per session; it exits as soon as the session
+        closes or nothing has rendered the board for a few seconds.
+        """
+        if self.__dict__.get("app") is None:
+            return  # headless (tests / embedding): nothing to animate
+        t = self.__dict__.get("_swarm_ticker")
+        if t is not None and t.is_alive():
+            return
+
+        def tick():
+            idle_frames = 0
+            while True:
+                time.sleep(0.125)
+                view = self.__dict__.get("_swarm_view_obj")
+                cache = self.__dict__.get("_swarm_rows_cache")
+                if view is None or not view.is_open:
+                    break
+                if cache is None or time.time() - cache[0] > 3.0:
+                    idle_frames += 1
+                    if idle_frames > 2:
+                        break
+                else:
+                    idle_frames = 0
+                self._invalidate()
+            self._invalidate()  # one last frame: the board collapses
+            view = self.__dict__.get("_swarm_view_obj")
+            summary = getattr(view, "last_summary", None)
+            if summary and summary.get("session") != self.__dict__.get(
+                    "_swarm_summary_printed"):
+                self._swarm_summary_printed = summary.get("session")
+                self._print_swarm_summary(summary)
+
+        try:
+            self._swarm_ticker = threading.Thread(
+                target=tick, daemon=True, name="ui-swarm-ticker")
+            self._swarm_ticker.start()
+        except Exception:
+            pass
+
+    def _print_swarm_summary(self, summary: dict) -> None:
+        """One scrollback line when a swarm session closes (also compacts
+        the chrome: a print re-renders the box at its natural height)."""
+        try:
+            from .swarmboard import clock, compact_tokens
+            t = Text()
+            t.append("◆ swarm complete ", style=f"bold {C['accent']}")
+            t.append(f"· {summary['total']} agent"
+                     f"{'s' if summary['total'] != 1 else ''} ",
+                     style=C["fg"])
+            t.append(f"· {summary['done']} done ", style=C["green"])
+            if summary.get("failed"):
+                t.append(f"· {summary['failed']} stopped ", style=C["red"])
+            t.append(f"· Σ {compact_tokens(summary['tokens'])} tok "
+                     f"· ⏱ {clock(summary['seconds'])}", style=C["dim"])
+            if summary.get("goal"):
+                t.append(f" · {summary['goal'][:60]}", style=C["dim"])
+            t.append(" · /agents", style=C["dim"])
+            t.truncate(max(20, self._width() - 2), overflow="ellipsis")
+            self.console.print(t)
+        except Exception as exc:  # noqa: BLE001
+            self._log_chrome_error("swarm_summary", exc)
+
+    # -- non-blocking hand-off: wake the agent when its swarm reports ------
+
+    def _schedule_swarm_wake(self, delay: float = 0.4) -> None:
+        """Debounced: several workers finishing together wake one turn."""
+        if self.__dict__.get("app") is None:
+            return
+        timer = self.__dict__.get("_swarm_wake_timer")
+        if timer is not None and timer.is_alive():
+            return
+        try:
+            timer = threading.Timer(delay, self._maybe_swarm_wake)
+            timer.daemon = True
+            self._swarm_wake_timer = timer
+            timer.start()
+        except Exception:
+            pass
+
+    def _maybe_swarm_wake(self) -> bool:
+        """Start a follow-up turn once the background swarm has reported.
+
+        Conditions: auto-wake on (``/swarm autowake``), nothing running or
+        queued, the user did not cancel the work, and finished reports are
+        waiting. It wakes when the whole swarm has settled — or, for a
+        swarm with a straggler, once a report has waited
+        ``swarm_wake_partial_s`` (default 45s) so the parent is not idle.
+        """
+        try:
+            if not bool(self.cfg.extra.get("swarm_autowake", True)):
+                return False
+        except Exception:
+            pass
+        mgr = self.agent.__dict__.get("subagents")
+        if mgr is None:
+            return False
+        if self.__dict__.get("_swarm_wake_blocked"):
+            try:
+                mgr.discard_notifications()
+            except Exception:
+                pass
+            return False
+        try:
+            pending = mgr.pending_notifications()
+            active = mgr.active_count()
+        except Exception:
+            return False
+        if not pending:
+            return False
+        if active:
+            first = self.__dict__.get("_swarm_pending_since") or time.time()
+            self._swarm_pending_since = first
+            try:
+                partial = float(self.cfg.extra.get("swarm_wake_partial_s", 45))
+            except (TypeError, ValueError):
+                partial = 45.0
+            if time.time() - first < partial:
+                # re-check later (one timer at a time): a straggler must
+                # not park the finished reports forever
+                recheck = self.__dict__.get("_swarm_recheck_timer")
+                if (recheck is None or not recheck.is_alive()
+                        or recheck is threading.current_thread()):
+                    recheck = threading.Timer(min(5.0, partial),
+                                              self._maybe_swarm_wake)
+                    recheck.daemon = True
+                    self._swarm_recheck_timer = recheck
+                    recheck.start()
+                return False
+        self._swarm_pending_since = None
+        q, lock = self._queue_state()
+        with lock:
+            if self._busy or self.__dict__.get("_turn_alive") or q:
+                return False  # the running turn picks the reports up itself
+            self._busy = True
+        self._cancel_flag.clear()
+        try:
+            from .subagents import SWARM_WAKE_PROMPT
+            threading.Thread(target=self._run_turn_thread,
+                             args=(SWARM_WAKE_PROMPT,),
+                             kwargs={"synthetic": pending},
+                             daemon=True, name="ui-swarm-wake").start()
+        except Exception:
+            with lock:
+                self._busy = False
+            return False
+        return True
 
     def _invalidate_agents(self) -> None:
         """Force the next frame to read the real subagent state."""
         self._agents_cache = None
         self._agents_cache_ts = 0.0
+        self._swarm_rows_cache = None
 
     def _agents_visible(self) -> bool:
-        """True while at least one subagent is queued or running."""
+        """True while a swarm session is open on the board.
+
+        The session opens with the first live worker and closes shortly
+        after the last one settles (see ``SwarmView``), so the board — and
+        the prompt box under it — does not jump as workers come and go.
+        """
         try:
-            snap = self._agents_snapshot()
-            return any(row.get("state") in cliui.ACTIVE_STATES
-                       for row in snap.get("workers") or [])
+            rows, _snap = self._swarm_rows()
+            return bool(rows)
         except Exception:
             return False
 
     def _agents_fragments(self) -> list:
         """The live swarm board, one prompt_toolkit fragment row per line."""
         try:
-            rows = cliui.agent_board(self._agents_snapshot(),
-                                     width=self._width(), colors=C)
+            from .swarmboard import render_board, session_goal
+            rows_data, snap = self._swarm_rows()
+            view = self._swarm_view()
+            view.goal = session_goal(snap, rows_data) or view.goal
+            rows = render_board(
+                rows_data, width=self._width() - 1, colors=C,
+                view=view, max_rows=self._board_max_rows(),
+                max_steps=int((snap or {}).get("max_steps") or 20),
+                goal=view.goal)
         except Exception as exc:  # noqa: BLE001 — chrome must never crash
             self._log_chrome_error("agent_board", exc)
             return []
@@ -1506,6 +1720,12 @@ class UI:
             height=Dimension(min=1, max=10),
             wrap_lines=True,
             get_line_prefix=get_line_prefix,
+            # Never grow past the typed lines: in non-full-screen mode the
+            # renderer keeps the tallest height it ever drew, so when the
+            # swarm board collapses the spare rows used to be handed to the
+            # input box — the bottom border dropped ten lines away from the
+            # prompt. The spare rows now go to the top filler instead.
+            dont_extend_height=True,
         )
         self.input_window = input_window
 
@@ -1532,7 +1752,16 @@ class UI:
             FormattedTextControl(self._background_fragments),
             dont_extend_height=True)
 
+        try:
+            from prompt_toolkit.layout import VerticalAlign
+            _align = {"align": VerticalAlign.BOTTOM}
+        except Exception:  # stub layout (prompt_toolkit missing)
+            _align = {}
         root = FloatContainer(
+            # BOTTOM: chrome is anchored to the bottom of its reserved area,
+            # so a board that collapses leaves the prompt box exactly where
+            # it was (the gap closes on the next printed line) instead of
+            # yanking it upward mid-keystroke.
             HSplit([
                 ConditionalContainer(
                     overlay_window,
@@ -1550,7 +1779,7 @@ class UI:
                 meta_window,
                 ConditionalContainer(self.search_toolbar,
                                      filter=Condition(self._search_visible)),
-            ]),
+            ], **_align),
             [
                 Float(xcursor=True, ycursor=True,
                       content=CompletionsMenu(
@@ -1852,6 +2081,9 @@ class UI:
                             pass
         except Exception:
             pass
+        # A cancelled swarm must not wake the agent back up behind the
+        # user's back once its workers wind down.
+        self._swarm_wake_blocked = True
         self._invalidate_agents()  # cancelled workers must leave the board now
         # Watchdog: if the turn thread is stuck (e.g. blocked in input()
         # or a hung subprocess), force-clear the busy state after 10s so
@@ -2044,6 +2276,17 @@ class UI:
         if text.startswith("/"):
             self._handle_slash(text)
             return
+
+        if self.__dict__.get("_swarm_wake_blocked"):
+            # The user cancelled the earlier swarm and is now giving a new
+            # instruction: do not feed them the cancelled workers' reports.
+            self._swarm_wake_blocked = False
+            try:
+                mgr = self.agent.__dict__.get("subagents")
+                if mgr is not None:
+                    mgr.discard_notifications()
+            except Exception:
+                pass
 
         q, lock = self._queue_state()
         with lock:
@@ -2320,6 +2563,8 @@ class UI:
             self.print_info(format_help(arg), C["fg"])
         elif cmd == "/agents":
             self._cmd_agents(arg)
+        elif cmd == "/swarm":
+            self._cmd_swarm(arg)
         elif cmd == "/diff":
             self._cmd_diff(arg)
         elif cmd == "/theme":
@@ -2648,12 +2893,101 @@ class UI:
 
     def _shutdown_subagents(self) -> None:
         """Cancel active child work without creating the lazy runtime."""
-        manager = self.agent.__dict__.get("subagents")
-        if manager is not None:
+        for manager in (self.agent.__dict__.get("subagents"),
+                        self.__dict__.get("_demo_swarm")):
+            if manager is not None:
+                try:
+                    manager.shutdown(wait=False)
+                except Exception:
+                    pass
+
+    def _cmd_swarm(self, arg: str) -> None:
+        """/swarm — live swarm controls (non-blocking parallel subagents)."""
+        text = (arg or "").strip()
+        parts = text.split()
+        action = parts[0].lower() if parts else "status"
+        if action in ("status", "list", "ls", "board"):
+            self._cmd_agents("")
+            pending = 0
             try:
-                manager.shutdown(wait=False)
+                mgr = self.agent.__dict__.get("subagents")
+                pending = mgr.pending_notifications() if mgr else 0
+            except Exception:
+                pending = 0
+            auto = bool(self.cfg.extra.get("swarm_autowake", True))
+            self.print_info(
+                f"  ◆ auto-wake {'on' if auto else 'off'} · "
+                f"{pending} undelivered report{'s' if pending != 1 else ''}"
+                " · swarms run in the background; the agent keeps working "
+                "and gets each report automatically", C["dim"])
+            return
+        if action == "autowake":
+            choice = parts[1].lower() if len(parts) > 1 else ""
+            if choice not in ("on", "off"):
+                self.print_error("usage: /swarm autowake on|off")
+                return
+            self.cfg.extra["swarm_autowake"] = choice == "on"
+            try:
+                self.cfg.save()
             except Exception:
                 pass
+            self.print_info(
+                f"✓ swarm auto-wake {choice} — "
+                + ("finished swarms continue the task on their own"
+                   if choice == "on" else
+                   "reports wait for your next message"), C["green"])
+            return
+        if action == "demo":
+            try:
+                n = int(parts[1]) if len(parts) > 1 else 8
+            except ValueError:
+                n = 8
+            old = self.__dict__.get("_demo_swarm")
+            if old is not None and old.active_count():
+                self.print_error("a demo swarm is already running — "
+                                 "/swarm stop ends it")
+                return
+            if old is not None:
+                try:
+                    old.shutdown(wait=False)
+                except Exception:
+                    pass
+            try:
+                from .swarmdemo import start_demo
+                tools = getattr(self.agent, "tools", {}) or {}
+                self._demo_swarm = start_demo(tools, workers=n)
+                self._demo_swarm.on_progress(
+                    lambda *_a: (self._invalidate_agents(),
+                                 self._invalidate()))
+            except Exception as exc:  # noqa: BLE001
+                self.print_error(f"demo swarm failed: {exc}")
+                return
+            self._invalidate_agents()
+            self._invalidate()
+            self.print_info(
+                f"◆ demo swarm started · {max(1, min(8, n))} agents · "
+                "simulated model, real swarm engine, no API calls. "
+                "Keep typing — the prompt stays live.", C["accent"])
+            return
+        if action == "stop":
+            stopped = 0
+            for mgr in (self.agent.__dict__.get("subagents"),
+                        self.__dict__.get("_demo_swarm")):
+                if mgr is None:
+                    continue
+                for worker in mgr.list():
+                    if worker.state in ("queued", "running"):
+                        try:
+                            mgr.stop(worker.id)
+                            stopped += 1
+                        except Exception:
+                            pass
+            self._swarm_wake_blocked = True
+            self.print_info(f"✓ stop requested for {stopped} swarm agent"
+                            f"{'s' if stopped != 1 else ''}", C["yellow"])
+            return
+        self.print_error(
+            "usage: /swarm [status | demo [n] | autowake on|off | stop]")
 
     def _print_agents_dashboard(self, manager) -> None:
         """Render a compact live board for the current parallel crew."""
@@ -2686,9 +3020,14 @@ class UI:
             activity = " ".join(activity.split())
             if len(activity) > 180:
                 activity = activity[:177] + "..."
-            pct = 100 if state == "done" else (0 if state == "queued" else min(95, max(15, row["steps"] * 10)))
-            filled = int(round(pct / 20))
-            pbar = "▰" * filled + "▱" * (5 - filled)
+            from .swarmboard import (clock, compact_tokens,
+                                     target_progress, worker_seconds)
+            row.setdefault("max_steps", snapshot.get("max_steps", 20))
+            frac = target_progress(row, int(snapshot.get("max_steps") or 20))
+            pct = 100 if state in ("done", "blocked", "error",
+                                   "cancelled") else int(frac * 100)
+            filled = int(round(frac * 10))
+            pbar = "█" * filled + "·" * (10 - filled)
             heading = Text()
             heading.append(state_icons.get(state, "·") + "  ",
                            style=f"bold {color}")
@@ -2704,10 +3043,13 @@ class UI:
             heading.append(f"  {row['id']}  ·  {row['batch_id']}{wave_badge}{prio_badge}{diff_badge}",
                            style=C["dim"])
             tps = f" · {row['tokens_per_sec']} tok/s" if row.get("tokens_per_sec") else ""
+            run_s = worker_seconds(row, time.time())
             work = Text(
                 f"{role_label(row['role'])} · {row['name']}  |  "
                 f"{row['steps']} steps · {row['tool_calls']} tools  |  "
-                f"{row['tokens_in']}→{row['tokens_out']} tokens{tps} · {seconds:.1f}s",
+                f"{compact_tokens(row['tokens_in'] + row['tokens_out'])} tok "
+                f"({row['tokens_in']}→{row['tokens_out']}){tps}  |  "
+                f"⏱ {clock(run_s)} running · {seconds:.1f}s total",
                 style=C["dim"])
             task_line = Text("Task  ", style=f"bold {C['cyan']}")
             task_line.append(task)
@@ -2729,6 +3071,10 @@ class UI:
             summary.append(f" · {counts[state]} {label}", style=color)
         summary.append(f" · {snapshot['tokens_in']}→{snapshot['tokens_out']} tokens",
                        style=C["dim"])
+        pending = int(snapshot.get("pending_notifications") or 0)
+        if pending:
+            summary.append(f" · {pending} report{'s' if pending != 1 else ''}"
+                           " queued for the agent", style=C["accent"])
         if not snapshot["workers"]:
             body = Group(summary, Text(
                 "No workers yet. Use TaskGroup for read-only parallel work or "
@@ -4181,7 +4527,7 @@ class UI:
 
     # -- turn execution (worker thread) ---------------------------------------------------------
 
-    def _run_turn_thread(self, text: str) -> None:
+    def _run_turn_thread(self, text: str, synthetic: int = 0) -> None:
         _q, lock = self._queue_state()
         with lock:
             self._busy = True
@@ -4190,7 +4536,12 @@ class UI:
             # Announce here, not in _dispatch: a queued turn should appear
             # in the transcript only when it actually starts, after the
             # previous turn's answer, not at the moment it was typed.
-            self._emit_user(text)
+            if synthetic:
+                # A swarm wake is not something the user typed: show what
+                # happened instead of echoing the internal prompt.
+                self._emit_swarm_wake(int(synthetic))
+            else:
+                self._emit_user(text)
             # Clear the agent's cancel flag on the turn thread, right before
             # run_turn: run_turn clears it again internally, but a cancel
             # landing in the window between thread start and that internal
@@ -4233,6 +4584,9 @@ class UI:
                 self._cancel_flag.clear()
 
         if next_text is None:
+            # Idle now: reports from a swarm that settled during the turn
+            # (or is still running) wake a follow-up turn on their own.
+            self._schedule_swarm_wake()
             return
         try:
             threading.Thread(target=self._run_turn_thread,
@@ -5088,6 +5442,15 @@ class UI:
             note.append(" to review and resume", style=C["dim"])
             self.console.print(note)
             self.console.print()
+
+    def _emit_swarm_wake(self, reports: int) -> None:
+        t = Text()
+        t.append("◆ swarm ", style=f"bold {C['accent']}")
+        t.append(f"{reports} report{'s' if reports != 1 else ''} ready",
+                 style=f"bold {C['green']}")
+        t.append(" — background agents finished, continuing with their "
+                 "results", style=C["dim"])
+        self.console.print(t)
 
     def _emit_user(self, text: str) -> None:
         t = Text()
