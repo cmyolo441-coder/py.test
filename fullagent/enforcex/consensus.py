@@ -75,9 +75,11 @@ _LEAK_TAG_RE = re.compile(
     r"(<\s*/?\s*(system|system_prompt|prompt|instructions|SYS|INST)\s*>"
     r"|\[/?\s*(system|system_prompt|instructions|INST)\s*\]|\u00abSYS\u00bb)", re.I)
 _FENCE_RE = re.compile(r"```|~~~")
-_LIST_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+\S", re.M)
-_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+\S", re.M)
-_TABLE_RE = re.compile(r"^\s*\|.+\|\s*$", re.M)
+# [ \t]* not \s*: under re.M, \s* crosses newlines and every line start
+# rescanned the following blank lines (quadratic on long output)
+_LIST_RE = re.compile(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]+\S", re.M)
+_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+\S", re.M)
+_TABLE_RE = re.compile(r"^[ \t]*\|.+\|[ \t]*$", re.M)
 _EMOJI_RE = re.compile("[\U0001F300-\U0001F5FF\U0001F600-\U0001F64F\U0001F680-\U0001F6FF\U0001F900-\U0001F9FF\U00002700-\U000027BF\U00002600-\U000026FF]")
 _NEGATION_RE = re.compile(r"\b(never|not|no|none|n't|without|forbidden|prohibited|cannot|can't|won't|don't|doesn't|shouldn't|mustn't|nahi|nahin|mat|kabhi)\b", re.I)
 _HEDGEHOG_RE = re.compile(r"\b(i (?:cannot|can't|can not|am unable to|won't|will not)[^.!?]{0,60}(?:comply|help|assist|follow|do that|provide)|policy (?:forbids|prevents|does not allow)|as an ai|as a language model)", re.I)
@@ -163,11 +165,17 @@ def _extract_keywords(text: str, limit: int = 6) -> List[str]:
         seen.setdefault(w, len(seen))
     return sorted(seen, key=lambda w: (-min(len(w), 12), seen[w]))[:limit]
 
-def _rule_patterns(rule: Dict[str, Any]) -> List[re.Pattern]:
-    pats: List[re.Pattern] = []
+_WORD_TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
+
+
+def _rule_patterns_keyed(rule: Dict[str, Any]) -> List[Tuple[re.Pattern, Optional[str]]]:
+    """(pattern, word) pairs; `word` is set when the pattern is just a
+    word-bounded single token, so callers can skip the regex scan when
+    the word is absent from the response's token set."""
+    pats: List[Tuple[re.Pattern, Optional[str]]] = []
     for src in (rule.get("patterns") or ()):
         try:
-            pats.append(re.compile(str(src), re.I))
+            pats.append((re.compile(str(src), re.I), None))
         except re.error:
             continue
     for kw in (rule.get("keywords") or ()):
@@ -175,16 +183,22 @@ def _rule_patterns(rule: Dict[str, Any]) -> List[re.Pattern]:
         if not kw or len(kw) > 40:
             continue
         try:
-            pats.append(re.compile(rf"\b{re.escape(kw)}\b", re.I))
+            pats.append((re.compile(rf"\b{re.escape(kw)}\b", re.I),
+                         kw if _WORD_TOKEN_RE.fullmatch(kw) else None))
         except re.error:
             continue
     if not pats and rule.get("text"):
         for kw in _extract_keywords(str(rule["text"])):
             try:
-                pats.append(re.compile(rf"\b{re.escape(kw)}\b", re.I))
+                pats.append((re.compile(rf"\b{re.escape(kw)}\b", re.I),
+                             kw if _WORD_TOKEN_RE.fullmatch(kw) else None))
             except re.error:
                 continue
     return pats
+
+
+def _rule_patterns(rule: Dict[str, Any]) -> List[re.Pattern]:
+    return [p for p, _w in _rule_patterns_keyed(rule)]
 
 # ── data model ───────────────────────────────────────────────────────────
 
@@ -349,6 +363,10 @@ def lexical_voter_fn(response_text: str, rules: Any = None, system_text: str = "
     sev_action = {"critical": "block", "high": "block", "medium": "warn", "low": "warn"}
     worst = "allow"
     worst_order = 0
+    # one tokenisation of the reply; single-word keyword patterns are
+    # only regex-scanned when the word occurs (rules x 200k-char scans
+    # took seconds per evaluation)
+    text_tokens = _token_set(text)
     for rule in rules_list:
         rtext = str(rule.get("text", ""))
         rcat = str(rule.get("category", "other"))
@@ -357,7 +375,9 @@ def lexical_voter_fn(response_text: str, rules: Any = None, system_text: str = "
             rsev = "medium"
         hit = False
         evidence = ""
-        for pat in _rule_patterns(rule):
+        for pat, word in _rule_patterns_keyed(rule):
+            if word is not None and word not in text_tokens:
+                continue
             mm = pat.search(text)
             if mm:
                 hit = True
@@ -392,9 +412,12 @@ def structural_voter_fn(response_text: str, rules: Any = None, system_text: str 
         violations.append(_normalize_violation({"category": cat, "severity": sev, "rule_id": rid,
                                                 "evidence": _clip(ev or text[:60]), "confidence": 0.6, "message": msg}))
 
-    if any(kw in low_rules for kw in ("numbered list", "numbered", "1.", "bullet list")):
+    # word-bounded format cues: plain substrings fired on unrelated rule
+    # text ("Use Python 3.11." -> "1.", "stable"/"suitable" -> "table",
+    # "C# " -> "# "), demanding lists/tables/headings that no rule asked for
+    if re.search(r"numbered|bullet list|(?<![\w.])1[.)]\s", low_rules):
         has_list = bool(_LIST_RE.search(text))
-        numbered = bool(re.search(r"^\s*\d+[.)]\s+\S", text, re.M))
+        numbered = bool(re.search(r"^[ \t]*\d+[.)][ \t]+\S", text, re.M))
         if not has_list:
             _vio("format", "medium", "STRUCT-LIST", "response lacks a required list")
         elif "numbered" in low_rules and not numbered:
@@ -402,9 +425,9 @@ def structural_voter_fn(response_text: str, rules: Any = None, system_text: str 
     if any(kw in low_rules for kw in ("code block", "code fence", "```", "markdown code")):
         if not _FENCE_RE.search(text):
             _vio("format", "medium", "STRUCT-CODEBLOCK", "code block required but not found")
-    if "table" in low_rules and not _TABLE_RE.search(text):
+    if re.search(r"\btables?\b", low_rules) and not _TABLE_RE.search(text):
         _vio("format", "low", "STRUCT-TABLE", "table required but not found")
-    if any(kw in low_rules for kw in ("heading", "# ", "##")) and not _HEADING_RE.search(text):
+    if re.search(r"\bheadings?\b|(?<![\w#])#{1,6}\s", low_rules) and not _HEADING_RE.search(text):
         _vio("format", "low", "STRUCT-HEADING", "heading required but not found")
     # length caps
     cap: Optional[int] = None
@@ -421,7 +444,7 @@ def structural_voter_fn(response_text: str, rules: Any = None, system_text: str 
             cap = cap or 200
     if cap is not None and wc > cap:
         _vio("format", "medium", "STRUCT-LENGTH", f"response {wc} words exceeds cap {cap}", f"{wc} words")
-    if "json" in low_rules:
+    if re.search(r"\bjson\b", low_rules):
         stripped = text.strip()
         if not (stripped.startswith("{") or stripped.startswith("[")) and not re.search(r"\{[^{}]{10,}\}", text):
             _vio("format", "medium", "STRUCT-JSON", "JSON required but not found")
@@ -456,6 +479,10 @@ def semantic_voter_fn(response_text: str, rules: Any = None, system_text: str = 
             pass
     # lexical fallback with negation awareness
     violations: List[Dict[str, Any]] = []
+    # response-side work is rule-independent: tokenising / regex-scanning
+    # the (up to 200k-char) reply once per rule was O(rules x text)
+    text_tokens = _token_set(text)
+    hedgehog = bool(_HEDGEHOG_RE.search(text))
     for rule in rules_list:
         rtext = str(rule.get("text", ""))
         if not rtext.strip():
@@ -463,9 +490,8 @@ def semantic_voter_fn(response_text: str, rules: Any = None, system_text: str = 
         salient = {w for w in _token_set(rtext) if w not in _STOPWORDS and len(w) > 2}
         if not salient:
             continue
-        overlap = len(salient & _token_set(text)) / len(salient)
+        overlap = len(salient & text_tokens) / len(salient)
         neg_rule = bool(_NEGATION_RE.search(rtext))
-        hedgehog = bool(_HEDGEHOG_RE.search(text))
         if neg_rule and overlap > 0.3:
             rsev = str(rule.get("severity", "medium")).lower()
             violations.append(_normalize_violation({"category": str(rule.get("category", "other")),

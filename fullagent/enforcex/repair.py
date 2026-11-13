@@ -255,7 +255,7 @@ def classify_violations(text: str, rules: Any = None) -> List[Dict[str, Any]]:
         m = pat.search(t)
         if m:
             _add(*_SENSITIVE_VIOLATION, rule_id=f"SECRET-{name.upper()}",
-                 evidence=m.group(0), conf=0.85,
+                 evidence=_mask_secret(m.group(0)), conf=0.85,
                  msg=f"possible secret material ({name})")
 
     for name, pat in _HOSTILE_PATTERNS:
@@ -329,20 +329,34 @@ def _strip_forbidden(text: str,
 _REDACT_PLACEHOLDER = "[REDACTED]"
 
 
+def _mask_secret(value: str) -> str:
+    """Audit-safe stand-in for a matched secret.
+
+    Violation evidence and RepairStep.removed_spans end up in reports,
+    ledgers and logs; they used to carry the raw API key / token /
+    password that redaction was removing from the reply.
+    """
+    v = str(value or "")
+    return f"{v[:4]}…[{len(v)} chars masked]" if len(v) > 4 \
+        else "[masked]"
+
+
 def _redact_sensitive(text: str,
                       violations: Sequence[Dict[str, Any]],
                       cfg: RepairConfig) -> Tuple[str, List[str]]:
     removed: List[str] = []
     for _name, pat in _SECRET_PATTERNS:
         for m in pat.finditer(text):
-            removed.append(m.group(0))
+            removed.append(_mask_secret(m.group(0)))
         text = pat.sub(_REDACT_PLACEHOLDER, text)
     # email addresses
-    email_re = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.]{2,}\b")
-    for m in email_re.finditer(text):
-        removed.append(m.group(0))
-    text = email_re.sub(_REDACT_PLACEHOLDER, text)
+    for m in _EMAIL_RE.finditer(text):
+        removed.append(_mask_secret(m.group(0)))
+    text = _EMAIL_RE.sub(_REDACT_PLACEHOLDER, text)
     return text, removed
+
+
+_EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.]{2,}\b")
 
 
 def _neutralize_injection(text: str,

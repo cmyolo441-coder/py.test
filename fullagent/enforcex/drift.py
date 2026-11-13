@@ -83,15 +83,19 @@ _DECAY = 0.88  # exponential decay for weighting (recent = heavier)
 _CLIP_LEN = 120
 
 # structural markers: each class counts occurrences
+# Line-anchored markers use ``^[ \t]*`` (horizontal whitespace only). The
+# old ``(?:^|\n)\s*`` let ``\s*`` run across newlines, so every line start
+# rescanned the rest of a blank-line run: O(n^2) on "\n" * n (a 20k-char
+# response of blank lines took >20s per scored turn).
 _STRUCT_PATTERNS: Dict[str, re.Pattern] = {
-    "markdown_heading": re.compile(r"(?:^|\n)\s*#{1,6}\s+\S", re.M),
-    "bullet_list": re.compile(r"(?:^|\n)\s*[-*•]\s+\S", re.M),
-    "numbered_list": re.compile(r"(?:^|\n)\s*\d+[\.\)]\s+\S", re.M),
+    "markdown_heading": re.compile(r"^[ \t]*#{1,6}[ \t]+\S", re.M),
+    "bullet_list": re.compile(r"^[ \t]*[-*•][ \t]+\S", re.M),
+    "numbered_list": re.compile(r"^[ \t]*\d+[\.\)][ \t]+\S", re.M),
     "code_block": re.compile(r"```"),
     "inline_code": re.compile(r"`[^`]+`"),
     "json_block": re.compile(r"\{[^{}]{10,}\}"),
     "table": re.compile(r"\|[^|\n]+\|"),
-    "blockquote": re.compile(r"(?:^|\n)\s*>\s+\S", re.M),
+    "blockquote": re.compile(r"^[ \t]*>[ \t]+\S", re.M),
 }
 
 # tone markers

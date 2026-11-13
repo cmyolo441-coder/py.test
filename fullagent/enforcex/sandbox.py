@@ -48,7 +48,9 @@ Public API
 from __future__ import annotations
 
 import hashlib
+import inspect
 import re
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set
@@ -271,18 +273,28 @@ class _Budget:
         self.ops = 0
         self._start = time.monotonic()
         self._check_every = 128
+        self._next_check = self._check_every
         self.timed_out = False
         self.exhausted = False
 
     def tick(self, n: int = 1) -> None:
         """Advance the counter by n; raise if budget exhausted."""
-        self.ops += max(1, int(n))
+        try:
+            step = max(1, int(n))
+        except (TypeError, ValueError):
+            step = 1
+        self.ops += step
         if self.ops >= self.max_ops:
             self.exhausted = True
             raise SandboxTimeoutError(
                 f"operation budget exhausted ({self.ops}/{self.max_ops})"
             )
-        if self.ops % self._check_every == 0:
+        # Poll the clock whenever the counter crosses the next checkpoint.
+        # ``ops % 128 == 0`` never fired for step sizes that skip the
+        # multiples of 128 (e.g. tick(3), tick(10)), so the wall-time
+        # limit was silently never enforced for those callers.
+        if self.ops >= self._next_check:
+            self._next_check = self.ops + self._check_every
             elapsed = time.monotonic() - self._start
             if elapsed >= self.timeout_s:
                 self.timed_out = True

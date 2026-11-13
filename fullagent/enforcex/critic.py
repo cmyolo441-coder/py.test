@@ -126,7 +126,11 @@ FORBIDDEN_TERMS = ("forbidden", "banned", "not allowed", "must not",
 REQUIRED_TERMS = ("must include", "always include", "must mention",
                   "always say", "must use", "always use", "required")
 
-SECTION_RE = re.compile(r"^\s*#{1,6}\s*(.+?)\s*$", re.M)
+# Horizontal whitespace only and a greedy body ending in \S: the old
+# ``^\s*#{1,6}\s*(.+?)\s*$`` crossed newlines and re-ran ``\s*$`` after every
+# lazy step, O(n^2) on blank-line runs or long trailing whitespace.
+SECTION_RE = re.compile(r"^[ \t]*#{1,6}[ \t]*(.*\S)[ \t]*$", re.M)
+_LIST_ITEM_RE = re.compile(r"^[ \t]*(?:[-*•]|\d+[.)])[ \t]+\S", re.M)
 
 
 # ── dataclasses ──────────────────────────────────────────────────────────
@@ -411,7 +415,7 @@ class StructuralCritic(BaseCritic):
         n_chars = len(text)
         n_words = len(text.split())
         n_sents = len(_sentences(text))
-        n_bullets = len(re.findall(r"^\s*(?:[-*•]|\d+[.)])\s+\S", text, re.M))
+        n_bullets = len(_LIST_ITEM_RE.findall(text))
         n_sections = len(SECTION_RE.findall(text))
         n_fences = text.count("```")
         has_greeting = bool(re.match(r"\s*(hi|hello|hey|namaste|greetings)\b",

@@ -81,8 +81,10 @@ _IMPERATIVE_RE = re.compile(
     r"must|should|need to|have to)\b",
     re.I,
 )
-_NUMBERED_RE = re.compile(r"(?:^|\n)\s*(?:\d+[\.\)]|\-|\*|•)\s+\S", re.M)
-_BULLET_RE = re.compile(r"(?:^|\n)\s*[-*•]\s+", re.M)
+# ``^[ \t]*`` instead of ``(?:^|\n)\s*``: \s also matches newlines, which made
+# both patterns O(n^2) on blank-line runs (seconds per call on 20k chars).
+_NUMBERED_RE = re.compile(r"^[ \t]*(?:\d+[\.\)]|\-|\*|•)[ \t]+\S", re.M)
+_BULLET_RE = re.compile(r"^[ \t]*[-*•][ \t]+", re.M)
 
 # sycophancy markers — agreeing with user against system constraints
 _SYCOPHANCY_RES: Tuple[re.Pattern, ...] = (
