@@ -477,7 +477,7 @@ class SemanticVerdict:
         def _f(key: str, default: float) -> float:
             try:
                 return float(d.get(key, default))  # type: ignore[arg-type]
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return default
         meta = d.get("meta")
         return cls(
@@ -518,14 +518,20 @@ class SemanticReport:
             return cls()
         try:
             overall = float(d.get("overall_compliance", 1.0))  # type: ignore[arg-type]
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             overall = 1.0
+        if overall != overall:
+            overall = 1.0
+        vs = d.get("verdicts")
+        vs = vs if isinstance(vs, (list, tuple)) else ()
+        cs = d.get("contradictions")
+        cs = cs if isinstance(cs, (list, tuple)) else ()
         uncovered = d.get("uncovered_rules", ())
         meta = d.get("meta")
         return cls(
-            verdicts=[SemanticVerdict.from_dict(x) for x in d.get("verdicts", ()) if isinstance(x, dict)],
+            verdicts=[SemanticVerdict.from_dict(x) for x in vs if isinstance(x, dict)],
             overall_compliance=overall,
-            contradictions=[SemanticVerdict.from_dict(x) for x in d.get("contradictions", ()) if isinstance(x, dict)],
+            contradictions=[SemanticVerdict.from_dict(x) for x in cs if isinstance(x, dict)],
             uncovered_rules=[str(x) for x in uncovered] if isinstance(uncovered, (list, tuple)) else [],
             meta=dict(meta) if isinstance(meta, dict) else {},
         )

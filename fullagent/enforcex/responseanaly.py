@@ -43,9 +43,16 @@ __all__ = [
 _RE_HEADING = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$", re.M)
 _RE_SETEXT_H1 = re.compile(r"^.+\n=+\s*$", re.M)
 _RE_SETEXT_H2 = re.compile(r"^.+\n-+\s*$", re.M)
-_RE_LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+\S", re.M)
-_RE_TABLE_ROW = re.compile(r"^\s*\|.+\|\s*$", re.M)
-_RE_TABLE_SEP = re.compile(r"^\s*\|?[\s:|-]+\|[\s:|-]*$", re.M)
+# Line-start patterns use [ \t]* rather than \s*: with re.M, \s* also
+# eats newlines, so every line start rescanned all following blank lines
+# (quadratic on long runs of newlines in model output).
+_RE_LIST_ITEM = re.compile(r"^[ \t]*(?:[-*+]|\d+[.)])[ \t]+\S", re.M)
+_RE_TABLE_ROW = re.compile(r"^[ \t]*\|.+\|[ \t]*$", re.M)
+# Separator row (|---|:--:|): the line holds only [ \t:|-] and has a pipe
+# after at least one such char. The lookaheads pin the line shape first so
+# the body cannot backtrack quadratically on long "|||..." lines.
+_RE_TABLE_SEP = re.compile(
+    r"^(?=[ \t:|-]*$)(?=[^|\n]*\|)[ \t]*\|?[ \t:|-]+\|", re.M)
 _RE_FENCE = re.compile(r"```|~~~")
 _RE_BOLD = re.compile(r"\*\*[^*\n]+\*\*|__[^_\n]+__")
 _RE_ITALIC = re.compile(r"(?<![\w*])\*[^*\n]+\*(?![\w*])|(?<![\w_])_[^_\n]+_(?![\w_])")
@@ -419,7 +426,7 @@ def analyze_response(text: str) -> ResponseFeatures:
     body = _RE_FENCE.sub("", text)
     f.heading_count = len(_RE_HEADING.findall(body))
     f.list_item_count = len(_RE_LIST_ITEM.findall(body))
-    numbered = re.findall(r"^\s*\d+[.)]\s+\S", body, re.M)
+    numbered = re.findall(r"^[ \t]*\d+[.)][ \t]+\S", body, re.M)
     f.has_numbered_list = bool(numbered)
     f.table_row_count = len(_RE_TABLE_ROW.findall(body))
     f.has_table = f.table_row_count >= 2 and bool(_RE_TABLE_SEP.search(body))
@@ -466,9 +473,19 @@ _LEAK_MIN_WORDS = 6
 _LEAK_NOISE = re.compile(r"[^\w\s\u0900-\u097F\u3400-\u9FFF]", re.UNICODE)
 
 
+def _drop_format_chars(text: str) -> str:
+    """Remove invisible format characters (category Cf: zero-width
+    space/joiners, soft hyphen, bidi controls, tag chars). Otherwise
+    _LEAK_NOISE turns "Ne\u200bver" into two tokens and a verbatim
+    leak slips past the n-gram match."""
+    if text.isascii():
+        return text
+    return "".join(c for c in text if unicodedata.category(c) != "Cf")
+
+
 def _norm_tokens(text: str) -> list[str]:
     """Lowercase NFKC-folded word tokens with confusables mapped."""
-    norm = unicodedata.normalize("NFKC", text or "").lower()
+    norm = unicodedata.normalize("NFKC", _drop_format_chars(text or "")).lower()
     norm = "".join(_CONFUSABLES.get(c, c) for c in norm)
     norm = _LEAK_NOISE.sub(" ", norm)
     return norm.split()
@@ -497,11 +514,23 @@ def detect_quoted_system_text(text: str, system_text: str) -> list[str]:
     leaked: list[str] = []
     seen: set[str] = set()
     n = len(resp_tokens)
+    m = len(sys_tokens)
+    # Index every system-prompt n-gram of _LEAK_MIN_WORDS tokens. A match
+    # of >= _LEAK_MIN_WORDS tokens starting at `start` must begin with
+    # that n-gram, so only those starts need extending. The old scan
+    # tried every start for every response position (O(n*m) Python
+    # steps: minutes for a 100k-char reply against a long prompt).
+    index: dict[tuple, list[int]] = {}
+    for start in range(m - _LEAK_MIN_WORDS + 1):
+        index.setdefault(tuple(sys_tokens[start:start + _LEAK_MIN_WORDS]),
+                         []).append(start)
     i = 0
     while i < n:
         # try to extend a match starting at i, longest first
         best_end = -1
-        for start in range(len(sys_tokens) - _LEAK_MIN_WORDS + 1):
+        best_frag = ""
+        starts = index.get(tuple(resp_tokens[i:i + _LEAK_MIN_WORDS]), ())
+        for start in starts:
             k = 0
             j = i
             while (start + k < len(sys_tokens) and j < n

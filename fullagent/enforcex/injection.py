@@ -104,11 +104,26 @@ _OVERRIDE_RES: Tuple[Tuple[str, re.Pattern], ...] = (
         r"\b(?:disregard|forget|drop|override)\s+(?:all\s+|the\s+|your\s+)?"
         r"(?:previous|prior|system|original|above)\s+"
         r"(?:instructions?|rules?|prompts?|directives?|guardrails?)\b", re.I)),
+    # "you are now ..." / "... mode" only count when the sentence is about
+    # the model's persona or restrictions: plain output such as "You are
+    # now in the src directory" or "enable Developer Mode in Chrome" is
+    # ordinary text and must not block a response (false positives).
     ("you_are_now", re.compile(
-        r"\byou\s+are\s+now\s+(?:a|an|in|free|allowed|unfiltered|"
-        r"unrestricted|no\s+longer)\b[^.!?]{0,80}", re.I)),
+        r"\byou\s+are\s+now\s+(?:free|allowed|unfiltered|unrestricted|"
+        r"uncensored|jailbroken|no\s+longer)\b[^.!?]{0,80}"
+        r"|\byou\s+are\s+now\s+(?:a|an|in)\b[^.!?]{0,60}?"
+        r"\b(?:mode|AI|assistant|chatbot|model|persona|character|DAN|"
+        r"jailbr\w*|unrestricted|unfiltered|uncensored|"
+        r"without\s+(?:any\s+)?(?:rules|restrictions|limits|filters))\b"
+        r"[^.!?]{0,60}", re.I)),
     ("developer_mode", re.compile(
-        r"\b(?:developer|dan|god|admin|sudo)\s+mode\b[^.!?]{0,60}", re.I)),
+        r"\byou(?:'re|\s+are)\s+(?:now\s+)?(?:in|running\s+in|operating\s+in)"
+        r"\s+(?:the\s+)?(?:developer|dan|god|admin|sudo)\s+mode\b[^.!?]{0,60}"
+        r"|\b(?:developer|dan|god|admin|sudo)\s+mode\b[^.!?]{0,60}?"
+        r"\b(?:no\s+(?:restrictions?|limits?|rules?|filters?|guidelines?|"
+        r"censorship)|without\s+(?:any\s+)?(?:restrictions?|limits?|rules?|"
+        r"filters?|guidelines?|censorship)|unrestricted|unfiltered|"
+        r"uncensored)\b[^.!?]{0,40}", re.I)),
     ("new_rules", re.compile(
         r"\b(?:new|real|actual|true)\s+(?:system\s+)?"
         r"(?:instructions?|rules?|prompt)\s*(?:are|:)\b[^.!?]{0,80}", re.I)),
@@ -152,23 +167,37 @@ _DELIMITER_RE = re.compile(
 )
 
 # ── V6: markdown / HTML directive spoofing ───────────────────────────────
+# Directive vocabulary for hidden markup. A bare "system"/"instructions"
+# is far too common in ordinary docs ("![System architecture]",
+# "<!-- system fonts -->", "## Instructions") to flag on its own.
+_DIRECTIVE_WORDS = (
+    r"(?:ignore|disregard|obey|system\s+prompt|"
+    r"(?:previous|prior|above|new|hidden|real)\s+instructions?|"
+    r"instructions?\s+(?:above|below))")
+
 _MARKUP_RES: Tuple[Tuple[str, re.Pattern], ...] = (
+    # Upper-case directive headers ("# SYSTEM", "### OVERRIDE") or any
+    # case followed by a colon ("## System: obey ..."). Title-case
+    # headings such as "## System requirements" / "## Instructions"
+    # are normal documentation.
     ("fake_header", re.compile(
-        r"^#{1,6}\s*(?:SYSTEM|INSTRUCTIONS?|OVERRIDE|ADMIN|DEVELOPER"
-        r"(?:\s+NOTES?)?)\b", re.I | re.M)),
+        r"^#{1,6}[ \t]*(?:(?:SYSTEM|INSTRUCTIONS?|OVERRIDE|ADMIN|DEVELOPER"
+        r"(?:[ \t]+NOTES?)?)\b(?![ \t]+(?:REQUIREMENTS?|DESIGN|ARCHITECTURE|"
+        r"OVERVIEW|SETUP|STATUS))"
+        r"|(?i:system(?:[ \t]+(?:prompt|message|override|notes?))?|"
+        r"instructions?|override|admin|developer(?:[ \t]+notes?)?)[ \t]*:)",
+        re.M)),
     ("html_comment_directive", re.compile(
-        r"<!--[^>]{0,200}?(?:ignore|instructions?|system|disregard|"
-        r"reveal)[^>]{0,200}-->", re.I)),
+        r"<!--[^>]{0,200}?" + _DIRECTIVE_WORDS + r"[^>]{0,200}-->", re.I)),
     ("bold_directive", re.compile(
-        r"\*\*\s*(?:SYSTEM|ADMIN|INSTRUCTION|OVERRIDE)\s*:\s*\*?\*?"
-        r"[^*\n]{0,120}", re.I)),
+        r"\*\*\s*(?:SYSTEM|ADMIN|INSTRUCTIONS?|OVERRIDE)\s*:\s*\*?\*?"
+        r"[^*\n]{0,120}")),
     ("link_title_directive", re.compile(
         r"\[[^\]]{0,80}\]\([^)]{0,200}\s+\"[^\"]{0,120}"
-        r"(?:ignore|instructions?|system|disregard)[^\"]{0,120}\"",
+        + _DIRECTIVE_WORDS + r"[^\"]{0,120}\"",
         re.I)),
     ("alt_text_directive", re.compile(
-        r"!\[[^\]]{0,120}(?:ignore|instructions?|system|disregard)"
-        r"[^\]]{0,120}\]", re.I)),
+        r"!\[[^\]]{0,120}" + _DIRECTIVE_WORDS + r"[^\]]{0,120}\]", re.I)),
     ("data_uri", re.compile(
         r"data:text/html[^)\s]{0,200}", re.I)),
     ("meta_refresh", re.compile(
@@ -202,10 +231,16 @@ _HOMOGLYPH_TRANS: Dict[int, str] = {
 
 _ASCII_WORD_RE = re.compile(r"[A-Za-z]{3,}")
 
-_MAX_TEXT = 200_000
+_MAX_TEXT = 200_000          # per-window scan size (chars)
+_SCAN_OVERLAP = 2_000        # window overlap so no match straddles a cut
+_MAX_SCAN = 8_000_000        # beyond this only head + tail are scanned
 _MAX_MATCHES = 64
 _MIN_B64_LEN = 40
 _EVIDENCE_CLIP = 120
+
+_JOINER_CODEPOINTS = frozenset((0x200C, 0x200D))   # ZWNJ, ZWJ
+_BLACK_FLAG = 0x1F3F4                               # emoji tag-flag base
+_TAG_CANCEL = 0xE007F
 
 
 def _clip(text: str, n: int = _EVIDENCE_CLIP) -> str:
@@ -264,19 +299,62 @@ class InjectionReport:
 
 # ── sanitize helpers ─────────────────────────────────────────────────────
 
-def _strip_invisible(text: str) -> str:
-    """Remove zero-width, bidi-override, soft-hyphen and tag chars."""
-    out: List[str] = []
-    for ch in text:
+def _benign_joiner(text: str, i: int) -> bool:
+    """ZWJ/ZWNJ between two non-ASCII characters is ordinary text: emoji
+    sequences (family / profession emoji) and Indic conjuncts use them.
+    Only joiners touching ASCII can split a Latin keyword."""
+    if i <= 0 or i + 1 >= len(text):
+        return False
+    prev, nxt = text[i - 1], text[i + 1]
+    return not prev.isascii() and not nxt.isascii()
+
+
+def _invisible_chars(text: str) -> List[Tuple[int, str]]:
+    """(index, kind) of every smuggling-capable invisible character.
+
+    kind is "zw", "bidi", "tag" or "cf". Legitimate uses are skipped:
+    joiners inside emoji / non-Latin script and emoji tag sequences
+    (subdivision flags such as England / Scotland / Wales are U+1F3F4
+    followed by tag characters and U+E007F).
+    """
+    out: List[Tuple[int, str]] = []
+    n = len(text)
+    i = 0
+    while i < n:
+        ch = text[i]
         cp = ord(ch)
-        if cp in _ZERO_WIDTH_CODEPOINTS or cp in _BIDI_CODEPOINTS:
+        if cp < 0x80:
+            i += 1
             continue
-        if _TAG_CODEPOINT_RANGE[0] <= cp <= _TAG_CODEPOINT_RANGE[1]:
+        if cp == _BLACK_FLAG:
+            j = i + 1
+            while j < n and 0xE0020 <= ord(text[j]) <= 0xE007E:
+                j += 1
+            if j > i + 1 and j < n and ord(text[j]) == _TAG_CANCEL:
+                i = j + 1
+                continue
+            i += 1
             continue
-        if unicodedata.category(ch) == "Cf":  # other format chars
-            continue
-        out.append(ch)
-    return "".join(out)
+        if cp in _ZERO_WIDTH_CODEPOINTS:
+            if not (cp in _JOINER_CODEPOINTS and _benign_joiner(text, i)):
+                out.append((i, "zw"))
+        elif cp in _BIDI_CODEPOINTS:
+            out.append((i, "bidi"))
+        elif _TAG_CODEPOINT_RANGE[0] <= cp <= _TAG_CODEPOINT_RANGE[1]:
+            out.append((i, "tag"))
+        elif unicodedata.category(ch) == "Cf":  # other format chars
+            out.append((i, "cf"))
+        i += 1
+    return out
+
+
+def _strip_invisible(text: str) -> str:
+    """Remove zero-width, bidi-override, soft-hyphen and tag chars
+    (keeping joiners inside emoji / non-Latin script and emoji flags)."""
+    drop = {i for i, _kind in _invisible_chars(text)}
+    if not drop:
+        return text
+    return "".join(ch for i, ch in enumerate(text) if i not in drop)
 
 
 def _decode_homoglyphs(text: str) -> str:
@@ -292,8 +370,32 @@ _HIDDEN_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
 _META_REFRESH_RE = re.compile(r"<\s*meta[^>]{0,200}>", re.I)
 
 
+def _strip_html_comments(text: str) -> str:
+    """Remove complete <!-- ... --> comments in linear time.
+
+    The regex form (<!--.*?--> with DOTALL) rescans to the end of the
+    text from every unterminated "<!--", which is quadratic on hostile
+    input; once no "-->" follows, no later comment can close either.
+    """
+    if "<!--" not in text:
+        return text
+    out: List[str] = []
+    pos = 0
+    while True:
+        start = text.find("<!--", pos)
+        if start < 0:
+            break
+        end = text.find("-->", start + 4)
+        if end < 0:
+            break
+        out.append(text[pos:start])
+        pos = end + 3
+    out.append(text[pos:])
+    return "".join(out)
+
+
 def _strip_hidden_markup(text: str) -> str:
-    text = _HIDDEN_COMMENT_RE.sub("", text)
+    text = _strip_html_comments(text)
     text = _META_REFRESH_RE.sub("", text)
     return text
 
@@ -308,8 +410,9 @@ def sanitize(text: Optional[str]) -> str:
     if not text or not isinstance(text, str):
         return text
     try:
-        out = text[:_MAX_TEXT]
-        out = _strip_invisible(out)
+        # The whole text is sanitized: truncating here silently dropped
+        # everything after _MAX_TEXT chars from the "sanitized" copy.
+        out = _strip_invisible(text)
         out = _decode_homoglyphs(out)
         out = _strip_fake_delimiters(out)
         out = _strip_hidden_markup(out)
@@ -365,11 +468,10 @@ def _rot13_blob_scores_hostile(text: str) -> Optional[_Match]:
 
 def _unicode_findings(text: str) -> Tuple[List[_Match], bool]:
     matches: List[_Match] = []
-    zw = sum(1 for c in text if ord(c) in _ZERO_WIDTH_CODEPOINTS)
-    bidi = sum(1 for c in text if ord(c) in _BIDI_CODEPOINTS)
-    tags = sum(1 for c in text
-               if _TAG_CODEPOINT_RANGE[0] <= ord(c)
-               <= _TAG_CODEPOINT_RANGE[1])
+    kinds = [k for _i, k in _invisible_chars(text)]
+    zw = kinds.count("zw")
+    bidi = kinds.count("bidi")
+    tags = kinds.count("tag")
     if zw >= 3:
         matches.append(_Match(
             VECTORS.UNICODE, f"zero-width characters ({zw})",
@@ -470,6 +572,30 @@ class InjectionScanner:
             out.append(m)
         return out
 
+    def _collect_all(self, text: str) -> List[_Match]:
+        """_collect over the whole text in overlapping windows.
+
+        The old analyze() only looked at the first _MAX_TEXT chars, so a
+        payload placed after 200k chars of padding was never scanned.
+        """
+        n = len(text)
+        if n <= _MAX_TEXT:
+            return self._collect(text)
+        starts: List[int] = []
+        step = _MAX_TEXT - _SCAN_OVERLAP
+        if n <= _MAX_SCAN:
+            starts = list(range(0, n - _SCAN_OVERLAP, step))
+        else:   # bounded work on absurd inputs: head and tail
+            half = _MAX_SCAN // 2
+            starts = list(range(0, half, step))
+            starts += list(range(n - half, n - _SCAN_OVERLAP, step))
+        found: List[_Match] = []
+        for start in starts:
+            for m in self._collect(text[start:start + _MAX_TEXT]):
+                m.span = (m.span[0] + start, m.span[1] + start)
+                found.append(m)
+        return self._dedup(found)
+
     def analyze(self, text: Optional[str]) -> InjectionReport:
         """Full analysis: detection + sanitization in one pass."""
         if text is None or not isinstance(text, str):
@@ -477,10 +603,34 @@ class InjectionScanner:
                 is_suspicious=False, score=0.0, vectors=[],
                 sanitized_text=text if isinstance(text, str) else "",
                 notes=["non-string input treated as empty"])
-        text = text[:_MAX_TEXT]
-        matches = self._collect(text)
         cap = max(1, int(self.config.max_matches or _MAX_MATCHES))
+        matches = self._collect_all(text)
+        sanitized = sanitize(text)
+        # Rescan normalized views: removing invisibles can reveal plain
+        # hostile keywords that were split before, and NFKC folds
+        # fullwidth / mathematical lookalikes ("ｉｇｎｏｒｅ") to ASCII.
+        views: List[str] = []
+        if sanitized != text:
+            views.append(sanitized)
+        try:
+            folded = _decode_homoglyphs(
+                unicodedata.normalize("NFKC", sanitized))
+        except Exception:
+            folded = sanitized
+        if folded != sanitized:
+            views.append(folded)
+        if views:
+            seen = {(m.vector, m.label, m.evidence) for m in matches}
+            for view in views:
+                for m in self._collect_all(view):
+                    key = (m.vector, m.label, m.evidence)
+                    if key not in seen:
+                        seen.add(key)
+                        matches.append(m)
         matches = matches[:cap]
+        # Score AFTER the rescans: previously a keyword revealed only by
+        # sanitization was listed in vectors but never raised the score,
+        # so is_suspicious stayed False for zero-width-split payloads.
         score = 0.0
         for vec in {m.vector for m in matches}:
             score += _VECTOR_WEIGHT.get(vec, 10.0)
@@ -489,13 +639,6 @@ class InjectionScanner:
         if delim_hits >= 3:
             score += 15.0
         score = min(100.0, score)
-        sanitized = sanitize(text)
-        if sanitized != text:
-            # rescan the sanitized text: removing invisibles can reveal
-            # plaintext hostile keywords that were split/hidden before.
-            extra = [m for m in self._collect(sanitized)]
-            merged = self._dedup(list(matches) + extra)
-            matches = merged[:cap]
         notes: List[str] = []
         if sanitized != text:
             notes.append("text was sanitized (hostile constructs removed)")

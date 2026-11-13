@@ -1280,12 +1280,25 @@ def _fold_apply(st: State, ev: Event) -> None:
         if d.get("status") == "error":
             st.tool_errors += 1
     elif t == "cost.incurred":
-        try:
-            st.cost_usd += float(d.get("usd", 0.0) or 0.0)
-            st.tokens_in += int(d.get("tokens_in", 0) or 0)
-            st.tokens_out += int(d.get("tokens_out", 0) or 0)
-        except (TypeError, ValueError):
-            pass  # corrupt numeric field — skip, never brick the fold
+        # corrupt numeric fields are skipped, never brick the fold: inf
+        # used to raise OverflowError in int() (not caught) and a NaN usd
+        # poisoned cost_usd for the rest of the session.
+        def _num(v):
+            try:
+                f = float(v or 0)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return f if f == f and f not in (float("inf"),
+                                             float("-inf")) else None
+        usd = _num(d.get("usd", 0.0))
+        tin = _num(d.get("tokens_in", 0))
+        tout = _num(d.get("tokens_out", 0))
+        if usd is not None:
+            st.cost_usd += usd
+        if tin is not None:
+            st.tokens_in += int(tin)
+        if tout is not None:
+            st.tokens_out += int(tout)
     elif t == "memory.episode":
         st.episodes.append(d)
     elif t == "deadend.recorded":

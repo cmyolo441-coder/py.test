@@ -248,9 +248,18 @@ class ApexEngine:
             rep = wire_attest(self.sealed, wire_system_content)
             result = {"ok": rep.ok, "detail": rep.summary()}
             if not rep.ok and self.chain is not None:
-                self.chain.append("wire", wire_system_content or "",
-                                  {"verdict": "broken",
-                                   "detail": rep.detail})
+                # one chain record per DISTINCT broken wire: the same broken
+                # prompt is re-checked every model call, and appending the
+                # whole system prompt each time grew the chain without bound
+                import hashlib
+                sig = hashlib.sha256(
+                    (wire_system_content or "").encode("utf-8",
+                                                      "replace")).hexdigest()
+                if sig != getattr(self, "_last_broken_wire", None):
+                    self._last_broken_wire = sig
+                    self.chain.append("wire", wire_system_content or "",
+                                      {"verdict": "broken",
+                                       "detail": rep.detail})
             return result
         except Exception as exc:
             base["detail"] = f"wire-check degraded: {type(exc).__name__}"

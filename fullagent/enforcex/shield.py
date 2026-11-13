@@ -420,14 +420,19 @@ class Shield:
             sha256=str(d.get("sha256", "") or ""),
             text=str(d.get("text", "") or ""),
             examples=tuple(FewShotExample.from_dict(x)
-                           for x in (d.get("examples") or ())
+                           for x in _as_seq(d.get("examples"))
                            if isinstance(x, dict)),
             covered_rules=tuple(str(x) for x in
-                                (d.get("covered_rules") or ())),
+                                _as_seq(d.get("covered_rules"))),
             config=ShieldConfig.from_dict(d.get("config")),
             created_at=_shield_float(d.get("created_at", 0.0)),
             meta=dict(meta) if isinstance(meta, dict) else {},
         )
+
+
+def _as_seq(v: Any) -> Tuple[Any, ...]:
+    """List-ish config value -> tuple; scalars/None/str -> ()."""
+    return tuple(v) if isinstance(v, (list, tuple)) else ()
 
 
 @dataclass

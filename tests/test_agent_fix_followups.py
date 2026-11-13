@@ -74,3 +74,34 @@ def test_run_turn_resets_retryhint_streaks(monkeypatch, tmp_path):
                                   "ERROR: old_string not found") is None
     ag.reset()
     assert ag._error_counts == {}
+
+
+def test_fold_skips_inf_and_nan_costs(tmp_path):
+    from fullagent.kernel import EventLog, fold
+    log = EventLog(tmp_path / "ev.jsonl")
+    log.append("cost.incurred", {"usd": 0.5, "tokens_in": 10,
+                                 "tokens_out": 2}, actor="t")
+    log.append("cost.incurred", {"usd": float("nan"),
+                                 "tokens_in": float("inf"),
+                                 "tokens_out": "x"}, actor="t")
+    st = fold(log)
+    assert st.cost_usd == 0.5 and st.tokens_in == 10 and st.tokens_out == 2
+
+
+def test_apex_wire_check_records_each_broken_wire_once():
+    from fullagent import apex
+
+    class Chain:
+        def __init__(self):
+            self.n = 0
+
+        def append(self, *a, **k):
+            self.n += 1
+
+    eng = apex.ApexEngine.__new__(apex.ApexEngine)
+    eng.sealed = "SEALED PROMPT " * 20
+    eng.chain = Chain()
+    for _ in range(50):
+        eng.wire_check("tampered wire")
+    eng.wire_check("another tampered wire")
+    assert eng.chain.n == 2
