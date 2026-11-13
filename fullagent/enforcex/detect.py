@@ -472,7 +472,8 @@ def _detect_leak_tags(text: str) -> List[Detection]:
     return out
 
 
-def _detect_forbidden(text: str, rules: Any) -> List[Detection]:
+def _detect_forbidden(text: str, rules: Any,
+                      secrets: bool = True) -> List[Detection]:
     """Rule-driven forbidden content + hardcoded secret patterns."""
     out: List[Detection] = []
     # rule-driven: a rule's own patterns hitting the response means the
@@ -502,7 +503,7 @@ def _detect_forbidden(text: str, rules: Any) -> List[Detection]:
                 ))
                 break  # one hit per pattern per rule is enough
     # hardcoded secrets — always forbidden, rule or no rule
-    for name, pat in _SECRET_RES:
+    for name, pat in (_SECRET_RES if secrets else ()):
         m = pat.search(text)
         if m:
             out.append(Detection(
@@ -577,8 +578,8 @@ def _detect_sensitive(text: str, rules: Any) -> List[Detection]:
         cat = _rule_field(rule, "category")
         rtext = _rule_field(rule, "text").lower()
         if cat == "content_policy" or re.search(
-                r"\b(never mention|do not discuss|avoid topic|politic|"
-                r"religio|profanity|confidential)\b", rtext):
+                r"\b(never mention|do not discuss|avoid topic|politic\w*|"
+                r"religio\w*|profanity|confidential)\b", rtext):
             has_policy = True
             break
     base_conf = _CONF_SENSITIVE if has_policy else _CONF_SENSITIVE * 0.5
@@ -769,7 +770,8 @@ class DetectEngine:
         if KINDS.LEAK_TAG in layers:
             steps.append(lambda: _detect_leak_tags(text))
         if KINDS.FORBIDDEN_CONTENT in layers:
-            steps.append(lambda: _detect_forbidden(text, rules))
+            steps.append(lambda: _detect_forbidden(
+                text, rules, bool(self.config.check_secrets)))
         if KINDS.REFUSAL in layers:
             steps.append(lambda: _detect_refusal(text))
         if KINDS.CONTRADICTION in layers:
@@ -803,7 +805,7 @@ class DetectEngine:
             if _SEV_ORDER.get(d.severity, 0) > _SEV_ORDER.get(worst, 0):
                 worst = d.severity
         return {
-            "total": len(list(detections or ())),
+            "total": sum(by_kind.values()),
             "by_kind": by_kind,
             "by_severity": by_sev,
             "worst_severity": worst if by_sev else "",
