@@ -870,13 +870,16 @@ def _ensure_window_fit(model: Model, messages: list[dict],
     APIError only when even the irreducible core cannot fit — the message
     carries "context window" so is_context_overflow routes it through the
     existing shrink-and-retry path instead of a doomed send.
+
+    The fit test is on INPUT size only: input + margin + a fixed minimum
+    completion. The requested max_tokens is NOT reserved here — it is
+    clamped to the remaining headroom afterwards (_window_max_tokens +
+    _clamp_max_tokens). Reserving it made every request fail whenever
+    max_tokens >= window (200k MAX_TOKENS vs a 128k window refused a
+    5k-token "hello").
     """
     window = effective_window(model)
-    requested = effort.max_tokens or 0
-    # When max_tokens is unset the backend chooses the completion length;
-    # still reserve room for a minimal completion so a huge input alone
-    # can never go out unflagged.
-    completion = requested if requested else _MIN_COMPLETION_TOKENS
+    completion = _MIN_COMPLETION_TOKENS
 
     def _fits(n: int) -> bool:
         margin = _context_margin(window) + n // 32
@@ -887,8 +890,8 @@ def _ensure_window_fit(model: Model, messages: list[dict],
         return n
     before_msgs, before_n = len(messages), n
     _log.warning(
-        "token pre-check: ~%d input tokens + %d max_tokens would exceed "
-        "the %s context window (%d) — pruning history first",
+        "token pre-check: ~%d input tokens (+ %d min completion) would "
+        "exceed the %s context window (%d) — pruning history first",
         n, completion, model.label, window)
     # Progressively tighter sliding windows (reuses agent.prune_messages:
     # keeps the system prompt + first user message + the tail).
