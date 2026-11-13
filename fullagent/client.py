@@ -504,11 +504,10 @@ def assistant_message(content: str | None, tool_calls: list[dict],
                 _rs = str(_rs)
         else:
             _rs = _typeguards.ensure_str(_rs)
-    # Only ONE reasoning key goes on the wire. Gateways that deserialize
-    # with serde treat "reasoning" as an alias of "reasoning_content", so
-    # sending both failed every follow-up turn with
-    # 'duplicate field `reasoning_content`' (Mistral Large 4 via Kios).
     if _rs:
+        # ONE key only: Rust/serde gateways (kios) alias "reasoning" to
+        # "reasoning_content", so a message carrying both is rejected
+        # with "duplicate field `reasoning_content`".
         msg["reasoning_content"] = _rs
     elif calls:
         msg["reasoning_content"] = ""
@@ -810,37 +809,71 @@ def _sanitize_messages(messages: list[dict]) -> bool:
         if message.get("reasoning_content") is None and message.get("reasoning") is None:
             message["reasoning_content"] = ""
             fixed = True
-    if _dedupe_reasoning_keys(messages):
+    # Never send both spellings of the thinking field (see
+    # assistant_message): keep reasoning_content, drop the alias.
+    if dedupe_reasoning_fields(messages):
         fixed = True
     return fixed
 
 
-def _dedupe_reasoning_keys(messages: list[dict]) -> bool:
-    """Keep a single reasoning field per message.
+def dedupe_reasoning_fields(messages: Any) -> bool:
+    """Collapse messages that carry both ``reasoning`` and
+    ``reasoning_content`` into ``reasoning_content`` alone, in place.
 
-    Older sessions (and older assistant_message() builds) stored the same
-    text under both ``reasoning_content`` and ``reasoning``. Serde-based
-    gateways alias the two and reject the body with
-    'duplicate field `reasoning_content`'. ``reasoning_content`` wins;
-    a lone ``reasoning`` is renamed so history keeps its thinking."""
-    fixed = False
-    for message in messages:
-        if not isinstance(message, dict) or "reasoning" not in message:
+    Rust/serde gateways (kios) treat ``reasoning`` as an alias of
+    ``reasoning_content`` and reject a message with both as "duplicate
+    field `reasoning_content`". History written by older versions (live or
+    in saved session files) has both. Returns True if anything changed."""
+    changed = False
+    for message in messages if isinstance(messages, list) else []:
+        if isinstance(message, dict) and "reasoning" in message:
+            # both keys, or a lone legacy "reasoning": keep one canonical key
+            if not message.get("reasoning_content") and message.get("reasoning"):
+                message["reasoning_content"] = message["reasoning"]
+            message.pop("reasoning", None)
+            changed = True
+    return changed
+
+
+def _is_duplicate_field_error(err: Exception) -> bool:
+    """A gateway refused the request JSON because a message carried a
+    field twice (serde: ``duplicate field `reasoning_content```)."""
+    return "duplicate field" in str(err).lower()
+
+
+def _duplicate_field_failure(err: APIError) -> APIError:
+    """The error for a duplicate-field rejection that survived the one
+    heal-and-retry: keeps the provider's text and status, says what was
+    already tried and what the user can do."""
+    return APIError(
+        f"{err} — already retried once without echoed thinking and the "
+        f"provider still refuses this conversation. Start a new session "
+        f"(/new) or pick another model (Ctrl+T).",
+        status=getattr(err, "status", None))
+
+
+def _strip_reasoning(messages: list[dict]) -> bool:
+    """Remove every echoed thinking field from the history; True if any.
+    Last-resort heal for a gateway that rejects them outright."""
+    changed = False
+    for message in messages if isinstance(messages, list) else []:
+        if not isinstance(message, dict):
             continue
-        legacy = message.pop("reasoning")
-        if message.get("reasoning_content") is None:
-            message["reasoning_content"] = legacy if isinstance(legacy, str) \
-                else _coerce_text(legacy)
-        fixed = True
-    return fixed
+        for key in ("reasoning", "reasoning_details"):
+            if key in message:
+                message.pop(key, None)
+                changed = True
+        if message.get("reasoning_content"):
+            message["reasoning_content"] = ""
+            changed = True
+    return changed
 
 
 def _is_reasoning_content_error(err: Exception) -> bool:
     """True if an APIError is the reasoning_content validation."""
     msg = str(err).lower()
-    if "duplicate field" in msg and "reasoning" in msg:
-        return True
-    return "reasoning_content" in msg and "required" in msg
+    return "reasoning_content" in msg and ("required" in msg
+                                           or "duplicate field" in msg)
 
 
 # -- token-limit pre-check (worker 17/20) -------------------------------------
@@ -2135,6 +2168,7 @@ def chat_stream(provider: Provider, model: Model, effort: Effort,
     headers = _base_headers(provider, stream=True)
     current_effort = effort
     shrinks_used = 0
+    healed_dup = False
     # invalid_request_error auto-recovery (worker 18/20): exactly one
     # prune-and-retry per call, enforced by maybe_recover_invalid_request.
     invalid_retried = False
@@ -2198,6 +2232,15 @@ def chat_stream(provider: Provider, model: Model, effort: Effort,
         except APIError as e:
             # reasoning_content validation — heal history and retry once,
             # but NEVER after output already streamed (see `streamed`)
+            if _is_duplicate_field_error(e) and not streamed["out"]:
+                if healed_dup:
+                    raise _duplicate_field_failure(e) from e
+                healed_dup = True
+                _log.warning("provider rejected a duplicated field (%s); "
+                             "retrying once without echoed thinking", e)
+                _sanitize_messages(messages)
+                _strip_reasoning(messages)
+                continue
             if _is_reasoning_content_error(e):
                 if streamed["out"]:
                     raise
@@ -2410,6 +2453,22 @@ def _sse_error_status(err: Any) -> int | None:
     return None
 
 
+def _body_is_empty(resp: Any) -> bool:
+    """True when a (non-SSE) HTTP 200 response has an empty or blank
+    body. Reads and caches the body, so a following resp.json() parses
+    the same bytes. Response stand-ins without a .content attribute are
+    treated as non-empty (their .json() decides)."""
+    try:
+        raw = resp.content
+    except AttributeError:
+        return False
+    if raw is None:
+        return True
+    if isinstance(raw, (bytes, bytearray, str)):
+        return not raw.strip()
+    return False
+
+
 def _chat_stream_once(url: str, headers: dict, payload: dict,
                       on_token: Callable[[str], None] | None,
                       on_reasoning: Callable[[str], None] | None,
@@ -2467,6 +2526,13 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
             # CANCEL: .json() reads the whole body — a stalled server
             # could hold this until the (long) read timeout; guard it.
             try:
+                if run_cancellable(lambda: _body_is_empty(resp),
+                                   should_cancel, name="model response"):
+                    # HTTP 200 with an empty body: the provider answered
+                    # with nothing. That is an EMPTY reply (the agent
+                    # retries once and then says so), not a JSON error.
+                    _clean_exit = True
+                    return StreamResult()
                 data = run_cancellable(resp.json, should_cancel,
                                        name="model response")
             except ValueError as e:
@@ -2953,6 +3019,11 @@ def _post_blocking(url: str, headers: dict, payload: dict,
                                status=resp.status_code,
                                retry_after=retry_after)
             try:
+                if run_cancellable(lambda: _body_is_empty(resp),
+                                   should_cancel, name="model response"):
+                    # HTTP 200, empty body: an empty reply (no choices),
+                    # not a JSON error — the agent retries it once.
+                    return {}
                 data = run_cancellable(resp.json, should_cancel,
                                        name="model response")
             except TurnCancelled:
@@ -3006,6 +3077,7 @@ def chat_blocking(provider: Provider, model: Model, effort: Effort,
     headers = _base_headers(provider, stream=False)
     current_effort = effort
     shrinks_used = 0
+    healed_dup = False
 
     for overflow_attempt in range(OVERFLOW_RETRIES + OVERFLOW_SHRINKS + 1):
         try:
@@ -3026,6 +3098,15 @@ def chat_blocking(provider: Provider, model: Model, effort: Effort,
                                   should_cancel=should_cancel,
                                   on_status=on_status)
         except APIError as err:
+            if _is_duplicate_field_error(err):
+                if healed_dup:
+                    raise _duplicate_field_failure(err) from err
+                healed_dup = True
+                _log.warning("provider rejected a duplicated field (%s); "
+                             "retrying once without echoed thinking", err)
+                _sanitize_messages(messages)
+                _strip_reasoning(messages)
+                continue
             if _is_reasoning_content_error(err):
                 if _sanitize_messages(messages):
                     continue

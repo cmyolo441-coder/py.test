@@ -244,6 +244,30 @@ class Turn:
         default_factory=lambda: datetime.now().strftime("%H:%M:%S"))
 
 
+def _is_empty_reply(result) -> bool:
+    """True when a model call produced nothing the user can see and
+    nothing to act on: no tool calls and no non-blank text. A reply that
+    carries only reasoning is empty too — the reasoning is shown as a
+    Thinking block at most, never as an answer."""
+    calls = getattr(result, "tool_calls", None)
+    if calls:
+        return False
+    content = getattr(result, "content", "")
+    if not isinstance(content, str):
+        content = "" if content is None else str(content)
+    return not content.strip()
+
+
+def _empty_reply_error(model_label: str, finish_reason: str | None) -> str:
+    """The message a turn ends with when the model answered with nothing
+    twice in a row — names the model and, when known, why it stopped."""
+    why = (f" (finish reason: {finish_reason})" if finish_reason
+           else "")
+    return (f"{model_label} returned an empty reply twice{why} — nothing "
+            f"was produced. Send it again or pick another model with "
+            f"Ctrl+T.")
+
+
 def _signature(name: str, args: dict) -> str:
     """Canonical approach signature — the dead-end ledger key."""
     payload = json.dumps({"name": name, "args": args},
@@ -1157,7 +1181,6 @@ class Agent:
             pass
         _exit_tracker = _EarlyExitTracker()  # earlyexit: per-turn novelty
         self._turn_status = on_status
-        empty_retries = 0
         try:
             while iterations < config.MAX_TOOL_ITERATIONS:
                 iterations += 1
@@ -1226,6 +1249,48 @@ class Agent:
                 # record usage for each call so the budget governor and the
                 # ledger see the real spend, not just the final reply
                 self._emit_cost(result.usage)
+
+                # EMPTY-REPLY GUARD: a model call that produced no visible
+                # text and no tool calls (reasoning alone counts as empty —
+                # the user saw nothing) must never end the turn as a silent
+                # "done". Ask the SAME model once more with the SAME
+                # messages; if it is empty again, end the turn with an
+                # error that says so. The empty reply is never appended to
+                # history, so the transcript and tool pairing stay valid.
+                if _is_empty_reply(result):
+                    self.log.append(
+                        "model.empty_reply",
+                        {"model": getattr(self.model, "id", ""),
+                         "finish_reason": result.finish_reason,
+                         "attempt": 1},
+                        actor="system", provenance="model",
+                        causation_id=user_ev.id)
+                    if should_cancel is not None and should_cancel():
+                        raise TurnCancelled()
+                    on_status("empty reply — asking again")
+                    result = self._complete(on_token, on_reasoning,
+                                            on_status, should_cancel,
+                                            on_tool_args=on_tool_args)
+                    if result.reasoning:
+                        if turn.reasoning and not turn.reasoning.endswith(
+                                "\n"):
+                            turn.reasoning += "\n"
+                        turn.reasoning += result.reasoning
+                    self._emit_cost(result.usage)
+                    if _is_empty_reply(result):
+                        turn.usage = result.usage
+                        turn.error = _empty_reply_error(
+                            getattr(self.model, "label", "")
+                            or getattr(self.model, "id", "the model"),
+                            result.finish_reason)
+                        self.log.append(
+                            "turn.error",
+                            {"error": turn.error, "kind": "empty_reply",
+                             "model": getattr(self.model, "id", ""),
+                             "finish_reason": result.finish_reason},
+                            actor="system", provenance="model",
+                            causation_id=user_ev.id)
+                        break
 
                 if result.tool_calls:
                     self.messages.append(assistant_message(
@@ -1485,28 +1550,6 @@ class Agent:
                             "automatically.")
                         break
                     continue
-
-                # EMPTY REPLY: no text and no tool calls. The turn used to
-                # end silently with "✦ done" and nothing on screen (seen
-                # with Gemini 4 Argon / Gwarden), and an empty assistant
-                # message went into history. Retry once, then report it.
-                # (After tool work an empty closing message is normal.)
-                if not (result.content or "").strip() and not turn.tools \
-                        and not turn.assistant_text.strip():
-                    if empty_retries < 1:
-                        empty_retries += 1
-                        on_status("empty reply from the model — retrying")
-                        continue
-                    turn.usage = result.usage
-                    turn.error = (
-                        f"{self.model.label} returned an empty reply "
-                        f"(no text, no tool call) twice. Send the message "
-                        f"again, or pick another model with Ctrl+T.")
-                    if self.messages and \
-                            self.messages[-1].get("role") == "user":
-                        self.messages.pop()
-                    self.log.append("turn.error", {"error": turn.error})
-                    break
 
                 # plain assistant reply — done
                 turn.assistant_text += result.content

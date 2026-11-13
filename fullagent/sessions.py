@@ -188,6 +188,14 @@ def resume_into(agent: Any, data: dict[str, Any]) -> str:
     present). Returns a one-line human-readable summary.
     """
     messages = list(data.get("messages") or [])
+    # Session files saved by older versions carry both "reasoning" and
+    # "reasoning_content" on assistant turns; kios rejects that with
+    # "duplicate field `reasoning_content`". Clean them on the way in.
+    try:
+        from .client import dedupe_reasoning_fields
+        dedupe_reasoning_fields(messages)
+    except Exception:  # noqa: BLE001 — resume must never fail on cleanup
+        pass
     sid = str(data.get("session_id") or getattr(agent, "session_id", ""))
     agent.messages = messages
     if sid:
