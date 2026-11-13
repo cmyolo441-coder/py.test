@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -139,13 +140,14 @@ class Clause:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Clause":
         try:
+            prio = float(d.get("priority", 0.25))
             return cls(
                 clause_id=str(d.get("clause_id", "")),
                 rule_id=str(d.get("rule_id", "")),
                 text=str(d.get("text", "")),
                 category=str(d.get("category", "other")),
                 severity=str(d.get("severity", "low")),
-                priority=float(d.get("priority", 0.25)),
+                priority=prio if math.isfinite(prio) else 0.25,
                 immutable=bool(d.get("immutable", False)),
                 source_line=int(d.get("source_line", 0)),
             )
@@ -241,7 +243,9 @@ def _seal(canon_id_seed: str, version: int, clauses: Sequence[Clause],
         },
         sort_keys=True, separators=(",", ":"), ensure_ascii=False,
     )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    # surrogatepass: lone surrogates (e.g. text decoded with
+    # errors="surrogateescape") made build() raise UnicodeEncodeError
+    return hashlib.sha256(payload.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def _canon_id_for(seal: str) -> str:
@@ -261,6 +265,10 @@ def _coerce_clauses(rules: Any) -> List[Clause]:
     if rules is None:
         return out
     items: List[Any] = []
+    if isinstance(rules, (str, bytes)):
+        # a bare string is not a rule list: list("abc") made one clause
+        # per character; the builder falls back to the prompt text
+        return out
     try:
         if hasattr(rules, "rules") and not isinstance(rules, (str, bytes)):
             items = list(getattr(rules, "rules", ()))
@@ -319,6 +327,10 @@ def _coerce_clauses(rules: Any) -> List[Clause]:
         text = _norm_text(text)[:_MAX_CLAUSE_CHARS]
         if not text:
             continue
+        if not math.isfinite(prio):
+            # NaN sorted inconsistently and serialized as non-standard
+            # JSON "NaN" into the sealed payload
+            prio = 0.25
         out.append(Clause(
             clause_id="", rule_id=rid, text=text, category=cat or "other",
             severity=sev or "low", priority=prio, immutable=immut,
@@ -601,7 +613,14 @@ def verify_seal(contract: Contract) -> bool:
         expected = _seal(contract.canon_id, contract.version,
                          contract.clauses, contract.preamble,
                          contract.source_sha256)
-        return bool(contract.sha256) and expected == contract.sha256
+        if not contract.sha256 or expected != contract.sha256:
+            return False
+        # canon_id is derived from the seal; a contract whose id was
+        # swapped (to impersonate another contract) used to verify.
+        # (version is intentionally not part of the content seal.)
+        if contract.canon_id != _canon_id_for(contract.sha256):
+            return False
+        return isinstance(contract.version, int) and contract.version >= 1
     except Exception:
         return False
 

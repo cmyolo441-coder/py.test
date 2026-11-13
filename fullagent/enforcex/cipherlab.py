@@ -115,8 +115,17 @@ HOMOGLYPH_MAP: Dict[str, str] = {
     "\u03b1": "a", "\u03b2": "b", "\u03b5": "e", "\u03bf": "o",
     "\u03c1": "p", "\u03c4": "t", "\u03c5": "y", "\u03ba": "k",
     "\u03b9": "i", "\u03bd": "n", "\u03c7": "x", "\u03b3": "y",
-    # fullwidth latin
+    # cyrillic / greek capitals ("ІGNОRE" with cyrillic І and О)
+    "\u0410": "a", "\u0412": "b", "\u0415": "e", "\u041a": "k",
+    "\u041c": "m", "\u041d": "h", "\u041e": "o", "\u0420": "p",
+    "\u0421": "c", "\u0422": "t", "\u0425": "x", "\u0406": "i",
+    "\u0408": "j", "\u0391": "a", "\u0392": "b", "\u0395": "e",
+    "\u0397": "h", "\u0399": "i", "\u039a": "k", "\u039c": "m",
+    "\u039d": "n", "\u039f": "o", "\u03a1": "p", "\u03a4": "t",
+    "\u03a5": "y", "\u03a7": "x", "\u0396": "z",
+    # fullwidth latin (both cases) and digits
     **{chr(0xFF41 + i): chr(ord("a") + i) for i in range(26)},
+    **{chr(0xFF21 + i): chr(ord("a") + i) for i in range(26)},
     **{chr(0xFF10 + i): str(i) for i in range(10)},
 }
 
@@ -199,36 +208,106 @@ class DecodeReport:
 
 # ── character-level normalizations ───────────────────────────────────────
 
+_ZW_SET = frozenset(ZERO_WIDTH_CHARS)
+_JOINERS = frozenset(("\u200c", "\u200d"))   # ZWNJ, ZWJ
+
+
+def _invisible_index(s: str) -> List[int]:
+    """Indices of invisible characters to strip.
+
+    Covers ZERO_WIDTH_CHARS plus every other format character
+    (category Cf: bidi isolates U+2066..U+2069, tag characters, ...),
+    which previously survived and split keywords ("ig\u2066nore").
+    Legitimate uses are kept: ZWJ/ZWNJ between two non-ASCII characters
+    (emoji sequences, Indic conjuncts) and emoji tag-flag sequences
+    (U+1F3F4 + tag chars + U+E007F) — flagging those made every family
+    emoji or Hindi reply look "obfuscated".
+    """
+    out: List[int] = []
+    n = len(s)
+    i = 0
+    while i < n:
+        ch = s[i]
+        if ch.isascii():
+            i += 1
+            continue
+        if ch == "\U0001F3F4":
+            j = i + 1
+            while j < n and 0xE0020 <= ord(s[j]) <= 0xE007E:
+                j += 1
+            if j > i + 1 and j < n and s[j] == "\U000E007F":
+                i = j + 1
+                continue
+        elif ch in _JOINERS and 0 < i < n - 1 \
+                and not s[i - 1].isascii() and not s[i + 1].isascii():
+            pass
+        elif ch in _ZW_SET or unicodedata.category(ch) == "Cf":
+            out.append(i)
+        i += 1
+    return out
+
+
 def strip_zero_width(text: Any) -> Tuple[str, int]:
     """Remove invisible characters.  Returns (clean, removed_count)."""
     s = _as_text(text)
     if not s:
         return "", 0
-    removed = 0
-    out_chars = []
-    for ch in s:
-        if ch in ZERO_WIDTH_CHARS:
-            removed += 1
-        else:
-            out_chars.append(ch)
-    return "".join(out_chars), removed
+    drop = _invisible_index(s)
+    if not drop:
+        return s, 0
+    dset = set(drop)
+    return "".join(ch for i, ch in enumerate(s) if i not in dset), len(drop)
+
+
+def _lookalike(ch: str) -> Optional[str]:
+    """Latin replacement for a lookalike char, or None."""
+    repl = HOMOGLYPH_MAP.get(ch)
+    if repl is not None:
+        return repl
+    if ch.isascii():
+        return None
+    # mathematical alphanumerics / other compatibility forms (𝐢𝐠𝐧𝐨𝐫𝐞)
+    folded = unicodedata.normalize("NFKC", ch)
+    if len(folded) == 1 and folded.isascii() and folded.isalnum():
+        return folded.lower()
+    return None
 
 
 def normalize_homoglyphs(text: Any) -> Tuple[str, int]:
-    """Map lookalike characters to latin.  Returns (clean, mapped_count)."""
+    """Map lookalike characters to latin.  Returns (clean, mapped_count).
+
+    Mapping is word-scoped: a word is rewritten only when it mixes
+    lookalikes with ASCII letters ("іgnоre") or consists entirely of
+    lookalikes (3+ chars, e.g. fullwidth "ｉｇｎｏｒｅ"). Genuine Greek or
+    Cyrillic words ("привет", "σου") are left alone, so ordinary
+    non-Latin text is not reported as obfuscated.
+    """
     s = _as_text(text)
     if not s:
         return "", 0
+    if s.isascii():
+        return s, 0
     mapped = 0
-    out_chars = []
-    for ch in s:
-        repl = HOMOGLYPH_MAP.get(ch)
-        if repl is not None:
-            out_chars.append(repl)
-            mapped += 1
+    out: List[str] = []
+    for word in re.split(r"(\w+)", s, flags=re.UNICODE):
+        if not word or word.isascii():
+            out.append(word)
+            continue
+        repls = [_lookalike(ch) for ch in word]
+        n_look = sum(1 for r in repls if r is not None)
+        if not n_look:
+            out.append(word)
+            continue
+        has_ascii_letter = any(ch.isascii() and ch.isalpha() for ch in word)
+        all_look = all(r is not None or (ch.isascii() and not ch.isalpha())
+                       for ch, r in zip(word, repls))
+        if has_ascii_letter or (all_look and n_look >= 3):
+            out.append("".join(r if r is not None else ch
+                               for ch, r in zip(word, repls)))
+            mapped += n_look
         else:
-            out_chars.append(ch)
-    return "".join(out_chars), mapped
+            out.append(word)
+    return "".join(out), mapped
 
 
 def normalize_leetspeak(text: Any) -> Tuple[str, int]:
@@ -239,11 +318,15 @@ def normalize_leetspeak(text: Any) -> Tuple[str, int]:
     substituted = 0
     out = []
     for word in re.split(r"(\w+)", s, flags=re.UNICODE):
-        if word and (word[0].isalpha() or word[0].isdigit()):
+        # only words that mix letters and leet digits: pure numbers
+        # ("2024", "8080") are data, not leetspeak
+        if word and any(c.isalpha() for c in word) \
+                and any(c.isdigit() for c in word):
             chars = []
             for ch in word:
                 low = ch.lower()
-                if low in LEET_MAP and low.isdigit() or low in ("@", "$", "!"):
+                if low in LEET_MAP and (low.isdigit()
+                                        or low in ("@", "$", "!")):
                     chars.append(LEET_MAP.get(low, ch))
                     substituted += 1
                 else:

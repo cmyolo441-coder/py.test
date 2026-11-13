@@ -61,6 +61,8 @@ EXIT_PASS = 0
 EXIT_FAIL = 1
 EXIT_USAGE = 2
 
+_MAX_REQUEST_BYTES = 8 * 1024 * 1024   # serve: max POST /check body
+
 
 # ── small helpers ────────────────────────────────────────────────────────
 
@@ -227,7 +229,7 @@ def cmd_check(args: argparse.Namespace) -> int:
             try:
                 _report.write_report(decision, args.html, fmt="html")
                 print(f"html report written: {args.html}")
-            except OSError as exc:
+            except (OSError, ValueError) as exc:
                 _eprint(f"warning: could not write html report: {exc}")
 
     if args.json:
@@ -295,8 +297,13 @@ def cmd_scan(args: argparse.Namespace) -> int:
     print(f"scan: {len(findings)} finding(s)")
     for i, f in enumerate(findings, 1):
         if isinstance(f, dict):
-            print(f"  {i}. [{f.get('severity', '?'):>8}] "
-                  f"[{f.get('category', '?')}] {f.get('evidence', '')[:80]}")
+            # str() every field: a None severity/evidence (or a non-str
+            # one) crashed the format spec / slice with TypeError.
+            sev = str(f.get('severity') or '?')
+            cat = str(f.get('category') or '?')
+            ev = str(f.get('evidence') or '').replace("\r", " ") \
+                .replace("\n", " ")
+            print(f"  {i}. [{sev:>8}] [{cat}] {ev[:80]}")
         else:
             print(f"  {i}. {str(f)[:100]}")
     return EXIT_FAIL
@@ -318,6 +325,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
         return _die("report module unavailable; cannot serve", EXIT_FAIL)
 
     class Handler(BaseHTTPRequestHandler):
+        # socket timeout: a client that never sends its body cannot
+        # wedge the single-threaded server forever
+        timeout = 30
+
         def _send(self, code: int, payload: str, ctype: str) -> None:
             body = payload.encode("utf-8")
             self.send_response(code)
@@ -337,9 +348,25 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 self._send(404, '{"error": "not found"}', "application/json")
                 return
             try:
-                length = int(self.headers.get("Content-Length", 0) or 0)
+                try:
+                    length = int(self.headers.get("Content-Length", 0) or 0)
+                except (TypeError, ValueError):
+                    self._send(400, '{"error": "bad Content-Length"}',
+                               "application/json")
+                    return
+                # A negative length made rfile.read(-1) block until the
+                # client closed the socket (hanging the single-threaded
+                # server); a huge one buffered it all in memory.
+                if length < 0 or length > _MAX_REQUEST_BYTES:
+                    self._send(413, '{"error": "request body too large"}',
+                               "application/json")
+                    return
                 raw = self.rfile.read(length) if length else b"{}"
                 req = json.loads(raw.decode("utf-8") or "{}")
+                if not isinstance(req, dict):
+                    self._send(400, '{"error": "JSON object expected"}',
+                               "application/json")
+                    return
                 response_text = str(req.get("response", ""))
                 session_id = str(req.get("session_id", "default"))
                 decision = gate_obj.evaluate(
@@ -355,7 +382,10 @@ def cmd_serve(args: argparse.Namespace) -> int:
         def log_message(self, fmt: str, *log_args: Any) -> None:
             pass  # keep stdout clean
 
-    server = HTTPServer((args.bind, args.port), Handler)
+    try:
+        server = HTTPServer((args.bind, args.port), Handler)
+    except OSError as exc:
+        return _die(f"cannot bind {args.bind}:{args.port}: {exc}", EXIT_FAIL)
     print(f"enforcex serving on http://{args.bind}:{args.port} "
           f"(POST /check, GET /health) — Ctrl+C to stop")
     try:
@@ -392,7 +422,13 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
             print(f"  {name:<16} SKIP (no _self_test)")
             continue
         try:
-            fn()
+            rv = fn()
+            if rv is not None and rv is not True and rv != 0:
+                # self-tests that report failure by return code (rather
+                # than raising) were previously counted as passing
+                failed.append(name)
+                print(f"  {name:<16} FAIL (returned {rv!r})")
+                continue
             ran.append(name)
             print(f"  {name:<16} OK")
         except AssertionError as exc:
@@ -447,7 +483,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(list(argv) if argv is not None else None)
+    try:
+        args = parser.parse_args(list(argv) if argv is not None else None)
+    except SystemExit as exc:
+        # argparse exits on bad usage / --help; main() returns codes
+        code = exc.code
+        return code if isinstance(code, int) else EXIT_USAGE
     if not getattr(args, "command", None):
         parser.print_help()
         return EXIT_USAGE

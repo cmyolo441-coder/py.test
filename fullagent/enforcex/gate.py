@@ -18,6 +18,7 @@ leak spans / fake tags. Stdlib only; never raises on bad input.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import threading
@@ -75,14 +76,26 @@ class GateConfig:
 
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, Any]]) -> "GateConfig":
-        d = d or {}
+        d = d if isinstance(d, dict) else {}
         cfg = cls()
+        # Bad values are ignored (defaults kept): float("nan") used to
+        # clamp to min_score=100 (min(100, nan) == 100), silently turning
+        # every response into a retry/block, and a non-numeric value
+        # raised despite the "never raises on bad input" contract.
         for f in ("min_score", "block_threshold"):
             if f in d:
-                setattr(cfg, f, max(0.0, min(100.0, float(d[f]))))
+                try:
+                    val = float(d[f])
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if math.isfinite(val):
+                    setattr(cfg, f, max(0.0, min(100.0, val)))
         for f in ("max_retries", "session_lru_size"):
             if f in d:
-                setattr(cfg, f, max(0, int(d[f])))
+                try:
+                    setattr(cfg, f, max(0, int(d[f])))
+                except (TypeError, ValueError, OverflowError):
+                    continue
         for f in ("rewrite_on_minor", "auto_sanitize_injection"):
             if f in d:
                 setattr(cfg, f, bool(d[f]))
@@ -346,7 +359,7 @@ class Gate:
     def __init__(self, config: Optional[GateConfig] = None) -> None:
         self.config = config or GateConfig.from_env()
         self._retry_counts: "OrderedDict[str, int]" = OrderedDict()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     # -- session memory ----------------------------------------------------
 
@@ -363,6 +376,19 @@ class Gate:
             while len(self._retry_counts) > lru:
                 self._retry_counts.popitem(last=False)
             return val
+
+    def _try_consume_retry(self, session_id: str) -> Tuple[bool, int]:
+        """Atomically check the retry budget and use one retry.
+
+        Returns (granted, count_after). The old check-then-bump pair ran
+        under two separate lock acquisitions, so concurrent evaluations
+        of one session could both pass the check and exceed max_retries.
+        """
+        with self._lock:
+            cur = self._retry_counts.get(session_id, 0)
+            if cur >= self.config.max_retries:
+                return False, cur
+            return True, self._bump_retry(session_id)   # RLock: re-entrant
 
     def reset_session(self, session_id: str) -> None:
         with self._lock:
@@ -455,7 +481,14 @@ class Gate:
         if score is None:
             score = _fallback_score(violations)
 
-        total = float(getattr(score, "total", 0.0))
+        try:
+            total = float(getattr(score, "total", 0.0))
+        except (TypeError, ValueError, OverflowError):
+            total = 0.0
+        if not math.isfinite(total):
+            # NaN compares False against every threshold and would fall
+            # straight through to "allow"; treat it as the worst score.
+            total = 0.0
         severities = [str(v.get("severity", "medium")).lower() for v in violations]
         hostile_high = any(
             v.get("category", "").lower() in ("injection", "leak")
@@ -472,21 +505,20 @@ class Gate:
             notes.append("hostile injection detected; blocking")
         elif total < self.config.block_threshold or \
                 (hostile_high and self.config.auto_sanitize_injection):
-            if self._retry_count(session_id) < self.config.max_retries:
-                self._bump_retry(session_id)
+            granted, used = self._try_consume_retry(session_id)
+            if granted:
                 action = "retry"
                 retry_prompt = build_retry_prompt(violations, rules)
                 notes.append(f"score {total:.1f} below block threshold "
                              f"{self.config.block_threshold:.1f}; retry "
-                             f"{self._retry_count(session_id)}/"
+                             f"{used}/"
                              f"{self.config.max_retries}")
             else:
                 action = "block"
                 notes.append("retry budget exhausted; blocking")
         elif total < self.config.min_score:
             if ("critical" in severities or "high" in severities):
-                if self._retry_count(session_id) < self.config.max_retries:
-                    self._bump_retry(session_id)
+                if self._try_consume_retry(session_id)[0]:
                     action = "retry"
                     retry_prompt = build_retry_prompt(violations, rules)
                     notes.append("high-severity violations; requesting retry")

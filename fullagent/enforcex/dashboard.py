@@ -20,7 +20,9 @@ string. Stdlib only, Python 3.9+.
 
 from __future__ import annotations
 
+import math
 import os
+import re
 import sys
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -90,13 +92,43 @@ def _paint(text: str, color: Optional[str], use_color: bool,
     return out + text + _RESET
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
 def _visible_len(text: str) -> int:
     """Length ignoring ANSI escape sequences."""
-    import re as _re
     try:
-        return len(_re.sub(r"\x1b\[[0-9;]*m", "", text))
+        return len(_ANSI_RE.sub("", text))
     except Exception:
         return len(text)
+
+
+def _fit(text: str, width: int) -> str:
+    """Truncate/pad ``text`` to ``width`` visible columns, ANSI-aware.
+
+    Plain slicing counted escape bytes as columns: a colored cell was
+    cut mid-sequence (dropping the reset, so the color bled over the
+    rest of the terminal) and padded short.
+    """
+    if "\x1b" not in text:
+        return text[:width].ljust(width)
+    out: List[str] = []
+    visible = 0
+    pos = 0
+    for m in _ANSI_RE.finditer(text):
+        chunk = text[pos:m.start()]
+        if visible < width:
+            take = chunk[:width - visible]
+            out.append(take)
+            visible += len(take)
+        out.append(m.group(0))          # keep every escape (incl. reset)
+        pos = m.end()
+    tail = text[pos:]
+    if visible < width:
+        take = tail[:width - visible]
+        out.append(take)
+        visible += len(take)
+    return "".join(out) + " " * max(0, width - visible)
 
 
 # ── primitives ───────────────────────────────────────────────────────────
@@ -143,11 +175,17 @@ def heat_bar(value: Any, maximum: Any = 100.0, width: int = 20,
     goes green -> yellow -> red as the ratio rises (or the reverse when
     ``invert=True``, e.g. for adherence where high = good)."""
     try:
+        width = max(1, min(200, int(width or 20)))
+    except (TypeError, ValueError, OverflowError):
+        width = 20
+    try:
         v = float(value)
         m = float(maximum if maximum else 100.0)
-    except (TypeError, ValueError):
-        return "·" * max(1, int(width or 20))
-    width = max(1, min(200, int(width or 20)))
+    except (TypeError, ValueError, OverflowError):
+        return "·" * width
+    if not (math.isfinite(v) and math.isfinite(m)):
+        # NaN clamped to a FULL bar before (min(1.0, nan) == 1.0)
+        return "·" * width
     ratio = 0.0 if m == 0 else max(0.0, min(1.0, v / m))
     filled = int(round(ratio * width))
     filled = max(0, min(width, filled))
@@ -245,17 +283,17 @@ def ascii_table(headers: Sequence[str], rows: Iterable[Iterable[Any]],
             if overflow <= 0:
                 break
             if widths[i] == widest:
-                take = min(overflow, widths[i] - 4)
+                take = max(0, min(overflow, widths[i] - 4))
                 widths[i] -= take
                 overflow -= take
 
-    lines = ["  │  ".join(h.ljust(widths[i]) for i, h in enumerate(head))]
+    lines = ["  │  ".join(_fit(h, widths[i]) for i, h in enumerate(head))]
     lines.append("──┼──".join("─" * w for w in widths))
     for ri, cells in enumerate(clean_rows):
         parts = []
         for ci, cell in enumerate(cells):
-            w = widths[ci] if ci < len(widths) else len(cell)
-            text = cell[:w].ljust(w)
+            w = widths[ci] if ci < len(widths) else _visible_len(cell)
+            text = _fit(cell, w)
             col = color_map.get((ri, ci))
             if col and use_color:
                 text = _paint(text, col, True)
@@ -298,14 +336,14 @@ def _rules_from_state(state: Dict[str, Any]) -> List[Dict[str, Any]]:
                 checks = _int(st.get("checks"))
                 viol = _int(st.get("violations"))
                 rate = _float(st.get("adherence"))
-                if rate is None and checks:
-                    rate = 100.0 * (1.0 - viol / checks)
+                if rate is None and checks > 0:
+                    rate = max(0.0, 100.0 * (1.0 - viol / checks))
                 out.append({
                     "rule_id": str(rid),
                     "checks": checks,
                     "violations": viol,
                     "adherence": rate,
-                    "severities": dict(st.get("severities") or {}),
+                    "severities": _dict(st.get("severities")),
                 })
             else:
                 out.append({"rule_id": str(rid), "checks": 0,
@@ -319,7 +357,7 @@ def _rules_from_state(state: Dict[str, Any]) -> List[Dict[str, Any]]:
                     "checks": _int(st.get("checks")),
                     "violations": _int(st.get("violations")),
                     "adherence": _float(st.get("adherence")),
-                    "severities": dict(st.get("severities") or {}),
+                    "severities": _dict(st.get("severities")),
                 })
     return out
 
@@ -342,15 +380,24 @@ def _sessions_from_state(state: Dict[str, Any]) -> List[Dict[str, Any]]:
 def _int(v: Any) -> int:
     try:
         return int(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):   # int(inf) overflows
         return 0
 
 
 def _float(v: Any) -> Optional[float]:
     try:
-        return float(v)
-    except (TypeError, ValueError):
+        f = float(v)
+    except (TypeError, ValueError, OverflowError):
         return None
+    return f if math.isfinite(f) else None
+
+
+def _dict(v: Any) -> Dict[str, Any]:
+    """dict(v) for mapping-shaped state, {} for anything else (dict() of
+    a list or string raised and broke the never-raises contract)."""
+    if isinstance(v, dict):
+        return dict(v)
+    return {}
 
 
 # ── section renderers ────────────────────────────────────────────────────
@@ -400,7 +447,7 @@ def severity_summary(state: Any, use_color: bool = False) -> str:
     for r in rules:
         for sev, n in (r.get("severities") or {}).items():
             counts[sev] = counts.get(sev, 0) + _int(n)
-    violations = _int((state.get("counters") or {}).get("gate.violations"))
+    violations = _int(_dict(state.get("counters")).get("gate.violations"))
     if violations and not counts:
         counts["medium"] = violations
     if not counts:
@@ -432,7 +479,7 @@ def render_session(session: Any, use_color: bool = False) -> str:
     sid = str(session.get("session_id", "?"))
     evals = _int(session.get("evaluations"))
     viols = _int(session.get("violations"))
-    actions = dict(session.get("actions") or {})
+    actions = _dict(session.get("actions"))
     lines: List[str] = []
     head = f"session {sid}"
     lines.append(_paint(head, None, use_color, bold=True))
@@ -473,7 +520,7 @@ def render_overview(state: Any, use_color: Optional[bool] = None,
     lines: List[str] = []
 
     # header
-    counters = dict(st.get("counters") or {})
+    counters = _dict(st.get("counters"))
     evals = _int(counters.get("gate.evaluations", counters.get("evaluations")))
     blocks = _int(counters.get("gate.blocked", counters.get("blocks")))
     retr = _int(counters.get("gate.retries"))
@@ -515,11 +562,11 @@ def render_overview(state: Any, use_color: Optional[bool] = None,
             lines.append("")
 
     # adherence trend sparkline from gate score histogram samples
-    hists = dict(st.get("histograms") or {})
+    hists = _dict(st.get("histograms"))
     score_h = hists.get("gate.score")
     if isinstance(score_h, dict):
         samples = score_h.get("samples") or []
-        if len(samples) >= 2:
+        if isinstance(samples, (list, tuple)) and len(samples) >= 2:
             lines.append(_paint("Score trend", None, use_color, bold=True))
             lines.append(sparkline(samples, 30 if compact else 60))
     return "\n".join(lines).rstrip() + "\n"

@@ -128,16 +128,19 @@ class Score:
                        violations_count=0, verdict="fail")
         def _f(key: str, default: float) -> float:
             try:
-                return float(d.get(key, default))  # type: ignore[arg-type]
-            except (TypeError, ValueError):
+                val = float(d.get(key, default))  # type: ignore[arg-type]
+            except (TypeError, ValueError, OverflowError):
                 return default
+            # "nan"/"inf" parse as floats but poison every comparison
+            # downstream (a NaN total grades "F" yet verdicts "pass").
+            return val if math.isfinite(val) else default
         try:
             vc = int(d.get("violations_count", 0))  # type: ignore[arg-type]
         except (TypeError, ValueError):
             vc = 0
         cats = d.get("category_scores", {})
         return cls(
-            total=_f("total", 0.0),
+            total=max(0.0, min(100.0, _f("total", 0.0))),
             grade=str(d.get("grade", "F")),
             category_scores=dict(cats) if isinstance(cats, dict) else {},
             violations_count=vc,
@@ -292,8 +295,15 @@ class DriftTracker:
     """
 
     def __init__(self, alpha: float = 0.3, window: int = 100) -> None:
-        self._alpha = float(alpha) if 0.0 < float(alpha) <= 1.0 else 0.3
-        self._window = max(10, int(window))
+        try:
+            alpha_f = float(alpha)
+        except (TypeError, ValueError):
+            alpha_f = 0.3
+        self._alpha = alpha_f if 0.0 < alpha_f <= 1.0 else 0.3
+        try:
+            self._window = max(10, int(window))
+        except (TypeError, ValueError, OverflowError):
+            self._window = 100
         self._ema: Optional[float] = None
         self._count = 0
         self._scores: List[float] = []
@@ -308,14 +318,16 @@ class DriftTracker:
         input)."""
         try:
             value = float(getattr(score, "total", score))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             if isinstance(score, Score):
                 return score
             return self._last or Score(total=0.0, grade="F",
                                        category_scores={},
                                        violations_count=0)
-        if isinstance(value, float) and (value != value):
-            value = 0.0
+        if not math.isfinite(value):
+            # NaN -> 0 as before; +/-inf used to poison the EMA forever
+            # (inf - inf = nan drift on every later update).
+            value = 0.0 if value != value else (100.0 if value > 0 else 0.0)
         with self._lock:
             before = self._ema
             if self._ema is None:
@@ -332,9 +344,13 @@ class DriftTracker:
                 score.drift = drift
                 self._last = score
                 return score
-            last = self._last or Score(total=value, grade=_grade_for(value),
-                                       category_scores={}, violations_count=0)
-            last.drift = drift
+            # A bare number gets its own Score. The old code re-used (and
+            # mutated) the previous Score object, so update(70) after
+            # update(60) returned total=60 and rewrote drift on a Score
+            # the caller already held.
+            last = Score(total=value, grade=_grade_for(value),
+                         category_scores={}, violations_count=0,
+                         drift=drift, verdict=_verdict_for(value, [], None))
             self._last = last
             return last
 
@@ -368,13 +384,15 @@ class DriftTracker:
     def summary(self) -> Dict[str, Any]:
         with self._lock:
             scores = list(self._scores)
+            count = self._count
+            ema = self._ema
         if not scores:
             return {"count": 0, "ema": None, "trend": "unknown",
                     "min": None, "max": None, "mean": None}
         half = max(1, len(scores) // 2)
         return {
-            "count": self._count,
-            "ema": round(self._ema, 2) if self._ema is not None else None,
+            "count": count,
+            "ema": round(ema, 2) if ema is not None else None,
             "trend": self.trend(),
             "min": round(min(scores), 2),
             "max": round(max(scores), 2),
@@ -406,23 +424,34 @@ class DriftTracker:
             window = int(d.get("window", 100))  # type: ignore[arg-type]
         except (TypeError, ValueError):
             window = 100
+        if not math.isfinite(alpha):
+            alpha = 0.3
         tracker = cls(alpha=alpha, window=window)
         try:
             ema = d.get("ema")
             tracker._ema = float(ema) if ema is not None else None  # type: ignore[arg-type]
-        except (TypeError, ValueError):
+            if tracker._ema is not None and not math.isfinite(tracker._ema):
+                tracker._ema = None
+        except (TypeError, ValueError, OverflowError):
             tracker._ema = None
         try:
-            tracker._count = int(d.get("count", 0))  # type: ignore[arg-type]
-        except (TypeError, ValueError):
+            tracker._count = max(0, int(d.get("count", 0)))  # type: ignore[arg-type]
+        except (TypeError, ValueError, OverflowError):
             tracker._count = 0
         scores: List[float] = []
-        for s in (d.get("scores", []) or []):
+        raw_scores = d.get("scores", []) or []
+        if not isinstance(raw_scores, (list, tuple)):
+            raw_scores = []
+        for s in raw_scores:
             try:
-                scores.append(float(s))  # type: ignore[arg-type]
-            except (TypeError, ValueError):
+                val = float(s)  # type: ignore[arg-type]
+            except (TypeError, ValueError, OverflowError):
                 continue
-        tracker._scores = scores
+            if math.isfinite(val):
+                scores.append(val)
+        # honour the window: a persisted (or hand-edited) blob with more
+        # samples than the window used to be kept whole
+        tracker._scores = scores[-tracker._window:]
         return tracker
 
 
@@ -514,7 +543,7 @@ def merge_history(scores: Iterable[Any]) -> Dict[str, Any]:
                 verdict = getattr(item, "verdict", "?")
         except Exception:
             continue
-        if isinstance(total, (int, float)):
+        if isinstance(total, (int, float)) and math.isfinite(float(total)):
             totals.append(float(total))
         grades[str(grade)] = grades.get(str(grade), 0) + 1
         verdicts[str(verdict)] = verdicts.get(str(verdict), 0) + 1

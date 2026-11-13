@@ -174,7 +174,7 @@ def to_markdown(decision: Any) -> str:
             ev = str(v.get("evidence", "") or v.get("message", "") or "")
             if len(ev) > 120:
                 ev = ev[:117] + "..."
-            ev = ev.replace("|", "\\|").replace("\n", " ")
+            ev = ev.replace("|", "\\|").replace("\r", " ").replace("\n", " ")
             lines.append(f"| {i} | {sev} | {cat} | {rule} | {ev or '—'} |")
         lines.append("")
         # top evidence detail
@@ -185,7 +185,10 @@ def to_markdown(decision: Any) -> str:
             lines.append("")
             for v in top[:3]:
                 ev = str(v.get("evidence", "") or v.get("message", "")).strip()
-                lines.append(f"> {ev[:300] if ev else '(no evidence captured)'}")
+                # one quoted line: an embedded newline ended the blockquote
+                # and let model-produced text render as live markdown
+                ev = " ".join(ev[:300].split())
+                lines.append(f"> {ev if ev else '(no evidence captured)'}")
                 lines.append("")
     else:
         lines.append("No violations detected — response fully compliant.")
@@ -352,13 +355,23 @@ def to_csv(decision: Any) -> str:
     writer.writerow(["severity", "category", "rule_id", "evidence", "message"])
     for v in _violations(d):
         writer.writerow([
-            str(v.get("severity", "medium")),
-            str(v.get("category", "other")),
-            str(v.get("rule_id", "")),
-            str(v.get("evidence", "")),
-            str(v.get("message", "")),
+            _csv_cell(v.get("severity", "medium")),
+            _csv_cell(v.get("category", "other")),
+            _csv_cell(v.get("rule_id", "")),
+            _csv_cell(v.get("evidence", "")),
+            _csv_cell(v.get("message", "")),
         ])
     return buf.getvalue()
+
+
+def _csv_cell(value: Any) -> str:
+    """Neutralize spreadsheet formula injection: evidence is quoted
+    model/attacker text, and a cell starting with = + - @ (or tab/CR)
+    is executed as a formula when the CSV is opened in a spreadsheet."""
+    text = str(value)
+    if text and text[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + text
+    return text
 
 
 def render(decision: Any, fmt: str) -> str:
@@ -403,7 +416,7 @@ def write_report(decision: Any, path: str,
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp_path, path)      # atomic on POSIX
-    except Exception:
+    except BaseException:               # incl. KeyboardInterrupt: no tmp leak
         try:
             os.unlink(tmp_path)
         except OSError:
