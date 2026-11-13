@@ -176,6 +176,8 @@ except ImportError:  # Headless / non-interactive fallback when prompt_toolkit i
         Tab = "tab"
         BackTab = "s-tab"
         Enter = "enter"
+        Delete = "delete"
+        CPRResponse = "<cursor-position-response>"
         Any = "<any>"
 
     class _LayoutBox:
@@ -202,6 +204,7 @@ from rich.text import Text
 from . import config
 from . import cliui
 from . import fx
+from . import swarmdash
 from .agent import Agent, ToolEvent
 from .config import (
     APP_NAME,
@@ -783,6 +786,31 @@ class OverlayList:
 # ---------------------------------------------------------------------------
 
 
+_SWARM_INIT_LOCK = threading.Lock()
+
+
+class _SwarmFollowup(str):
+    """Turn text for an automatic swarm follow-up: announced as a dim
+    system notice, never echoed as if the user had typed it."""
+
+    pending = 0
+
+
+class _SwarmRuntime:
+    """Per-UI swarm chrome plumbing: redraw governor, debounce gate and
+    the single pulse thread that drives trailing-edge redraws, 4 fps
+    animation ticks and the auto-continue check."""
+
+    def __init__(self, invalidate):
+        self.governor = swarmdash.RedrawGovernor(invalidate, max_fps=12.0)
+        self.gate = swarmdash.AutoContinueGate(debounce=0.8)
+        self.lock = threading.Lock()
+        self.wake = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.tick_interval = 0.25
+        self.idle_exit = 3.0
+
+
 class UI:
     def __init__(self, cfg: Config, agent: Agent):
         self.cfg = cfg
@@ -1276,41 +1304,404 @@ class UI:
             pass
 
     def _on_subagent_event(self, _worker=None, _kind=None) -> None:
-        """Manager callback (worker thread): drop the cache and redraw."""
+        """Manager callback (worker thread): drop the cache and redraw.
+
+        Runs on every worker transition of every worker — a 16-worker
+        swarm emits thousands of these. It only flips a few flags: the
+        redraw goes through the swarm governor (at most ~12 frames/s,
+        leading edge immediate, trailing edge from the pulse thread), so
+        worker threads can never flood prompt_toolkit's event loop.
+        """
         self._invalidate_agents()
         try:
-            self._invalidate()
+            rt = self._swarm_rt()
+            if _kind in ("subagent.done", "subagent.cancelled",
+                         "subagent.error", "subagent.blocked"):
+                rt.gate.note_event(time.monotonic())
+            result = rt.governor.request()
+            if result == "scheduled" or rt.thread is None:
+                self._swarm_kick()
         except Exception:
-            pass
+            try:
+                self._invalidate()
+            except Exception:
+                pass
 
     def _invalidate_agents(self) -> None:
         """Force the next frame to read the real subagent state."""
         self._agents_cache = None
         self._agents_cache_ts = 0.0
 
+    def _board_plan(self) -> "swarmdash.BoardPlan":
+        """Stable-height plan for the compact board (see BoardKeeper)."""
+        keeper = self.__dict__.get("_board_keeper")
+        if keeper is None:
+            with _SWARM_INIT_LOCK:
+                keeper = self.__dict__.get("_board_keeper")
+                if keeper is None:
+                    keeper = self._board_keeper = swarmdash.BoardKeeper()
+        return keeper.update(self._agents_snapshot(), time.monotonic())
+
     def _agents_visible(self) -> bool:
-        """True while at least one subagent is queued or running."""
+        """True while a swarm is live, and for a short hold after it
+        settled — the board keeps one stable height for the whole swarm
+        instead of shrinking row by row as workers finish."""
         try:
-            snap = self._agents_snapshot()
-            return any(row.get("state") in cliui.ACTIVE_STATES
-                       for row in snap.get("workers") or [])
+            return self._board_plan().visible
         except Exception:
             return False
 
     def _agents_fragments(self) -> list:
         """The live swarm board, one prompt_toolkit fragment row per line."""
         try:
-            rows = cliui.agent_board(self._agents_snapshot(),
-                                     width=self._width(), colors=C)
+            plan = self._board_plan()
+            if not plan.visible:
+                return []
+            rows = swarmdash.compact_board(
+                self._agents_snapshot(), plan, width=self._width(),
+                colors=C, now=time.monotonic(), age_s=self._agents_age())
         except Exception as exc:  # noqa: BLE001 — chrome must never crash
             self._log_chrome_error("agent_board", exc)
             return []
+        return self._join_rows(rows)
+
+    @staticmethod
+    def _join_rows(rows: list) -> list:
         frags: list = []
         for idx, row in enumerate(rows):
             frags.extend(row)
             if idx < len(rows) - 1:
                 frags.append(("", "\n"))
         return frags
+
+    def _agents_age(self) -> float:
+        """Seconds since the cached subagent snapshot was taken."""
+        try:
+            ts = float(self.__dict__.get("_agents_cache_ts") or 0.0)
+            return max(0.0, min(2.0, time.time() - ts)) if ts else 0.0
+        except Exception:
+            return 0.0
+
+    # -- live swarm dashboard (Ctrl+G · ↓ · /swarm) -----------------------------
+
+    def _swarm_rt(self) -> "_SwarmRuntime":
+        rt = self.__dict__.get("_swarm_runtime")
+        if rt is None:
+            with _SWARM_INIT_LOCK:
+                rt = self.__dict__.get("_swarm_runtime")
+                if rt is None:
+                    rt = self._swarm_runtime = _SwarmRuntime(
+                        lambda: self._invalidate())
+        return rt
+
+    def _swarm_state(self) -> "swarmdash.DashState":
+        st = self.__dict__.get("_swarm_dash")
+        if st is None:
+            with _SWARM_INIT_LOCK:
+                st = self.__dict__.get("_swarm_dash")
+                if st is None:
+                    st = self._swarm_dash = swarmdash.DashState()
+        return st
+
+    def _swarm_dash_open(self) -> bool:
+        st = self.__dict__.get("_swarm_dash")
+        return bool(st is not None and st.open)
+
+    def _swarm_dash_keys(self) -> bool:
+        """Dashboard owns the keyboard (the approve bar always wins)."""
+        return self._swarm_dash_open() and self.__dict__.get(
+            "_approve_request") is None
+
+    def _swarm_active(self) -> bool:
+        """A swarm is live (or just settled and still on the board)."""
+        return self._agents_visible()
+
+    def _term_rows(self) -> int:
+        now = time.time()
+        cached = self.__dict__.get("_rows_cache")
+        if cached is not None and now - cached[1] < 0.5:
+            return cached[0]
+        try:
+            rows = int(get_app().output.get_size().rows)
+        except Exception:
+            rows = shutil.get_terminal_size((100, 24)).lines
+        rows = max(10, rows)
+        self._rows_cache = (rows, now)
+        return rows
+
+    def _swarm_dash_fragments(self) -> list:
+        """Render the live dashboard (pure renderer over the cached
+        snapshot — no manager lock, no I/O on the render thread)."""
+        if not self._swarm_dash_open():
+            return []
+        try:
+            st = self._swarm_state()
+            keeper = self.__dict__.get("_board_keeper")
+            ids = keeper.epoch_ids if keeper is not None else []
+            # header (4) + footer (1) + detail panel + prompt chrome (~8)
+            spare = self._term_rows() - 13 - (
+                swarmdash.DETAIL_ROWS + 1 if st.expanded else 0)
+            rows = swarmdash.render_dashboard(
+                self._agents_snapshot(), width=self._width(), colors=C,
+                state=st, now=time.monotonic(), wall_now=time.time(),
+                max_list_rows=max(3, min(14, spare)),
+                age_s=self._agents_age(), only_ids=ids or None)
+        except Exception as exc:  # noqa: BLE001 — chrome must never crash
+            self._log_chrome_error("swarm_dash", exc)
+            return []
+        return self._join_rows(rows)
+
+    def _toggle_swarm_dash(self, force: bool | None = None) -> bool:
+        st = self._swarm_state()
+        if force is None:
+            st.toggle()
+        elif force:
+            if not st.open:
+                st.show()
+        else:
+            st.close()
+        if st.open:
+            self._invalidate_agents()
+            self._swarm_kick()
+        self._invalidate()
+        return st.open
+
+    def _swarm_manager(self):
+        try:
+            return self.agent.__dict__.get("subagents")
+        except Exception:
+            return None
+
+    def _swarm_cancel_selected(self) -> None:
+        st = self._swarm_state()
+        target = st.selected_id
+        mgr = self._swarm_manager()
+        if not target or mgr is None:
+            self._set_flash("no subagent selected", C["dim"])
+            return
+        self._set_flash(f"⊘ cancelling {target}…", C["yellow"])
+
+        def run():
+            try:
+                mgr.stop(target)
+            except Exception as exc:  # noqa: BLE001
+                self._set_flash(f"⚠ cannot cancel {target}: {exc}", C["red"])
+            self._invalidate_agents()
+            self._swarm_rt().governor.request()
+
+        self._swarm_spawn(run, "swarm-cancel")
+
+    def _swarm_cancel_all(self) -> None:
+        mgr = self._swarm_manager()
+        if mgr is None:
+            self._set_flash("no subagents running", C["dim"])
+            return
+        self._set_flash("⊘ cancelling every active subagent…", C["yellow"])
+
+        def run():
+            n = 0
+            try:
+                stop_all = getattr(mgr, "stop_all", None)
+                if callable(stop_all):
+                    n = int(stop_all() or 0)
+                else:
+                    for row in (mgr.snapshot() or {}).get("workers") or []:
+                        if row.get("state") in ("queued", "running"):
+                            try:
+                                mgr.stop(row["id"])
+                                n += 1
+                            except Exception:
+                                pass
+            except Exception as exc:  # noqa: BLE001
+                self._set_flash(f"⚠ cancel all failed: {exc}", C["red"])
+                return
+            self._set_flash(f"⊘ cancelled {n} subagent{'s' if n != 1 else ''}",
+                            C["yellow"])
+            self._invalidate_agents()
+            self._swarm_rt().governor.request()
+
+        self._swarm_spawn(run, "swarm-cancel-all")
+
+    @staticmethod
+    def _swarm_spawn(fn, name: str) -> None:
+        # manager.stop() takes the manager lock and appends to the audit
+        # log (disk): never on the key handler / render thread
+        def guarded():
+            try:
+                fn()
+            except Exception:
+                pass
+        threading.Thread(target=guarded, daemon=True, name=name).start()
+
+    # -- swarm pulse: coalesced redraws, animation ticks, auto-continue ------
+
+    def _swarm_kick(self) -> None:
+        """Make sure the pulse thread runs and re-evaluates now."""
+        try:
+            rt = self._swarm_rt()
+            with rt.lock:
+                rt.wake.set()
+                if rt.thread is not None and rt.thread.is_alive():
+                    return
+                th = threading.Thread(target=self._swarm_pulse_loop,
+                                      args=(rt,), daemon=True,
+                                      name="swarm-pulse")
+                rt.thread = th
+            th.start()
+        except Exception:
+            pass
+
+    def _swarm_animating(self) -> bool:
+        """Something on screen moves: live workers, the open dashboard or
+        the board's settle hold. Only meaningful with a real app."""
+        if self.__dict__.get("app") is None:
+            return False
+        if self._swarm_dash_open():
+            return True
+        try:
+            return self._board_plan().visible
+        except Exception:
+            return False
+
+    def _swarm_pulse_loop(self, rt: "_SwarmRuntime") -> None:
+        idle_since = None
+        while True:
+            try:
+                now = time.monotonic()
+                animating = self._swarm_animating()
+                wait = 0.5
+                due = rt.governor.due_in(now)
+                if due is not None:
+                    wait = min(wait, due)
+                if animating:
+                    wait = min(wait, max(0.0, rt.tick_interval
+                                         - (now - rt.governor.last_fire)))
+                if rt.gate.waiting():
+                    wait = min(wait, 0.2)
+                rt.wake.wait(max(0.004, wait))
+                rt.wake.clear()
+                now = time.monotonic()
+                if rt.governor.due_in(now) == 0.0:
+                    # refresh the snapshot HERE (off the render loop) so
+                    # the frame below finds a warm cache
+                    try:
+                        self._agents_snapshot()
+                    except Exception:
+                        pass
+                    rt.governor.pump(now)
+                elif animating and not self.__dict__.get("_spinner_on"):
+                    # the turn spinner already redraws ~11x/s while busy
+                    rt.governor.tick(rt.tick_interval, now)
+                self._swarm_auto_continue_check(now)
+                quiet = (not animating and rt.governor.due_in(now) is None
+                         and not rt.gate.waiting())
+                if quiet:
+                    if idle_since is None:
+                        idle_since = now
+                    elif now - idle_since > rt.idle_exit:
+                        with rt.lock:
+                            if not rt.wake.is_set():
+                                rt.thread = None
+                                return
+                else:
+                    idle_since = None
+            except Exception as exc:  # noqa: BLE001 — never die silently
+                try:
+                    self._log_chrome_error("swarm_pulse", exc)
+                except Exception:
+                    pass
+                time.sleep(0.2)
+
+    # -- auto-continue when swarm results are waiting --------------------------
+
+    def _swarm_auto_enabled(self) -> bool:
+        for owner in (getattr(self.agent, "cfg", None),
+                      self.__dict__.get("cfg")):
+            extra = getattr(owner, "extra", None)
+            if isinstance(extra, dict):
+                return bool(extra.get("swarm_auto_continue", True))
+        return True
+
+    def _swarm_pending(self) -> int:
+        fn = getattr(self.__dict__.get("agent"), "swarm_pending_results",
+                     None)
+        if not callable(fn):
+            return 0
+        try:
+            return max(0, int(fn() or 0))
+        except Exception:
+            return 0
+
+    def _swarm_idle(self) -> bool:
+        q, lock = self._queue_state()
+        with lock:
+            return not (self._busy or getattr(self, "_turn_alive", False)
+                        or q or self.__dict__.get("_approve_request")
+                        is not None)
+
+    def _swarm_buffer_empty(self) -> bool:
+        buf = self.__dict__.get("buffer")
+        try:
+            return not (buf.text.strip() if buf is not None else "")
+        except Exception:
+            return True
+
+    def _swarm_auto_continue_check(self, now: float | None = None) -> bool:
+        """Start ONE follow-up turn when finished-swarm results wait for an
+        idle main agent (debounced; never while busy or while the user is
+        typing; off with cfg.extra['swarm_auto_continue'] = False)."""
+        rt = self._swarm_rt()
+        now = time.monotonic() if now is None else now
+        enabled = self._swarm_auto_enabled()
+        pending = self._swarm_pending() if enabled else 0
+        if pending <= 0:
+            rt.gate.check(now, pending=0, idle=True, buffer_empty=True,
+                          enabled=enabled)
+            return False
+        try:
+            fp = swarmdash.results_fingerprint(self._agents_snapshot(),
+                                               pending)
+        except Exception:
+            fp = None
+        if not rt.gate.check(now, pending=pending, fingerprint=fp,
+                             idle=self._swarm_idle(),
+                             buffer_empty=self._swarm_buffer_empty(),
+                             enabled=enabled):
+            return False
+        return self._swarm_start_followup(pending)
+
+    def _swarm_start_followup(self, pending: int) -> bool:
+        """Hand the follow-up to the normal turn path, atomically: the same
+        busy/queue lock as _dispatch(), so it can never overlap a turn."""
+        q, lock = self._queue_state()
+        with lock:
+            if (self._busy or getattr(self, "_turn_alive", False) or q
+                    or self.__dict__.get("_approve_request") is not None):
+                return False
+            self._busy = True
+        try:
+            self._cancel_flag.clear()
+        except Exception:
+            pass
+        text = _SwarmFollowup(swarmdash.AUTO_CONTINUE_PROMPT)
+        text.pending = pending
+        try:
+            threading.Thread(target=self._run_turn_thread, args=(text,),
+                             daemon=True, name="swarm-followup").start()
+        except Exception:
+            with lock:
+                self._busy = False
+            return False
+        return True
+
+    def _emit_swarm_notice(self, text: "_SwarmFollowup") -> None:
+        n = int(getattr(text, "pending", 0) or 0)
+        what = (f"{n} swarm result{'s' if n != 1 else ''} ready"
+                if n else "swarm results ready")
+        try:
+            self.print_info(f"  ⚡ {what} · continuing", C["dim"])
+        except Exception:
+            pass
 
     def _agent_counts(self) -> tuple:
         """(running, queued, live) from the real snapshot — live only.
@@ -1518,6 +1909,12 @@ class UI:
         agents_window = Window(
             FormattedTextControl(self._agents_fragments),
             dont_extend_height=True)
+        # live swarm dashboard (Ctrl+G / ↓ / /swarm): replaces the compact
+        # board while open; keys are routed to it by eager bindings, so
+        # the prompt keeps focus and nothing leaks into the buffer
+        swarm_window = Window(
+            FormattedTextControl(self._swarm_dash_fragments),
+            dont_extend_height=True)
         bottom_window = Window(FormattedTextControl(self._bottom_fragments),
                                height=1, dont_extend_height=True)
         left_window = Window(FormattedTextControl(
@@ -1538,8 +1935,12 @@ class UI:
                     overlay_window,
                     filter=Condition(self._overlay_open)),
                 ConditionalContainer(
+                    swarm_window,
+                    filter=Condition(self._swarm_dash_open)),
+                ConditionalContainer(
                     agents_window,
-                    filter=Condition(self._agents_visible)),
+                    filter=Condition(lambda: not self._swarm_dash_open()
+                                     and self._agents_visible())),
                 hud_window,
                 top_window,
                 ConditionalContainer(
@@ -1734,16 +2135,17 @@ class UI:
         def _hist_next(event):
             self.buffer.history_forward()
 
-        # Qoder-style board: ↓ on an empty prompt opens /agents instead of
-        # doing nothing (registered after _hist_next so it wins).
+        # ↓ on an empty prompt while a swarm is live opens the live swarm
+        # dashboard — also mid-turn, so the swarm can be watched and
+        # steered while the main agent keeps working (registered after
+        # _hist_next so it wins; no swarm → ↓ stays history navigation).
         @kb.add(Keys.Down, filter=focused & ~ov & idle &
                 Condition(self._on_last_line) &
                 Condition(self._buffer_empty) &
-                Condition(lambda: not self._busy) &
-                ~Condition(self._completion_active))
+                ~Condition(self._completion_active) &
+                Condition(self._swarm_active))
         def _manage_agents(event):
-            if self._agents_visible():
-                self._cmd_agents("")
+            self._toggle_swarm_dash(True)
 
         @kb.add("s-tab", filter=focused & ~ov & idle)
         def _toggle_auto(event):
@@ -1814,7 +2216,97 @@ class UI:
         def _external_editor(event):
             self.buffer.open_in_editor(validate_and_handle=True)
 
+        self._add_swarm_bindings(kb, idle)
         return kb
+
+    def _add_swarm_bindings(self, kb: KeyBindings, idle) -> None:
+        """Ctrl+G toggles the live swarm dashboard; while it is open it
+        owns the keyboard. Every binding is eager (and registered last),
+        so it wins over the prompt's own keys — Esc closes the dashboard
+        instead of cancelling the turn, Enter expands instead of
+        submitting, and a catch-all swallows typing so nothing leaks into
+        the buffer. The approve bar still wins (filter), and normal typing
+        resumes the moment the dashboard closes."""
+        dash = Condition(self._swarm_dash_keys)
+
+        @kb.add(Keys.Any, filter=dash, eager=True,
+                save_before=lambda e: False)
+        def _dash_swallow(event):
+            # An eager catch-all also sees the terminal's cursor-position
+            # reports; forward those to the renderer (what prompt_toolkit's
+            # own CPR binding does) so the non-fullscreen layout keeps
+            # working while the dashboard is open.
+            try:
+                kp = event.key_sequence[0]
+                if kp.key == Keys.CPRResponse:
+                    row, _col = map(int, kp.data[2:-1].split(";"))
+                    event.app.renderer.report_absolute_cursor_row(row)
+            except Exception:
+                pass
+
+        @kb.add("c-g", filter=idle, eager=True)
+        def _dash_toggle(event):
+            self._toggle_swarm_dash()
+
+        @kb.add(Keys.Escape, filter=dash, eager=True)
+        @kb.add("q", filter=dash, eager=True)
+        @kb.add("c-c", filter=dash, eager=True)
+        def _dash_close(event):
+            self._toggle_swarm_dash(False)
+
+        @kb.add(Keys.Up, filter=dash, eager=True)
+        @kb.add("k", filter=dash, eager=True)
+        @kb.add("c-p", filter=dash, eager=True)
+        @kb.add(Keys.BackTab, filter=dash, eager=True)
+        def _dash_up(event):
+            self._swarm_state().move(-1)
+            self._invalidate()
+
+        @kb.add(Keys.Down, filter=dash, eager=True)
+        @kb.add("j", filter=dash, eager=True)
+        @kb.add("c-n", filter=dash, eager=True)
+        @kb.add(Keys.Tab, filter=dash, eager=True)
+        def _dash_down(event):
+            self._swarm_state().move(1)
+            self._invalidate()
+
+        @kb.add(Keys.PageUp, filter=dash, eager=True)
+        def _dash_pgup(event):
+            self._swarm_state().move(-5)
+            self._invalidate()
+
+        @kb.add(Keys.PageDown, filter=dash, eager=True)
+        def _dash_pgdn(event):
+            self._swarm_state().move(5)
+            self._invalidate()
+
+        @kb.add(Keys.Home, filter=dash, eager=True)
+        @kb.add("g", filter=dash, eager=True)
+        def _dash_home(event):
+            self._swarm_state().home()
+            self._invalidate()
+
+        @kb.add(Keys.End, filter=dash, eager=True)
+        @kb.add("G", filter=dash, eager=True)
+        def _dash_end(event):
+            self._swarm_state().end()
+            self._invalidate()
+
+        @kb.add(Keys.Enter, filter=dash, eager=True)
+        @kb.add(" ", filter=dash, eager=True)
+        def _dash_expand(event):
+            st = self._swarm_state()
+            st.expanded = not st.expanded
+            self._invalidate()
+
+        @kb.add("x", filter=dash, eager=True)
+        @kb.add(Keys.Delete, filter=dash, eager=True)
+        def _dash_cancel(event):
+            self._swarm_cancel_selected()
+
+        @kb.add("X", filter=dash, eager=True)
+        def _dash_cancel_all(event):
+            self._swarm_cancel_all()
 
     def _request_cancel(self) -> int:
         """Idempotently cancel this UI turn and drop pending follow-ups.
@@ -2320,6 +2812,10 @@ class UI:
             self.print_info(format_help(arg), C["fg"])
         elif cmd == "/agents":
             self._cmd_agents(arg)
+        elif cmd == "/swarm":
+            if self._toggle_swarm_dash():
+                self._set_flash("⚡ swarm dashboard · ↑↓ select · ⏎ details "
+                                "· x cancel · Esc close", C["cyan"])
         elif cmd == "/diff":
             self._cmd_diff(arg)
         elif cmd == "/theme":
@@ -4190,7 +4686,13 @@ class UI:
             # Announce here, not in _dispatch: a queued turn should appear
             # in the transcript only when it actually starts, after the
             # previous turn's answer, not at the moment it was typed.
-            self._emit_user(text)
+            if isinstance(text, _SwarmFollowup):
+                # automatic swarm follow-up: a dim system notice, never a
+                # fake "❯ user" line in the transcript
+                self._emit_swarm_notice(text)
+                text = str(text)
+            else:
+                self._emit_user(text)
             # Clear the agent's cancel flag on the turn thread, right before
             # run_turn: run_turn clears it again internally, but a cancel
             # landing in the window between thread start and that internal
@@ -4211,6 +4713,10 @@ class UI:
             with lock:
                 self._turn_alive = False
             self._advance_queue()
+            # the agent is idle again: let the swarm pulse re-check
+            # whether finished-worker results should continue the task
+            if self._swarm_pending() > 0:
+                self._swarm_kick()
 
     def _advance_queue(self) -> None:
         """Release the turn slot, then start at most one queued message.
@@ -4964,6 +5470,7 @@ class UI:
             row("/exit", "quit"),
             row("Enter", "send    Esc+Enter: newline    Ctrl+R: search history"),
             row("Ctrl+T", "models    Ctrl+E: effort    Ctrl+L: clear"),
+            row("Ctrl+G", "live swarm dashboard (/swarm · ↓ on empty prompt)"),
         ]
         self.overlay = OverlayList("HELP", items, 0, None, footer="Esc close")
         self.overlay.open()
