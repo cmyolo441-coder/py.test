@@ -31,6 +31,7 @@ import json
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -45,21 +46,20 @@ from .client import (
 from .roles import ROLES, role_label
 from .tools import RISK_SAFE, Tool, parse_tool_arguments
 
-MAX_GROUP_SIZE = 8
+MAX_GROUP_SIZE = 16
 # Real concurrency limit. MAX_GROUP_SIZE is the largest batch the tools
 # accept, so the pool must be able to run that whole batch at once —
 # otherwise "8 parallel specialists" would silently be 4 running + 4
 # queued (the TUI shows the exact split, but the capability should be real).
-DEFAULT_WORKERS = 8
-DEFAULT_ACTIVE_LIMIT = 8
-MAX_RETAINED = 40
+DEFAULT_WORKERS = MAX_GROUP_SIZE
+DEFAULT_ACTIVE_LIMIT = MAX_GROUP_SIZE
+MAX_RETAINED = 64
 MAX_TASK_CHARS = 12_000
 MAX_CONTEXT_CHARS = 24_000
 MAX_TOOL_OUTPUT_CHARS = 12_000
 MAX_CALLS_PER_STEP = 12
 MAX_TOTAL_TOOL_CALLS = 80
 MAX_STEPS = 20
-DEFAULT_ACTIVE_LIMIT = 8
 CALL_TIMEOUT = 120.0
 DRAIN_TIMEOUT = 5.0
 
@@ -257,6 +257,21 @@ class Subagent:
     diffs: list[dict[str, Any]] = field(default_factory=list)
     lines_added: int = 0
     lines_removed: int = 0
+    max_steps: int = MAX_STEPS
+    # live activity trail for the swarm dashboard (newest last, bounded)
+    recent: deque = field(default_factory=lambda: deque(maxlen=6),
+                          repr=False, compare=False)
+    # True once the main agent has received this worker's final report
+    # (auto-delivery, TaskCollect or TaskOutput) — never delivered twice
+    delivered: bool = False
+
+    def set_action(self, text: str) -> None:
+        """Update current_action and the bounded activity trail.
+        Caller holds the manager lock."""
+        text = " ".join(str(text or "").split())[:160]
+        self.current_action = text
+        if text and (not self.recent or self.recent[-1] != text):
+            self.recent.append(text)
 
     def tokens_per_sec(self) -> float:
         if self.started_at <= 0:
@@ -306,6 +321,13 @@ class Subagent:
             "lines_added": int(self.lines_added),
             "lines_removed": int(self.lines_removed),
             "diffs_count": len(self.diffs),
+            "progress_pct": self.progress_pct(self.max_steps),
+            "run_ms": (max(0, int(((self.finished_at or time.time())
+                                   - self.started_at) * 1000))
+                       if self.started_at > 0 else 0),
+            "max_steps": int(self.max_steps),
+            "recent": list(self.recent),
+            "delivered": bool(self.delivered),
         }
 
 
@@ -337,7 +359,7 @@ class ParallelSubagents:
         self._scope_registry = PathScopeRegistry(self.workspace)
         self.blackboard = SharedBlackboard()
         self.max_workers = max(1, min(16, int(max_workers)))
-        self.max_active = max(1, min(24, int(max_active)))
+        self.max_active = max(1, min(48, int(max_active)))
         self.max_steps = max(1, min(64, int(max_steps)))
         self.chat = chat or chat_with_retry
         self._session_id = str(getattr(log, "session", "") or "")
@@ -353,6 +375,12 @@ class ParallelSubagents:
         self._active_running = 0
         self._peak_concurrency = 0
         self._progress_callbacks: list[Callable[[Subagent, str], None]] = []
+        # Results inbox: ids of settled workers whose final report the
+        # main agent has not received yet, in finish order. The main agent
+        # drains it at its next model call (drain_results), so it can hand
+        # work to the swarm and keep going instead of blocking on
+        # TaskCollect.
+        self._inbox: list[str] = []
         self._closed = False
         self._transitioning = False
         self._pool = concurrent.futures.ThreadPoolExecutor(
@@ -606,6 +634,13 @@ class ParallelSubagents:
         except TypeError:
             event = self.log.append(kind, safe_data)
         if worker is not None:
+            if kind in ("subagent.done", "subagent.cancelled"):
+                with self._lock:
+                    if (worker.state in TERMINAL_STATES
+                            and not worker.delivered
+                            and worker.id in self._workers
+                            and worker.id not in self._inbox):
+                        self._inbox.append(worker.id)
             self._notify_listeners(worker, kind)
         return event
 
@@ -624,6 +659,8 @@ class ParallelSubagents:
                     f"subagent history is full ({MAX_RETAINED}); wait or stop work"
                 )
             self._order.remove(oldest)
+            if oldest in self._inbox:
+                self._inbox.remove(oldest)
             removed = self._workers.pop(oldest, None)
             self._futures.pop(oldest, None)
             self._done_events.pop(oldest, None)
@@ -781,6 +818,7 @@ class ParallelSubagents:
                     depends_on=resolved_deps[idx],
                     max_retries=item["max_retries"],
                     timeout=item["timeout"],
+                    max_steps=self.max_steps,
                 )
                 worker.messages = [
                     {
@@ -1020,6 +1058,8 @@ class ParallelSubagents:
         ids = [worker.id for worker in workers]
         states = self.wait(ids, timeout=timeout, should_cancel=should_cancel)
         reports = [self.format_worker(worker) for worker in workers]
+        self.mark_delivered(
+            [w.id for w in workers if w.state in TERMINAL_STATES])
         still_active = [
             aid for aid, state in states.items() if state in ACTIVE_STATES
         ]
@@ -1153,6 +1193,7 @@ class ParallelSubagents:
                 self._futures.clear()
                 self._done_events.clear()
                 self._batch_members.clear()
+                self._inbox.clear()
                 self.blackboard.clear()
                 self._latest_batch_id = ""
                 self._session_id = next_session
@@ -1229,7 +1270,7 @@ class ParallelSubagents:
         if not worker.depends_on:
             return True, ""
         with self._lock:
-            worker.current_action = f"waiting on {', '.join(worker.depends_on)}"
+            worker.set_action(f"waiting on {', '.join(worker.depends_on)}")
         deadline = time.monotonic() + worker.timeout
         upstream_blocks: list[str] = []
         for dep_id in worker.depends_on:
@@ -1420,8 +1461,11 @@ class ParallelSubagents:
                 ]
                 with self._lock:
                     worker.tool_calls += len(batch_calls)
-                    worker.current_action = (
-                        f"parallel read x{len(batch_calls)}"
+                    worker.set_action(
+                        f"parallel read x{len(batch_calls)}: "
+                        + ", ".join(_describe_call(
+                            c["function"]["name"], a)
+                            for c, a in zip(batch_calls, parsed_args))
                     )
                     for c in batch_calls:
                         cn = c["function"]["name"]
@@ -1503,7 +1547,7 @@ class ParallelSubagents:
             args = parse_tool_arguments(fn.get("arguments", "{}"))
             with self._lock:
                 worker.tool_calls += 1
-                worker.current_action = name
+                worker.set_action(_describe_call(name, args))
                 worker.tool_breakdown[name] = (
                     worker.tool_breakdown.get(name, 0) + 1
                 )
@@ -1577,7 +1621,7 @@ class ParallelSubagents:
                 attempts += 1
                 with self._lock:
                     worker.retries = attempts
-                    worker.current_action = (
+                    worker.set_action(
                         f"retrying ({attempts}/{worker.max_retries})"
                     )
                 backoff = min(2.0, 0.05 * (2 ** (attempts - 1)))
@@ -1629,7 +1673,7 @@ class ParallelSubagents:
                 if worker.stop_event.is_set():
                     raise TurnCancelled()
                 worker.state = "running"
-                worker.current_action = "starting"
+                worker.set_action("starting")
                 worker.started_at = time.time()
                 self._active_running += 1
                 active_incremented = True
@@ -1653,9 +1697,7 @@ class ParallelSubagents:
                     raise TurnCancelled()
                 with self._lock:
                     worker.steps = step
-                    worker.current_action = (
-                        f"model step {step}/{self.max_steps}"
-                    )
+                    worker.set_action(f"model step {step}/{self.max_steps}")
                 result = self._call_model_with_retries(worker, schemas)
                 if worker.stop_event.is_set():
                     raise TurnCancelled()
@@ -1746,7 +1788,7 @@ class ParallelSubagents:
                 if active_incremented:
                     self._active_running = max(0, self._active_running - 1)
                 worker.finished_at = time.time()
-                worker.current_action = worker.state
+                worker.set_action(worker.state)
                 data = worker.to_dict()
                 done_ev = self._done_events.get(worker.id)
                 if done_ev is not None:
@@ -1851,6 +1893,65 @@ class ParallelSubagents:
                 )
         return "\n".join(lines)
 
+    # -- non-blocking result delivery ----------------------------------------
+
+    def mark_delivered(self, worker_ids) -> None:
+        """Record that the main agent has these settled workers' reports
+        (via TaskCollect/TaskOutput), so auto-delivery skips them."""
+        with self._lock:
+            for aid in worker_ids or ():
+                worker = self._workers.get(str(aid))
+                if worker is not None and worker.state in TERMINAL_STATES:
+                    worker.delivered = True
+                    if worker.id in self._inbox:
+                        self._inbox.remove(worker.id)
+
+    def pending_results(self) -> int:
+        """Settled workers whose report the main agent has not received."""
+        with self._lock:
+            return len(self._inbox)
+
+    def drain_results(self, limit: int = 8,
+                      max_chars: int = 16_000) -> list[str]:
+        """Pop up to ``limit`` undelivered final reports (finish order).
+
+        Each report is format_worker() output. Marked delivered, so a
+        report reaches the main agent exactly once whichever path (this,
+        TaskCollect or TaskOutput) gets there first."""
+        out: list[str] = []
+        used = 0
+        with self._lock:
+            while self._inbox and len(out) < max(1, int(limit)):
+                aid = self._inbox[0]
+                worker = self._workers.get(aid)
+                if worker is None or worker.delivered:
+                    self._inbox.pop(0)
+                    continue
+                report = self.format_worker(worker)
+                if out and used + len(report) > max_chars:
+                    break
+                if len(report) > max_chars:
+                    report = report[:max_chars - 1] + "…"
+                self._inbox.pop(0)
+                worker.delivered = True
+                out.append(report)
+                used += len(report)
+        return out
+
+    def stop_all(self) -> int:
+        """Request cancellation of every queued/running worker."""
+        with self._lock:
+            ids = [w.id for w in self._workers.values()
+                   if w.state in ("queued", "running")]
+        n = 0
+        for aid in ids:
+            try:
+                self.stop(aid)
+                n += 1
+            except SubagentError:
+                pass
+        return n
+
     def snapshot(self) -> dict:
         """Return an immutable-style, JSON-safe live dashboard snapshot."""
         with self._lock:
@@ -1893,6 +1994,15 @@ class ParallelSubagents:
                 "roles_used": sorted({row["role"] for row in workers}),
                 "files_touched": files_touched,
                 "blackboard_count": len(self.blackboard.read()),
+                "pending_results": len(self._inbox),
+                "swarm_started_at": min(
+                    (self._workers[aid].created_at for aid in self._order
+                     if aid in self._workers
+                     and self._workers[aid].state in ACTIVE_STATES),
+                    default=0.0),
+                "tokens_per_sec": round(sum(
+                    row["tokens_per_sec"] for row in workers
+                    if row["state"] == "running"), 1),
             }
 
     def shutdown(self, wait: bool = True) -> None:
@@ -1919,6 +2029,22 @@ class ParallelSubagents:
         if draining:
             concurrent.futures.wait(draining, timeout=DRAIN_TIMEOUT)
         self._pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _describe_call(name: str, args: Any) -> str:
+    """Short human label for a tool call: ``read_file · src/app.py``."""
+    name = str(name or "tool")
+    if not isinstance(args, dict):
+        return name
+    for key in ("path", "file_path", "pattern", "query", "url", "command",
+                "cmd", "dst", "src"):
+        val = args.get(key)
+        if isinstance(val, str) and val.strip():
+            val = " ".join(val.split())
+            if len(val) > 72:
+                val = val[:69] + "…"
+            return f"{name} · {val}"
+    return name
 
 
 def _scope_view(item: dict) -> Subagent:

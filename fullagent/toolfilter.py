@@ -543,7 +543,26 @@ def build_full_registry():
             return [_ev(e) for e in node.elts]
         if isinstance(node, _ast.Tuple):
             return tuple(_ev(e) for e in node.elts)
+        if isinstance(node, _ast.JoinedStr):
+            # f-string description: keep the literal text, render each
+            # runtime value (e.g. the configured swarm size) as "N"
+            return "".join(v.value if isinstance(v, _ast.Constant)
+                           else "N" for v in node.values)
         raise ValueError("non-literal")
+
+    # simple string constants the Tool() literals reference (e.g. the
+    # shared AUTO_NOTE appended to every swarm tool description)
+    for node in _ast.walk(tree):
+        if (isinstance(node, _ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], _ast.Name)
+                and node.targets[0].id.isupper()
+                and node.targets[0].id not in _ns):
+            try:
+                val = _ev(node.value)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(val, str):
+                _ns[node.targets[0].id] = val
 
     from fullagent.tools import Tool as _Tool
     for node in _ast.walk(tree):

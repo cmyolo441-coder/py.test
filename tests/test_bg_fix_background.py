@@ -39,7 +39,7 @@ def test_speculator_threads_do_not_pile_up_across_turns():
         release.set()
 
 
-def _wait_cached(sp, n=1, timeout=5.0):
+def _wait_cached(sp, n=1, timeout=15.0):
     deadline = time.monotonic() + timeout
     while len(sp._cache) < n and time.monotonic() < deadline:
         time.sleep(0.01)

@@ -43,7 +43,7 @@ from typing import Any
 # them, so treating the newest one as "the prompt" made /retry restart
 # the turn with the runtime note as its prompt and keep every failed
 # attempt that preceded it.
-_HARNESS_PREFIXES = ("[RUNTIME NOTE", "[compliance-gate]")
+_HARNESS_PREFIXES = ("[RUNTIME NOTE", "[compliance-gate]", "[SWARM RESULTS")
 
 
 def _prompt_text(msg: Any) -> str | None:

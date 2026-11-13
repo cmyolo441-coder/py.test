@@ -1122,6 +1122,13 @@ class Agent:
                                  f"with /budget (e.g. /budget steps 500 " \
                                  f"or /budget reset) or stop."
                     break
+                # Non-blocking swarm: results of background subagents that
+                # finished since the last model call are handed to the
+                # model here, so it never has to block on TaskCollect.
+                try:
+                    self._deliver_swarm_results(on_status)
+                except Exception:
+                    pass
                 on_status("thinking")
                 # keep the context under the window — compact stale turns
                 # before asking the model (I9: input budget governor)
@@ -2803,6 +2810,61 @@ class Agent:
 
     # -- enterprise: notifications ------------------------------------------------------
 
+    # -- swarm: non-blocking result delivery ---------------------------------
+
+    def swarm_pending_results(self) -> int:
+        """Finished background subagents whose reports the model has not
+        received yet (0 when no swarm exists). Cheap; UI-safe."""
+        mgr = self.__dict__.get("subagents")
+        if mgr is None:
+            return 0
+        try:
+            return int(mgr.pending_results())
+        except Exception:
+            return 0
+
+    def _deliver_swarm_results(self, on_status=None) -> int:
+        """Append finished subagent reports to the conversation as one
+        runtime note before the next model call. Returns how many."""
+        mgr = self.__dict__.get("subagents")
+        if mgr is None or not mgr.pending_results():
+            return 0
+        # Only between complete exchanges: never between an assistant
+        # tool_calls message and its tool results.
+        if self.messages and self.messages[-1].get("role") == "assistant" \
+                and self.messages[-1].get("tool_calls"):
+            return 0
+        reports = mgr.drain_results(limit=8)
+        if not reports:
+            return 0
+        try:
+            still = int(mgr.snapshot().get("active", 0))
+        except Exception:
+            still = 0
+        head = (f"[SWARM RESULTS — {len(reports)} background subagent "
+                f"report(s) delivered automatically"
+                + (f"; {still} still working" if still else "; swarm idle")
+                + "]")
+        body = "\n\n".join(reports)
+        self.messages.append({
+            "role": "user",
+            "content": (head + "\n\n" + body + "\n\nUse these results "
+                        "for the task. They are already collected; do not "
+                        "call TaskCollect for them again."),
+        })
+        try:
+            self.log.append("swarm.delivered",
+                            {"count": len(reports), "still_active": still},
+                            actor="sovereign")
+        except Exception:
+            pass
+        if on_status is not None:
+            try:
+                on_status(f"swarm: {len(reports)} result(s) received")
+            except Exception:
+                pass
+        return len(reports)
+
     def _flush_notifications(self) -> None:
         """Emit any NOTIFY_EVENTS sealed since the last flush.
 
@@ -3323,12 +3385,31 @@ class Agent:
         from .roles import ROLES
         from .subagents import ParallelSubagents, SubagentError
 
+        _cfg = self.__dict__.get("cfg")
+        _extra = getattr(_cfg, "extra", None) or {}
+        if not isinstance(_extra, dict):
+            _extra = {}
+
+        def _int_extra(key: str, default: int, lo: int, hi: int) -> int:
+            try:
+                return max(lo, min(hi, int(_extra.get(key, default))))
+            except (TypeError, ValueError):
+                return default
+
+        # Swarm sizing: how many model calls run at once (rate limits) and
+        # how many workers may be queued + running in total.
+        swarm_concurrency = _int_extra("swarm_concurrency", 8, 1, 16)
+        swarm_capacity = _int_extra("swarm_capacity", 32, swarm_concurrency,
+                                    48)
         manager = ParallelSubagents(
             self.log, self.tools, self._subagent_runtime,
             before_write=self._snapshot_subagent_write,
             after_write=self._after_subagent_write,
-            workspace=Path.cwd())
+            workspace=Path.cwd(),
+            max_workers=swarm_concurrency,
+            max_active=swarm_capacity)
         self.subagents = manager
+        AUTO_NOTE = 'Results are delivered to you automatically (a [SWARM RESULTS] note) as each worker finishes, so keep working on other parts and do not wait; call TaskCollect only when you cannot continue without a result.'
 
         def _task_error(fn):
             try:
@@ -3345,14 +3426,15 @@ class Agent:
                     task, role=subagent_type, context=context, name=name,
                     model_id=model_id, allow_writes=False)
                 return (f"Started batch {worker.batch_id}: {worker.id} "
-                        f"({worker.role}, model {worker.model_id}). "
-                        "Use TaskCollect with this batch_id to collect its "
-                        "result or TaskList to inspect all workers.")
+                        f"({worker.role}, model {worker.model_id}) in the "
+                        "background. Its result will be delivered to you "
+                        "automatically when it finishes; keep working. "
+                        "TaskCollect waits for it only if you need it now.")
             return _task_error(start)
 
         def task_group(tasks: list, context: str = "",
                        role: str = "researcher", model_id: str = "") -> str:
-            """Atomically launch up to eight parallel read-only specialists."""
+            """Atomically launch up to sixteen parallel read-only specialists."""
             def start():
                 if not tasks:
                     raise SubagentError("tasks must be a non-empty list")
@@ -3363,8 +3445,10 @@ class Agent:
                 return (f"Launched batch {batch_id} with {len(workers)} "
                         "parallel read-only subagent(s): "
                         + ", ".join(w.id for w in workers)
-                        + ". Use TaskCollect with batch_id for all reports; "
-                        "TaskList shows live status.")
+                        + ". They run in the background and each result is "
+                        "delivered to you automatically when it finishes; "
+                        "keep working. TaskCollect waits only if you need "
+                        "the reports now; TaskList shows live status.")
             return _task_error(start)
 
         def task_write_group(tasks: list, context: str = "",
@@ -3382,8 +3466,9 @@ class Agent:
                         + ", ".join(
                             f"{w.id} ({w.role}) [{', '.join(w.write_scope)}]"
                             for w in workers)
-                        + ". Their writes are snapshot-backed; use TaskOutput "
-                        "or TaskCollect with batch_id to collect reports.")
+                        + ". Their writes are snapshot-backed; each report is "
+                        "delivered to you automatically when it finishes "
+                        "(TaskCollect waits only if you need it now).")
             return _task_error(start)
 
         def task_output(task_id: str, wait_seconds: float = 30.0,
@@ -3394,6 +3479,7 @@ class Agent:
                     return f"ERROR: unknown subagent: {task_id}"
                 manager.wait([task_id], timeout=wait_seconds,
                              should_cancel=should_cancel)
+                manager.mark_delivered([task_id])
                 return manager.format_worker(worker)
             return _task_error(collect)
 
@@ -3462,9 +3548,8 @@ class Agent:
         }
         self.tools["Task"] = Tool(
             "Task",
-            "Start one independent read-only specialist in the background. "
-            "Choose the closest role; use TaskCollect with the returned batch_id "
-            "to collect its report, or TaskOutput for one worker.",
+            "Start one independent read-only specialist in the background "
+            "and keep working. Choose the closest role. " + AUTO_NOTE,
             {"type": "object", "properties": {
                 "task": {"type": "string"},
                 "subagent_type": {"type": "string", "enum": roles,
@@ -3474,30 +3559,33 @@ class Agent:
              "required": ["task"]}, task)
         self.tools["TaskGroup"] = Tool(
             "TaskGroup",
-            "Submit up to eight independent, individually scoped read-only specialists as one "
-            "parallel batch; up to four model calls run at once and excess work "
-            "queues. Use for reviews, exploration, design, or test analysis; "
-            "each task can select its own role and explicit configured model; "
-            "all tasks are validated before any are started. Collect the whole "
-            "batch with TaskCollect.",
+            "Submit up to sixteen independent, individually scoped read-only "
+            "specialists as one parallel swarm batch; "
+            f"up to {manager.max_workers} model calls run at once and excess "
+            "work queues. Use for reviews, exploration, design, or test "
+            "analysis; each task can select its own role and explicit "
+            "configured model; all tasks are validated before any are "
+            "started. " + AUTO_NOTE,
             {"type": "object", "properties": {
                 "tasks": {"type": "array", "items": task_item,
-                          "minItems": 1, "maxItems": 8},
+                          "minItems": 1, "maxItems": 16},
                 "context": {"type": "string"},
                 "role": {"type": "string", "enum": read_roles},
                 "model_id": {"type": "string"}},
              "required": ["tasks"]}, task_group)
         self.tools["TaskWriteGroup"] = Tool(
             "TaskWriteGroup",
-            "Launch up to eight scoped implementation specialists (four model calls at once) with "
+            "Launch up to sixteen scoped implementation specialists "
+            f"({manager.max_workers} model calls at once) with "
             "distinct, explicit workspace write_scope paths. This operation "
             "requires the existing permission gate; "
             "writers cannot use shell, delete, move, copy, or arbitrary patch tools, "
             "and every file write is preceded by a recovery snapshot. Each task "
-            "can choose an appropriate write-enabled role and model; collect via TaskCollect.",
+            "can choose an appropriate write-enabled role and model. "
+            + AUTO_NOTE,
             {"type": "object", "properties": {
                 "tasks": {"type": "array", "items": write_item,
-                          "minItems": 1, "maxItems": 8},
+                          "minItems": 1, "maxItems": 16},
                 "context": {"type": "string"},
                 "model_id": {"type": "string"}},
              "required": ["tasks"]}, task_write_group, risk=RISK_CONFIRM)
@@ -3513,14 +3601,14 @@ class Agent:
             background_wait=True)
         self.tools["TaskCollect"] = Tool(
             "TaskCollect",
-            "Wait once for a named batch (or up to eight explicit task IDs) and "
+            "Wait once for a named batch (or up to sixteen explicit task IDs) and "
             "return every report with state, evidence, verification, usage, and blockers. "
             "If neither selector is supplied, collect the latest batch.",
             {"type": "object", "properties": {
                 "batch_id": {"type": "string",
                              "description": "Batch ID returned by Task, TaskGroup, or TaskWriteGroup."},
                 "task_ids": {"type": "array", "items": {"type": "string"},
-                             "minItems": 1, "maxItems": 8},
+                             "minItems": 1, "maxItems": 16},
                 "wait_seconds": {"type": "number", "minimum": 0,
                                  "maximum": 90}},
              "additionalProperties": False}, task_collect,
