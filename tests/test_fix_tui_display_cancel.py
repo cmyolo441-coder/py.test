@@ -73,11 +73,15 @@ class StrayEscapeDoesNotCancel(unittest.TestCase):
         run_with_ui(body, FakeManager(0))
 
     def test_real_escape_key_still_cancels(self):
+        """A lone Esc only arms (it may be the head of a late terminal
+        report); pressing it again stops the turn."""
         def body(ui):
             ui._busy = True
             feed_bytes(ui, "\x1b")           # a lone Esc keypress
+            self.assertFalse(ui._cancel_flag.is_set())
+            feed_bytes(ui, "\x1b")           # pressed again
             self.assertTrue(ui._cancel_flag.is_set(),
-                            "a real Esc must still cancel the turn")
+                            "Esc twice must cancel the turn")
             ui._busy = False
         run_with_ui(body, FakeManager(0))
 

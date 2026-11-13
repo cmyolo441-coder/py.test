@@ -38,6 +38,7 @@ preview.
 from __future__ import annotations
 
 import difflib
+import logging
 import os
 import shutil
 import re
@@ -422,6 +423,35 @@ def _is_stray_escape(event) -> bool:
         return len(kp.key_buffer) > len(event.key_sequence)
     except Exception:
         return False
+
+_ui_log = logging.getLogger("fullagent.tui")
+
+# A single Escape byte is ambiguous: it is the user's Esc key AND the first
+# byte of every report a terminal sends back (cursor-position answers to the
+# ESC[6n requests the prompt makes while it redraws, focus and mouse
+# reports). When the rest of a report reaches us late (a laggy ssh, web or
+# docker terminal) prompt_toolkit has already emitted the Escape on its own
+# and the tail ("[25;1R") arrives as typed text. A lone Escape therefore
+# never stops a running turn by itself: the first one arms, a second within
+# this window stops it. Ctrl+C (a byte no report contains) stops at once.
+ESC_CONFIRM_WINDOW = 2.5
+
+# Tails of terminal reports whose Escape arrived separately (see above):
+# cursor-position answers and SGR mouse reports. Nobody types these.
+_REPORT_TAIL_RE = re.compile(r"\[\d{1,4};\d{1,4}R|\[<\d{1,4};\d{1,4};\d{1,4}[Mm]")
+# Focus reports are short enough to be real text ("[I"), so they are only
+# stripped right after a lone Escape was seen.
+_FOCUS_TAIL_RE = re.compile(r"\[[IO]$")
+_FOCUS_TAIL_WINDOW = 10.0
+
+
+def _strip_report_tails(text: str, focus_tail: bool = False) -> str:
+    """Remove terminal-report tails that leaked into typed text."""
+    out = _REPORT_TAIL_RE.sub("", text)
+    if focus_tail:
+        out = _FOCUS_TAIL_RE.sub("", out)
+    return out
+
 
 # Slash commands that replace or rewrite agent.messages / the timeline;
 # refused while a turn is running (see UI._handle_slash).
@@ -1213,7 +1243,7 @@ class UI:
             pending = self._pending_count()
             queued = f" · {pending} msg queued" if pending else ""
             tail = (f"{tok_rate}{elapsed}{queued} · Enter queue · "
-                    "Esc cancel ")
+                    "Esc Esc / ^C stop ")
             max_status = max(0, inner - _disp_width(f" ⠹ {tail}") - 4)
             status = _truncate_w(self._status_text, max_status)
             bar_len = (_disp_width(f" {frame} ") + _disp_width(status)
@@ -1733,7 +1763,7 @@ class UI:
                 return False
             self._busy = True
         try:
-            self._cancel_flag.clear()
+            self._reset_cancel_state()
         except Exception:
             pass
         text = _SwarmFollowup(swarmdash.AUTO_CONTINUE_PROMPT)
@@ -1932,6 +1962,7 @@ class UI:
             history=SafeFileHistory(str(config.HISTORY_FILE)),
             accept_handler=self._accept_handler,
         )
+        self.buffer.on_text_changed += self._on_buffer_changed
 
         def get_line_prefix(line: int, wrap_count: int):
             if line == 0 and wrap_count == 0:
@@ -2224,7 +2255,7 @@ class UI:
         @kb.add("c-c", filter=focused & ~ov & idle)
         def _ctrl_c(event):
             if self._busy:
-                cleared = self._request_cancel()
+                cleared = self._request_cancel("Ctrl+C")
                 self._set_status("cancelling…")
                 if cleared:
                     self._set_flash(
@@ -2246,7 +2277,20 @@ class UI:
                 # head of an unknown terminal report (CSI-u key, DA
                 # reply, split cursor report) — not the user's Esc
                 return
-            cleared = self._request_cancel()
+            now = time.monotonic()
+            self._last_lone_esc = now
+            armed = self.__dict__.get("_esc_armed_at")
+            if armed is None or now - armed > ESC_CONFIRM_WINDOW:
+                # first Esc: may be the head of a late terminal report,
+                # so it only arms — nothing is stopped yet
+                self._esc_armed_at = now
+                _ui_log.warning("Esc during a turn: armed, not cancelled "
+                             "(keys=%r)", [k.data for k in event.key_sequence])
+                self._set_flash("Esc again to stop this turn · "
+                                "Ctrl+C stops it now", C["yellow"])
+                return
+            self._esc_armed_at = None
+            cleared = self._request_cancel("Esc twice")
             self._set_status("cancelling…")
             if cleared:
                 self._set_flash(
@@ -2378,14 +2422,53 @@ class UI:
         def _dash_cancel_all(event):
             self._swarm_cancel_all()
 
-    def _request_cancel(self) -> int:
+    def _reset_cancel_state(self) -> None:
+        """A new turn starts with no cancel, no armed Esc, no source."""
+        self._cancel_flag.clear()
+        self._cancel_source = None
+        self._esc_armed_at = None
+
+    def _on_buffer_changed(self, buff) -> None:
+        """Drop terminal-report tails ("[25;1R") that reached the prompt
+        because their Escape arrived separately; such an Escape also never
+        counts towards stopping a turn."""
+        if self.__dict__.get("_stripping_tails"):
+            return
+        text = buff.text
+        if "[" not in text:
+            return
+        last = self.__dict__.get("_last_lone_esc")
+        focus = (last is not None
+                 and time.monotonic() - last < _FOCUS_TAIL_WINDOW)
+        clean = _strip_report_tails(text, focus_tail=focus)
+        if clean == text:
+            return
+        _ui_log.warning("dropped terminal report tail from the prompt: %r",
+                     text[len(clean):] if text.startswith(clean) else text)
+        # the lone Escape before this tail was the report's head, not a key
+        self._esc_armed_at = None
+        removed = len(text) - len(clean)
+        cur = max(0, min(len(clean), buff.cursor_position - removed))
+        self._stripping_tails = True
+        try:
+            from prompt_toolkit.document import Document as _Doc
+            buff.set_document(_Doc(clean, cur), bypass_readonly=True)
+        finally:
+            self._stripping_tails = False
+
+    def _request_cancel(self, source: str = "Esc/Ctrl+C") -> int:
         """Idempotently cancel this UI turn and drop pending follow-ups.
 
+        ``source`` is the user's action that asked for it; it is shown on
+        the "⊘ cancelled" line and logged, so a cancel is never a mystery.
         Returns the number of queued messages dropped so the key handler
         can tell the user exactly what happened.
         """
+        _ui_log.warning("turn cancel requested by %s", source)
         q, lock = self._queue_state()
         with lock:
+            if not self._cancel_flag.is_set():
+                self._cancel_source = source
             self._cancel_flag.set()
             cleared = len(q)
             q.clear()
@@ -2633,7 +2716,7 @@ class UI:
             self._invalidate()
             return
 
-        self._cancel_flag.clear()
+        self._reset_cancel_state()
         try:
             threading.Thread(target=self._run_turn_thread, args=(next_text,),
                              daemon=True).start()
@@ -4803,7 +4886,7 @@ class UI:
                 # so start it with a clean cancel state.
                 next_text = q.popleft()
                 self._busy = True
-                self._cancel_flag.clear()
+                self._reset_cancel_state()
 
         if next_text is None:
             return
@@ -5265,7 +5348,9 @@ class UI:
                                    soft_wrap=True)
             if turn.error:
                 if turn.error == "cancelled":
-                    self.print_info("⊘ cancelled", C["yellow"])
+                    src = self.__dict__.get("_cancel_source") or "Esc/Ctrl+C"
+                    self.print_info(f"⊘ cancelled — you pressed {src}",
+                                    C["yellow"])
                 else:
                     self.print_error(turn.error)
             else:
@@ -5501,10 +5586,13 @@ class UI:
         prov = PROVIDERS.get(m.provider)
         busy = bool(getattr(self, "_busy", False)
                     or getattr(self.agent, "turn_model_id", None))
+        why = {"picker": "you picked it in the Ctrl+T menu",
+               "/model": "you ran /model"}.get(via, f"via {via}")
         self.print_info(
             f"✓ model → {m.label} ({m.id} · "
-            f"{prov.name if prov else m.provider})"
-            + (" — applies from the next turn" if busy else ""), C["green"])
+            f"{prov.name if prov else m.provider}) — {why}"
+            + ("; applies from the next turn" if busy else ""), C["green"])
+        _ui_log.warning("model changed %s -> %s (%s)", old, m.id, why)
         self._set_flash(f"model → {m.label} ({m.id})", C["green"])
         try:
             self.agent.log.append("model.changed",

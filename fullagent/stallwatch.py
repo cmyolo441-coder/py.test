@@ -63,7 +63,7 @@ class StallWatcher:
             self._warned = True
             return (
                 "Model is taking unusually long "
-                f"(no output for {self.threshold:g}s). Press Esc to cancel."
+                f"(no output for {self.threshold:g}s). Press Ctrl+C (or Esc twice) to cancel."
             )
         return None
 
@@ -92,7 +92,7 @@ if __name__ == "__main__":
     warn = w.check()
     _expect(warn is not None, "warning fires at 61s")
     _expect(warn == "Model is taking unusually long (no output for 60s). "
-                    "Press Esc to cancel.", "warning text exact match")
+                    "Press Ctrl+C (or Esc twice) to cancel.", "warning text exact match")
     _expect(w.check() is None, "warning fires only once per episode")
 
     # 2. Normal token flow: token at 30s, then 30s more -> no warning.
