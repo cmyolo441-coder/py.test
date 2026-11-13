@@ -809,21 +809,46 @@ def _sanitize_messages(messages: list[dict]) -> bool:
             message["reasoning_content"] = ""
             fixed = True
     # Never send both spellings of the thinking field (see
-    # _assistant_message): keep reasoning_content, drop the alias.
-    for message in messages:
+    # assistant_message): keep reasoning_content, drop the alias.
+    if dedupe_reasoning_fields(messages):
+        fixed = True
+    return fixed
+
+
+def dedupe_reasoning_fields(messages: Any) -> bool:
+    """Collapse messages that carry both ``reasoning`` and
+    ``reasoning_content`` into ``reasoning_content`` alone, in place.
+
+    Rust/serde gateways (kios) treat ``reasoning`` as an alias of
+    ``reasoning_content`` and reject a message with both as "duplicate
+    field `reasoning_content`". History written by older versions (live or
+    in saved session files) has both. Returns True if anything changed."""
+    changed = False
+    for message in messages if isinstance(messages, list) else []:
         if isinstance(message, dict) and "reasoning" in message \
                 and "reasoning_content" in message:
             if not message.get("reasoning_content") and message.get("reasoning"):
                 message["reasoning_content"] = message["reasoning"]
             message.pop("reasoning", None)
-            fixed = True
-    return fixed
+            changed = True
+    return changed
 
 
 def _is_duplicate_field_error(err: Exception) -> bool:
     """A gateway refused the request JSON because a message carried a
     field twice (serde: ``duplicate field `reasoning_content```)."""
     return "duplicate field" in str(err).lower()
+
+
+def _duplicate_field_failure(err: APIError) -> APIError:
+    """The error for a duplicate-field rejection that survived the one
+    heal-and-retry: keeps the provider's text and status, says what was
+    already tried and what the user can do."""
+    return APIError(
+        f"{err} — already retried once without echoed thinking and the "
+        f"provider still refuses this conversation. Start a new session "
+        f"(/new) or pick another model (Ctrl+T).",
+        status=getattr(err, "status", None))
 
 
 def _strip_reasoning(messages: list[dict]) -> bool:
@@ -2190,8 +2215,9 @@ def chat_stream(provider: Provider, model: Model, effort: Effort,
         except APIError as e:
             # reasoning_content validation — heal history and retry once,
             # but NEVER after output already streamed (see `streamed`)
-            if _is_duplicate_field_error(e) and not streamed["out"] \
-                    and not healed_dup:
+            if _is_duplicate_field_error(e) and not streamed["out"]:
+                if healed_dup:
+                    raise _duplicate_field_failure(e) from e
                 healed_dup = True
                 _log.warning("provider rejected a duplicated field (%s); "
                              "retrying once without echoed thinking", e)
@@ -3026,8 +3052,12 @@ def chat_blocking(provider: Provider, model: Model, effort: Effort,
                                   should_cancel=should_cancel,
                                   on_status=on_status)
         except APIError as err:
-            if _is_duplicate_field_error(err) and not healed_dup:
+            if _is_duplicate_field_error(err):
+                if healed_dup:
+                    raise _duplicate_field_failure(err) from err
                 healed_dup = True
+                _log.warning("provider rejected a duplicated field (%s); "
+                             "retrying once without echoed thinking", err)
                 _sanitize_messages(messages)
                 _strip_reasoning(messages)
                 continue
