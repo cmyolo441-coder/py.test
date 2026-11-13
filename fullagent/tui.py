@@ -4972,6 +4972,7 @@ class UI:
             parts.append(piece)
             maxw = max(1, self._width() - 26)
             if "\n" in piece:
+                _flush_thinking()
                 # the unfinished tail never contains "\n" (it is the text
                 # after the last newline seen), so a newline can only have
                 # arrived inside this piece — join once, split, done.
@@ -5037,6 +5038,27 @@ class UI:
             # status so the user sees no reasoning text at all.
             reasoning_stream.feed(piece)
             _reasoning_status()
+
+        # Thinking goes ABOVE the reply it produced. The streamed reply is
+        # printed live, line by line, while the Thinking block used to be
+        # printed only once the turn ended — so the transcript read
+        # "reply · Thinking · done". Flush any not-yet-shown reasoning the
+        # moment visible output (reply text or a tool row) starts.
+        think_shown = {"chars": 0}
+
+        def _flush_thinking() -> None:
+            if not _reasoning_visible:
+                return
+            try:
+                full = reasoning_stream.text
+                fresh = full[think_shown["chars"]:]
+                if not fresh.strip():
+                    return
+                think_shown["chars"] = len(full)
+                self._print_thinking_block(fresh, expanded=bool(getattr(
+                    self.agent, "thinking_expanded", False)))
+            except Exception:
+                pass
 
         # live shell streaming state — one tool runs at a time, so a plain
         # dict is enough: on_tool_call arms it, on_tool_output streams the
@@ -5176,6 +5198,7 @@ class UI:
                 _throttle.discard()
                 _reasoning_throttle.discard()
                 _args_throttle.discard()
+            _flush_thinking()
             rem = "".join(stream_tail["parts"]).strip("\n")
             stream_tail["parts"].clear()
             stream_tail["pv"] = ""
@@ -5306,6 +5329,9 @@ class UI:
         finally:
             with _STATUS_LOCK:
                 self._active_throttle = None
+            if not render_md or turn is None or turn.error:
+                # reply text (streamed or the error) follows its thinking
+                _flush_thinking()
             rem = "".join(stream_tail["parts"]).strip("\n")
             stream_tail["parts"].clear()
             # Final flush: apply any preview frame the throttle absorbed so
@@ -5334,7 +5360,11 @@ class UI:
                     self.agent, "thinking_visible", _think_visible))
             except Exception:
                 pass
-            if turn.reasoning and _think_visible:
+            if think_shown["chars"]:
+                # streamed thinking: print only what has not been shown
+                # yet (Markdown mode defers it to here, above the reply)
+                _flush_thinking()
+            elif turn.reasoning and _think_visible:
                 try:
                     _exp = bool(getattr(self.agent, "thinking_expanded",
                                         False))

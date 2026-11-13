@@ -503,10 +503,12 @@ def assistant_message(content: str | None, tool_calls: list[dict],
                 _rs = str(_rs)
         else:
             _rs = _typeguards.ensure_str(_rs)
+    # Only ONE reasoning key goes on the wire. Gateways that deserialize
+    # with serde treat "reasoning" as an alias of "reasoning_content", so
+    # sending both failed every follow-up turn with
+    # 'duplicate field `reasoning_content`' (Mistral Large 4 via Kios).
     if _rs:
         msg["reasoning_content"] = _rs
-        # some providers also accept "reasoning"
-        msg["reasoning"] = _rs
     elif calls:
         msg["reasoning_content"] = ""
     return msg
@@ -807,12 +809,36 @@ def _sanitize_messages(messages: list[dict]) -> bool:
         if message.get("reasoning_content") is None and message.get("reasoning") is None:
             message["reasoning_content"] = ""
             fixed = True
+    if _dedupe_reasoning_keys(messages):
+        fixed = True
+    return fixed
+
+
+def _dedupe_reasoning_keys(messages: list[dict]) -> bool:
+    """Keep a single reasoning field per message.
+
+    Older sessions (and older assistant_message() builds) stored the same
+    text under both ``reasoning_content`` and ``reasoning``. Serde-based
+    gateways alias the two and reject the body with
+    'duplicate field `reasoning_content`'. ``reasoning_content`` wins;
+    a lone ``reasoning`` is renamed so history keeps its thinking."""
+    fixed = False
+    for message in messages:
+        if not isinstance(message, dict) or "reasoning" not in message:
+            continue
+        legacy = message.pop("reasoning")
+        if message.get("reasoning_content") is None:
+            message["reasoning_content"] = legacy if isinstance(legacy, str) \
+                else _coerce_text(legacy)
+        fixed = True
     return fixed
 
 
 def _is_reasoning_content_error(err: Exception) -> bool:
     """True if an APIError is the reasoning_content validation."""
     msg = str(err).lower()
+    if "duplicate field" in msg and "reasoning" in msg:
+        return True
     return "reasoning_content" in msg and "required" in msg
 
 

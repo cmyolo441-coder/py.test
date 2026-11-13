@@ -1149,6 +1149,7 @@ class Agent:
             pass
         _exit_tracker = _EarlyExitTracker()  # earlyexit: per-turn novelty
         self._turn_status = on_status
+        empty_retries = 0
         try:
             while iterations < config.MAX_TOOL_ITERATIONS:
                 iterations += 1
@@ -1476,6 +1477,28 @@ class Agent:
                             "automatically.")
                         break
                     continue
+
+                # EMPTY REPLY: no text and no tool calls. The turn used to
+                # end silently with "✦ done" and nothing on screen (seen
+                # with Gemini 4 Argon / Gwarden), and an empty assistant
+                # message went into history. Retry once, then report it.
+                # (After tool work an empty closing message is normal.)
+                if not (result.content or "").strip() and not turn.tools \
+                        and not turn.assistant_text.strip():
+                    if empty_retries < 1:
+                        empty_retries += 1
+                        on_status("empty reply from the model — retrying")
+                        continue
+                    turn.usage = result.usage
+                    turn.error = (
+                        f"{self.model.label} returned an empty reply "
+                        f"(no text, no tool call) twice. Send the message "
+                        f"again, or pick another model with Ctrl+T.")
+                    if self.messages and \
+                            self.messages[-1].get("role") == "user":
+                        self.messages.pop()
+                    self.log.append("turn.error", {"error": turn.error})
+                    break
 
                 # plain assistant reply — done
                 turn.assistant_text += result.content
