@@ -131,6 +131,18 @@ class Cassette:
         # seeks a binary handle to it)
         self._fh = self.path.open("ab")
         self._fh.seek(0, os.SEEK_END)
+        # a crash mid-record leaves a torn last line with no "\n": the next
+        # record would be glued onto it and lost on reload — terminate it
+        if self._fh.tell() > 0:
+            try:
+                with self.path.open("rb") as rf:
+                    rf.seek(-1, os.SEEK_END)
+                    torn = rf.read(1) != b"\n"
+            except OSError:
+                torn = False
+            if torn:
+                self._fh.write(b"\n")
+                self._fh.flush()
 
     def close(self) -> None:
         """Release the persistent append handle (record mode)."""

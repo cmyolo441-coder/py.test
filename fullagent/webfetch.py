@@ -133,7 +133,9 @@ class _TextExtractor(HTMLParser):
 
 def _collapse(s: str) -> str:
     """Collapse horizontal whitespace; keep paragraph breaks."""
-    s = html.unescape(s)
+    # no html.unescape here: the parser runs with convert_charrefs=True,
+    # so entities are already decoded — a second pass turned the literal
+    # text "&lt;b&gt;" (source "&amp;lt;b&amp;gt;") into "<b>".
     s = re.sub(r"[ \t\r\f\v\u00a0]+", " ", s)
     s = re.sub(r"\n[ \t]*\n+", "\n\n", s)
     s = re.sub(r"[ \t]*\n[ \t]*", "\n", s)

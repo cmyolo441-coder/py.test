@@ -85,6 +85,12 @@ def predict(user_text: str, recent_tools: list[dict],
     # 1+2: paths named by the user
     for m in _PATH_RE.finditer(user_text or ""):
         path = m.group(1)
+        # sentence-final period ("fix src/main.py.") is punctuation, not
+        # part of the path; "." / ".." / "dir/." keep their dot
+        core = path.rstrip(".")
+        if (path.endswith(".") and core and not core.endswith("/")
+                and not path.endswith("..")):
+            path = core
         if path.endswith(("/", ".")):
             add(Prediction("list_dir", {"path": path.rstrip("/") or "."},
                            0.9, "path in user message"))

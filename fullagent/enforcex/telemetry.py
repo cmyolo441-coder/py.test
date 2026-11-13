@@ -194,7 +194,7 @@ class Histogram:
         for p in (ps or (50,)):
             try:
                 key = f"p{int(p)}"  # type: ignore[arg-type]
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 # percentile() guards its own value, but the dict key
                 # conversion above used to raise first.
                 continue
@@ -272,9 +272,15 @@ class Histogram:
                 h.buckets = restored
         # restore the true count/total/extremes beyond the trimmed samples
         try:
-            h.count = max(h.count, int(d.get("count", 0)))
-            h.total = max(h.total, float(d.get("total", 0.0)))
-        except (TypeError, ValueError):
+            saved_count = int(d.get("count", 0))
+            saved_total = float(d.get("total", 0.0))
+            # the saved total is authoritative whenever it covers at least
+            # the re-observed samples; max() picked the trimmed-sample sum
+            # for negative observations
+            if saved_count >= h.count and math.isfinite(saved_total):
+                h.count = saved_count
+                h.total = saved_total
+        except (TypeError, ValueError, OverflowError):
             pass
         for key, pick in (("minimum", min), ("maximum", max)):
             try:
@@ -316,6 +322,9 @@ class RateWindow:
         try:
             now = float(ts) if ts is not None else time.time()
         except (TypeError, ValueError):
+            now = time.time()
+        if not math.isfinite(now):
+            # a NaN/inf timestamp broke the sorted-list invariant
             now = time.time()
         try:
             n = max(1, min(1000, int(n)))  # type: ignore[arg-type]
@@ -406,9 +415,13 @@ class EventBus:
         """Register fn for a topic; returns a handle for unsubscribe."""
         if not callable(fn):
             return -1
+        # "" / "*" mean "all topics"; normalize_topic("") is "generic",
+        # so a catch-all subscribe("") used to only see "generic" events.
+        raw = str(topic or "").strip()
+        sub_topic = "*" if raw in ("", "*") else normalize_topic(topic)
         with self._lock:
             self._next_id += 1
-            self._subs[self._next_id] = (normalize_topic(topic), fn)
+            self._subs[self._next_id] = (sub_topic, fn)
             return self._next_id
 
     def unsubscribe(self, handle: int) -> bool:
@@ -750,7 +763,7 @@ class Telemetry:
             def _mi(value: Any, default: int = 0) -> int:
                 try:
                     return int(value or 0)  # type: ignore[arg-type]
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     return default
             rules = data.get("rules") or {}
             if isinstance(rules, dict):

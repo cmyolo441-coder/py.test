@@ -83,6 +83,15 @@ def _whitespace_normalized_match(
     start_n = norm_content.find(norm_old)
     end_n = start_n + len(norm_old)
     start = content_map[start_n]
+    if norm_old.startswith(" "):
+        # The needle's leading indentation matched a whitespace run that
+        # may begin with the PREVIOUS line's newline: start after the
+        # run's last newline, or a replacement joins the two lines.
+        run_end = (content_map[start_n + 1] if start_n + 1 < len(content_map)
+                   else len(content))
+        nl = content.rfind("\n", start, run_end)
+        if nl >= 0:
+            start = nl + 1
     # The last normalized char maps to the first original char of the last
     # run/token, so the original span ends one past that char.
     end = content_map[end_n - 1] + 1

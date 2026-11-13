@@ -48,6 +48,14 @@ def _config_key(config: dict) -> tuple:
         return tuple(sorted((k, repr(v)) for k, v in config.items()))
 
 
+def _rank_score(t: "Trial") -> float:
+    """Score for ranking: NaN (a failed/undefined objective) ranks
+    last. Raw NaN poisoned max()/sorted(): max() kept a leading NaN trial
+    as "best" forever, since every comparison with NaN is False."""
+    s = t.score
+    return float("-inf") if s != s else s
+
+
 @dataclass
 class Trial:
     config: dict
@@ -136,7 +144,7 @@ class ParzenTuner:
     def suggest(self) -> dict:
         """One config proposal: ε-uniform explore, else TPE exploit."""
         n_good = max(1, int(len(self.history) * _GAMMA))
-        ranked = sorted(self.history, key=lambda t: -t.score)
+        ranked = sorted(self.history, key=_rank_score, reverse=True)
         good, rest = ranked[:n_good], ranked[n_good:]
         if not self.history or self.rng.random() < _EPSILON:
             return {k: self.rng.choice(v)
@@ -194,7 +202,7 @@ class ParzenTuner:
     def best(self) -> Trial | None:
         if not self.history:
             return None
-        return max(self.history, key=lambda t: t.score)
+        return max(self.history, key=_rank_score)
 
     def run(self, n: int = 20) -> TunerReport:
         """Run up to n trials, stopping early on convergence.

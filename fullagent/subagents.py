@@ -931,7 +931,9 @@ class ParallelSubagents:
             for f in row["files_touched"]:
                 if f not in files_touched:
                     files_touched.append(f)
-            all_diffs.extend(row.get("diffs", []))
+            # to_dict() carries only diffs_count; the diffs live on the worker
+            with self._lock:
+                all_diffs.extend(dict(d) for d in w.diffs)
         states = {
             s: sum(1 for r in data_rows if r["state"] == s)
             for s in ("queued", "running", "cancelling", "done", "blocked", "error", "cancelled")
@@ -1271,7 +1273,10 @@ class ParallelSubagents:
             return True, ""
         with self._lock:
             worker.set_action(f"waiting on {', '.join(worker.depends_on)}")
-        deadline = time.monotonic() + worker.timeout
+        # worker.timeout bounds ONE model call; an upstream worker runs up
+        # to max_steps calls, so a single-call deadline blocked downstream
+        # workers whenever their upstream simply took >timeout in total
+        deadline = time.monotonic() + worker.timeout * (self.max_steps + 1)
         upstream_blocks: list[str] = []
         for dep_id in worker.depends_on:
             while True:

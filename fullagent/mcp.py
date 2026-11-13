@@ -56,6 +56,11 @@ class MCPError(Exception):
     """Anything that went wrong talking to an MCP server."""
 
 
+class MCPServerError(MCPError):
+    """A JSON-RPC error *response* from a live server (the connection is
+    still healthy)."""
+
+
 # ---------------------------------------------------------------------------
 # config
 # ---------------------------------------------------------------------------
@@ -256,6 +261,10 @@ class _MCPClient:
                 f"MCP server '{self.name}' busy (timed out on '{method}')")
         try:
             return self._request_locked(method, params, timeout)
+        except MCPServerError:
+            # the server answered with an error: the connection is fine
+            # (its message may well contain "failed"/"timed out")
+            raise
         except MCPError as e:
             # A timed-out / dead connection is unusable (a late reply would
             # stay in the pipe); drop it so the next call reconnects
@@ -299,7 +308,7 @@ class _MCPClient:
             if "error" in msg and msg["error"] is not None:
                 err = msg["error"]
                 detail = err.get("message") if isinstance(err, dict) else err
-                raise MCPError(
+                raise MCPServerError(
                     f"MCP server '{self.name}' error on '{method}': {detail}")
             return msg.get("result")
 
@@ -486,6 +495,8 @@ def _make_tool(manager: MCPManager, server: str,
             client = manager.ensure_client(server)
             result = client.call_tool(tool_name, kwargs)
             return _format_result(result)
+        except MCPServerError as e:
+            return f"ERROR: {e}"
         except Exception:
             return f"ERROR: MCP server '{server}' unavailable"
 
@@ -573,7 +584,7 @@ def handle_mcp(ui: Any, arg: str) -> None:
             lines.append(
                 f"  {name:<20} {manager.status(name):<28} "
                 f"{n_tools} tool(s)  [{cfg['command']} "
-                f"{' '.join(cfg['args'])}]".rstrip())
+                f"{' '.join(str(a) for a in cfg['args'])}]".rstrip())
         ui.print_info("\n".join(lines))
         return
     name = text.split(None, 1)[0]

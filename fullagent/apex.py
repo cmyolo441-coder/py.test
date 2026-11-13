@@ -128,6 +128,17 @@ class ApexEngine:
         # a rebuild starts from a clean health card — otherwise every
         # rebuild() appended the previous build's degradations again
         self.report = r = ApexReport()
+        # reset every layer product: a layer that fails on rebuild must be
+        # OFF, not silently keep serving the PREVIOUS document's state
+        self.directives = []
+        self.graph = None
+        self.resolver = None
+        self.ledger = None
+        self.payload = None
+        self.plan = None
+        self.sentinel = None
+        self.chain = None
+        self.rubric = []
         doc = self.doc_text
         memo = _static_layers(doc)
 

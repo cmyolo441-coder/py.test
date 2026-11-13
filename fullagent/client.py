@@ -6,6 +6,7 @@ import functools
 import hashlib
 import json
 import operator
+import os
 import queue
 import random
 import re
@@ -1388,10 +1389,14 @@ def _load_calibration() -> None:
         data = json.loads(_CALIBRATION_FILE.read_text())
     except (OSError, ValueError):
         return
+    if not isinstance(data, dict):
+        return
     # Schema 2: per-model correction multipliers. Schema-1 "ratios"
     # (chars/token) are deliberately NOT migrated — different units.
     if data.get("schema") == _ESTIMATOR_SCHEMA:
-        corrections = data.get("corrections") or {}
+        corrections = data.get("corrections")
+        if not isinstance(corrections, dict):
+            corrections = {}
         for key, samples in corrections.items():
             if isinstance(samples, list):
                 clean = [float(s) for s in samples
@@ -1399,7 +1404,9 @@ def _load_calibration() -> None:
                          and _MIN_CORRECTION <= float(s) <= _MAX_CORRECTION]
                 if clean:
                     _correction_samples[key] = clean[-_CORRECTION_SAMPLES_MAX:]
-    windows = data.get("windows") or {}
+    windows = data.get("windows")
+    if not isinstance(windows, dict):
+        windows = {}
     for key, win in windows.items():
         if isinstance(win, int) and win > 0:
             _learned_windows[key] = win
@@ -1416,14 +1423,18 @@ def _save_calibration() -> None:
         # Atomic write (tmp + rename): concurrent savers from worker
         # threads can otherwise interleave and tear the JSON, silently
         # losing all calibration on the next load.
-        tmp = _CALIBRATION_FILE.with_name(_CALIBRATION_FILE.name + ".tmp")
+        # Per-writer tmp name: a shared ".tmp" let two concurrent savers
+        # write into the same file and rename a torn mix into place.
+        tmp = _CALIBRATION_FILE.with_name(
+            f"{_CALIBRATION_FILE.name}.{os.getpid()}."
+            f"{threading.get_ident()}.tmp")
         tmp.write_text(json.dumps({
             "schema": _ESTIMATOR_SCHEMA,
             "corrections": _correction_samples,
             "windows": _learned_windows,
         }))
         tmp.replace(_CALIBRATION_FILE)
-    except OSError:
+    except (OSError, RuntimeError, TypeError, ValueError):
         pass  # persistence is an optimisation, never a failure path
 
 
@@ -2159,7 +2170,6 @@ def chat_stream(provider: Provider, model: Model, effort: Effort,
     on_tool_args_w = _mark_emitted_args(on_tool_args)
 
     for overflow_attempt in range(OVERFLOW_RETRIES + OVERFLOW_SHRINKS + 1):
-        sent_raw = prompt_raw_tokens(messages, tools)
         try:
             payload = build_payload(model, current_effort, messages, tools,
                                     stream=True)
@@ -2171,6 +2181,12 @@ def chat_stream(provider: Provider, model: Model, effort: Effort,
                 shrinks_used += 1
                 continue
             raise
+        # Measured AFTER build_payload: it repairs/prunes `messages` in
+        # place, so a pre-build estimate described a different (larger)
+        # prompt than the one the backend's usage reports on, poisoning
+        # the learned correction.
+        sent_raw = prompt_raw_tokens(payload["messages"],
+                                     payload.get("tools"))
         try:
             result = _chat_stream_with_retries(
                 url, headers, payload, on_token_w, on_reasoning_w,
@@ -2992,7 +3008,6 @@ def chat_blocking(provider: Provider, model: Model, effort: Effort,
     shrinks_used = 0
 
     for overflow_attempt in range(OVERFLOW_RETRIES + OVERFLOW_SHRINKS + 1):
-        sent_raw = prompt_raw_tokens(messages, tools)
         try:
             payload = build_payload(model, current_effort, messages, tools,
                                     stream=False)
@@ -3004,6 +3019,8 @@ def chat_blocking(provider: Provider, model: Model, effort: Effort,
                 shrinks_used += 1
                 continue
             raise
+        sent_raw = prompt_raw_tokens(payload["messages"],
+                                     payload.get("tools"))
         try:
             data = _post_blocking(url, headers, payload, timeout,
                                   should_cancel=should_cancel,

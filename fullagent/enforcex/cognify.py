@@ -353,7 +353,7 @@ class CognitiveReport:
         except (TypeError, ValueError):
             cog = 0.0
         return cls(
-            signals=[CognitiveSignal.from_dict(x) for x in d.get("signals", ()) if isinstance(x, dict)],
+            signals=[CognitiveSignal.from_dict(x) for x in (d.get("signals") or ()) if isinstance(x, dict)],
             hijacked=bool(d.get("hijacked", False)),
             overload=overload,
             dominant_goal=str(d.get("dominant_goal", "balanced")),

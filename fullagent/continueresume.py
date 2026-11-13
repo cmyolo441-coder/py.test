@@ -115,17 +115,21 @@ def _args_preview(args: Any) -> str:
     return " ".join(bits)
 
 
-def summarize_capped_turn(turn: Any) -> str:
+def summarize_capped_turn(turn: Any, goal: str | None = None) -> str:
     """Build the deterministic summary text for a capped turn.
 
     Duck-typed on Turn: user_text, assistant_text, tools (ToolEvents
-    with name/args/result/status), error.
+    with name/args/result/status), error. ``goal`` overrides the turn's
+    own user_text (a capped "continue" turn's user_text is just
+    "continue", not the real goal).
     """
     tools = list(getattr(turn, "tools", []) or [])
     lines: list[str] = []
     files: list[str] = []
 
-    goal = _cap(getattr(turn, "user_text", "") or "", _SUM_GOAL_CAP)
+    if goal is None:
+        goal = getattr(turn, "user_text", "") or ""
+    goal = _cap(goal, _SUM_GOAL_CAP)
     lines.append(
         "[SUMMARY OF PRIOR TURN — that turn hit the tool-call cap and "
         "stopped. Continue EXACTLY where it left off; do not restart "
@@ -219,7 +223,19 @@ def seed_continue_history(agent: Any, user_text: str) -> bool:
     if not isinstance(messages, list) or not messages:
         return False
 
-    summary = summarize_capped_turn(prev)
+    # When the capped turn was itself a "continue", its user_text is just
+    # "continue": walk back to the real request so a second capped
+    # continue does not reseed the history with "continue" as the goal.
+    original_request = ""
+    for t in reversed(turns):
+        ut = (getattr(t, "user_text", "") or "").strip()
+        if ut and not is_continue_request(ut):
+            original_request = ut
+            break
+    if not original_request:
+        original_request = (getattr(prev, "user_text", "") or "").strip()
+
+    summary = summarize_capped_turn(prev, goal=original_request)
 
     # keep only the leading system message(s); everything else — the full
     # capped-turn history — is replaced by the summary
@@ -232,7 +248,6 @@ def seed_continue_history(agent: Any, user_text: str) -> bool:
         else:
             break
 
-    original_request = (getattr(prev, "user_text", "") or "").strip()
     new_messages: list[dict] = list(kept)
     new_messages.append({"role": "user", "content": original_request})
     new_messages.append({

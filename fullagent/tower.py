@@ -189,7 +189,7 @@ class Tower:
                 return {"ok": False, "error": "no brain attached"}
             stats = brain.sleep()
             return {"ok": True, "slept": stats}
-        text = str(payload.get("text", "")).strip()
+        text = str(payload.get("text") or "").strip()
         if not text:
             return {"ok": False, "error": "empty command"}
         with self._pending_lock:

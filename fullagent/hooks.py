@@ -114,8 +114,13 @@ def _run_hook_command(command: str, env: dict) -> tuple[int | None, str, str]:
     """
     from .cancelguard import run_in_group
     try:
-        with tempfile.TemporaryFile(mode="w+") as out_f, \
-                tempfile.TemporaryFile(mode="w+") as err_f:
+        # explicit utf-8/replace: a hook printing undecodable bytes made
+        # read() raise, which was treated as a spawn failure (fail-OPEN),
+        # silently bypassing a PreToolUse hook that exited non-zero
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8",
+                                    errors="replace") as out_f, \
+                tempfile.TemporaryFile(mode="w+", encoding="utf-8",
+                                       errors="replace") as err_f:
             # own process group: a timed-out hook's children die with it
             # (subprocess.run killed only the sh wrapper)
             proc = run_in_group(command, shell=True, env=env,

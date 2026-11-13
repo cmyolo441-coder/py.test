@@ -252,7 +252,7 @@ def record_and_transcribe(seconds: int = 10) -> str:
     """
     try:
         seconds = int(seconds)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # inf from JSON Infinity
         return "seconds must be an integer"
     seconds = max(1, min(MAX_RECORD_SECONDS, seconds))
 

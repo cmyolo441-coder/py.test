@@ -221,6 +221,13 @@ class SnapshotStore:
                 import threading
                 tmp = p.with_name(f"{p.name}.{os.getpid()}.{threading.get_ident()}.snap-tmp")
                 tmp.write_bytes(data)
+                # keep the current file's permissions (an executable
+                # script used to come back as a plain 0644 file)
+                try:
+                    if p.is_file():
+                        os.chmod(tmp, p.stat().st_mode & 0o7777)
+                except OSError:
+                    pass
                 os.replace(tmp, p)
                 restored += 1
             except OSError:

@@ -163,7 +163,12 @@ def export_markdown(log: EventLog, title: str = "FullAgent session report"
     lines += ["", "## Timeline (key events)",
               "| seq | time | event | detail |", "|---|---|---|---|"]
     for row in g["timeline"][-200:]:
-        stamp = time.strftime("%H:%M:%S", time.localtime(row["ts"]))
+        # a corrupted ts (NaN / inf / 1e20 pass the kernel's "is a
+        # number" check) made localtime() raise and killed the export
+        try:
+            stamp = time.strftime("%H:%M:%S", time.localtime(row["ts"]))
+        except (TypeError, ValueError, OverflowError, OSError):
+            stamp = "?"
         d = row["data"]
         if row["type"] in ("user.message", "assistant.message"):
             detail = str(d.get("text", ""))[:80]

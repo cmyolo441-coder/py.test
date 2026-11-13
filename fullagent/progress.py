@@ -61,7 +61,7 @@ class ProgressTracker:
 
     def start(self, label: str, total: int) -> str:
         """Begin tracking ``label`` (expects ``total`` units); return its id."""
-        label = (label or "").strip() or "task"
+        label = str(label if label is not None else "").strip() or "task"
         try:
             total = int(total)
         except (TypeError, ValueError, OverflowError):

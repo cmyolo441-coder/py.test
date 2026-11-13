@@ -4962,7 +4962,9 @@ class UI:
                 # Keep a bounded preview; the agent owns the complete reply.
                 maxw = max(1, self._width() - 26)
                 md_preview = (md_preview + piece)[-maxw:]
-                preview = md_preview.strip("\n")
+                # the status lives in a one-row border: an embedded
+                # newline would push the closing ╯ off the row
+                preview = " ".join(md_preview.split())
                 _stream_status(preview if preview else "writing…")
                 return
             # patch_stdout can only interleave output safely when every
