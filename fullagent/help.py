@@ -53,6 +53,13 @@ COMMANDS: dict[str, list[tuple[str, str]]] = {
         ("/verify", "verify the Merkle event spine"),
         ("/goal", "set · prove · close · status · waive · clear a goal"),
     ],
+    "Swarm": [
+        ("/swarm", "live swarm dashboard — Ctrl+G or ↓ on an empty prompt "
+                   "toggles it (works mid-turn); ↑↓/jk select · ⏎ details · "
+                   "x cancel one · X cancel all · Esc close"),
+        ("/agents", "static crew report — roles, detail, results, wait, "
+                    "errors, stop"),
+    ],
     "System": [
         ("/help", "show this help"),
         ("/permissions", "view / toggle tool permissions"),

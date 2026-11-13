@@ -6,6 +6,7 @@ SLASH_COMMANDS = [
     ("/diff", "live diff viewer — /diff [last|all|clear|<path>]"),
     ("/theme", "switch TUI color theme — /theme [neon|dracula|nord|emerald]"),
     ("/agents", "parallel crew dashboard — roles, detail, results, wait, errors, stop"),
+    ("/swarm", "live swarm dashboard (also Ctrl+G, or ↓ on an empty prompt) — ↑↓ select · ⏎ details · x cancel · X cancel all"),
     ("/models", "list all models and providers"),
     ("/effort", "low · medium · high · extrahigh · ultrahigh"),
     ("/goal", "goal contract — set · prove · close · status · waive · clear"),

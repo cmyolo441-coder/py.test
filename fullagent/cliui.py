@@ -330,6 +330,7 @@ def hud_fragments(
         left.append((f"bold {colors.get('pink', '')}",
                      f"· ◎ {int(agents_running)} running "
                      f"· {int(agents_queued)} queued "))
+        left.append((colors.get("dim", ""), "· ^G swarm "))
     right: List[Fragment] = [
         (f"bold {colors.get('cyan', '')}", f" {max(0, int(skills))} skills "),
     ]
