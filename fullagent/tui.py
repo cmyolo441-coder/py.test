@@ -178,6 +178,13 @@ except ImportError:  # Headless / non-interactive fallback when prompt_toolkit i
         BackTab = "s-tab"
         Enter = "enter"
         Delete = "delete"
+        Left = "left"
+        Right = "right"
+        ControlH = "c-h"
+        ControlU = "c-u"
+        ControlW = "c-w"
+        ControlK = "c-k"
+        BracketedPaste = "<bracketed-paste>"
         CPRResponse = "<cursor-position-response>"
         Any = "<any>"
 
@@ -435,6 +442,28 @@ _ui_log = logging.getLogger("fullagent.tui")
 # never stops a running turn by itself: the first one arms, a second within
 # this window stops it. Ctrl+C (a byte no report contains) stops at once.
 ESC_CONFIRM_WINDOW = 2.5
+
+# The session model changes only on an unambiguous, deliberate act
+# (v4.1.2 report: "✓ model → …" lines the user never chose). Real paths:
+# a "/model" recalled from the persistent input history and submitted with
+# Enter opened the picker (slash commands are not echoed, so nothing showed
+# it); the next ↑/↓ meant for history moved the picker and the Enter meant
+# to send a message committed a model — and a message pasted or recalled
+# while the picker was open stayed in the prompt and was sent again.
+#   * the picker opens only from a lone Ctrl+T key or a typed /model;
+#   * Enter commits only after the picker was open MODEL_PICKER_MIN_OPEN s,
+#     never as part of a key burst, never while the prompt holds text;
+#   * the picker closes itself after MODEL_PICKER_IDLE_CLOSE s untouched;
+#   * a state-changing slash command recalled from history and not edited
+#     needs a second, separate Enter.
+MODEL_PICKER_MIN_OPEN = 0.4
+MODEL_PICKER_IDLE_CLOSE = 20.0
+# Keys closer together than this came from one terminal read (a paste, a
+# replayed buffer, auto-repeat): no human presses two keys this fast.
+KEY_BURST_GAP = 0.03
+# slash commands that change the session model / effort: a verbatim
+# history recall of one of these is not run by the same Enter
+_RECALL_CONFIRM_CMDS = frozenset({"/model", "/effort"})
 
 # Tails of terminal reports whose Escape arrived separately (see above):
 # cursor-position answers and SGR mouse reports. Nobody types these.
@@ -2052,6 +2081,99 @@ class UI:
             min_redraw_interval=0.05,
             mouse_support=False,
         )
+        # key timing for the deliberate-act checks (Ctrl+T / picker Enter)
+        try:
+            self.app.key_processor.after_key_press += self._note_key_done
+        except Exception:  # noqa: BLE001 — stub prompt_toolkit
+            pass
+
+    # -- deliberate-act checks (model picker, recalled slash commands) -------
+
+    def _note_key_done(self, _sender=None) -> None:
+        d = self.__dict__
+        d["_prev_key_at"] = time.monotonic()
+        d["_key_count"] = d.get("_key_count", 0) + 1
+
+    def _key_context(self, event) -> dict:
+        """Raw facts about the key being handled: its data, whether more
+        keys from the same terminal read wait behind it, and how long
+        after the previous key it came. Used to tell a deliberate key
+        from one inside a burst (paste, replayed input, auto-repeat)."""
+        try:
+            data = [k.data for k in event.key_sequence]
+        except Exception:  # noqa: BLE001
+            data = []
+        pending = []
+        try:
+            from prompt_toolkit.key_binding.key_processor import _Flush
+            pending = [k.data for k in event.key_processor.input_queue
+                       if k is not _Flush and k.key != Keys.CPRResponse]
+        except Exception:  # noqa: BLE001
+            pass
+        prev = self.__dict__.get("_prev_key_at")
+        gap = None if prev is None else time.monotonic() - prev
+        burst = (len(data) > 1 or bool(pending)
+                 or (gap is not None and gap < KEY_BURST_GAP))
+        return {"data": data, "pending": pending, "gap": gap,
+                "burst": burst}
+
+    def _recalled_unedited(self, text: str) -> bool:
+        """True when the prompt shows a history entry exactly as recalled
+        (↑/↓, prefix search, Ctrl+R) — the user has not typed it."""
+        b = self.buffer
+        try:
+            lines = b._working_lines
+            idx = b.working_index
+            if idx >= len(lines) - 1:
+                return False            # the fresh (typed) line
+            hist = list(b.history.get_strings())
+        except Exception:  # noqa: BLE001
+            return False
+        # _working_lines = [history oldest→newest…, fresh line]; an entry
+        # edited after recall no longer matches its history string
+        off = len(lines) - 1 - len(hist)
+        j = idx - off
+        if 0 <= j < len(hist):
+            return hist[j] == text
+        return text in hist
+
+    def _needs_recall_confirm(self, text: str, event) -> bool:
+        """A state-changing slash command (``/model``, ``/effort`` and
+        their aliases) that came verbatim from history runs only on a
+        second, separate Enter right after the notice — never on the same
+        breath as the recall."""
+        stripped = text.strip()
+        if not stripped.startswith("/"):
+            return False
+        try:
+            from .help import resolve_alias
+            cmd = resolve_alias(stripped.split(None, 1)[0].lower())
+        except Exception:  # noqa: BLE001
+            cmd = stripped.split(None, 1)[0].lower()
+        if cmd not in _RECALL_CONFIRM_CMDS:
+            return False
+        if not self._recalled_unedited(text):
+            return False
+        d = self.__dict__
+        pend = d.get("_recall_pending")
+        ctx = self._key_context(event)
+        now = time.monotonic()
+        if (pend and pend[0] == text
+                and d.get("_key_count", 0) == pend[2] + 1
+                and now - pend[1] >= MODEL_PICKER_MIN_OPEN
+                and not ctx["burst"]):
+            d["_recall_pending"] = None
+            _ui_log.warning("recalled %r confirmed with a second Enter "
+                            "(keys=%r)", stripped, ctx["data"])
+            return False
+        d["_recall_pending"] = (text, now, d.get("_key_count", 0))
+        _ui_log.warning("recalled %r from history NOT run: Enter came "
+                        "with an unedited recall (keys=%r pending=%r)",
+                        stripped, ctx["data"], ctx["pending"])
+        self._set_flash(f"{stripped} came from history — press Enter "
+                        "again to run it", C["yellow"])
+        self._invalidate()
+        return True
 
     def _search_visible(self) -> bool:
         try:
@@ -2068,7 +2190,105 @@ class UI:
     # -- state filters ------------------------------------------------------------------
 
     def _overlay_open(self) -> bool:
-        return self.overlay is not None and self.overlay.visible
+        if self.overlay is None or not self.overlay.visible:
+            return False
+        self._expire_model_picker()
+        return self.overlay.visible
+
+    # -- model picker bookkeeping ---------------------------------------------------------
+    # Every open / commit / close of the model menu is logged with its raw
+    # trigger, how it was opened, how long it was open and the keys pressed
+    # inside it, so a user's log shows exactly what changed the model.
+
+    def _model_picker(self) -> dict | None:
+        """The state of the model menu, if it is the open overlay."""
+        mp = self.__dict__.get("_mpick")
+        if mp is not None and mp.get("overlay") is self.__dict__.get("overlay"):
+            return mp
+        return None
+
+    def _model_picker_desc(self, mp: dict) -> str:
+        return (f"opened with {mp['via']} (raw={mp['raw']!r}), open "
+                f"{time.monotonic() - mp['opened_at']:.2f}s, "
+                f"keys inside={mp['keys']!r}")
+
+    def _model_picker_key(self, event, name: str) -> None:
+        mp = self._model_picker()
+        if mp is None:
+            return
+        try:
+            data = [k.data for k in event.key_sequence]
+        except Exception:  # noqa: BLE001
+            data = []
+        mp["keys"].append(f"{name}{data!r}")
+        mp["last_touch"] = time.monotonic()
+
+    def _close_overlay(self, reason: str, event=None) -> None:
+        ov = self.__dict__.get("overlay")
+        if ov is None:
+            return
+        was_open = ov.visible
+        ov.close()
+        mp = self._model_picker()
+        if mp is not None:
+            if event is not None:
+                self._model_picker_key(event, "close")
+            if was_open:
+                _ui_log.warning("model menu closed (%s) — model unchanged "
+                                "(%s); %s", reason, self.cfg.model_id,
+                                self._model_picker_desc(mp))
+            self.__dict__["_mpick"] = None
+        self._invalidate()
+
+    def _expire_model_picker(self) -> None:
+        mp = self._model_picker()
+        if mp is None or not self.overlay.visible:
+            return
+        idle = time.monotonic() - mp["last_touch"]
+        if idle < MODEL_PICKER_IDLE_CLOSE:
+            return
+        self._close_overlay(f"auto-closed after {idle:.1f}s untouched")
+        self._set_flash("model menu closed — nothing changed", C["dim"])
+
+    def _model_picker_idle_tick(self, mp: dict) -> None:
+        """Timer thread: wake the UI when the picker's idle time is up;
+        the redraw evaluates _overlay_open, which closes it on the UI
+        thread. Re-arms itself while the picker is being used."""
+        if self.__dict__.get("_mpick") is not mp or not mp["overlay"].visible:
+            return
+        left = MODEL_PICKER_IDLE_CLOSE - (time.monotonic() - mp["last_touch"])
+        if left > 0:
+            t = threading.Timer(left + 0.05, self._model_picker_idle_tick,
+                                args=(mp,))
+            t.daemon = True
+            t.start()
+            return
+        self._invalidate()
+
+    def _model_picker_enter_refused(self, event) -> bool:
+        """Enter in the model menu commits only as a deliberate act: the
+        menu was open for MODEL_PICKER_MIN_OPEN s, the Enter is not part
+        of a key burst, and the prompt holds no message being written (an
+        Enter then was meant to send it). Otherwise the menu closes and
+        nothing changes."""
+        mp = self._model_picker()
+        if mp is None:
+            return False
+        ctx = self._key_context(event)
+        age = time.monotonic() - mp["opened_at"]
+        reason = None
+        if self.buffer.text.strip():
+            reason = "Enter while the prompt holds text"
+        elif age < MODEL_PICKER_MIN_OPEN:
+            reason = f"Enter only {age:.2f}s after opening"
+        elif ctx["burst"]:
+            reason = (f"Enter inside a key burst (pending={ctx['pending']!r}"
+                      f" gap={ctx['gap']})")
+        if reason is None:
+            return False
+        self._close_overlay(reason, event)
+        self._set_flash("model menu closed — nothing changed", C["yellow"])
+        return True
 
     def _approving(self) -> bool:
         return self._approve_request is not None
@@ -2127,55 +2347,97 @@ class UI:
             self._answer_approve("n")
 
         # --- overlay navigation ---
-        # Typing while a picker is open means the user is back at the
-        # prompt: close the picker and type the character. Otherwise the
-        # arrows (history recall) moved the hidden-in-plain-sight model
-        # picker and the Enter meant to send the message committed another
-        # model instead (the "model switched by itself" report).
-        @kb.add(Keys.Any, filter=ov & idle)
+        # Only the picker's own keys (↑↓ PgUp PgDn Home End Tab, Enter,
+        # Esc) act on an open picker; ANY other key means the user is back
+        # at the prompt: the picker closes and the key does what it does
+        # there. Before, the arrows (history recall) moved the picker, and
+        # editing keys / pastes changed the prompt under it, so the Enter
+        # meant to send a message committed another model instead (the
+        # "model switched by itself" report). All overlay bindings are
+        # eager so they win over prompt_toolkit's default editing keys.
+        @kb.add(Keys.Any, filter=ov & idle, eager=True)
         def _ov_typed(event):
             data = getattr(event, "data", "") or ""
+            try:
+                key = event.key_sequence[0].key
+            except Exception:  # noqa: BLE001
+                key = None
+            if key == Keys.CPRResponse:
+                # a cursor-position answer: hand it to the renderer
+                try:
+                    row, _col = map(int, data[2:-1].split(";"))
+                    event.app.renderer.report_absolute_cursor_row(row)
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+            if key == getattr(Keys, "Ignore", object()):
+                return
             if len(data) == 1 and data.isprintable():
-                self.overlay.close()
+                self._close_overlay(f"typed {data!r}", event)
                 self.buffer.insert_text(data)
                 self._invalidate()
+                return
+            self._close_overlay(f"key {key!s} {data!r}", event)
+            if key != Keys.ControlT and event.key_sequence:
+                # Ctrl+T again just closes the menu; any other key is
+                # replayed at the prompt
+                event.key_processor.feed(event.key_sequence[0], first=True)
+            self._invalidate()
 
-        @kb.add(Keys.Enter, filter=ov)
+        # a paste while the picker is open is a message being written:
+        # back to the prompt with it
+        @kb.add(Keys.BracketedPaste, filter=ov & idle, eager=True)
+        def _ov_paste(event):
+            self._close_overlay("paste", event)
+            data = (event.data or "").replace("\r\n", "\n").replace("\r", "\n")
+            self.buffer.insert_text(data)
+            self._invalidate()
+
+        @kb.add(Keys.Enter, filter=ov, eager=True)
         def _ov_enter(event):
+            if self._model_picker_enter_refused(event):
+                return
+            self._model_picker_key(event, "Enter")
             self.overlay.select()
 
-        @kb.add(Keys.Escape, filter=ov)
-        @kb.add("c-c", filter=ov)
+        @kb.add(Keys.Escape, filter=ov, eager=True)
+        @kb.add("c-c", filter=ov, eager=True)
         def _ov_close(event):
-            self.overlay.close()
+            self._close_overlay("Esc/Ctrl+C", event)
 
-        @kb.add(Keys.Up, filter=ov)
-        @kb.add("c-p", filter=ov)
-        @kb.add(Keys.BackTab, filter=ov)
+        @kb.add(Keys.Up, filter=ov, eager=True)
+        @kb.add("c-p", filter=ov, eager=True)
+        @kb.add(Keys.BackTab, filter=ov, eager=True)
         def _ov_up(event):
+            self._model_picker_key(event, "Up")
             self.overlay.move(-1)
 
-        @kb.add(Keys.Down, filter=ov)
-        @kb.add("c-n", filter=ov)
-        @kb.add(Keys.Tab, filter=ov)
+        @kb.add(Keys.Down, filter=ov, eager=True)
+        @kb.add("c-n", filter=ov, eager=True)
+        @kb.add(Keys.Tab, filter=ov, eager=True)
         def _ov_down(event):
+            self._model_picker_key(event, "Down")
             self.overlay.move(1)
 
-        @kb.add(Keys.PageUp, filter=ov)
+        @kb.add(Keys.PageUp, filter=ov, eager=True)
         def _ov_pgup(event):
+            self._model_picker_key(event, "PageUp")
             self.overlay.page(-1)
 
-        @kb.add(Keys.PageDown, filter=ov)
+        @kb.add(Keys.PageDown, filter=ov, eager=True)
         def _ov_pgdn(event):
+            self._model_picker_key(event, "PageDown")
             self.overlay.page(1)
 
-        @kb.add(Keys.Home, filter=ov)
+        @kb.add(Keys.Home, filter=ov, eager=True)
         def _ov_home(event):
+            self._model_picker_key(event, "Home")
             self.overlay.index = 0
             self.overlay._top = 0
 
-        @kb.add(Keys.End, filter=ov)
+        @kb.add(Keys.End, filter=ov, eager=True)
         def _ov_end(event):
+            self._model_picker_key(event, "End")
             self.overlay.index = len(self.overlay.items) - 1
             self.overlay._top = max(0, self.overlay.index - OverlayList.WINDOW + 1)
 
@@ -2216,6 +2478,15 @@ class UI:
                 return
             if not b.text.strip():
                 return
+            if self._needs_recall_confirm(b.text, event):
+                return      # recalled /model etc.: a 2nd Enter runs it
+            if b.text.lstrip().startswith("/"):
+                ctx = self._key_context(event)
+                _ui_log.warning(
+                    "slash command submitted: %r (recalled from history "
+                    "unedited=%s, keys=%r pending=%r)",
+                    b.text.strip()[:80], self._recalled_unedited(b.text),
+                    ctx["data"], ctx["pending"])
             b.validate_and_handle()
 
         @kb.add(Keys.Escape, Keys.Enter, filter=focused & ~ov & idle)
@@ -2316,7 +2587,20 @@ class UI:
 
         @kb.add("c-t", filter=focused & ~ov & idle)
         def _ctrl_t(event):
-            self.open_model_selector()
+            ctx = self._key_context(event)
+            # only a lone Ctrl+T key opens the model menu: the one byte
+            # \x14, nothing else from the same terminal read behind it and
+            # no key right before it (a paste or replayed input carrying
+            # a 0x14 byte is not the user pressing Ctrl+T)
+            lone = (len(ctx["data"]) == 1 and ctx["data"][0] in ("\x14", "")
+                    and not ctx["burst"])
+            if not lone:
+                _ui_log.warning(
+                    "Ctrl+T ignored — not a lone key press (keys=%r "
+                    "pending=%r gap=%s)", ctx["data"], ctx["pending"],
+                    None if ctx["gap"] is None else f"{ctx['gap']:.3f}s")
+                return
+            self.open_model_selector(via="Ctrl+T", raw=ctx["data"])
 
         @kb.add("c-e", filter=focused & ~ov & idle)
         def _ctrl_e(event):
@@ -2739,6 +3023,9 @@ class UI:
         parts = text.strip().split(None, 1)
         cmd = parts[0].lower()
         arg = parts[1].strip() if len(parts) > 1 else ""
+        # the command as the user typed it (alias included) — the model
+        # menu names it as its opener
+        self._slash_typed = cmd
         # Slash commands run on the event-loop thread, concurrently with
         # the turn thread. Commands that replace or rewrite the shared
         # conversation history must never race a running agent.run_turn
@@ -2934,12 +3221,15 @@ class UI:
                     self.print_error(
                         f"unknown model: {arg} — use /model to browse")
                 else:
-                    self._choose_model(m, via="/model")
+                    typed = self.__dict__.get("_slash_typed") or "/model"
+                    self._choose_model(m, via="/model",
+                                       detail=f"{typed} {arg}")
             else:
                 # Open the interactive selector (same as Ctrl+T) instead of
                 # just printing the list — users couldn't figure out how to
                 # actually SELECT a model.
-                self.open_model_selector()
+                typed = self.__dict__.get("_slash_typed") or "/model"
+                self.open_model_selector(via=typed, raw=typed)
         elif cmd == "/models":
             from .modelpick import list_models, format_model_list
             filt = arg.strip()
@@ -5622,7 +5912,10 @@ class UI:
 
     # -- overlays ------------------------------------------------------------------------------------
 
-    def open_model_selector(self) -> None:
+    def open_model_selector(self, via: str = "/model", raw=None) -> None:
+        """Open the model menu. ``via`` is what opened it (``Ctrl+T`` or
+        the slash command typed); it is logged with the raw key data and
+        named in the transcript line if a model is chosen."""
         items = []
         current = 0
         for i, m in enumerate(MODELS):
@@ -5634,14 +5927,36 @@ class UI:
             if m.id == self.cfg.model_id:
                 current = i
 
-        def on_select(idx: int):
-            self._choose_model(MODELS[idx], via="picker")
+        mp: dict = {}
 
-        self.overlay = OverlayList("SELECT MODEL", items, current, on_select)
+        def on_select(idx: int):
+            _ui_log.warning("model menu commit: %s -> %s; %s",
+                            self.cfg.model_id, MODELS[idx].id,
+                            self._model_picker_desc(mp))
+            if self.__dict__.get("_mpick") is mp:
+                self.__dict__["_mpick"] = None
+            self._choose_model(MODELS[idx], via=f"menu:{via}")
+
+        self.overlay = OverlayList(
+            "SELECT MODEL", items, current, on_select,
+            footer="↑↓ move · Enter select · Esc close · typing closes it")
+        now = time.monotonic()
+        mp.update(overlay=self.overlay, via=via, raw=raw, opened_at=now,
+                  last_touch=now, keys=[])
+        self.__dict__["_mpick"] = mp
         self.overlay.open()
+        _ui_log.warning("model menu opened with %s (raw=%r); current model "
+                        "%s", via, raw, self.cfg.model_id)
+        try:
+            t = threading.Timer(MODEL_PICKER_IDLE_CLOSE + 0.05,
+                                self._model_picker_idle_tick, args=(mp,))
+            t.daemon = True
+            t.start()
+        except Exception:  # noqa: BLE001
+            pass
         self._invalidate()
 
-    def _choose_model(self, m: Model, via: str) -> None:
+    def _choose_model(self, m: Model, via: str, detail: str = "") -> None:
         """The ONE place the session model changes: an explicit user pick.
 
         Never silent: a permanent transcript line (not just a flash) and a
@@ -5658,8 +5973,13 @@ class UI:
         prov = PROVIDERS.get(m.provider)
         busy = bool(getattr(self, "_busy", False)
                     or getattr(self.agent, "turn_model_id", None))
-        why = {"picker": "you picked it in the Ctrl+T menu",
-               "/model": "you ran /model"}.get(via, f"via {via}")
+        # say truthfully what made the change — never "you picked it"
+        if via.startswith("menu:"):
+            why = f"chosen in the model menu (opened with {via[5:]})"
+        elif via == "/model":
+            why = f"set with {detail.strip() or '/model'}"
+        else:
+            why = f"via {via}"
         self.print_info(
             f"✓ model → {m.label} ({m.id} · "
             f"{prov.name if prov else m.provider}) — {why}"
