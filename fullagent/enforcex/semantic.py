@@ -556,6 +556,13 @@ def _iter_rules(rules: Any) -> Iterable[Tuple[str, str, str, str]]:
     """Yield (rule_id, text, category, severity) tuples, tolerant of shapes."""
     if rules is None:
         return
+    if isinstance(rules, str):
+        # a bare rule string used to be iterated per CHARACTER: every
+        # one-letter "rule" was vacuously entailed, so a violated rule
+        # reported 100% compliance
+        if rules.strip():
+            yield "", rules, "other", "low"
+        return
     try:
         if hasattr(rules, "rules") and not isinstance(rules, (str, bytes)):
             for r in getattr(rules, "rules", ()):  # PromptSpec-like

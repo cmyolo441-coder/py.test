@@ -40,8 +40,14 @@ def _safe_int(v, default: int = 0) -> int:
     """int() that never raises — same contract as _safe_float."""
     try:
         return int(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
+
+
+def _safe_len(v) -> int:
+    """len() of a list-ish field; a malformed scalar (e.g. a finding
+    COUNT instead of a findings list) counts as 0 instead of raising."""
+    return len(v) if isinstance(v, (list, tuple, dict)) else 0
 
 
 def _copy_snapshot(s: dict) -> dict:
@@ -103,7 +109,7 @@ class Dashboard:
                        if e.get("type") == "council.verdict")
 
         # v4 engineering subsystem activity
-        taint_findings = sum(len(e.get("findings") or [])
+        taint_findings = sum(_safe_len(e.get("findings"))
                              for e in st.analysis_events
                              if e.get("type") == "analysis.taint")
         graph_entities = 0
@@ -291,7 +297,7 @@ def _summarise(type_: str, data: dict) -> str:
     if type_ == "mutation.result":
         return f"mutation score {_safe_float(data.get('score', 0)):.0%}"
     if type_ == "analysis.taint":
-        return f"taint {len(data.get('findings') or [])} finding(s)"
+        return f"taint {_safe_len(data.get('findings'))} finding(s)"
     return ""
 
 

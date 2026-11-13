@@ -358,6 +358,12 @@ def check_diff_assert(path: str, forbid: list | None = None,
     if not p.is_file():
         return Verdict(False, "diff_assert", f"file not found: {p}")
     content = p.read_text(errors="replace")
+    # a bare string pattern must stay ONE regex: iterating it char by
+    # char turned forbid="TODO" into "any T, O or D" (false failures)
+    if isinstance(forbid, str):
+        forbid = [forbid]
+    if isinstance(require, str):
+        require = [require]
     for pat in forbid or []:
         try:
             m = re.search(str(pat), content, re.MULTILINE)

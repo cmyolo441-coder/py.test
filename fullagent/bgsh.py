@@ -229,7 +229,7 @@ def launch(command: str, description: str = "",
         secs = float(timeout)
     except (TypeError, ValueError):
         raise ValueError(f"timeout must be a number, got {timeout!r}")
-    if secs <= 0:
+    if not secs > 0:  # also rejects NaN, which disabled the watchdog
         raise ValueError("timeout must be positive")
     secs = min(secs, MAX_TIMEOUT)
     desc = (description.strip() if isinstance(description, str)
@@ -408,7 +408,7 @@ def _handle_bash_output(**kwargs: Any) -> str:
     if tail_lines is not None:
         try:
             n = int(tail_lines)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return (f"ERROR: tail_lines must be an integer, "
                     f"got {tail_lines!r}")
         n = max(0, min(n, 2000))

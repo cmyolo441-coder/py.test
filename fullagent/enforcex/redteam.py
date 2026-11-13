@@ -603,6 +603,10 @@ def generate_scenarios(rules: Sequence[Any],
     Returns a list of waves; each wave is a list of Attack objects.
     Never raises; empty/None rules yield an empty campaign.
     """
+    if isinstance(waves, str):
+        # a single wave name must not be iterated char by char (which
+        # matched nothing and silently ran ALL waves)
+        waves = (waves,)
     wave_names = [w for w in (waves or WAVES.ALL) if w in WAVES.ALL] \
         or list(WAVES.ALL)
     rule_list = [r for r in (rules or []) if r is not None][:1024]

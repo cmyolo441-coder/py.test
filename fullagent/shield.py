@@ -196,8 +196,8 @@ def fence(content: str, source: str, risk: float) -> str:
     # used to pass through with its middle outside any fence.
     if (content.startswith(FENCE_OPEN + " ")
             and content.rstrip().endswith(FENCE_CLOSE)
-            and content.count(FENCE_OPEN) == 1
-            and content.count(FENCE_CLOSE) == 1):
+            and content.count(FENCE_OPEN + ' source="') == 1
+            and content.count("\n" + FENCE_CLOSE) == 1):
         return content
     r = f"{risk:.2f}"
     return (f'{FENCE_OPEN} source="{source}" risk="{r}">\n'

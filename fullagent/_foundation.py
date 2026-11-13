@@ -158,7 +158,10 @@ def capture_logs_to_file(path: "str | os.PathLike[str]"):
                     lg.removeHandler(h)
                     detached.append((lg, h))
         root.addHandler(sink)
-        if not fa.propagate:
+        # fa's _ConsoleHandler already forwards every record to the sink;
+        # attaching the sink as well wrote each fullagent record twice.
+        if not fa.propagate and not any(
+                isinstance(h, _ConsoleHandler) for h in fa.handlers):
             fa.addHandler(sink)
         prev_last_resort = logging.lastResort
         logging.lastResort = sink

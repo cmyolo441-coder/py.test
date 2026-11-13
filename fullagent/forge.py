@@ -78,6 +78,13 @@ def _lockfile_hash(cwd: Path) -> str | None:
     return None
 
 
+def _utf8_safe(text: str) -> str:
+    """POSIX env values / paths with non-UTF-8 bytes arrive as lone
+    surrogates (surrogateescape); they made payload.encode() and the
+    event log's hashing raise UnicodeEncodeError, crashing probe()."""
+    return text.encode("utf-8", "replace").decode("utf-8")
+
+
 class Forge:
     """Environment digest + drift detection over the event log."""
 
@@ -105,9 +112,10 @@ class Forge:
             "implementation": platform.python_implementation(),
             "locale": str(locale.getlocale()),
             "encoding": getattr(sys.stdout, "encoding", "") or "",
-            "cwd": str(self.cwd),
+            "cwd": _utf8_safe(str(self.cwd)),
             "lockfile_hash": _lockfile_hash(self.cwd),
-            "env": {k: os.environ.get(k, "") for k in env_allowlist},
+            "env": {k: _utf8_safe(os.environ.get(k, ""))
+                    for k in env_allowlist},
             # copy: _tool_versions() is a process-wide lru_cache and
             # EventLog.append stores data by reference — handing out the
             # cached dict would let any later mutation of the sealed

@@ -131,8 +131,11 @@ class RuleGraph:
         nodes, higher-precedence (lower level) rules emit first."""
         indeg: dict[str, int] = {n: 0 for n in self.nodes}
         for u in self.edges:
+            if u not in self.nodes:
+                continue  # edge from an id never add()ed: nothing to emit
             for v in self.edges[u]:
-                indeg[v] = indeg.get(v, 0) + 1
+                if v in indeg:
+                    indeg[v] += 1
         ready = [n for n, d in indeg.items() if d == 0]
         order: list[str] = []
         while ready:
@@ -140,6 +143,8 @@ class RuleGraph:
             u = ready.pop(0)
             order.append(u)
             for v in self.edges.get(u, ()):
+                if v not in indeg:
+                    continue
                 indeg[v] -= 1
                 if indeg[v] == 0:
                     ready.append(v)
