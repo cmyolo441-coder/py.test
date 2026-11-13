@@ -4957,6 +4957,11 @@ class UI:
 
         def on_token(piece: str):
             nonlocal md_preview
+            if not think["answer"]:
+                # first answer token of this model call: its Thinking
+                # block goes into the transcript ABOVE the reply
+                think["answer"] = True
+                _flush_thinking()
             self._stream_tokens_count = getattr(self, "_stream_tokens_count", 0) + 1
             if render_md:
                 # Keep a bounded preview; the agent owns the complete reply.
@@ -5016,6 +5021,46 @@ class UI:
         except Exception:
             pass
 
+        # THINKING BEFORE THE ANSWER: providers stream reasoning_content
+        # first and content after it, but the Thinking block used to be
+        # printed only once run_turn() returned — i.e. BELOW the reply that
+        # had already streamed live. Each model call's reasoning is now
+        # buffered and flushed as its own Thinking block right before that
+        # call's first visible output (first answer token, tool block or
+        # live diff), or at the end of the turn when no answer followed.
+        # "answer" marks that the current call's reply has started; it is
+        # reset at each tool call (the next model call starts after it).
+        think = {"pending": [], "streamed": 0, "answer": False,
+                 "lock": threading.Lock()}
+
+        def _flush_thinking() -> None:
+            with think["lock"]:
+                body = "".join(think["pending"])
+                think["pending"].clear()
+            if not body.strip():
+                return
+            # resolved at print time, like the old turn-end panel: the
+            # thinking module attaches agent.thinking_visible lazily, so a
+            # value read at turn start can miss it on the very first turn
+            visible = self.cfg.show_reasoning
+            expanded = False
+            try:
+                visible = bool(getattr(self.agent, "thinking_visible",
+                                       visible))
+                expanded = bool(getattr(self.agent, "thinking_expanded",
+                                        False))
+            except Exception:
+                pass
+            if not visible:
+                return
+            try:
+                self._print_thinking_block(body, expanded=expanded)
+            except Exception:
+                try:
+                    self.print_reasoning(body)
+                except Exception:
+                    pass
+
         def _reasoning_status() -> None:
             _reasoning_throttle.update(
                 reasoning_stream.preview() if _reasoning_visible
@@ -5036,6 +5081,10 @@ class UI:
             # callback. When thinking display is off, keep the old static
             # status so the user sees no reasoning text at all.
             reasoning_stream.feed(piece)
+            if piece:
+                with think["lock"]:
+                    think["pending"].append(str(piece))
+                    think["streamed"] += len(str(piece))
             _reasoning_status()
 
         # live shell streaming state — one tool runs at a time, so a plain
@@ -5117,6 +5166,9 @@ class UI:
                 _lf_flush()
 
         def on_tool_args(name: str, chunk: str):
+            if not think["answer"] and think["pending"]:
+                # a live diff header may print below — thinking goes first
+                _flush_thinking()
             if name not in ("write_file", "edit_file", "MultiEdit", "multiedit", "apply_patch"):
                 return
             if not self.cfg.extra.get("live_stream_edits", True):
@@ -5180,9 +5232,16 @@ class UI:
             stream_tail["parts"].clear()
             stream_tail["pv"] = ""
             stream_tail["blank"] = False
+            if not think["answer"]:
+                _flush_thinking()   # this step's thinking, then its tool
             if rem:
                 self.console.print(Text(rem), soft_wrap=True)
-            shell_live["active"] = ev.name in ("run_command", "live_shell")
+            # reasoning a provider interleaved AFTER content (rare) lands
+            # under the reply it followed, never splitting a line
+            _flush_thinking()
+            # the next model call starts after this tool runs
+            think["answer"] = False
+            shell_live["active"] =ev.name in ("run_command", "live_shell")
             shell_live["streamed"] = False
             shell_live["lines"] = 0
             if ev.name not in ("write_file", "edit_file", "MultiEdit", "multiedit", "apply_patch"):
@@ -5302,10 +5361,14 @@ class UI:
                 on_route=on_route, on_tool_output=on_tool_output,
                 on_tool_args=on_tool_args)
         except Exception as e:  # noqa: BLE001 — never kill the UI thread
+            # thinking that streamed before the failure stays above it
+            if not think["answer"]:
+                _flush_thinking()
             self.print_error(f"{type(e).__name__}: {e}")
         finally:
             with _STATUS_LOCK:
                 self._active_throttle = None
+                _reasoning_throttle.discard()
             rem = "".join(stream_tail["parts"]).strip("\n")
             stream_tail["parts"].clear()
             # Final flush: apply any preview frame the throttle absorbed so
@@ -5313,10 +5376,15 @@ class UI:
             frame = _throttle.flush()
             if frame is not None:
                 self._set_status(frame)
+            if not think["answer"]:
+                # reasoning with no answer after it (reasoning-only call,
+                # cancel or error mid-thought) still gets its block
+                _flush_thinking()
             if rem:
                 self.console.print(Text(rem), soft_wrap=True)
             else:
                 self.console.print()
+            _flush_thinking()   # interleaved late reasoning, if any
             self._stop_spinner()
             self._set_status("")
             self._invalidate()
@@ -5334,7 +5402,11 @@ class UI:
                     self.agent, "thinking_visible", _think_visible))
             except Exception:
                 pass
-            if turn.reasoning and _think_visible:
+            # Streamed reasoning was already printed above its answer by
+            # _flush_thinking(); only reasoning that never streamed
+            # (cassette replay, non-streaming fallback) is printed here,
+            # so no Thinking block is ever shown twice.
+            if turn.reasoning and _think_visible and not think["streamed"]:
                 try:
                     _exp = bool(getattr(self.agent, "thinking_expanded",
                                         False))
