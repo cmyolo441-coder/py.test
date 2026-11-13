@@ -825,8 +825,8 @@ def dedupe_reasoning_fields(messages: Any) -> bool:
     in saved session files) has both. Returns True if anything changed."""
     changed = False
     for message in messages if isinstance(messages, list) else []:
-        if isinstance(message, dict) and "reasoning" in message \
-                and "reasoning_content" in message:
+        if isinstance(message, dict) and "reasoning" in message:
+            # both keys, or a lone legacy "reasoning": keep one canonical key
             if not message.get("reasoning_content") and message.get("reasoning"):
                 message["reasoning_content"] = message["reasoning"]
             message.pop("reasoning", None)
@@ -871,7 +871,8 @@ def _strip_reasoning(messages: list[dict]) -> bool:
 def _is_reasoning_content_error(err: Exception) -> bool:
     """True if an APIError is the reasoning_content validation."""
     msg = str(err).lower()
-    return "reasoning_content" in msg and "required" in msg
+    return "reasoning_content" in msg and ("required" in msg
+                                           or "duplicate field" in msg)
 
 
 # -- token-limit pre-check (worker 17/20) -------------------------------------

@@ -85,7 +85,15 @@ class ThinkingBeforeDone(unittest.TestCase):
         self.assertLess(done, out.index("0.4s"))
 
     def test_streamed_reply(self):
-        run_with_ui(lambda ui: self._check(_run(ui)), FakeManager(0))
+        def body(ui):
+            out = _run(ui)
+            self._check(out)
+            # the live-streamed reply must come AFTER its Thinking block
+            self.assertLess(out.index("Thinking"),
+                            out.index("Hey! What can I do for you?"),
+                            "reply printed before its Thinking block:\n"
+                            + out)
+        run_with_ui(body, FakeManager(0))
 
     def test_markdown_reply_has_thinking_above_answer(self):
         def body(ui):
