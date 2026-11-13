@@ -522,6 +522,7 @@ def render_rich_diff_panel(
 ) -> Any:
     """Render a Rich Panel containing a colorized unified diff with +N/-M stats."""
     from rich import box
+    from rich.markup import escape as _escape_markup
     from rich.panel import Panel
     from rich.text import Text
 
@@ -565,7 +566,7 @@ def render_rich_diff_panel(
 
     title = (
         f"[bold {pal['accent']}]Δ Live Diff[/] · "
-        f"[bold {pal['cyan']}]{path}[/] · "
+        f"[bold {pal['cyan']}]{_escape_markup(path)}[/] · "
         f"[bold {pal['green']}]+{added}[/] [bold {pal['red']}]-{removed}[/]"
     )
     return Panel(

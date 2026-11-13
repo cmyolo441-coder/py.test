@@ -1075,11 +1075,15 @@ def _mk_rule(rid: str, text: str, keywords: Tuple[str, ...] = (),
         except Exception:
             pass
 
+    # Class bodies resolve names they assign via globals, skipping this
+    # function's scope, so ``text = text`` raised NameError; bind aliases.
+    _text, _kws, _sev = text, tuple(keywords), severity
+
     class _R:  # minimal fallback
         id = rid
-        text = text
-        keywords = tuple(keywords)
-        severity = severity
+        text = _text
+        keywords = _kws
+        severity = _sev
         patterns: tuple = ()
     return _R()
 

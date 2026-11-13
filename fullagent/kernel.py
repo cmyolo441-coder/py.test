@@ -561,6 +561,12 @@ class EventLog:
                     except UnicodeDecodeError:
                         ok = False
                         break
+                    if "\\" in branch:
+                        # JSON-escaped name (e.g. a '"' inside it): the raw
+                        # bytes are not the real name and distinct branches
+                        # could collide here — let the slow path parse it.
+                        ok = False
+                        break
                     if branch not in head_evs:
                         # newest line wins: file order, later overwrites.
                         branch_line[branch] = bytes(mm[pos:end])

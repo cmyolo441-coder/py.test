@@ -209,8 +209,19 @@ class UserConfig:
         if not ok:
             raise ValueError(f"invalid value for {key!r}: {err}")
         with self._lock:
+            _missing = object()
+            prev = self._data.get(key, _missing)
             self._data[key] = value
-            self._persist_locked()
+            try:
+                self._persist_locked()
+            except BaseException:
+                # an unwritable config dir must not leave memory claiming
+                # a value that was never saved
+                if prev is _missing:
+                    self._data.pop(key, None)
+                else:
+                    self._data[key] = prev
+                raise
         return value
 
     def reset(self, key: str):
@@ -222,8 +233,14 @@ class UserConfig:
                 + ", ".join(self.valid_keys())
             )
         with self._lock:
-            self._data.pop(key, None)
-            self._persist_locked()
+            _missing = object()
+            prev = self._data.pop(key, _missing)
+            try:
+                self._persist_locked()
+            except BaseException:
+                if prev is not _missing:
+                    self._data[key] = prev
+                raise
         return SCHEMA[key]["default"]
 
 

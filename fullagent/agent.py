@@ -391,6 +391,12 @@ class ToolTimeout(Exception):
                          f"{_fmt_timeout(limit)}s and was killed.")
 
 
+import threading as _threading
+
+# shared, re-entrant guard for Agent.__getattr__ lazy subsystem init
+_SUBSYSTEM_INIT_LOCK = _threading.RLock()
+
+
 class Agent:
     # cache for _handler_takes_cancel (handler -> bool)
     _cancel_kwarg_cache: dict = {}
@@ -488,8 +494,10 @@ class Agent:
         # Double-checked lazy init: parallel tool threads can race the
         # factory, building two instances with last-writer-wins caching
         # (some calls using a discarded subsystem).
-        import threading as _th
-        with _th.Lock():
+        # (a fresh Lock() per call excluded nobody — the lock must be
+        # shared; re-entrant because factories touch other lazy
+        # subsystems, e.g. goal -> judge)
+        with _SUBSYSTEM_INIT_LOCK:
             if name in self.__dict__:
                 return self.__dict__[name]
             value = factory(self)

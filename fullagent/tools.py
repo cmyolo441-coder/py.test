@@ -357,16 +357,21 @@ def _read_window_streaming(p: Path, offset: int, limit: int,
                            size: int) -> str:
     """read_file for files too big to load whole: stream to the window,
     then count the remaining newlines in raw chunks (no decode)."""
-    import itertools
     chunk: list[str] = []
     try:
         with open(p, "rb") as fh:
-            for raw in itertools.islice(fh, offset - 1, offset - 1 + limit):
+            seen = 0  # lines consumed (incl. skipped ones before offset)
+            for raw in fh:
+                seen += 1
+                if seen < offset:
+                    continue
                 line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
                 if len(line) > _READ_MAX_LINE_CHARS:
                     line = (line[:_READ_MAX_LINE_CHARS]
                             + f"… [+{len(line) - _READ_MAX_LINE_CHARS} chars]")
                 chunk.append(line)
+                if len(chunk) >= limit:
+                    break
             # total line count from here on, cheaply
             rest = 0
             last = b""
@@ -376,7 +381,8 @@ def _read_window_streaming(p: Path, offset: int, limit: int,
                     break
                 rest += buf.count(b"\n")
                 last = buf[-1:]
-            pos_lines = offset - 1 + len(chunk)
+            # past-EOF offset: only `seen` lines exist, not offset - 1
+            pos_lines = seen
     except OSError as e:
         return f"ERROR: {e}"
     total = pos_lines + rest + (1 if last and last != b"\n" else 0)
@@ -1155,7 +1161,7 @@ def _validate_shell_args(command: str, timeout: int,
     except (TypeError, ValueError):
         return None, None, \
             f"ERROR: timeout must be a number, got {timeout!r}"
-    if secs <= 0:
+    if not secs > 0:  # also rejects NaN (no timeout at all)
         return None, None, "ERROR: timeout must be positive"
     return command, min(secs, 600.0), None  # hard cap: 10 minutes
 
@@ -1549,7 +1555,7 @@ def apply_patch(patch: str) -> str:
                            key=lambda h: h["old_start"], reverse=True):
             ctx: list[tuple[str, str]] = []   # (tag, text)
             for raw in hunk["lines"]:
-                tag, txt = (raw[0], raw[1:]) if len(raw) > 1 else (" ", "")
+                tag, txt = (raw[0], raw[1:]) if raw else (" ", "")
                 ctx.append((tag, txt))
             # find where the hunk's old-side lines start in the file
             old_side = [(t, x) for t, x in ctx if t in (" ", "-")]

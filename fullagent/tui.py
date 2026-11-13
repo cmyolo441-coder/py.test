@@ -4389,11 +4389,11 @@ class UI:
             r = ag.formal.audit_log()
             self.print_info(("HISTORY AUDIT — CLEAN ✓" if r.ok else
                              "HISTORY AUDIT — VIOLATIONS FOUND ✗")
-                            + ("\n".join("" if not r.violations else
-                                         "\n" + "\n".join(
-                                             f"  ⚠ {v['property']}: "
-                                             f"{v['why']}"
-                                             for v in r.violations))),
+                            + ("" if not r.violations else
+                               "\n" + "\n".join(
+                                   f"  ⚠ {v['property']}: "
+                                   f"{v['why']}"
+                                   for v in r.violations)),
                             C["green"] if r.ok else C["red"])
             return
         goal = arg.strip()

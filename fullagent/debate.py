@@ -160,6 +160,7 @@ class DebateTournament:
         # empty/degenerate run has no outcome, so confirm() then falls
         # back to crediting exactly the model the caller names
         self._champion_cluster = set()
+        self._clusters = []
         if not question or not self.models:
             return result
         positions = [Position(model_id=m) for m in self.models]

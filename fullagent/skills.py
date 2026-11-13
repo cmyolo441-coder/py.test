@@ -195,6 +195,11 @@ def _validate_safety(tree: ast.Module) -> str | None:
         elif isinstance(node, ast.Attribute):
             if node.attr.startswith("__") and node.attr.endswith("__"):
                 return f"dunder access forbidden: {node.attr}"
+            # allowed modules re-export dangerous ones (random._os,
+            # posixpath.os): `random._os.system(...)` bypassed both the
+            # import allowlist and the receiver-root check above.
+            if node.attr.lstrip("_") in _DANGEROUS_MODULES:
+                return f"access to dangerous module forbidden: .{node.attr}"
         elif isinstance(node, ast.Global):
             return "global statements forbidden in skills"
     return None
@@ -208,6 +213,8 @@ def _run_tests(skill: Skill, namespace: dict) -> str | None:
     if not skill.tests:
         return "a skill must ship at least one test case"
     for i, t in enumerate(skill.tests, 1):
+        if not isinstance(t, dict):
+            return f"test {i} is not an object"
         args = t.get("args") or {}
         expect = str(t.get("expect", ""))
         try:
@@ -363,7 +370,7 @@ class SkillForge:
                     parameters = dict(meta.get("parameters") or {})
                     tests = list(meta.get("tests") or [])
                     description = str(meta.get("description") or description)
-                except (OSError, ValueError):
+                except (OSError, ValueError, TypeError, AttributeError):
                     pass
             skill = Skill(name=name, description=description,
                           source=source, entry=entry,
@@ -460,6 +467,8 @@ def _parse_skill_md(text: str,
     title_idx = -1
     for i in range(idx, len(lines)):
         ln = lines[i]
+        if not ln.strip():
+            continue
         if fm_name is None:
             m = re.match(r"^\s*name\s*:\s*(.+?)\s*$", ln)
             if m:
@@ -468,6 +477,9 @@ def _parse_skill_md(text: str,
         if ln.startswith("# ") and title is None:
             title = ln[2:].strip()
             title_idx = i
+        # the title must lead the file: a "# comment" line inside a body
+        # code block used to be taken as the skill's name
+        break
     name = title or fm_name
     if not name:
         _log.warning("skills: %s has no '# Title' or 'name:' — skipped",

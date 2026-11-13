@@ -322,7 +322,7 @@ def review_git(repo: str = ".", staged: bool = False) -> str:
     return format_report(review_diff(diff), title)
 
 
-def review_files(paths: list[str]) -> str:
+def review_files(paths: list[str], staged: bool = False) -> str:
     """Review specific paths: `git diff -- <paths>`, else file contents.
 
     When the cwd is not a git repo, each file is read directly and its
@@ -330,9 +330,13 @@ def review_files(paths: list[str]) -> str:
     """
     paths = [str(p) for p in paths if str(p).strip()]
     if not paths:
-        return review_git(".")
+        return review_git(".", staged=staged)
 
-    diff = _git_diff(["diff", "--no-color", "--no-ext-diff", "--", *paths],
+    # --staged must come before "--": `/review --staged a.py` and the
+    # ReviewChanges tool with path+staged used to silently review the
+    # unstaged working-tree diff instead of the index.
+    diff = _git_diff(["diff", "--no-color", "--no-ext-diff",
+                      *(["--staged"] if staged else []), "--", *paths],
                      ".")
     if diff is not None:
         if not diff.strip():
@@ -368,7 +372,7 @@ def review_files(paths: list[str]) -> str:
 def _handle_review_changes(path: str = ".", staged: bool = False) -> str:
     """ReviewChanges tool handler: path=".", staged=false."""
     if path and path != ".":
-        return review_files([path])
+        return review_files([path], staged=bool(staged))
     return review_git(".", staged=bool(staged))
 
 
@@ -410,7 +414,7 @@ def run_review_command(ui: Any, arg: str) -> None:
             paths.append(tok)
     try:
         if paths:
-            report = review_files(paths)
+            report = review_files(paths, staged=staged)
         else:
             report = review_git(".", staged=staged)
     except Exception as e:  # never crash the TUI on a review

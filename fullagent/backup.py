@@ -330,9 +330,18 @@ def restore_backup(ref: str, confirm: bool = False,
                     return {"ok": False,
                             "message": "refusing to restore — MANIFEST.json "
                                        "is corrupt"}
+                # A non-object manifest (e.g. ``[]``) raised AttributeError
+                # on .get() below, escaping restore_backup.
+                if not isinstance(manifest, dict):
+                    return {"ok": False,
+                            "message": "refusing to restore — MANIFEST.json "
+                                       "is corrupt"}
+                # tar.add() stores the 2nd path of a hard-linked pair as a
+                # LNKTYPE member (islnk(), not isfile()), so it was missing
+                # here and the manifest check rejected the whole backup.
                 archived = {m.name for m in members
                             if m.name != MANIFEST_NAME
-                            and (m.isfile() or m.issym())}
+                            and (m.isfile() or m.issym() or m.islnk())}
                 listed = set(manifest.get("files", []))
                 if archived != listed:
                     return {"ok": False,
@@ -351,7 +360,8 @@ def restore_backup(ref: str, confirm: bool = False,
         # be copied into the app dir as a stray file on every restore.
         targets = [(m, tmp / m.name, app_dir / m.name)
                    for m in members
-                   if (m.isfile() or m.issym()) and m.name != MANIFEST_NAME]
+                   if (m.isfile() or m.issym() or m.islnk())
+                   and m.name != MANIFEST_NAME]
         existing = [str(dst) for _, _, dst in targets
                     if dst.exists() or dst.is_symlink()]
         if existing and not confirm:

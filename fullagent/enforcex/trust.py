@@ -564,6 +564,7 @@ class TrustLedger:
         return TrustState(
             session_id=session_id,
             score=self.config.initial_score,
+            min_score=self.config.initial_score,
             category_scores={
                 "content": self.config.initial_score,
                 "format": self.config.initial_score,
@@ -666,7 +667,10 @@ class TrustLedger:
         # the lowest score the session ever reached (burned sessions
         # must demonstrate sustained good behavior to fully heal)
         if cfg.recovery_cap < 100.0:
-            new_score = min(new_score, state.min_score + cfg.recovery_cap)
+            # (never *lowers* the score: a clean interaction must not act
+            # as a penalty after a manual upward adjust)
+            new_score = min(new_score, max(state.score,
+                                           state.min_score + cfg.recovery_cap))
         state.score = round(_clamp(new_score, 0.0, 100.0, state.score), 2)
         for cat in state.category_scores:
             old = state.category_scores[cat]

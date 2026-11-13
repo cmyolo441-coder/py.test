@@ -480,6 +480,9 @@ class MutatorConfig:
             self.max_variants = max(1, min(64, int(self.max_variants)))
         except Exception:
             self.max_variants = MAX_VARIANTS_DEFAULT
+        if isinstance(self.families, str):
+            # a bare family name would otherwise be iterated per character
+            self.families = [self.families]
         if self.families is not None:
             try:
                 resolved: List[str] = []

@@ -488,6 +488,13 @@ def _strategy_applicable(name: str,
     return False
 
 
+def _has_serious(viols: Sequence[Any]) -> bool:
+    """True when a high/critical finding remains (a passing score alone is
+    not "verified": one unredacted API key still scores ~80)."""
+    return any(isinstance(v, dict) and str(v.get("severity", "")).lower()
+               in ("critical", "high") for v in viols or ())
+
+
 # ── engine ───────────────────────────────────────────────────────────────
 
 class RepairEngine:
@@ -588,7 +595,8 @@ class RepairEngine:
                 best_text, best_score = current, score_now
             current = current if score_now >= score_before or round_changed \
                 else best_text
-            if score_now >= cfg.verify_threshold:
+            if score_now >= cfg.verify_threshold \
+                    and not _has_serious(viols_now):
                 result.repaired = current
                 result.verification_score = score_now
                 result.violations_after = viols_now
@@ -612,7 +620,8 @@ class RepairEngine:
         result.verification_score = final_score
         result.violations_after = final_viols
         result.strategies_applied = applied
-        result.verified = final_score >= cfg.verify_threshold
+        result.verified = final_score >= cfg.verify_threshold \
+            and not _has_serious(final_viols)
         return result
 
     # -- helpers ---------------------------------------------------------------

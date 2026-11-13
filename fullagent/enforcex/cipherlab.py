@@ -562,7 +562,7 @@ def decode(text: Any, max_depth: Any = MAX_DEPTH) -> DecodeReport:
     depth_limit = MAX_DEPTH
     try:
         depth_limit = max(1, min(MAX_DEPTH, int(max_depth)))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         depth_limit = MAX_DEPTH
 
     clean, zw_removed = strip_zero_width(raw)

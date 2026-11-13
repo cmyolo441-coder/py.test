@@ -249,7 +249,7 @@ def _collect_violations(text: str, rules: Any, system_text: str,
     # detect.run_all
     if _run_all is not None:
         try:
-            res = _run_all(text, system_text=system_text)
+            res = _run_all(text, rules, system_text=system_text)
             if isinstance(res, dict):
                 found = res.get("violations") or res.get("findings") or []
                 if isinstance(found, list):

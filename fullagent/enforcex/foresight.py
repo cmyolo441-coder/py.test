@@ -125,6 +125,11 @@ def _clean_state_part(s: Any, allowed: Sequence[str], default: str) -> str:
     return s if s in allowed else default
 
 
+def _is_violation_kind(kind: Any) -> bool:
+    return (not isinstance(kind, dict)
+            and _clean_state_part(kind, KINDS.ALL, "") != "")
+
+
 def normalise_event(event: Any) -> str:
     """Normalise any event-ish input to a "<sev>|<kind>" state name.
 
@@ -153,18 +158,24 @@ def _normalise_event(event: Any) -> str:
     elif isinstance(event, dict):
         sev_raw = event.get("severity", event.get("sev", ""))
         kind_raw = event.get("kind", event.get("violation_kind", ""))
-        if not sev_raw and isinstance(event.get("payload"), dict):
-            sev_raw = event["payload"].get("severity", "")
-        if not kind_raw and isinstance(event.get("payload"), dict):
-            kind_raw = event["payload"].get("kind", "")
+        payload = event.get("payload")
+        if not sev_raw and isinstance(payload, dict):
+            sev_raw = payload.get("severity", "")
+        if isinstance(payload, dict) and not _is_violation_kind(kind_raw):
+            # ledger-entry shape: top-level "kind" is the ledger kind
+            # (decision/detection/...), the violation kind is nested
+            kind_raw = payload.get("kind", "") or kind_raw
     else:
         sev_raw = getattr(event, "severity", "") or ""
         kind_raw = getattr(event, "kind", "") or ""
-        if not sev_raw and not kind_raw:
-            payload = getattr(event, "payload", None)
-            if isinstance(payload, dict):
+        payload = getattr(event, "payload", None)
+        if isinstance(payload, dict):
+            # LedgerEntry: .kind is the ledger kind ("violation",
+            # "detection", ...) — the violation lives in .payload
+            if not sev_raw:
                 sev_raw = payload.get("severity", "")
-                kind_raw = payload.get("kind", "")
+            if not _is_violation_kind(kind_raw):
+                kind_raw = payload.get("kind", "") or kind_raw
     if isinstance(sev_raw, dict):
         sev_raw = ""
     if isinstance(kind_raw, dict):

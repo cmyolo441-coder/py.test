@@ -92,6 +92,10 @@ def _score_dict(d: Dict[str, Any]) -> Dict[str, Any]:
         return score
     if score is None:
         return {}
+    if isinstance(score, (int, float)) and not isinstance(score, bool):
+        # a bare numeric score (kept as-is by _as_dict / plain JSON) is
+        # the total itself — getattr(87.5, "total") reported 0.0
+        return {"total": score}
     return {"total": getattr(score, "total", 0.0),
             "grade": getattr(score, "grade", "?"),
             "verdict": getattr(score, "verdict", "?")}
@@ -105,6 +109,8 @@ def _violations(d: Dict[str, Any]) -> List[Dict[str, Any]]:
         # A single message string is one violation, not one violation
         # per character (iterating a string yields its characters).
         raw = [{"message": raw, "severity": "medium", "category": "other"}]
+    elif not hasattr(raw, "__iter__"):
+        raw = [raw]       # e.g. a bare number: iterating it raised
     out: List[Dict[str, Any]] = []
     for v in raw:
         if isinstance(v, dict):

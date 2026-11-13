@@ -162,6 +162,19 @@ def _make_preexec(cpu_limit: int | None,
         limits.append((resource.RLIMIT_FSIZE,
                        int(fsize_limit_mb) * 1024 * 1024))
     setrlimit = resource.setrlimit
+    # An unprivileged process may not raise its hard limit: requesting
+    # (v, v) above an inherited lower hard limit made setrlimit raise in
+    # the child, so every run died with SubprocessError. Clamp to it.
+    clamped: list[tuple[int, int]] = []
+    for which, v in limits:
+        try:
+            hard = resource.getrlimit(which)[1]
+        except (OSError, ValueError):
+            hard = resource.RLIM_INFINITY
+        if hard != resource.RLIM_INFINITY and hard >= 0:
+            v = min(v, hard)
+        clamped.append((which, v))
+    limits = clamped
 
     def _preexec() -> None:
         for which, v in limits:
