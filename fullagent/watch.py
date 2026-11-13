@@ -328,6 +328,8 @@ class WatchManager:
         with self._lock:
             self._state = {(wid, f): st for (wid, f), st in self._state.items()
                            if wid != w.id}
+            if w.id not in self.watches:
+                return fired  # removed mid-poll: don't resurrect its state
             for f, st in current.items():
                 self._state[(w.id, f)] = st
         return fired
