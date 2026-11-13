@@ -2368,6 +2368,22 @@ def _sse_error_status(err: Any) -> int | None:
     return None
 
 
+def _body_is_empty(resp: Any) -> bool:
+    """True when a (non-SSE) HTTP 200 response has an empty or blank
+    body. Reads and caches the body, so a following resp.json() parses
+    the same bytes. Response stand-ins without a .content attribute are
+    treated as non-empty (their .json() decides)."""
+    try:
+        raw = resp.content
+    except AttributeError:
+        return False
+    if raw is None:
+        return True
+    if isinstance(raw, (bytes, bytearray, str)):
+        return not raw.strip()
+    return False
+
+
 def _chat_stream_once(url: str, headers: dict, payload: dict,
                       on_token: Callable[[str], None] | None,
                       on_reasoning: Callable[[str], None] | None,
@@ -2425,6 +2441,13 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
             # CANCEL: .json() reads the whole body — a stalled server
             # could hold this until the (long) read timeout; guard it.
             try:
+                if run_cancellable(lambda: _body_is_empty(resp),
+                                   should_cancel, name="model response"):
+                    # HTTP 200 with an empty body: the provider answered
+                    # with nothing. That is an EMPTY reply (the agent
+                    # retries once and then says so), not a JSON error.
+                    _clean_exit = True
+                    return StreamResult()
                 data = run_cancellable(resp.json, should_cancel,
                                        name="model response")
             except ValueError as e:
@@ -2911,6 +2934,11 @@ def _post_blocking(url: str, headers: dict, payload: dict,
                                status=resp.status_code,
                                retry_after=retry_after)
             try:
+                if run_cancellable(lambda: _body_is_empty(resp),
+                                   should_cancel, name="model response"):
+                    # HTTP 200, empty body: an empty reply (no choices),
+                    # not a JSON error — the agent retries it once.
+                    return {}
                 data = run_cancellable(resp.json, should_cancel,
                                        name="model response")
             except TurnCancelled:
