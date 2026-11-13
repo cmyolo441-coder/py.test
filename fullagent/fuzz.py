@@ -22,6 +22,7 @@ from __future__ import annotations
 import random
 import string
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -33,6 +34,13 @@ _log = get_logger("fuzz")
 MAX_SHRINK_STEPS = 60
 DEFAULT_CALL_TIMEOUT = 5.0   # per-invocation hang guard (seconds)
 SHRINK_PROBE_TIMEOUT = 1.0   # shorter probe while shrinking hangs
+# Python cannot kill a hung thread: every hang (during the run OR a
+# shrink probe) leaves one daemon thread spinning for the rest of the
+# process. Bound how many a single fuzz() call may create, and bound
+# the wall clock any one shrink may take.
+MAX_HANGS_PER_RUN = 3        # stop the run after this many hangs
+MAX_HANG_PROBES = 4          # hang probes allowed while shrinking one hang
+SHRINK_DEADLINE_S = 20.0     # wall-clock cap for one shrink
 
 
 # ---------------------------------------------------------------------------
@@ -69,13 +77,17 @@ class Generator:
             return b""
         return self.rng.randbytes(self.rng.randint(1, 32))
 
-    def lst(self) -> list:
+    # depth is threaded through: the old code always recursed with
+    # depth=1, so nested lists/dicts never reached the depth>2 cut-off
+    # and generation recursion was bounded only by luck.
+    def lst(self, depth: int = 0) -> list:
         n = self.rng.randint(0, 8)
-        return [self.any(depth=1) for _ in range(n)]
+        return [self.any(depth=depth + 1) for _ in range(n)]
 
-    def dct(self) -> dict:
+    def dct(self, depth: int = 0) -> dict:
         n = self.rng.randint(0, 5)
-        return {self.text()[:8]: self.any(depth=1) for _ in range(n)}
+        return {self.text()[:8]: self.any(depth=depth + 1)
+                for _ in range(n)}
 
     def any(self, depth: int = 0) -> object:
         if depth > 2:
@@ -90,10 +102,10 @@ class Generator:
         if choice < 0.7:
             return self.rng.random()
         if choice < 0.85:
-            return self.lst()
+            return self.lst(depth)
         if choice < 0.92:
             return self.blob()
-        return self.dct()
+        return self.dct(depth)
 
     def args_for(self, nargs: int) -> tuple:
         return tuple(self.any() for _ in range(nargs))
@@ -138,7 +150,8 @@ def _simpler(variant: object, gen: Generator) -> list:
                 del d[k]
                 out.append(d)
     elif isinstance(variant, float):
-        out.append(0.0)
+        if variant != 0.0:
+            out.append(0.0)
     elif isinstance(variant, bytes):
         if variant:
             out.append(b"")
@@ -248,6 +261,7 @@ class Fuzzer:
         self.log.append("fuzz.run",
                         {"target": report.target, "iterations": iterations,
                          "nargs": nargs, "timeout": timeout}, actor="fuzzer")
+        hangs = 0
         for i in range(iterations):
             report.iterations = i + 1
             args = self.gen.args_for(nargs)
@@ -255,6 +269,17 @@ class Fuzzer:
             if not ok:
                 self._record_crash(report, target, args, error, kind,
                                    i + 1, timeout)
+                if kind == "hang":
+                    hangs += 1
+                    if hangs >= MAX_HANGS_PER_RUN:
+                        # each hang leaked an unkillable thread and cost
+                        # a full timeout; the finding is already made
+                        self.log.append(
+                            "fuzz.aborted",
+                            {"target": report.target,
+                             "reason": f"{hangs} hangs",
+                             "iteration": i + 1}, actor="fuzzer")
+                        break
                 continue
             if invariant is not None:
                 try:
@@ -319,9 +344,16 @@ class Fuzzer:
             want_inv_exc = crash.error[len("invariant raised "):].split(
                 ":")[0]
 
+        deadline = time.monotonic() + SHRINK_DEADLINE_S
+        hang_probes = [0]
+
         def reproduces(candidate: list) -> bool:
+            if crash.kind == "hang" and hang_probes[0] >= MAX_HANG_PROBES:
+                return False   # every hang probe leaks a spinning thread
             ok, result, error, kind = _call_guarded(target,
                                                     tuple(candidate), probe)
+            if kind == "hang":
+                hang_probes[0] += 1
             if crash.kind == "hang":
                 return kind == "hang"
             if crash.kind == "invariant":
@@ -339,9 +371,19 @@ class Fuzzer:
 
         current = list(crash.args)
         for _ in range(MAX_SHRINK_STEPS):
+            if time.monotonic() > deadline:
+                break
             improved = False
             for idx, val in enumerate(current):
                 for simpler in _simpler(val, self.gen):
+                    # a "simpler" value equal to the current one (e.g.
+                    # "a"[0] == "a") always reproduces, so it counted as
+                    # progress forever: the shrink burned every step on
+                    # a no-op and never reached the other arguments
+                    if type(simpler) is type(val) and simpler == val:
+                        continue
+                    if time.monotonic() > deadline:
+                        break
                     candidate = list(current)
                     candidate[idx] = simpler
                     if reproduces(candidate):
@@ -353,7 +395,15 @@ class Fuzzer:
             if not improved:
                 break
         crash.shrunk_args = tuple(current)
-        if reproduces(list(current)):
+        if crash.kind == "hang":
+            # every accepted candidate was already observed hanging by
+            # its probe; re-running it twice more would only leak two
+            # more spinning threads (and, past MAX_HANG_PROBES, report
+            # a still-hanging input as "no longer reproduces")
+            crash.shrunk_error = (crash.error if current == list(crash.args)
+                                  else f"TimeoutError: hung for "
+                                       f">{probe:g}s")
+        elif reproduces(list(current)):
             # re-run once more to capture the shrunk failure's text
             ok, result, error, _ = _call_guarded(target, tuple(current),
                                                  probe)

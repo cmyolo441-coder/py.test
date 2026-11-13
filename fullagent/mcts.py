@@ -140,7 +140,13 @@ class TreeSearch:
                 assignment = dict(node.assignment)
                 for i in range(len(assignment), len(items)):
                     assignment[i] = self.rng.choice(strategies)
-                score = self.evaluator(assignment)
+                # coerce INSIDE the guard: a None/str score used to pass
+                # here and then crash backprop (`value += None`) outside
+                # the try, killing the whole search; a NaN poisoned
+                # every ancestor's UCB1 and could never be "best".
+                score = float(self.evaluator(assignment))
+                if not math.isfinite(score):
+                    raise ValueError("non-finite rollout score")
             except Exception:
                 # One bad rollout must not kill the whole search: the
                 # evaluator scores a real (cheap) worker run in

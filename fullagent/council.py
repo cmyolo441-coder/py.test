@@ -61,8 +61,15 @@ _SYNTHESIS_BRIEF = (
     "CONFIDENCE: <0-100>%\n"
     "REASON: <one or two sentences>")
 
-_WINNER_RE = re.compile(r"winner:\s*(A|B|DRAW)", re.IGNORECASE)
-_CONF_RE = re.compile(r"confidence:\s*(\d+(?:\.\d+)?)\s*%", re.IGNORECASE)
+# Word boundaries matter: without them "WINNER: Argument B" matched the
+# "A" of "Argument" (thesis wins) and "WINNER: Both" read as B. An
+# optional "argument"/"side" label before the letter is accepted.
+_WINNER_RE = re.compile(
+    r"winner:\s*\**\s*(?:(?:argument|side)\s+)?(A|B|DRAW)\b",
+    re.IGNORECASE)
+# the "%" is optional: "CONFIDENCE: 82" is the same answer as "82%"
+_CONF_RE = re.compile(r"confidence:\s*\**\s*(\d+(?:\.\d+)?)\s*%?",
+                      re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------

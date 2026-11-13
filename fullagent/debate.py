@@ -254,16 +254,23 @@ class DebateTournament:
             return _sim[key]
 
         # single-link clustering over the similarity threshold
+        # An answer that links to SEVERAL existing clusters merges them —
+        # true single-link. (Dropping it into the first linked cluster
+        # only left A~C~B split into {A,C} and {B}, so a 3-model
+        # consensus could lose to a 2-model one.)
         clusters: list[list[int]] = []
         for i in range(len(vecs)):
-            placed = False
-            for c in clusters:
-                if any(sim(i, j) >= _CLUSTER_THRESHOLD for j in c):
-                    c.append(i)
-                    placed = True
-                    break
-            if not placed:
+            linked = [c for c in clusters
+                      if any(sim(i, j) >= _CLUSTER_THRESHOLD for j in c)]
+            if not linked:
                 clusters.append([i])
+                continue
+            head = linked[0]
+            for c in linked[1:]:
+                head.extend(c)
+                clusters.remove(c)
+            head.append(i)
+            head.sort()
 
         def cluster_weight(c: list[int]) -> float:
             # calibration mass × agreement tightness (mean pairwise sim)

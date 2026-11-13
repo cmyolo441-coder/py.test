@@ -36,7 +36,7 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 
-from .kernel import EventLog, Event
+from .kernel import EventLog, Event, _canonical
 from ._foundation import get_logger
 
 _log = get_logger("merge")
@@ -47,9 +47,15 @@ _SKIP_TYPES = ("kernel.rewind", "kernel.branch")
 
 
 def _payload_key(ev: Event) -> str:
-    """Logical identity of an event (branch/seq stripped)."""
+    """Logical identity of an event (branch/seq stripped).
+
+    Canonical JSON (sorted keys at EVERY depth): the old key was the repr
+    of the top-level items only, so two semantically identical payloads
+    whose NESTED dicts were built in a different key order (e.g. tool args
+    {"path", "content"} vs {"content", "path"}) hashed differently and the
+    same work was replayed twice instead of being kept once."""
     return hashlib.sha256(
-        f"{ev.type}|{sorted(ev.data.items(), key=lambda kv: str(kv[0]))}"
+        f"{ev.type}|{_canonical(ev.data)}"
         .encode("utf-8", "replace")).hexdigest()[:16]
 
 
@@ -60,18 +66,30 @@ def _write_path(ev: Event) -> str | None:
     name = str(ev.data.get("name", ""))
     if name not in ("write_file", "edit_file"):
         return None
-    p = str((ev.data.get("args") or {}).get("path", "")).strip()
+    args = ev.data.get("args") or {}
+    if not isinstance(args, dict):
+        return None
+    p = str(args.get("path", "")).strip()
     return p or None
 
 
 def _content_hash(ev: Event) -> str:
-    """Hash of the written content (for same-file divergence checks)."""
+    """Hash of the written content (for same-file divergence checks).
+
+    Every content-bearing arg participates: an edit_file is identified by
+    BOTH its old_string and its new_string — hashing new_string alone made
+    two different edits that happen to insert the same text (replacing
+    different regions of the file) look identical, so a real conflict was
+    reported as a clean merge."""
     args = ev.data.get("args") or {}
-    for key in ("content", "new_string", "text"):
-        if key in args:
-            return hashlib.sha256(str(args[key]).encode(
-                "utf-8", "replace")).hexdigest()[:16]
-    return ""
+    if not isinstance(args, dict):
+        return ""
+    parts = [f"{key}={args[key]}" for key in
+             ("content", "old_string", "new_string", "text") if key in args]
+    if not parts:
+        return ""
+    return hashlib.sha256("\x00".join(parts).encode(
+        "utf-8", "replace")).hexdigest()[:16]
 
 
 @dataclass
@@ -100,7 +118,7 @@ class TimelineMerger:
     # -- ancestor ---------------------------------------------------------------
 
     def _archived_rows(self) -> dict[str, dict]:
-        """id -> archived event dict for every readable archived event.
+        """id -> {"seq", "parent"} for every readable archived event.
 
         Needed when the retention window truncates a chain: the missing
         ancestors can belong to OTHER branches (a fork point lives on the
@@ -115,7 +133,11 @@ class TimelineMerger:
                     except ValueError:
                         continue
                     if isinstance(d, dict) and isinstance(d.get("id"), str):
-                        rows[d["id"]] = d
+                        # keep only the link fields: holding every full
+                        # archived payload in RAM to walk a parent chain
+                        # cost O(archive bytes) of memory per merge
+                        rows[d["id"]] = {"seq": d.get("seq"),
+                                         "parent": d.get("parent")}
         except OSError:
             pass
         return rows
@@ -268,11 +290,25 @@ class TimelineMerger:
         # (_event_at -> None, .id -> AttributeError); materialise it from
         # the archive exactly like kernel.fork() does.
         base = None
-        replay = []
-        for ev in result.only_a + result.only_b + result.shared:
-            # every classified copy replays — duplicates are REAL history
-            if ev.type in _CONTENT_TYPES:
-                replay.append(ev)
+        # Causal interleave (the documented contract): every event keeps
+        # its distance from the ancestor; A's events (exclusive AND shared,
+        # in A's own order) and B's exclusive events are merged by that
+        # distance, A first on a tie. The old order — all A-exclusive, then
+        # all B-exclusive, then ALL shared — pushed shared work (usually
+        # the earliest, e.g. the same first message on both sides) after
+        # everything that causally followed it.
+        b_only_ids = {e.id for e in result.only_b}
+        slots: list[tuple[int, int, int, Event]] = []
+        for i, ev in enumerate(evs_a):        # only_a + shared, A's order
+            slots.append((i, 0, i, ev))
+        for i, ev in enumerate(evs_b):
+            if ev.id in b_only_ids:
+                slots.append((i, 1, i, ev))
+        slots.sort(key=lambda s: (s[0], s[1], s[2]))
+        replay = [ev for _, _, _, ev in slots
+                  # every classified copy replays — duplicates are REAL
+                  # history; structural events would be lies
+                  if ev.type in _CONTENT_TYPES]
         # the head seed + branch swap + replay must be one critical
         # section: self.log.branch is shared turn state, so a concurrent
         # append between the swap and the restore lands on the wrong
@@ -289,18 +325,18 @@ class TimelineMerger:
                     self.log._by_id[base.id] = base
                     self.log._extra.add(base.id)
             self.log._heads[merge_branch] = base.id if base else None
-            cur = self.log.branch
-            self.log.branch = merge_branch
-            try:
-                for ev in replay:
-                    # deep-copy the payload: the original event and the
-                    # replayed one must never share a mutable dict — mutating
-                    # either side would corrupt the other's content hash and
-                    # break verify()
-                    self.log.append(ev.type, copy.deepcopy(ev.data),
-                                    actor="merge", provenance=ev.provenance)
-            finally:
-                self.log.branch = cur
+            # append with an explicit branch= instead of swapping the
+            # shared self.log.branch: readers that look at log.branch
+            # without the lock (TUI, other turns) never see the transient
+            # merge branch as "current"
+            for ev in replay:
+                # deep-copy the payload: the original event and the
+                # replayed one must never share a mutable dict — mutating
+                # either side would corrupt the other's content hash and
+                # break verify()
+                self.log.append(ev.type, copy.deepcopy(ev.data),
+                                branch=merge_branch,
+                                actor="merge", provenance=ev.provenance)
         self.log.checkout(merge_branch)
 
         self.log.append("merge.merged", result.to_dict(), actor="kernel")

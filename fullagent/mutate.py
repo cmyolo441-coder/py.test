@@ -24,8 +24,11 @@ from __future__ import annotations
 
 import ast
 import copy
+import os
+import signal
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -226,20 +229,56 @@ class MutationTester:
         self.timeout = timeout
 
     def _run_suite(self) -> tuple[int, str]:
+        """Run the suite once. The shell gets its OWN session so a
+        timeout kills the whole tree: subprocess.run(timeout=) killed
+        only the shell, then blocked in communicate() for as long as the
+        forked pytest kept the pipes open — the timeout did not bound
+        anything. stdin is /dev/null (a suite reading the terminal would
+        steal the TUI's keys), and PYTHONDONTWRITEBYTECODE keeps mutant
+        bytecode out of the project's __pycache__."""
         from .judge import resolve_shell
         argv = resolve_shell()
         if argv is None:
             return 127, "no POSIX shell available"
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+        kw: dict = {"start_new_session": True} if os.name != "nt" else {}
         try:
-            proc = subprocess.run(argv + [self.suite_command],
-                                  capture_output=True, text=True,
-                                  timeout=self.timeout)
-            out = (proc.stdout or "") + (proc.stderr or "")
-            return proc.returncode, out[-300:]
-        except subprocess.TimeoutExpired:
-            return 124, "suite timed out"
+            proc = subprocess.Popen(argv + [self.suite_command],
+                                    stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT,
+                                    text=True, encoding="utf-8",
+                                    errors="replace", env=env, **kw)
         except OSError as e:
             return 127, str(e)
+        try:
+            out, _ = proc.communicate(timeout=self.timeout)
+        except subprocess.TimeoutExpired:
+            self._kill_tree(proc)
+            try:
+                proc.communicate(timeout=5)
+            except Exception:  # noqa: BLE001 — best-effort drain
+                pass
+            return 124, "suite timed out"
+        except BaseException:
+            self._kill_tree(proc)
+            raise
+        return proc.returncode, (out or "")[-300:]
+
+    @staticmethod
+    def _kill_tree(proc) -> None:
+        """Kill the suite's own process group (never ours: the child was
+        started in a new session, so its pgid is its pid)."""
+        try:
+            if os.name != "nt" and proc.pid != os.getpgrp():
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:
+                proc.kill()
+        except OSError:
+            try:
+                proc.kill()
+            except OSError:
+                pass
 
     def run(self, path: str, max_mutants: int = MAX_MUTANTS
             ) -> MutationReport:
@@ -247,7 +286,10 @@ class MutationTester:
         report = MutationReport(path=str(p))
         if not p.is_file():
             return report
-        original = p.read_text(errors="replace")
+        try:
+            original = p.read_bytes().decode("utf-8", errors="replace")
+        except OSError:
+            return report
         mutants = generate_mutants(original, max_mutants)
         report.total = len(mutants)
         self.log.append("mutation.run",
@@ -262,17 +304,36 @@ class MutationTester:
         # was tried here before — the suite imports the original
         # module path, so the mutants were never exercised and every
         # mutant silently "survived" with a 0.0 score.)
-        target = Path(self.mutant_path) if self.mutant_path else p
-        backup = None
+        target = Path(self.mutant_path).expanduser() if self.mutant_path \
+            else p
+        # Back up the BYTES (and the stat times): the old text round
+        # trip (read_text(errors="replace") / write_text) "restored" a
+        # CRLF file as LF and a latin-1 file with U+FFFD replacement
+        # characters — the file under test came back silently changed.
+        backup: bytes | None = None
+        backup_stat = None
+        existed = target.exists()
         try:
-            backup = target.read_text(errors="replace")
+            backup = target.read_bytes()
+            backup_stat = target.stat()
         except OSError:
             backup = None
+        # Each mutant gets a distinct mtime. Python's .pyc cache is keyed
+        # on (mtime in whole seconds, size): two same-size mutants (a
+        # `+`->`-` flip and its twin) written within one second reused
+        # the previous mutant's bytecode, so the suite tested the WRONG
+        # mutant and real kills were reported as survivors.
+        stamp = max(time.time(),
+                    backup_stat.st_mtime if backup_stat else 0.0) + 2
         try:
-            for m in mutants:
+            for n, m in enumerate(mutants):
                 res = MutantResult(m["kind"], m["description"])
                 try:
-                    target.write_text(m["source"])
+                    target.write_text(m["source"], encoding="utf-8")
+                    try:
+                        os.utime(target, (stamp + n, stamp + n))
+                    except OSError:
+                        pass
                     code, out = self._run_suite()
                 except OSError as e:
                     code, out = 127, str(e)
@@ -293,7 +354,23 @@ class MutationTester:
         finally:
             if backup is not None:
                 try:
-                    target.write_text(backup)
+                    target.write_bytes(backup)
+                    if backup_stat is not None:
+                        os.utime(target, ns=(backup_stat.st_atime_ns,
+                                             backup_stat.st_mtime_ns))
+                except OSError as e:
+                    # never silent: the file now holds a MUTANT
+                    _log.error("mutate: FAILED to restore %s: %s",
+                               target, e)
+                    self.log.append("mutation.restore_failed",
+                                    {"path": str(target),
+                                     "error": str(e)[:200]},
+                                    actor="tester")
+            elif not existed and mutants:
+                # a scratch mutant_path we created: don't leave the last
+                # mutant lying around
+                try:
+                    target.unlink()
                 except OSError:
                     pass
 

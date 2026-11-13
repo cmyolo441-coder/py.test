@@ -133,6 +133,11 @@ class LiveDiffStreamer:
     held_lines: List[str] = field(default_factory=list)
     existing_disk_text: Optional[str] = None
     _key_re: Optional[re.Pattern] = field(default=None, init=False, repr=False)
+    # per-field incremental extraction state (key -> dict). Without it,
+    # detect_path() and the old_string lookup re-searched and re-unescaped
+    # the WHOLE accumulated buffer on every chunk: O(n^2) on the UI thread
+    # (a 200KB streamed edit took over a minute and froze the TUI).
+    _fields: dict = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         key_map = {
@@ -197,11 +202,42 @@ class LiveDiffStreamer:
         val, _, done = cls._unescape_json_fragment(buf[m.end() :])
         return val if done else None
 
+    def _field_value(self, key: str) -> Optional[str]:
+        """Complete string value of ``key`` once fully streamed, else None.
+
+        Same result as ``extract_complete_field(self.buf, key)`` but linear
+        over the whole stream: the key search resumes where it stopped and
+        the value is unescaped only over newly arrived characters."""
+        st = self._fields.get(key)
+        if st is None:
+            st = {"re": re.compile(r'"' + re.escape(key) + r'"\s*:\s*"'),
+                  "scan": 0, "start": -1, "pos": 0, "parts": [],
+                  "done": False}
+            self._fields[key] = st
+        if st["done"]:
+            return "".join(st["parts"])
+        buf = self.buf
+        if st["start"] < 0:
+            m = st["re"].search(buf, st["scan"])
+            if not m:
+                # keep an overlap so a key split across chunks still matches
+                st["scan"] = max(0, len(buf) - len(key) - 64)
+                return None
+            st["start"] = m.end()
+        text, consumed, done = self._unescape_json_fragment(
+            buf[st["start"] + st["pos"]:])
+        st["pos"] += consumed
+        st["parts"].append(text)
+        if done:
+            st["done"] = True
+            return "".join(st["parts"])
+        return None
+
     def detect_path(self) -> str:
         if self.path_resolved:
             return self.path_resolved
         for k in ("path", "file_path"):
-            val = self.extract_complete_field(self.buf, k)
+            val = self._field_value(k)
             if val:
                 self.path_resolved = val
                 self.existing_disk_text = _read_current(val)
@@ -243,7 +279,7 @@ class LiveDiffStreamer:
 
         if self.tool_name in ("edit_file", "MultiEdit", "multiedit"):
             if not self.old_emitted:
-                old_s = self.extract_complete_field(self.buf, "old_string")
+                old_s = self._field_value("old_string")
                 if old_s is not None:
                     self.start_line = self._compute_hunk_start(old_s)
                     old_lns = old_s.splitlines()

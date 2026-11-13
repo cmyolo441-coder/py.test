@@ -38,6 +38,9 @@ Self-test: ``python3 -m fullagent.retryhint``
 
 from __future__ import annotations
 
+import threading
+import time
+
 # Per-tool recovery alternatives injected alongside the generic hint.
 # Keep this table small — it lands in the model's context on every
 # repeated failure.
@@ -68,10 +71,23 @@ _ALTERNATIVES: dict[str, tuple[str, ...]] = {
     ),
 }
 
-# tool name -> (consecutive failure count, last error text, truncated)
-_fails: dict[str, tuple[int, str]] = {}
+# tool name -> (consecutive failure count, last error text (truncated),
+# monotonic time of the last failure)
+_fails: dict[str, tuple[int, str, float]] = {}
+_lock = threading.Lock()
 
 _HINT_AFTER = 2  # failures before a hint is injected
+
+# The agent loop never calls reset_turn() at a turn boundary, so without
+# an age limit a single failure from an hour ago (another turn, another
+# task) still counted as the first of a "consecutive" streak and the very
+# next failure was reported as "2 failed attempts". A streak whose last
+# failure is older than this is stale and starts over.
+_STALE_AFTER_S = 600.0
+
+# Tool names come from the model (hallucinated names included), so the
+# ledger is bounded explicitly instead of trusting the tool registry.
+_MAX_TOOLS = 256
 
 
 def note_failure(tool: str, error: str) -> str | None:
@@ -82,9 +98,16 @@ def note_failure(tool: str, error: str) -> str | None:
     failure, so the nudge persists while the loop continues), else None.
     """
     err = " ".join(str(error or "").split())[:180] or "(no error text)"
-    count, _ = _fails.get(tool, (0, ""))
-    count += 1
-    _fails[tool] = (count, err)
+    now = time.monotonic()
+    with _lock:
+        count, _, last = _fails.get(tool, (0, "", now))
+        if now - last > _STALE_AFTER_S:
+            count = 0
+        count += 1
+        _fails.pop(tool, None)          # re-insert: dict order = recency
+        _fails[tool] = (count, err, now)
+        while len(_fails) > _MAX_TOOLS:
+            _fails.pop(next(iter(_fails)))
     if count < _HINT_AFTER:
         return None
     hint = (
@@ -102,12 +125,14 @@ def note_failure(tool: str, error: str) -> str | None:
 
 def note_success(tool: str) -> None:
     """Record a successful tool call — resets that tool's failure streak."""
-    _fails.pop(tool, None)
+    with _lock:
+        _fails.pop(tool, None)
 
 
 def reset_turn() -> None:
     """Clear all per-tool failure counters (turn boundary)."""
-    _fails.clear()
+    with _lock:
+        _fails.clear()
 
 
 if __name__ == "__main__":
