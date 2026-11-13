@@ -124,6 +124,11 @@ class SnapshotStore:
                     manifest[key] = self._put_file(p, key)
                 except OSError:
                     manifest[key] = None
+            elif p.is_dir():
+                # An existing directory is NOT recorded: None means
+                # "absent", and restoring None used to rmtree the user's
+                # pre-existing directory (e.g. the source of copy_path).
+                continue
             else:
                 manifest[key] = None
         tree_bytes = json.dumps(manifest, sort_keys=True,
@@ -176,7 +181,7 @@ class SnapshotStore:
         if manifest is None:
             return {"restored": 0, "removed": 0, "missing_blobs": 0,
                     "error": f"tree {tree_hash[:10]} does not resolve"}
-        restored = removed = missing = 0
+        restored = removed = missing = kept = 0
         for key, blob in manifest.items():
             p = Path(key)
             if blob is None:
@@ -186,13 +191,17 @@ class SnapshotStore:
                 if p.exists() or p.is_symlink():
                     try:
                         if p.is_dir() and not p.is_symlink():
-                            import shutil
-                            shutil.rmtree(p, ignore_errors=True)
+                            # Only an EMPTY directory is removed. A
+                            # non-empty one may hold the user's data that
+                            # was moved here (move_path of an existing dir)
+                            # or files the snapshot never covered, so it is
+                            # kept rather than rmtree'd.
+                            p.rmdir()
                         else:
                             p.unlink()
                         removed += 1
                     except OSError:
-                        pass
+                        kept += 1
                 continue
             if not isinstance(blob, str):
                 # Corrupt manifest entry: count it missing instead of
@@ -216,8 +225,11 @@ class SnapshotStore:
                 restored += 1
             except OSError:
                 missing += 1
-        return {"restored": restored, "removed": removed,
-                "missing_blobs": missing}
+        out = {"restored": restored, "removed": removed,
+               "missing_blobs": missing}
+        if kept:
+            out["kept_nonempty_dirs"] = kept
+        return out
 
     def diff(self, tree_a: str, tree_b: str) -> dict:
         """Paths added / removed / modified going from tree A to tree B.

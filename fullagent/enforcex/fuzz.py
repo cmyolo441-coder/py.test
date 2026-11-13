@@ -272,7 +272,12 @@ def inject_noise(message: str, level: int = 1,
     level 0 -> unchanged; level 1 -> light; level 2 -> heavy.
     Deterministic given (message, seed). Never raises.
     """
-    msg = message or ""
+    msg = message if isinstance(message, str) else (
+        "" if message is None else str(message))
+    try:
+        level = int(level)
+    except (TypeError, ValueError, OverflowError):
+        level = 0
     if level <= 0 or not msg:
         return msg
     rng = random.Random(hashlib.sha256(f"{msg}:{seed}".encode()).hexdigest()
@@ -314,10 +319,14 @@ def paraphrase(message: str, variant: int = 0) -> str:
     variant selects among a small fixed set of transformations.
     Never raises; empty in -> empty out.
     """
-    msg = (message or "").strip()
+    msg = (message if isinstance(message, str) else
+           ("" if message is None else str(message))).strip()
     if not msg:
         return ""
-    v = int(variant) % 4
+    try:
+        v = int(variant) % 4
+    except (TypeError, ValueError, OverflowError):
+        v = 0
     if v == 0:
         return f"{_PARAPHRASE_OPENERS[0]} {msg}"
     if v == 1:
@@ -492,12 +501,14 @@ class Harness:
     def _safe_verify(self, reply: str, probe: Any) -> Tuple[str, float, List[Dict[str, Any]], str]:
         try:
             verdict, score, viols = self.verifier(reply, probe)
-            verdict = str(verdict or Verdict.ERROR)
-            if verdict not in (Verdict.COMPLIANT, Verdict.VIOLATION,
-                               Verdict.ERROR):
-                verdict = Verdict.VIOLATION if verdict == "violation" \
-                    else Verdict.COMPLIANT
-            return verdict, float(score), list(viols or []), ""
+            verdict = _coerce_verdict(verdict)
+            try:
+                score_f = float(score)
+            except (TypeError, ValueError, OverflowError):
+                score_f = 0.0
+            if score_f != score_f:
+                score_f = 0.0
+            return verdict, score_f, list(viols or []), ""
         except Exception as exc:
             return Verdict.ERROR, 0.0, [], f"verifier: {type(exc).__name__}"
 
@@ -633,7 +644,10 @@ class Harness:
             k: 100.0 * sum(v) / len(v) for k, v in by_cat.items() if v}
         rep.adherence_by_difficulty = {
             k: 100.0 * sum(v) / len(v) for k, v in by_diff.items() if v}
-        ranked = sorted(case_list, key=lambda c: (c.score, c.verdict == Verdict.VIOLATION))
+        # worst first: lowest score, and among equal scores violations
+        # before compliant cases (the old key sorted violations LAST)
+        ranked = sorted(case_list, key=lambda c: (
+            c.score, c.verdict != Verdict.VIOLATION))
         rep.worst_cases = ranked[:10]
         return rep
 
@@ -646,13 +660,43 @@ class _ProbeView:
         self.message = message
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self._probe, name)
+        if name.startswith("__") or name == "_probe":
+            raise AttributeError(name)     # no recursion before __init__
+        probe = self.__dict__.get("_probe")
+        if isinstance(probe, dict) and name in probe:
+            return probe[name]             # dict probes expose their keys
+        return getattr(probe, name)
 
     def to_dict(self) -> Dict[str, Any]:
         d = getattr(self._probe, "to_dict", None)
         base = dict(d()) if callable(d) else {}
         base["message"] = self.message
         return base
+
+
+_VIOLATION_WORDS = frozenset({
+    "violation", "violated", "violates", "fail", "failed", "failure",
+    "block", "blocked", "deny", "denied", "unsafe", "noncompliant",
+    "non-compliant", "non_compliant", "reject", "rejected"})
+_COMPLIANT_WORDS = frozenset({
+    "compliant", "comply", "pass", "passed", "ok", "allow", "allowed",
+    "safe", "clean", "success"})
+
+
+def _coerce_verdict(verdict: Any) -> str:
+    """Normalise a verifier's verdict. Unknown strings used to be counted
+    as COMPLIANT (so "VIOLATION", "fail" or "block" inflated adherence);
+    now synonyms map to their meaning and anything else is an ERROR."""
+    if isinstance(verdict, bool):
+        return Verdict.COMPLIANT if verdict else Verdict.VIOLATION
+    v = str(verdict or "").strip().lower()
+    if v in (Verdict.COMPLIANT, Verdict.VIOLATION, Verdict.ERROR):
+        return v
+    if v in _VIOLATION_WORDS:
+        return Verdict.VIOLATION
+    if v in _COMPLIANT_WORDS:
+        return Verdict.COMPLIANT
+    return Verdict.ERROR
 
 
 def _final_verdict(verdicts: Sequence[str]) -> str:

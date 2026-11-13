@@ -755,6 +755,7 @@ class Agent:
         # would misfire in the next one, so a reset starts it empty
         # (resume_session and focus.stop already clear it on their paths)
         self._focus_history.clear()
+        self._error_counts.clear()
         self.session_id = uuid.uuid4().hex[:8]
         self.log.session = self.session_id
         self.log.append("session.start", {"session_id": self.session_id,
@@ -1095,6 +1096,14 @@ class Agent:
         _stall_count = 0
         turn_stopped = False
         _retry_loop_det = _RetryLoopDetector()  # loopdetect: per-turn detector
+        # retryhint keeps module-global failure streaks; without a reset at
+        # the turn boundary one stale failure from an earlier turn made the
+        # next unrelated failure read as a repeated attempt.
+        try:
+            from .retryhint import reset_turn as _rh_reset
+            _rh_reset()
+        except Exception:
+            pass
         _exit_tracker = _EarlyExitTracker()  # earlyexit: per-turn novelty
         self._turn_status = on_status
         try:
@@ -2670,6 +2679,12 @@ class Agent:
             if ev.status == "error":
                 sig = _signature(ev.name, ev.args)
                 self._error_counts[sig] = self._error_counts.get(sig, 0) + 1
+                # bounded: one entry per distinct failing call signature
+                # would otherwise grow for the whole session
+                if len(self._error_counts) > 2048:
+                    for _k in list(self._error_counts)[:1024]:
+                        if _k != sig:
+                            self._error_counts.pop(_k, None)
                 if self._error_counts[sig] == 2:
                     self.memory.record_dead_end(
                         signature=sig,

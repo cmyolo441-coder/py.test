@@ -300,7 +300,10 @@ def _mutate_nesting(text: str, rng: random.Random, intensity: float) -> str:
         payload = text.replace('"', '\\"').replace("\n", " ")
         if len(payload) > 120 and rng.random() < intensity:
             payload = payload[:120] + "…"
-        res = tmpl.format(payload=payload)
+        # str.format() choked on the JSON template's literal braces
+        # (KeyError), so that variant silently returned the input
+        # unchanged; substitute the slot literally instead.
+        res = tmpl.replace("{payload}", payload)
         if rng.random() < 0.4:
             res = f"Process this object: {res}"
         return _ensure_nonempty(text, res)
@@ -495,7 +498,7 @@ class MutatorConfig:
                 self.families = None
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, Any]]) -> "MutatorConfig":
-        d = d or {}
+        d = d if isinstance(d, dict) else {}
         return cls(
             families=d.get("families"),
             intensity=d.get("intensity", DEFAULT_INTENSITY),
@@ -720,6 +723,7 @@ def enumerate_mutations(
     families = list(FAMILIES)[:max_n] if max_n else []
     cfg = MutatorConfig(intensity=intensity, seed=seed)
     mut = Mutator(cfg)
+    intensity = cfg.intensity      # clamped/validated, like Mutator.mutate
     count = 0
     for fam in families:
         if count >= max_n:

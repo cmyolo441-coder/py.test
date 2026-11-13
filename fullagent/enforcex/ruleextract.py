@@ -250,7 +250,8 @@ class Rule:
         """True when any keyword or compiled pattern hits `text`."""
         t = (text or "").lower()
         for kw in self.keywords:
-            if kw in t:
+            # keywords from from_dict/JSON may be mixed case
+            if kw and str(kw).lower() in t:
                 return True
         return any(p.search(text or "") is not None
                    for p in self.compiled_patterns())
@@ -274,19 +275,25 @@ class Rule:
             return cls(id="", text="")
         try:
             priority = float(d.get("priority", 0.25))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            priority = 0.25
+        if priority != priority:
             priority = 0.25
         try:
             source_line = int(d.get("source_line", 0))  # type: ignore[arg-type]
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             source_line = 0
         raw_kws = d.get("keywords", ())
         if isinstance(raw_kws, str):
             # A single string keyword is one keyword, not its characters.
             raw_kws = (raw_kws,)
+        elif not isinstance(raw_kws, (list, tuple, set, frozenset)):
+            raw_kws = ()          # None/int used to raise TypeError
         raw_pats = d.get("patterns", ())
         if isinstance(raw_pats, str):
             raw_pats = (raw_pats,)
+        elif not isinstance(raw_pats, (list, tuple, set, frozenset)):
+            raw_pats = ()
         return cls(
             id=str(d.get("id", "")),
             text=str(d.get("text", "")),
@@ -338,7 +345,10 @@ class PromptSpec:
     def from_dict(cls, d: Any) -> "PromptSpec":
         if not isinstance(d, dict):
             return cls(signature="", source_sha256="")
-        rules = [Rule.from_dict(x) for x in d.get("rules", ())
+        raw_rules = d.get("rules", ())
+        if not isinstance(raw_rules, (list, tuple)):
+            raw_rules = ()        # None/int used to raise TypeError
+        rules = [Rule.from_dict(x) for x in raw_rules
                  if isinstance(x, dict)]
         meta = d.get("meta") if isinstance(d.get("meta"), dict) else {}
         return cls(
@@ -382,7 +392,9 @@ def _is_heading(text: str, next_line: str = "") -> bool:
     if t.startswith("#"):
         return True
     core = _HEADER_LINE_RE.match(t)
-    if core and core.group(1).strip().upper() in _HEADER_KEYWORDS_MAPALL:
+    # the keyword map is lowercase: comparing .upper() never matched, so
+    # "Security:" / "Format:" label lines were not recognised as headers
+    if core and core.group(1).strip().lower() in _HEADER_KEYWORDS_MAPALL:
         return True
     stripped = t.rstrip(":").strip()
     if stripped and stripped == stripped.upper() and len(stripped) >= 3:
@@ -592,11 +604,23 @@ def _dedupe(rules: list[Rule]) -> list[Rule]:
         seen_exact.add(norm)
         exact_pass.append(r)
     out: list[Rule] = []
+    kept_tokens: list[frozenset] = []
     for r in exact_pass:
-        dup = any(token_jaccard(r.text, keep.text) > _JACCARD_NEAR_DUP
-                  for keep in out)
+        # tokenize each rule once (was re-tokenizing both sides of every
+        # pair: O(n^2) regex passes over the rule texts)
+        tr = _tokens(r.text)
+        dup = False
+        if tr:
+            for tk in kept_tokens:
+                if not tk:
+                    continue
+                union = len(tr | tk)
+                if union and len(tr & tk) / union > _JACCARD_NEAR_DUP:
+                    dup = True
+                    break
         if not dup:
             out.append(r)
+            kept_tokens.append(tr)
     return out
 
 
@@ -615,7 +639,12 @@ def extract_rules(text: str, *, max_rules: int = _MAX_RULES) -> list[Rule]:
     raw: list[Rule] = []
     section = ""
     section_category = ""
+    # raw is truncated to max_rules below anyway: stop collecting there
+    # instead of classifying an arbitrarily huge prompt to the end
+    budget = max(0, int(max_rules))
     for seg in segs:
+        if len(raw) >= budget:
+            break
         if seg.is_heading:
             section = seg.text.rstrip(":").strip()
             section_category = seg.header_category
@@ -634,7 +663,7 @@ def extract_rules(text: str, *, max_rules: int = _MAX_RULES) -> list[Rule]:
             if not is_imperative(sent):
                 continue
             raw.append(_make_rule(seg, section_category, override=sent))
-    raw = raw[:max_rules]
+    raw = raw[:budget]
     rules = _dedupe(raw)
     # stable ids in reading order
     for i, r in enumerate(rules, start=1):
