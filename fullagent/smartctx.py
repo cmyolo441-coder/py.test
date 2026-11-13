@@ -24,7 +24,8 @@ import re
 from typing import Any, List, Tuple
 
 # @<path> token, e.g. @src/main.py, @./notes.md, @~/todo.txt
-_MENTION_RE = re.compile(r"@([\w./-][\w./~+-]*)")
+# (?<!\w): the "@" of an e-mail address (bob@example.com) is not a mention
+_MENTION_RE = re.compile(r"(?<!\w)@([\w./-][\w./~+-]*)")
 
 _QUOTES = "'\"`"
 
@@ -64,7 +65,13 @@ def extract_mentions(text: str, cwd: str = ".") -> List[str]:
 
     # 1. @path tokens — kept as written (no existence check here)
     for match in _MENTION_RE.finditer(text or ""):
-        _add(match.group(1))
+        token = match.group(1)
+        # sentence punctuation ("read @notes.txt.") is not part of the path
+        if token.endswith(".") and _candidate_path(token, cwd) is None:
+            trimmed = token.rstrip(".")
+            if trimmed and _candidate_path(trimmed, cwd) is not None:
+                token = trimmed
+        _add(token)
 
     # 2. bare tokens that are existing files
     for token in (text or "").split():
@@ -94,6 +101,10 @@ def read_attachments(paths: List[str], cwd: str = ".") -> str:
         full = path if os.path.isabs(path) else os.path.join(cwd, path)
         full = os.path.expanduser(full)
         try:
+            # @mentions are not existence-checked: a FIFO / device
+            # (@/dev/zero) reports size 0 and read() never ends
+            if not os.path.isfile(full):
+                raise OSError("not a regular file")
             size = os.path.getsize(full)
         except OSError:
             parts.append(header + "[skipped: unreadable]\n")

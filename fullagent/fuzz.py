@@ -367,7 +367,10 @@ class Fuzzer:
                     return want_inv_exc is not None and \
                         type(e).__name__ == want_inv_exc
                 return not inv_ok and want_inv_exc is None
-            return not ok and error.split(":")[0] == want_type
+            # kind must match too: a hang's "TimeoutError: ..." text
+            # otherwise passed for a target that RAISED TimeoutError
+            return not ok and kind == "exception" and \
+                error.split(":")[0] == want_type
 
         current = list(crash.args)
         for _ in range(MAX_SHRINK_STEPS):

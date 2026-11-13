@@ -236,7 +236,10 @@ class Router:
 
     def _seal(self, task: str, diff: Difficulty, choice: RouteChoice) -> None:
         self.log.append("router.decision",
-                        {"task": task[:200], **choice.to_dict(),
+                        # str(): classify() accepts non-str tasks (None,
+                        # bytes) but slicing None here raised TypeError
+                        {"task": (task if isinstance(task, str)
+                                  else str(task))[:200], **choice.to_dict(),
                          "axes": diff.axes},
                         actor="router")
 

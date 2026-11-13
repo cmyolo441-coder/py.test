@@ -45,7 +45,7 @@ def load_style() -> str:
     """Read the persisted style; fall back to DEFAULT_STYLE."""
     try:
         name = _store_path().read_text(encoding="utf-8").strip().lower()
-    except OSError:
+    except (OSError, ValueError):  # ValueError: UnicodeDecodeError
         return DEFAULT_STYLE
     return name if name in STYLES else DEFAULT_STYLE
 
@@ -61,7 +61,9 @@ def _persist(name: str) -> None:
 
 def set_style(agent, name: str) -> str:
     """Set the agent's output style; raises ValueError on unknown names."""
-    key = (name or "").strip().lower()
+    # str(): a non-string tool arg (style=5) raised AttributeError, which
+    # the OutputStyle tool's ValueError handler did not catch
+    key = str(name or "").strip().lower()
     if key not in STYLES:
         raise ValueError(
             f"unknown output style {name!r}; choose from: "
@@ -74,7 +76,7 @@ def set_style(agent, name: str) -> str:
 def get_style(agent) -> str:
     """Return the agent's current style; default is DEFAULT_STYLE."""
     name = getattr(agent, "output_style", None)
-    return name if name in STYLES else DEFAULT_STYLE
+    return name if isinstance(name, str) and name in STYLES else DEFAULT_STYLE
 
 
 def style_instruction(agent) -> str:

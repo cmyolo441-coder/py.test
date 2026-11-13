@@ -285,7 +285,8 @@ class Voter:
             act = raw.lower().strip()
             if act not in _ACTION_ORDER:
                 act = "allow"
-            return Vote(voter_name=self.name, action=act, reasoning=f"string verdict: {raw}")
+            return Vote(voter_name=self.name, action=act, abstained=act == "abstain",
+                        reasoning=f"string verdict: {raw}")
         return Vote(voter_name=self.name, action="abstain", abstained=True, reasoning="unrecognized return shape")
 
 

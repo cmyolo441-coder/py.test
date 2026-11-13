@@ -136,7 +136,7 @@ class Score:
             return val if math.isfinite(val) else default
         try:
             vc = int(d.get("violations_count", 0))  # type: ignore[arg-type]
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             vc = 0
         cats = d.get("category_scores", {})
         return cls(
@@ -422,7 +422,7 @@ class DriftTracker:
             alpha = 0.3
         try:
             window = int(d.get("window", 100))  # type: ignore[arg-type]
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             window = 100
         if not math.isfinite(alpha):
             alpha = 0.3

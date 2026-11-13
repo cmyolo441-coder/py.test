@@ -74,7 +74,7 @@ class WorkflowStep:
             raise WorkflowError("'expect' must be a predicate dict")
         try:
             phase = int(d.get("phase", 0))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise WorkflowError("'phase' must be an integer")
         return cls(task=str(d["task"]).strip(),
                    role=str(d.get("role", "coder")).strip() or "coder",

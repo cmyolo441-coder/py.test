@@ -249,6 +249,8 @@ class WorldModel:
             if hops >= _MAX_HOPS:
                 continue
             for dst, edge in adj.get(cur, ()):
+                if dst == path:
+                    continue  # a cycle back to the touched file itself
                 p = edge.risk * (_DECAY ** hops)
                 via = "direct" if hops == 0 else f"{hops + 1} hops"
                 if dst not in ranked or p > ranked[dst][0]:

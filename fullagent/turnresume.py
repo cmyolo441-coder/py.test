@@ -165,10 +165,14 @@ def _snapshot_messages(messages: list) -> list:
     for m in kept:
         try:
             _is_system = m.get("role") == "system"
+            content = m.get("content", "")
             snap.append({
                 "role": m.get("role", "?"),
-                "content": _clip(
-                    m.get("content", ""),
+                # None (assistant tool-call turns) must stay None: _clip
+                # JSON-encoded it to the literal text "null", which a
+                # resume then fed back to the model as assistant content
+                "content": None if content is None else _clip(
+                    content,
                     _SYSTEM_CONTENT_CAP if _is_system else _MSG_CONTENT_CAP),
                 "tool_calls": m.get("tool_calls", []),
                 "tool_call_id": m.get("tool_call_id"),

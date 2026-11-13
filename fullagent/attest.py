@@ -166,7 +166,11 @@ def seal_envelope(text: str, doc_id: str = "") -> str:
     if text.lstrip().startswith(_ENVELOPE_OPEN):
         return text
     body = text.strip()
-    did = doc_id or content_hash(body)
+    # the header is parsed up to the first "]" and split on whitespace:
+    # a doc_id with "]" or spaces made the sealed envelope unopenable
+    did = "_".join(str(doc_id).replace("]", "_").split()) if doc_id \
+        else ""
+    did = did or content_hash(body)
     header = (f"{_ENVELOPE_OPEN} id={did} h={content_hash(body)} "
               f"chars={len(body)}]")
     return f"{header}\n{body}\n{_ENVELOPE_CLOSE}"

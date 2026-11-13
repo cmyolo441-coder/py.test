@@ -186,7 +186,11 @@ class IntentCompiler:
             if id(it) not in out_ids:
                 remap[it["id"]] = seen[_item_key(it)]["id"]
         for it in out:
-            it["depends_on"] = [remap.get(d, d) for d in it["depends_on"]]
+            # a dep on one's own dropped twin remaps to itself: drop it, or
+            # _layers' cycle breaker cuts an unrelated item's real deps
+            it["depends_on"] = [r for r in (remap.get(d, d)
+                                            for d in it["depends_on"])
+                                if r != it["id"]]
         return out
 
     def _remap_deps(self, items: list[dict]) -> None:

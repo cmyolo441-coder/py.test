@@ -70,7 +70,10 @@ def sleep_cancellable(seconds: float,
     """time.sleep() that raises TurnCancelled within `poll` seconds of
     the user pressing Esc. Replaces every bare time.sleep() on the turn
     path (retry backoffs, rate-limit waits)."""
-    if seconds <= 0:
+    # `not > 0` (not `<= 0`): a NaN delay compared False to `<= 0`, made
+    # the deadline NaN and looped forever (never cancellable without a
+    # callback).
+    if not seconds > 0:
         check_cancelled(should_cancel, "sleep")
         return
     deadline = time.monotonic() + seconds

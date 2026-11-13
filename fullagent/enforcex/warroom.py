@@ -183,7 +183,8 @@ class IncidentEvent:
             kind=str(d.get("kind", "note") or "note"),
             detail=str(d.get("detail", "") or ""),
             operator=str(d.get("operator", "") or ""),
-            data=dict(d.get("data") or {}),
+            data=(dict(d["data"]) if isinstance(d.get("data"), dict)
+                  else {}),
         )
 
 
@@ -291,7 +292,9 @@ class Incident:
             severity=str(d.get("severity", "medium") or "medium"),
             rule_ids=_str_list(d.get("rule_ids")),
             session_ids=_str_list(d.get("session_ids")),
-            detections=[x for x in (d.get("detections") or [])
+            detections=[x for x in (d.get("detections")
+                                    if isinstance(d.get("detections"),
+                                                  (list, tuple)) else [])
                         if isinstance(x, dict)],
             repair_actions=_str_list(d.get("repair_actions")),
             tags=_str_list(d.get("tags")),
@@ -376,10 +379,10 @@ class IncidentStore:
             if self._fh is None:
                 self._fh = open(self.path, "a", encoding="utf-8")
             self._fh.write(json.dumps(rec, ensure_ascii=False,
-                                      sort_keys=True) + "\n")
+                                      sort_keys=True, default=str) + "\n")
             self._fh.flush()
             self._records += 1
-        except OSError:
+        except (OSError, TypeError, ValueError):
             pass
 
     def _compact(self) -> None:
@@ -401,11 +404,12 @@ class IncidentStore:
                     fh.write(json.dumps(
                         {"type": "snapshot", "ts": inc.last_activity(),
                          "data": inc.to_dict()},
-                        ensure_ascii=False, sort_keys=True) + "\n")
+                        ensure_ascii=False, sort_keys=True,
+                        default=str) + "\n")
             self.shutdown()
             os.replace(tmp, self.path)
             self._records = len(self._incidents)
-        except OSError:
+        except (OSError, TypeError, ValueError):
             try:
                 os.unlink(tmp)
             except OSError:

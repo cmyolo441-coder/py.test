@@ -248,7 +248,7 @@ def _selftest() -> int:
     check("fuzzy exact-unique short-circuits",
           fuzzy_find("abc", "xxabcxx") == "abc")
     check("fuzzy resolves tab-vs-spaces drift",
-          fuzzy_find("\tx = 1", "y = 0\n    x = 1\nz = 2") == "\n    x = 1")
+          fuzzy_find("\tx = 1", "y = 0\n    x = 1\nz = 2") == "    x = 1")
     check("fuzzy no candidate -> None",
           fuzzy_find("qqq-not-there", "aaa\nbbb\n") is None)
     check("fuzzy ambiguous -> None",

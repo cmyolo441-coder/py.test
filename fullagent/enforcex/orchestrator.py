@@ -269,16 +269,18 @@ class EnforcementOutcome:
     def from_dict(cls, d: Any) -> "EnforcementOutcome":
         if not isinstance(d, dict):
             return cls()
-        stages = [StageRecord(**s) if isinstance(s, dict) and
-                  {"name"} & set(s) else StageRecord(name=str(s))
-                  for s in (d.get("stages") or [])]
+        stages = [_stage_from_dict(s) for s in (d.get("stages") or [])]
+        try:
+            ledger_seq = int(d.get("ledger_seq", -1))
+        except (TypeError, ValueError, OverflowError):
+            ledger_seq = -1
         return cls(
             final_text=str(d.get("final_text", "") or ""),
             blocked=bool(d.get("blocked", False)),
             decisions=list(d.get("decisions") or []),
             detections=list(d.get("detections") or []),
             repair_applied=bool(d.get("repair_applied", False)),
-            ledger_seq=int(d.get("ledger_seq", -1)),
+            ledger_seq=ledger_seq,
             elapsed_ms=float(d.get("elapsed_ms", 0.0) or 0.0),
             session_id=str(d.get("session_id", "") or "default"),
             gate_action=str(d.get("gate_action", "") or ""),
@@ -291,6 +293,20 @@ class EnforcementOutcome:
             dry_run=bool(d.get("dry_run", False)),
             ts=float(d.get("ts", 0.0) or 0.0),
         )
+
+
+def _stage_from_dict(s: Any) -> StageRecord:
+    # StageRecord(**s) raised TypeError on any extra/unknown key and on
+    # a non-numeric elapsed_ms; from_dict promises never to raise
+    if not isinstance(s, dict) or "name" not in s:
+        return StageRecord(name=str(s))
+    try:
+        elapsed = float(s.get("elapsed_ms", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        elapsed = 0.0
+    return StageRecord(name=str(s.get("name")), ok=bool(s.get("ok", False)),
+                       skipped=bool(s.get("skipped", False)),
+                       note=str(s.get("note", "") or ""), elapsed_ms=elapsed)
 
 
 # ── pluggable hooks / multipliers ────────────────────────────────────────

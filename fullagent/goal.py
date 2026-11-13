@@ -365,6 +365,9 @@ class GoalContract:
             except (TypeError, ValueError):
                 raise GoalContractError(
                     f"clause {cid}: weight must be numeric, got {weight!r}")
+            if weight != weight or weight in (float("inf"), float("-inf")):
+                raise GoalContractError(
+                    f"clause {cid}: weight must be finite, got {weight!r}")
             if weight < 0:
                 raise GoalContractError(f"clause {cid}: negative weight")
             total += weight

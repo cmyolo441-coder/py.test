@@ -137,6 +137,8 @@ def _run_once(command: Any, shell: bool,
     except OSError as e:
         return (NOT_FOUND_RC, "", f"failed to start process: {e}",
                 "spawn failed")
+    except ValueError as e:  # e.g. embedded NUL byte in an argument
+        return (2, "", f"invalid command: {e}", "invalid command")
     try:
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -293,7 +295,7 @@ def _coerce_params(kwargs: dict) -> tuple[Any, int, float, float, float,
         base_delay = float(kwargs.get("base_delay", DEFAULT_BASE_DELAY))
         max_delay = float(kwargs.get("max_delay", DEFAULT_MAX_DELAY))
         timeout = float(kwargs.get("timeout", DEFAULT_TIMEOUT))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return (None, 0, 0.0, 0.0, 0.0,
                 "ERROR: max_attempts/base_delay/max_delay/timeout must "
                 "be numbers")

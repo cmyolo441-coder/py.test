@@ -704,6 +704,8 @@ def mutate_text(
     intensity: float = DEFAULT_INTENSITY,
 ) -> List[Mutation]:
     """One-shot mutation without managing a Mutator instance."""
+    if isinstance(families, str):
+        families = [families]
     cfg = MutatorConfig(families=list(families) if families else None,
                         intensity=intensity, seed=seed)
     return Mutator(cfg).mutate(text)

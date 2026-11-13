@@ -366,6 +366,8 @@ def _strip_fake_delimiters(text: str) -> str:
     return _DELIMITER_RE.sub("", text)
 
 
+_SANITIZE_PASSES = 32
+
 _HIDDEN_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
 _META_REFRESH_RE = re.compile(r"<\s*meta[^>]{0,200}>", re.I)
 
@@ -414,8 +416,16 @@ def sanitize(text: Optional[str]) -> str:
         # everything after _MAX_TEXT chars from the "sanitized" copy.
         out = _strip_invisible(text)
         out = _decode_homoglyphs(out)
-        out = _strip_fake_delimiters(out)
-        out = _strip_hidden_markup(out)
+        # Repeat until stable: one pass over "<sys<system>tem>" or
+        # "<|im_<|im_end|>start|>" removed the inner delimiter and so
+        # REASSEMBLED a live outer one in the "sanitized" text. Bounded
+        # so deeply nested hostile input stays cheap.
+        for _ in range(_SANITIZE_PASSES):
+            prev = out
+            out = _strip_fake_delimiters(out)
+            out = _strip_hidden_markup(out)
+            if out == prev:
+                break
         return out
     except Exception:
         return text

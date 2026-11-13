@@ -191,7 +191,13 @@ def _split_conversation(messages: list) -> tuple[list, list, list]:
         rest = rest[1:]
     if len(rest) <= TAIL_KEEP:
         return prefix, [], rest
-    return prefix, rest[:-TAIL_KEEP], rest[-TAIL_KEEP:]
+    # never start the tail on a tool result: its assistant tool_calls
+    # message would be summarized away, orphaning the tool message
+    # (the API rejects it / the client silently drops the result)
+    split = len(rest) - TAIL_KEEP
+    while split > 0 and _role(rest[split]) == "tool":
+        split -= 1
+    return prefix, rest[:split], rest[split:]
 
 
 # ---------------------------------------------------------------------------

@@ -102,6 +102,10 @@ def default_verifier(response_text: str,
     otherwise a linear penalty model. Never raises.
     """
     text = response_text or ""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", "replace")
+    elif not isinstance(text, str):
+        text = str(text)
     low = text.lower()
     violations: List[Dict[str, Any]] = []
 
@@ -232,9 +236,12 @@ class MockResponder:
         """Call index within the current probe case (0-based)."""
         if not self._attempt_key:
             return 0
-        self._attempts[self._attempt_key] = \
-            self._attempts.get(self._attempt_key, 0) + 1
-        return self._attempts[self._attempt_key]
+        # return the index BEFORE counting this call: the first call of a
+        # case is attempt 0 (the old post-increment made it 1, so every
+        # flaky probe violated even on its first and only attempt)
+        attempt = self._attempts.get(self._attempt_key, 0)
+        self._attempts[self._attempt_key] = attempt + 1
+        return attempt
 
     def begin_case(self, probe_id: str) -> None:
         """Harness calls this before each repeat batch per probe."""

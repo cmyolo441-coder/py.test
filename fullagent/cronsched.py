@@ -172,7 +172,9 @@ def next_run_after(expr: str, after: datetime) -> datetime:
     (mins, hours, doms, months, dows,
      dom_restricted, dow_restricted) = _parse(expr)
     t = after.replace(second=0, microsecond=0) + timedelta(minutes=1)
-    limit = t + timedelta(days=366)
+    # 8 years + slack: Feb 29 can be 8 years away (2096 -> 2104); a
+    # one-year window rejected "0 0 29 2 *" in every non-leap stretch.
+    limit = t + timedelta(days=366 * 8 + 2)
     # PERF: skip whole months / days / hours that cannot match instead of
     # stepping minute by minute. The old loop did up to ~527k iterations
     # for rare or impossible expressions ("0 0 29 2 *", "0 0 30 2 *") —
@@ -204,7 +206,7 @@ def next_run_after(expr: str, after: datetime) -> datetime:
             t += timedelta(minutes=1)
             continue
         return t
-    raise ValueError(f"no run of {expr!r} within a year")
+    raise ValueError(f"no run of {expr!r} within 8 years")
 
 
 def validate_cron_expr(expr: str) -> str:
@@ -292,7 +294,7 @@ class CronScheduler:
     def runs(self, cron_id: int, limit: int = 5) -> list[dict]:
         try:
             limit = max(1, min(50, int(limit)))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             limit = 5
         with self._lock:
             cur = self._conn.execute(
@@ -547,9 +549,11 @@ def _coerce_cron_id(id: Any) -> int | None:
     int("abc") / int(None) used to raise out of these handlers.
     """
     try:
-        return int(id)
-    except (TypeError, ValueError):
+        cid = int(id)
+    except (TypeError, ValueError, OverflowError):
         return None
+    # beyond SQLite's INTEGER range execute() raises OverflowError
+    return cid if -(2 ** 63) <= cid < 2 ** 63 else None
 
 
 def _handle_cron_remove(id: int) -> str:

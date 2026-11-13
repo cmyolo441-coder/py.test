@@ -60,7 +60,10 @@ def _run_git(args: list[str], cwd: str | None = None
         return 124, "", f"git timed out after {_GIT_TIMEOUT:g}s"
     except (OSError, ValueError) as e:
         return 127, "", f"could not run git: {e}"
-    return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+    # rstrip only: porcelain/branch/--stat output carries meaningful
+    # leading spaces (" M file" = unstaged change); strip() turned the
+    # first entry into "M file" (staged)
+    return proc.returncode, proc.stdout.rstrip(), proc.stderr.strip()
 
 
 def _check_repo(cwd: str | None = None) -> str | None:
@@ -310,6 +313,10 @@ def git_log(n: int = 10, cwd: str = "") -> str:
         return coer
     rc, out, err_out = _run_git(["log", "--oneline", f"-{n}"], cwdd)
     if rc != 0:
+        # a fresh repo has no HEAD: git log exits 128 rather than
+        # printing nothing
+        if _run_git(["rev-parse", "--verify", "-q", "HEAD"], cwdd)[0] != 0:
+            return "(no commits yet)"
         return f"ERROR: git log failed: {err_out[:300]}"
     return out or "(no commits yet)"
 

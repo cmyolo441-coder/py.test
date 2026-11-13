@@ -129,11 +129,14 @@ _SCHEMA_READY: set[str] = set()
 def _connect() -> sqlite3.Connection:
     path = _db_path()
     key = str(path)
-    if key not in _SCHEMA_READY:
+    # existence must be checked BEFORE connect(): connecting creates an
+    # empty file, so checking afterwards never re-created a deleted table
+    existed = path.exists()
+    if key not in _SCHEMA_READY or not existed:
         path.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(key, timeout=10.0)
     con.row_factory = sqlite3.Row
-    if key not in _SCHEMA_READY or not path.exists():
+    if key not in _SCHEMA_READY or not existed:
         # PERF: the CREATE TABLE + commit (a write transaction + fsync)
         # used to run on EVERY operation — several per 5s poll tick.
         con.execute(_SCHEMA)

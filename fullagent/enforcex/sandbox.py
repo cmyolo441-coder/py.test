@@ -883,7 +883,10 @@ class Sandbox:
         except Exception:
             self.timeout_s = _DEFAULT_TIMEOUT_S
         self._rules: List[SandboxRule] = _coerce_rules(rules, capabilities_map)
-        self._capabilities_map = dict(capabilities_map or {})
+        # a non-dict map (e.g. a list of capability names) is ignored by
+        # _coerce_rules; dict() on it raised out of the constructor
+        self._capabilities_map = (dict(capabilities_map)
+                                  if isinstance(capabilities_map, dict) else {})
         # for sharing across evaluate() calls without re-coercing
         self._hash = hashlib.sha256(
             "|".join(r.rule_id for r in self._rules).encode("utf-8", errors="ignore")

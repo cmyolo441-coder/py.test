@@ -67,7 +67,10 @@ def normalize_error(error_text) -> str:
     """
     if not isinstance(error_text, str):
         error_text = "" if error_text is None else str(error_text)
-    text = error_text.splitlines()[0] if error_text else ""
+    # first NON-BLANK line: an error that starts with a newline used to
+    # normalise to "" — every such failure, whatever its cause, then
+    # shared one signature and tripped the loop breaker falsely.
+    text = next((ln for ln in error_text.splitlines() if ln.strip()), "")
     text = re.sub(r"^(ERROR:\s*)+", "", text).strip()
     text = _HEX_RE.sub("<HEX>", text)
     text = _NUM_RE.sub("<N>", text)
@@ -110,7 +113,7 @@ class LoopDetector:
             if self._streak >= self.repeat_limit:
                 msg = (
                     f"Loop detected: {tool_name} failed {self._streak}x "
-                    f"with the same error ({error_signature[:120]}). "
+                    f"with the same error ({str(error_signature)[:120]}). "
                     "Stop retrying. Alternatives: re-read the file, try a "
                     "different old_string, use line numbers."
                 )

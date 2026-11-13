@@ -198,7 +198,11 @@ def _pick_kw(rule: Any, index: int) -> str:
         # would otherwise split it into individual characters.
         kws = (raw_kws,)
     else:
-        kws = tuple(raw_kws)
+        try:
+            kws = tuple(raw_kws)
+        except TypeError:
+            # malformed rule (e.g. keywords=5): treat as one keyword
+            kws = (raw_kws,)
     if kws:
         return str(kws[index % len(kws)])
     return topic_for(str(_rf(rule, "id", "R") or "R"), index)

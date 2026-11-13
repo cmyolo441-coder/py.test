@@ -109,7 +109,7 @@ def _complete_command_groups() -> dict[str, list[tuple[str, str]]]:
 def format_help(command: str | None = None) -> str:
     """Return all command help, or a single command’s description."""
     groups = _complete_command_groups()
-    if command:
+    if command and command.strip():  # "   " made split()[0] IndexError
         name = command.strip().split()[0].lower()
         if not name.startswith("/"):
             name = "/" + name

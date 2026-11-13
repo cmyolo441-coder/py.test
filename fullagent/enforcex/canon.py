@@ -210,7 +210,10 @@ class Contract:
     def from_dict(cls, d: Dict[str, Any]) -> "Contract":
         if not isinstance(d, dict):
             return cls(canon_id="", version=1, sha256="")
-        clauses = [Clause.from_dict(x) for x in d.get("clauses", ())
+        raw_clauses = d.get("clauses")
+        if not isinstance(raw_clauses, (list, tuple)):
+            raw_clauses = ()
+        clauses = [Clause.from_dict(x) for x in raw_clauses
                    if isinstance(x, dict)]
         meta = d.get("meta") if isinstance(d.get("meta"), dict) else {}
         try:
@@ -409,10 +412,18 @@ class ContractBuilder:
             extracted = self._extract(prompt_text)
             clauses = _coerce_clauses(extracted) if extracted else \
                 _fallback_rules_from_text(prompt_text)
-        # assign ids in canonical order
+        # assign ids in canonical order; an auto id must not collide with
+        # an explicit one (by_rule_id() would silently drop a clause)
+        used = {c.rule_id for c in clauses if c.rule_id}
         for i, c in enumerate(clauses, start=1):
             if not c.rule_id:
-                c.rule_id = f"R{i:02d}"
+                cand = f"R{i:02d}"
+                k = 2
+                while cand in used:
+                    cand = f"R{i:02d}.{k}"
+                    k += 1
+                c.rule_id = cand
+                used.add(cand)
             c.clause_id = _clause_id_for(c.rule_id, c.text, i)
         version = 1
         if prev is not None:

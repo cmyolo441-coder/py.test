@@ -59,15 +59,29 @@ def _sanitize(obj: Any) -> Any:
     """Replace non-finite floats (NaN/inf) with None so canonical JSON
     never raises: the old allow_nan=False made seal()/persist() crash
     on any payload containing NaN, contradicting Ledger.append's
-    "never raises" contract. Dict keys are left untouched (JSON keys
-    must stay strings); only values are sanitized."""
+    "never raises" contract. Non-str dict keys are stringified the way json does."""
     if isinstance(obj, float):
         return obj if obj == obj and abs(obj) != float("inf") else None
     if isinstance(obj, dict):
-        return {k: _sanitize(v) for k, v in obj.items()}
+        # non-str keys: json.dumps(sort_keys=True) raised TypeError on
+        # mixed int/str keys, and int keys sorted numerically in memory
+        # but as strings after reload, so the entry never re-verified.
+        # Stringify them exactly as json would (1 -> "1", True -> "true").
+        return {_json_key(k): _sanitize(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_sanitize(v) for v in obj]
     return obj
+
+
+def _json_key(k: Any) -> str:
+    if isinstance(k, str):
+        return k
+    if k is None or isinstance(k, (bool, int, float)):
+        try:
+            return json.dumps(k)
+        except ValueError:          # NaN/inf key
+            return str(k)
+    return str(k)
 
 
 def canonical_json(obj: Any) -> str:

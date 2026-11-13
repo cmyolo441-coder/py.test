@@ -195,8 +195,12 @@ class WireSentinel:
             # which broke the gate's intact_prefix check and forced a
             # prompt restore (dropping the composed context sections)
             # on every model call
+            # (the contract head carries no fingerprint, so intact() alone
+            # never detected an earlier P0 — re-apply duplicated it)
+            ch = self.payload.contract_head.strip()
             already_contract = isinstance(head, str) and (
                 head.lstrip().startswith("[CONFIG_LAYER")
+                or (bool(ch) and head.lstrip().startswith(ch))
                 or _is_sovereign(head))
             if (isinstance(head, str) and not already_contract
                     and not self.payload.intact(head)):

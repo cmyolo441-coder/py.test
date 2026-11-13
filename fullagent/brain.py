@@ -56,6 +56,7 @@ REVIEW_BOOST = 1.6            # each review multiplies strength
 PROMOTE_THRESHOLD = 5         # reviews needed for semantic -> procedural
 MERGE_SIMILARITY = 0.72       # token-Jaccard for near-duplicates
 MAX_PER_STORE = 512
+_MAX_STRENGTH = 1e12          # curve is already flat long before this
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
@@ -126,7 +127,9 @@ class Memory:
         """A recall is a review: strength up, curve flattened, schedule
         pushed out (spaced repetition, mechanically)."""
         self.reviews += 1
-        self.strength *= REVIEW_BOOST
+        # capped: ~1500 reviews overflowed to inf, which _load() rejects
+        # as non-finite — the most-recalled memory vanished on restart
+        self.strength = min(self.strength * REVIEW_BOOST, _MAX_STRENGTH)
         self.last_review = time.time()
 
     def to_dict(self) -> dict:
@@ -190,7 +193,9 @@ class Brain:
                     skipped += 1
                     continue
                 self.memories[m.id] = m
-                n = int(m.id[1:]) if m.id[1:].isdigit() else 0
+                # isdecimal, not isdigit: "m²" passed isdigit and int()
+                # raised out of _load, bricking startup
+                n = int(m.id[1:]) if m.id[1:].isdecimal() else 0
                 self._counter = max(self._counter, n)
             if skipped:
                 _log.warning("brain load: skipped %d malformed entries "
@@ -215,6 +220,8 @@ class Brain:
             return None
         if not isinstance(m.text, str):
             return None
+        if not isinstance(m.kind, str):
+            return None  # unhashable kind broke importance's dict lookup
         for attr in ("created", "last_review", "strength"):
             v = getattr(m, attr)
             if isinstance(v, bool) or not isinstance(v, (int, float)) \

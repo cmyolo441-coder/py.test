@@ -75,8 +75,11 @@ def default_generator(provider, model, effort):
     from .systemprompt import synth_generator_prompt
 
     def generate(spec: SynthSpec) -> str:
+        # examples are model/user data: a missing key or a non-dict entry
+        # must not crash drafting (run_examples fails such examples)
         ex = "\n".join(
-            f"  {e['args']} == {e['want']!r}" for e in spec.examples)
+            f"  {e.get('args')} == {e.get('want')!r}"
+            for e in spec.examples if isinstance(e, dict))
         result = chat_blocking(
             provider, model, effort,
             [{"role": "system", "content": synth_generator_prompt()},

@@ -35,7 +35,7 @@ def _safe_int(v: object, default: int = 0) -> int:
     """Coerce a log value to int; corrupt log data must not crash rendering."""
     try:
         return int(v)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 

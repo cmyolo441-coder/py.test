@@ -191,8 +191,13 @@ def fence(content: str, source: str, risk: float) -> str:
     # fence and closes with it). A substring test let any tool output
     # that merely contains both tags — this module's own source, or an
     # attacker who adds them on purpose — skip fencing entirely.
+    # Exactly one open/close pair: '<untrusted ..>a</untrusted> INJECTED
+    # <untrusted ..>b</untrusted>' also starts/ends with the tags, and
+    # used to pass through with its middle outside any fence.
     if (content.startswith(FENCE_OPEN + " ")
-            and content.rstrip().endswith(FENCE_CLOSE)):
+            and content.rstrip().endswith(FENCE_CLOSE)
+            and content.count(FENCE_OPEN) == 1
+            and content.count(FENCE_CLOSE) == 1):
         return content
     r = f"{risk:.2f}"
     return (f'{FENCE_OPEN} source="{source}" risk="{r}">\n'

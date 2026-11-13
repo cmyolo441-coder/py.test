@@ -34,7 +34,7 @@ def _pick_app_dir() -> Path:
     for c in candidates:
         try:
             c.mkdir(parents=True, exist_ok=True)
-            probe = c / ".write-probe"
+            probe = c / f".write-probe-{os.getpid()}"
             probe.write_text("ok")
             probe.unlink()
             # Also verify SQLite POSIX locking works on this mount (e.g. 9P/NFS
@@ -360,7 +360,7 @@ class Config:
                     # drift-safe int validation; 0 disables the feature
                     try:
                         setattr(cfg, k, max(0, int(data[k])))
-                    except (TypeError, ValueError):
+                    except (TypeError, ValueError, OverflowError):
                         pass
                 elif isinstance(data[k], str):
                     # model_id/effort/theme/prompt are names — a drifted

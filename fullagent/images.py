@@ -168,6 +168,10 @@ def image_dimensions(mime: str, data: bytes) -> Optional[Tuple[int, int]]:
 
 def _resolve(path: Any) -> Path:
     """Resolve a user-supplied path against the process cwd (traversal-safe)."""
+    if isinstance(path, os.PathLike):
+        path = os.fspath(path)
+    if not isinstance(path, str):
+        raise TypeError(f"path must be a string, got {type(path).__name__}")
     p = validate_path(path)  # raises ValidationError on bad input
     if not p.is_absolute():
         p = Path.cwd() / p

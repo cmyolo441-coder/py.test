@@ -113,6 +113,8 @@ class WatchManager:
         self._wake = threading.Event()  # poke: instant wake when work arrives
         self._thread: threading.Thread | None = None
         self._running: list[subprocess.Popen] = []  # live action processes
+        # watch ids whose first scan has been recorded as the baseline
+        self._primed: set[str] = set()
         self._dirty = False
         self._load()
 
@@ -130,7 +132,10 @@ class WatchManager:
             return
         if not isinstance(data, dict):
             return
-        for wid, entry in data.get("watches", {}).items():
+        watches = data.get("watches")
+        if not isinstance(watches, dict):
+            return  # "watches": null / a list used to crash __init__
+        for wid, entry in watches.items():
             if not isinstance(entry, dict):
                 continue
             try:
@@ -188,6 +193,12 @@ class WatchManager:
                                       action=str(action),
                                       added_at=time.time())
             self._save()
+            w = self.watches[wid]
+        # record the files that already exist as the baseline NOW, so
+        # they are not reported as "created" and a change made right
+        # after this call is still detected
+        with self._poll_lock:
+            self._poll_watch(w)
         _log.info("watch: added %s -> %s (%s)", wid, p, pattern or "*")
         self.start()  # idempotent; lazily started on first watch
         self.poke()  # pick the new watch up on the next instant tick
@@ -197,6 +208,7 @@ class WatchManager:
         with self._lock:
             existed = watch_id in self.watches
             self.watches.pop(watch_id, None)
+            self._primed.discard(watch_id)
             self._state = {k: v for k, v in self._state.items()
                            if k[0] != watch_id}
             self._save()
@@ -300,6 +312,17 @@ class WatchManager:
                 w.last_error = f"poll error: {e}"
             return 0
 
+        with self._lock:
+            if w.id not in self._primed:
+                # First scan of this watch (just added, or re-armed after
+                # a restart): it is the baseline. Firing "created" for
+                # every pre-existing file used to run the action once per
+                # file in the tree on every startup.
+                if w.id in self.watches:
+                    for f, st in current.items():
+                        self._state[(w.id, f)] = st
+                    self._primed.add(w.id)
+                return 0
         fired = 0
         now = time.time()
         with self._lock:

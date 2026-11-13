@@ -307,8 +307,10 @@ class RuleStore:
         """Atomic write: tempfile in same dir → os.replace."""
         doc["schema"] = SCHEMA_VERSION
         doc["history"] = doc["history"][-HISTORY_LIMIT:]
-        payload = json.dumps(doc, indent=2, sort_keys=True,
-                             ensure_ascii=False)
+        # no sort_keys: latest() falls back to the insertion order of
+        # doc["specs"] once history is trimmed; sorting by signature made
+        # it return the lexically-largest spec instead of the newest
+        payload = json.dumps(doc, indent=2, ensure_ascii=False)
         directory = os.path.dirname(os.path.abspath(self.path)) or "."
         fd, tmp_path = tempfile.mkstemp(
             prefix=".enforcex-", suffix=".tmp", dir=directory)
@@ -435,7 +437,8 @@ class RuleStore:
             self._acquire_lock()
             try:
                 doc = self._load_doc()
-                prev = doc["specs"].get(sig)
+                # pop + re-insert: a re-saved spec becomes the newest entry
+                prev = doc["specs"].pop(sig, None)
                 doc["specs"][sig] = _spec_to_dict(spec)
                 diff_note = ""
                 if prev is not None:

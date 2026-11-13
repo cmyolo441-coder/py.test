@@ -51,6 +51,7 @@ on malformed input, every public path returns a value.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import re
 import threading
 from dataclasses import dataclass, field
@@ -125,6 +126,7 @@ MAX_TEXT_LEN = 200_000
 MAX_RULES = 256
 _WS_RE = re.compile(r"\s+")
 _CLIP_LEN = 160
+_SHADOW_SESSION_SEQ = itertools.count()  # next() is atomic under the GIL
 _SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
 # hostile / leak patterns for fallback detection
@@ -254,7 +256,26 @@ def _gate_evaluate(gate: Any, response_text: str, rules: Any, system_text: str) 
     # try real gate
     if gate is not None:
         try:
-            res = gate.evaluate(text, rules=rules, system_text=system_text or "")
+            # Each persona evaluation gets its own throwaway retry session:
+            # with the gate's shared "default" session the retry budget was
+            # used up by the first personas, so later personas (and later
+            # runs of the SAME input) got "block" instead of "retry" and
+            # the fragile verdict depended on persona order / history.
+            sid = f"shadow:{next(_SHADOW_SESSION_SEQ)}"
+            try:
+                res = gate.evaluate(text, rules=rules,
+                                    system_text=system_text or "",
+                                    session_id=sid)
+            except TypeError:
+                res = gate.evaluate(text, rules=rules,
+                                    system_text=system_text or "")
+            finally:
+                reset = getattr(gate, "reset_session", None)
+                if callable(reset):
+                    try:
+                        reset(sid)
+                    except Exception:
+                        pass
             if hasattr(res, "to_dict"):
                 return res.to_dict()
             if isinstance(res, dict):

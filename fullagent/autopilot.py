@@ -161,7 +161,9 @@ class AutoPilot:
         clauses: list[dict] = []
 
         # tests mentioned -> find the real test command on disk (rung 3)
-        if any(w in low for w in ("test", "pytest", "suite")):
+        # word-anchored: a bare substring check made "the latest release"
+        # or "contest" draft a pytest clause the request never asked for
+        if re.search(r"\b(?:py|unit)?test|\bsuite\b", low):
             cmd = self._detect_test_command()
             if cmd:
                 clauses.append({

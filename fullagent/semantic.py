@@ -253,7 +253,8 @@ class SemanticMemory:
         scored = [(cosine(qv, it.vector), it) for it in self._items]
         scored.sort(key=lambda p: (-p[0], p[1].kind, p[1].text))
         out = []
-        for sim, it in scored[:k]:
+        # a negative k sliced from the END (scored[:-1] = all but one)
+        for sim, it in scored[:max(0, k)]:
             if sim < min_similarity:
                 break
             # the payload aliases the kernel's SHARED cached fold state,

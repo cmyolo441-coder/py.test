@@ -105,7 +105,7 @@ class CostTracker:
                             "in": max(0, int(row.get("in", 0) or 0)),
                             "out": max(0, int(row.get("out", 0) or 0)),
                         }
-                    except (TypeError, ValueError):
+                    except (TypeError, ValueError, OverflowError):
                         # one hand-edited/corrupt row must not discard the
                         # whole session (int(list) raised TypeError here)
                         continue
@@ -140,13 +140,17 @@ class CostTracker:
         """Record one completed turn (or completion). Never raises."""
         try:
             mid = str(model_id or "unknown")
+            # convert before mutating: a bad out_tokens used to raise after
+            # "turns"/"in" were already bumped, leaving a half-counted turn
+            tin = max(0, int(in_tokens or 0))
+            tout = max(0, int(out_tokens or 0))
             with self._lock:
                 row = self._by_model.get(mid)
                 if row is None:
                     row = self._by_model[mid] = {"turns": 0, "in": 0, "out": 0}
                 row["turns"] += 1
-                row["in"] += max(0, int(in_tokens or 0))
-                row["out"] += max(0, int(out_tokens or 0))
+                row["in"] += tin
+                row["out"] += tout
                 self.save()
         except Exception:
             pass

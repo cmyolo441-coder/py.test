@@ -331,7 +331,10 @@ def register(agent: Any) -> None:
         if pname not in enabled:
             continue
         for tool in plugin["tools"]:
-            tool_name = f"plugin_{pname}_{tool['name']}"
+            # names may contain '.', which OpenAI-compatible APIs reject in
+            # function names (^[a-zA-Z0-9_-]+$) -- one such plugin made
+            # every chat request fail with HTTP 400
+            tool_name = f"plugin_{pname}_{tool['name']}".replace(".", "_")
             if tool_name in agent.tools:
                 continue
             agent.tools[tool_name] = Tool(

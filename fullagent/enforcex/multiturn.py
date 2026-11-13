@@ -546,7 +546,10 @@ def _match_rules(user_msg: str, rules: Any) -> Tuple[str, ...]:
         if not rid:
             continue
         matched = False
-        for kw in (_rule_field(rule, "keywords", ()) or ()):
+        keywords = _rule_field(rule, "keywords", ()) or ()
+        if isinstance(keywords, str):
+            keywords = (keywords,)  # a bare string iterated per CHARACTER
+        for kw in keywords:
             try:
                 if str(kw).lower() in low:
                     matched = True
@@ -554,7 +557,10 @@ def _match_rules(user_msg: str, rules: Any) -> Tuple[str, ...]:
             except Exception:
                 continue
         if not matched:
-            for src in (_rule_field(rule, "patterns", ()) or ()):
+            patterns = _rule_field(rule, "patterns", ()) or ()
+            if isinstance(patterns, str):
+                patterns = (patterns,)
+            for src in patterns:
                 try:
                     if re.search(str(src), user_msg, re.I):
                         matched = True

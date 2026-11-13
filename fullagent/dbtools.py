@@ -232,8 +232,11 @@ def db_query(db_path: str, sql: str, confirm: bool = False) -> str:
             stripped = s[end + 2:]
             continue
         break
-    first = stripped.lstrip("(").split(None, 1)
-    keyword = (first[0].upper() if first else "")
+    # Leading word only: "SELECT*FROM t" / "VALUES(1)" split on whitespace
+    # gave "SELECT*FROM" / "VALUES(1)" and were refused as non-SELECT.
+    import re as _re
+    first = _re.match(r"\s*\(*\s*([A-Za-z_]+)", stripped)
+    keyword = (first.group(1).upper() if first else "")
     read_only = keyword in _READ_ONLY_STARTERS
     if not read_only and not confirm:
         return ("ERROR: refusing to run non-SELECT statement "

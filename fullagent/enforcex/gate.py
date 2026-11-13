@@ -98,7 +98,12 @@ class GateConfig:
                     continue
         for f in ("rewrite_on_minor", "auto_sanitize_injection"):
             if f in d:
-                setattr(cfg, f, bool(d[f]))
+                v = d[f]
+                # bool("false") is True: a string flag from a JSON/TOML
+                # config used to turn the option ON when set to "false"
+                if isinstance(v, str):
+                    v = v.strip().lower() in ("1", "true", "yes", "on")
+                setattr(cfg, f, bool(v))
         return cfg
 
     @classmethod
