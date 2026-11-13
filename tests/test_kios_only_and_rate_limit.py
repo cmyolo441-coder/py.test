@@ -12,7 +12,8 @@ def test_configured_providers():
     assert {m.id for m in config.MODELS} == {
         "deepseek-v4.1-flash-1017", "gemini-4-argon",
         "mistral-large-4", "ernie-5.5-flash-preview",
-        "deepseek-v4.1-flash-free", "mistralai/mistral-large-4-1t-a52b"}
+        "deepseek-v4.1-flash-free", "mistralai/mistral-large-4-1t-a52b",
+        "moonshotai/kimi-k3.1-pro"}
     assert config.DEFAULT_MODEL_ID == "deepseek-v4.1-flash-1017"
     gwarden = config.PROVIDERS["gwarden"]
     assert gwarden.base_url == "https://gwarden.su/v1"
@@ -134,7 +135,7 @@ def test_nvidia_provider_reads_key_from_environment_only(monkeypatch, tmp_path):
     assert nvidia.base_url == "https://integrate.api.nvidia.com/v1"
     assert "nvidia" not in config._EMBEDDED_KEYS, "no NVIDIA key may ship"
     assert [m.id for m in config.MODELS if m.provider == "nvidia"] == [
-        "mistralai/mistral-large-4-1t-a52b"]
+        "mistralai/mistral-large-4-1t-a52b", "moonshotai/kimi-k3.1-pro"]
     monkeypatch.setattr(config, "APP_DIR", tmp_path)
     monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
     assert config._provider_api_key("nvidia") == ""

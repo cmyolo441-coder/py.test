@@ -114,6 +114,8 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     # Mistral Large 4 model card (build.nvidia.com, 2026-11-13): 262,144
     "mistralai/mistral-large-4-1t-a52b": 262_144,
     "mistral-large-4": 262_144,
+    # Kimi K3.1 Pro model card (build.nvidia.com, 2026-11-13): 1,048,576
+    "moonshotai/kimi-k3.1-pro": 1_048_576,
     # no published served window yet: stay conservative
     "ernie-5.5-flash-preview": 128_000,
 }
@@ -263,6 +265,11 @@ MODELS: list[Model] = [
           "Mistral Large 4 (NVIDIA)", tag="nvidia", supports_tools=True,
           context_window=model_context_window(
               "mistralai/mistral-large-4-1t-a52b")),
+    # Listed on build.nvidia.com (2026-11-13); its page says API access is
+    # preview-only for now, so calls may be refused until NVIDIA opens it.
+    Model("moonshotai/kimi-k3.1-pro", "nvidia", "Kimi K3.1 Pro (NVIDIA)",
+          tag="nvidia", supports_tools=True,
+          context_window=model_context_window("moonshotai/kimi-k3.1-pro")),
 ]
 # Fastest route measured 2026-10-21: default to it.
 DEFAULT_MODEL_ID = "deepseek-v4.1-flash-1017"
