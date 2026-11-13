@@ -62,7 +62,7 @@ def _clamp_pct(used_pct: Any) -> float:
 def _clamp_width(width: Any) -> int:
     try:
         w = int(width)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return DEFAULT_WIDTH
     return max(MIN_WIDTH, min(MAX_WIDTH, w))
 

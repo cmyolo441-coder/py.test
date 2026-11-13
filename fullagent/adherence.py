@@ -112,6 +112,14 @@ def sanitize_section(body: str) -> tuple[str, list[str]]:
                         .replace("[/SYS]", "‹/SYS›"))
             line = re.sub(r"(?i)^(\s*)###\s*(system|assistant)\b",
                           r"\1### \2-quoted", line)
+            # the engine's own seal markers were detected (and flagged
+            # "defused") but passed through verbatim, so a section could
+            # still forge an END OF CONTEXT / WRAP-ID / PRE-RESPONSE CHECK
+            line = re.sub(r"(?i)\bEND OF CONTEXT\b",
+                          lambda m: m.group(0).replace(" ", "\u2011"), line)
+            line = re.sub(r"(?i)\b(?:WRAP-ID(?=\s+v\d+\s*:)|"
+                          r"PRE-RESPONSE CHECK\b)",
+                          lambda m: m.group(0).replace("-", "\u2011"), line)
         out_lines.append(line)
     return "\n".join(out_lines), flags
 

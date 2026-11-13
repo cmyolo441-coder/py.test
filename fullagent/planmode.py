@@ -133,6 +133,9 @@ def _make_plan_write_tool(agent: Any) -> Tool:
         if not plan.strip():
             return "ERROR: plan must be a non-empty markdown string"
         agent.plan_text = plan
+        # a new/revised plan needs its own approval: a stale approval of
+        # the previous plan used to let mutating tools run unreviewed.
+        agent._plan_approved = False
         n_lines = len(plan.splitlines())
         return (f"Plan recorded ({n_lines} lines). "
                 "Mutating tools remain blocked until the user approves "

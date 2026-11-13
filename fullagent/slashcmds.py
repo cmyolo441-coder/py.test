@@ -60,7 +60,9 @@ def default_commands_dir():
 def _parse_file(path):
     """Read one .md file -> (description, template). Never raises."""
     try:
-        with open(path, "r", encoding="utf-8") as fh:
+        # utf-8-sig: a BOM (Windows editors) hid the frontmatter, so the
+        # "---/description" block leaked into the prompt template.
+        with open(path, "r", encoding="utf-8-sig") as fh:
             text = fh.read()
     except Exception:
         return "", ""
