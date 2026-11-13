@@ -504,9 +504,10 @@ def assistant_message(content: str | None, tool_calls: list[dict],
         else:
             _rs = _typeguards.ensure_str(_rs)
     if _rs:
+        # ONE key only: Rust/serde gateways (kios) alias "reasoning" to
+        # "reasoning_content", so a message carrying both is rejected
+        # with "duplicate field `reasoning_content`".
         msg["reasoning_content"] = _rs
-        # some providers also accept "reasoning"
-        msg["reasoning"] = _rs
     elif calls:
         msg["reasoning_content"] = ""
     return msg
@@ -807,7 +808,39 @@ def _sanitize_messages(messages: list[dict]) -> bool:
         if message.get("reasoning_content") is None and message.get("reasoning") is None:
             message["reasoning_content"] = ""
             fixed = True
+    # Never send both spellings of the thinking field (see
+    # _assistant_message): keep reasoning_content, drop the alias.
+    for message in messages:
+        if isinstance(message, dict) and "reasoning" in message \
+                and "reasoning_content" in message:
+            if not message.get("reasoning_content") and message.get("reasoning"):
+                message["reasoning_content"] = message["reasoning"]
+            message.pop("reasoning", None)
+            fixed = True
     return fixed
+
+
+def _is_duplicate_field_error(err: Exception) -> bool:
+    """A gateway refused the request JSON because a message carried a
+    field twice (serde: ``duplicate field `reasoning_content```)."""
+    return "duplicate field" in str(err).lower()
+
+
+def _strip_reasoning(messages: list[dict]) -> bool:
+    """Remove every echoed thinking field from the history; True if any.
+    Last-resort heal for a gateway that rejects them outright."""
+    changed = False
+    for message in messages if isinstance(messages, list) else []:
+        if not isinstance(message, dict):
+            continue
+        for key in ("reasoning", "reasoning_details"):
+            if key in message:
+                message.pop(key, None)
+                changed = True
+        if message.get("reasoning_content"):
+            message["reasoning_content"] = ""
+            changed = True
+    return changed
 
 
 def _is_reasoning_content_error(err: Exception) -> bool:
@@ -2098,6 +2131,7 @@ def chat_stream(provider: Provider, model: Model, effort: Effort,
     headers = _base_headers(provider, stream=True)
     current_effort = effort
     shrinks_used = 0
+    healed_dup = False
     # invalid_request_error auto-recovery (worker 18/20): exactly one
     # prune-and-retry per call, enforced by maybe_recover_invalid_request.
     invalid_retried = False
@@ -2156,6 +2190,14 @@ def chat_stream(provider: Provider, model: Model, effort: Effort,
         except APIError as e:
             # reasoning_content validation — heal history and retry once,
             # but NEVER after output already streamed (see `streamed`)
+            if _is_duplicate_field_error(e) and not streamed["out"] \
+                    and not healed_dup:
+                healed_dup = True
+                _log.warning("provider rejected a duplicated field (%s); "
+                             "retrying once without echoed thinking", e)
+                _sanitize_messages(messages)
+                _strip_reasoning(messages)
+                continue
             if _is_reasoning_content_error(e):
                 if streamed["out"]:
                     raise
@@ -2964,6 +3006,7 @@ def chat_blocking(provider: Provider, model: Model, effort: Effort,
     headers = _base_headers(provider, stream=False)
     current_effort = effort
     shrinks_used = 0
+    healed_dup = False
 
     for overflow_attempt in range(OVERFLOW_RETRIES + OVERFLOW_SHRINKS + 1):
         sent_raw = prompt_raw_tokens(messages, tools)
@@ -2983,6 +3026,11 @@ def chat_blocking(provider: Provider, model: Model, effort: Effort,
                                   should_cancel=should_cancel,
                                   on_status=on_status)
         except APIError as err:
+            if _is_duplicate_field_error(err) and not healed_dup:
+                healed_dup = True
+                _sanitize_messages(messages)
+                _strip_reasoning(messages)
+                continue
             if _is_reasoning_content_error(err):
                 if _sanitize_messages(messages):
                     continue
