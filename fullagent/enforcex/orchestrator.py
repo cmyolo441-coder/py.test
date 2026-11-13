@@ -501,6 +501,8 @@ class Orchestrator:
         if getattr(report, "is_suspicious", False) and \
                 score >= self._injection_max_score:
             ctx["blocked"] = True
+            # input-side block: the response score cannot vouch for it
+            ctx["injection_blocked"] = True
             ctx["notes"].append(
                 f"injection in {label}: score {score:.0f} >= "
                 f"{self._injection_max_score:.0f}")
@@ -697,7 +699,11 @@ class Orchestrator:
                     f"trust multiplier {ctx['multiplier']:.2f} hardened "
                     f"verdict (score {ctx['score']:.1f} < {threshold:.1f})")
         elif ctx["multiplier"] < 1.0 and ctx["blocked"] and \
+                not ctx.get("injection_blocked") and \
                 ctx.get("score") is not None and ctx["score"] >= 40.0:
+            # A softening multiplier may relax a near-threshold *response*
+            # verdict, but the gate score says nothing about a hostile
+            # user/tool input: it used to un-block injection hits too.
             ctx["blocked"] = False
             ctx["notes"].append(
                 f"trust multiplier {ctx['multiplier']:.2f} softened verdict")
@@ -782,8 +788,11 @@ class Orchestrator:
             dry_run=dry,
             ts=t0,
         )
-        order = [s for s in (stage_order or STAGE_ORDER)
-                 if s in STAGE_ORDER] or list(STAGE_ORDER)
+        # unknown names dropped, duplicates removed (a repeated "ledger"
+        # or "telemetry" used to append/count the same turn twice)
+        order = list(dict.fromkeys(
+            s for s in (stage_order or STAGE_ORDER)
+            if isinstance(s, str) and s in STAGE_ORDER)) or list(STAGE_ORDER)
         for name in order:
             fn = self._stages.get(name)
             rec = StageRecord(name=name)

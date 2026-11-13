@@ -41,6 +41,7 @@ Public API
 from __future__ import annotations
 
 import collections
+import functools
 import hashlib
 import math
 import re
@@ -77,6 +78,10 @@ _WS_RE = re.compile(r"\s+")
 _SENT_RE = re.compile(r"(?<=[.!?।])\s+")
 _MAX_TEXT = 200_000
 _MAX_TURNS = 500
+# Cap on the cumulative "seen" vocabulary. It used to grow by every novel
+# token of every turn for the whole session (only the 500-turn list was
+# capped); past the cap it is rebuilt from the anchor + the current window.
+_MAX_VOCAB = 50_000
 _DEFAULT_WINDOW = 20
 _DEFAULT_THRESHOLD = 0.55
 _DECAY = 0.88  # exponential decay for weighting (recent = heavier)
@@ -226,6 +231,52 @@ def _vocab_growth(anchor_tokens: frozenset, text_tokens: frozenset) -> float:
 
 # ── core scoring ─────────────────────────────────────────────────────────
 
+class _TextFeatures:
+    """Pre-computed lexical/structural/tone features of one text."""
+
+    __slots__ = ("norm", "tokens", "token_set", "bigrams", "trigrams",
+                 "struct", "tone")
+
+    def __init__(self, text: str) -> None:
+        toks = _tokens(text)
+        self.norm = _norm(text)
+        self.tokens = len(toks)
+        self.token_set = frozenset(toks)
+        self.bigrams = _ngrams_from_tokens(toks, 2)
+        self.trigrams = _ngrams_from_tokens(toks, 3)
+        self.struct = _structural_vector(text)
+        self.tone = _tone_vector(text)
+
+
+def _ngrams_from_tokens(toks: List[str], n: int) -> frozenset:
+    if len(toks) < n:
+        return frozenset(toks) if toks else frozenset()
+    return frozenset(tuple(toks[i:i + n]) for i in range(len(toks) - n + 1))
+
+
+def _jac(a: frozenset, b: frozenset) -> float:
+    if not a or not b:
+        return 0.0
+    union = len(a | b)
+    return len(a & b) / union if union else 0.0
+
+
+def _vec_distance(va: Dict[str, float], vb: Dict[str, float]) -> float:
+    keys = set(va) | set(vb)
+    if not keys:
+        return 0.0
+    return sum(abs(va.get(k, 0.0) - vb.get(k, 0.0)) for k in keys) / max(1, len(keys))
+
+
+@functools.lru_cache(maxsize=8)
+def _anchor_features(anchor: str) -> _TextFeatures:
+    # The anchor (system prompt, up to 200k chars) is the same for every
+    # turn; re-tokenising it and re-running every structural/tone regex
+    # on each add_turn() made a long session pay O(len(anchor)) per turn
+    # (~100ms/turn for a 175k-char prompt). Cache its features.
+    return _TextFeatures(anchor)
+
+
 def score_drift(anchor: str, text: str) -> float:
     """Score drift of text away from anchor, 0 (no drift) .. 1 (total drift).
 
@@ -241,23 +292,24 @@ def score_drift(anchor: str, text: str) -> float:
             if not anchor.strip():
                 return 0.0
             return 0.75  # anchor exists but text empty -> high drift
+        fa = _anchor_features(anchor)
+        ft = _TextFeatures(text)
         # identical shortcut
-        if _norm(anchor) == _norm(text):
+        if fa.norm == ft.norm:
             return 0.0
         # lexical fidelity
-        tj = token_jaccard(anchor, text)
-        bj = bigram_jaccard(anchor, text)
-        tg = trigram_jaccard(anchor, text)
+        tj = _jac(fa.token_set, ft.token_set)
+        bj = _jac(fa.bigrams, ft.bigrams)
+        tg = _jac(fa.trigrams, ft.trigrams)
         # ordered n-gram blend (unigram heavier, trigram light)
         ngram_sim = 0.55 * tj + 0.30 * bj + 0.15 * tg
         lexical_drift = 1.0 - ngram_sim
         # structural + tone
-        struct_d = _structural_distance(anchor, text)
-        tone_d = _tone_distance(anchor, text)
+        struct_d = min(1.0, _vec_distance(fa.struct, ft.struct))
+        # tone matters less than lexical, so compress
+        tone_d = min(1.0, _vec_distance(fa.tone, ft.tone) * 0.9)
         # vocabulary growth component
-        anchor_set = _token_set(anchor)
-        text_set = _token_set(text)
-        growth = _vocab_growth(anchor_set, text_set)
+        growth = _vocab_growth(fa.token_set, ft.token_set)
         # blend with weights: lexical dominates, structural/tone/growth contribute
         drift = (
             0.52 * lexical_drift
@@ -266,8 +318,8 @@ def score_drift(anchor: str, text: str) -> float:
             + 0.16 * growth
         )
         # length-normalized adjustment: very short text vs long anchor is driftier
-        alen = len(_tokens(anchor))
-        tlen = len(_tokens(text))
+        alen = fa.tokens
+        tlen = ft.tokens
         if alen > 0 and tlen > 0:
             len_ratio = min(alen, tlen) / max(alen, tlen)
             # if lengths differ hugely, add a little
@@ -440,6 +492,8 @@ class DriftTracker:
             # update seen
             try:
                 self._vocab_seen |= set(tset)  # type: ignore
+                if len(self._vocab_seen) > _MAX_VOCAB:
+                    self._rebuild_vocab(extra=tset)
             except Exception:
                 pass
             # topic-shift vs gradual drift: abrupt high drift preceded by low drift
@@ -464,11 +518,25 @@ class DriftTracker:
                 self._turns = self._turns[-_MAX_TURNS:]
             return turn
         except Exception as exc:  # never raise
-            turn = Turn(text=text or "", turn_id=self._next_id, drift_score=0.0,
+            try:
+                safe_text = str(text or "")[:_MAX_TEXT]
+            except Exception:
+                safe_text = ""
+            turn = Turn(text=safe_text, turn_id=self._next_id, drift_score=0.0,
                         anchor_similarity=1.0, meta={"error": type(exc).__name__})
             self._turns.append(turn)
             self._next_id += 1
+            if len(self._turns) > _MAX_TURNS:
+                self._turns = self._turns[-_MAX_TURNS:]
             return turn
+
+    def _rebuild_vocab(self, extra: Any = ()) -> None:
+        """Shrink the seen-vocabulary to anchor + recent window tokens."""
+        seen: Set[str] = set(self._anchor_tokens)  # type: ignore
+        for t in self._turns[-self.window:]:
+            seen |= set(_token_set(t.text))  # type: ignore
+        seen |= set(extra or ())
+        self._vocab_seen = seen
 
     def reset(self) -> None:
         """Clear history but keep the anchor."""
@@ -601,12 +669,14 @@ class DriftTracker:
         turns = d.get("turns", ())
         if not isinstance(turns, (list, tuple)):
             turns = ()
-        obj._turns = [Turn.from_dict(x) for x in turns if isinstance(x, dict)]
+        obj._turns = [Turn.from_dict(x) for x in turns if isinstance(x, dict)][-_MAX_TURNS:]
         obj._next_id = _safe_int(d.get("next_id", len(obj._turns)), len(obj._turns))
         # rebuild vocab_seen from turns
         try:
             for t in obj._turns:
                 obj._vocab_seen |= set(_token_set(t.text))  # type: ignore
+            if len(obj._vocab_seen) > _MAX_VOCAB:
+                obj._rebuild_vocab()
         except Exception:
             pass
         return obj
@@ -704,9 +774,17 @@ def scan(response_text: str, rules: Any = None, system_text: str = "", **_kw: An
         d = score_drift(anchor, text)
         # build a one-turn tracker report for richer context
         tracker = DriftTracker(anchor_text=anchor, window=window, threshold=threshold)
-        # seed with any history provided
+        # seed with any history provided. Only the last `window` entries
+        # can influence the report (overall drift, alert, trend and topic
+        # shift are all computed over the window), so only those are
+        # scored: re-scoring the caller's whole, ever-growing history on
+        # every scan made a long session O(n^2). Turn ids keep counting
+        # from the true history position.
         hist = _kw.get("history") or _kw.get("turns") or []
         if isinstance(hist, (list, tuple)):
+            if len(hist) > tracker.window:
+                tracker._next_id = len(hist) - tracker.window
+                hist = hist[-tracker.window:]
             for h in hist:
                 if isinstance(h, str) and h.strip():
                     tracker.add_turn(h)

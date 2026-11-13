@@ -178,8 +178,21 @@ def _norm(text: str) -> str:
 
 
 def _clip(text: str, n: int = _CLIP_LEN) -> str:
-    t = _WS_RE.sub(" ", text or "").strip()
-    return t if len(t) <= n else t[: n - 1] + "…"
+    # Collapse whitespace on a growing PREFIX only: the snippet needs the
+    # first n visible chars, and running the substitution over the whole
+    # response once per rule cost ~2 s for 256 rules on a 216 KB reply.
+    # Result is identical to collapsing the whole text.
+    text = text or ""
+    window = max(64, n * 4)
+    while True:
+        part = text[:window]
+        t = _WS_RE.sub(" ", part).lstrip()
+        if window >= len(text):
+            t = t.rstrip()
+            return t if len(t) <= n else t[: n - 1] + "…"
+        if len(t) > n:
+            return t[: n - 1] + "…"
+        window *= 4
 
 
 # check_all() scores every rule against the SAME response; each helper

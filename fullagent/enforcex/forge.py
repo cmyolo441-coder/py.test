@@ -135,8 +135,27 @@ def compare_versions(a: Any, b: Any) -> Optional[int]:
     if ra != rb:
         return -1 if ra < rb else 1
     if pa[3] != pb[3]:
-        # numeric identifiers compare numerically; otherwise lexically
-        return -1 if pa[3] < pb[3] else 1
+        # SemVer 11.4: compare dot-separated identifiers left to right;
+        # numeric ones numerically and below alphanumeric ones; a shorter
+        # list of equal identifiers sorts first. (A plain string compare
+        # put "alpha.10" before "alpha.2" and "rc.9" after "rc.10".)
+        return _cmp_prerelease(pa[3], pb[3])
+    return 0
+
+
+def _cmp_prerelease(a: str, b: str) -> int:
+    ia, ib = a.split("."), b.split(".")
+    for x, y in zip(ia, ib):
+        if x == y:
+            continue
+        xd, yd = x.isdigit(), y.isdigit()
+        if xd and yd:
+            return -1 if int(x) < int(y) else 1
+        if xd != yd:
+            return -1 if xd else 1
+        return -1 if x < y else 1
+    if len(ia) != len(ib):
+        return -1 if len(ia) < len(ib) else 1
     return 0
 
 
@@ -237,8 +256,23 @@ def _rule_from_obj(obj: Any, errors: List[str]) -> Optional[Dict[str, Any]]:
 def _to_int(v: Any) -> int:
     try:
         return int(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
+
+
+def _to_priority(v: Any) -> float:
+    """Clamp a pack priority to [0, 1]; garbage -> 0.25 (never raises).
+
+    validate_pack does not type-check priorities, so a pack with
+    ``"priority": "high"`` passed validation and then crashed load_pack.
+    """
+    try:
+        f = float(v if v is not None else 0.25)
+    except (TypeError, ValueError):
+        return 0.25
+    if f != f or f in (float("inf"), float("-inf")):
+        return 0.25
+    return max(0.0, min(1.0, f)) if f else 0.25
 
 
 def _coerce_policy(policy: Any, notes: List[str]) -> Dict[str, Any]:
@@ -584,6 +618,7 @@ def save_pack(pack: Dict[str, Any], path: str) -> str:
     if not isinstance(pack, dict):
         raise ForgeError("save_pack: pack is not a dict")
     directory = os.path.dirname(os.path.abspath(path)) or "."
+    tmp = ""
     try:
         os.makedirs(directory, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=directory, prefix=".pack-",
@@ -593,8 +628,18 @@ def save_pack(pack: Dict[str, Any], path: str) -> str:
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
-    except OSError as exc:
+        tmp = ""
+    except (OSError, ValueError, TypeError) as exc:
+        # ValueError: e.g. a circular reference inside the pack. It used
+        # to escape un-wrapped and, like any failure after mkstemp,
+        # leave a stray .pack-*.tmp file behind next to the target.
         raise ForgeError(f"save_pack failed: {exc}") from exc
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
     return path
 
 
@@ -649,7 +694,7 @@ def load_pack(pack: Any, migrate: bool = True
             "text": str(r.get("text", "")),
             "category": str(r.get("category", "other")),
             "severity": str(r.get("severity", "low")),
-            "priority": float(r.get("priority", 0.25) or 0.25),
+            "priority": _to_priority(r.get("priority", 0.25)),
             "keywords": tuple(str(k) for k in (r.get("keywords") or ())),
             "patterns": tuple(str(p) for p in (r.get("patterns") or ())),
             "immutable": bool(r.get("immutable", False)),

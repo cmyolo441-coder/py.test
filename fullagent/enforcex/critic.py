@@ -129,6 +129,48 @@ REQUIRED_TERMS = ("must include", "always include", "must mention",
 # Horizontal whitespace only and a greedy body ending in \S: the old
 # ``^\s*#{1,6}\s*(.+?)\s*$`` crossed newlines and re-ran ``\s*$`` after every
 # lazy step, O(n^2) on blank-line runs or long trailing whitespace.
+def _pair_regex(word: str, negated: bool) -> "re.Pattern":
+    """Whole-word matcher for one side of a CONTRA_PAIRS entry.
+
+    The positive side must not be the start of its own negation, so
+    "will" does not match inside "will not" and "can" not inside "cannot".
+    """
+    w = r"\s+".join(re.escape(part) for part in word.split())
+    if negated:
+        return re.compile(r"\b" + w + r"\b", re.I)
+    return re.compile(r"\b" + w + r"\b(?!\s+not\b)", re.I)
+
+
+# Substring tests made every "cannot" contain "can" (and "will not" contain
+# "will", "know"/"now"/"not" contain "no"), so ordinary refusals and
+# sentences scored as self-contradictions.
+_CONTRA_RES = tuple(
+    (pos, neg, _pair_regex(pos, False), _pair_regex(neg, True))
+    for pos, neg in CONTRA_PAIRS)
+_WONT_RE = re.compile(r"\b(won'?t|will\s+not|never)\b", re.I)
+_WILL_RE = re.compile(r"\b(will(?!\s+not\b)|i'll|always)\b", re.I)
+
+_NEGATIVE_RULE_RE = re.compile(
+    r"\b(never|not|no|don'?t|avoid|without|forbidden|banned|prohibited|"
+    r"refuse|disallowed|exclude)\b", re.I)
+_AFFIRMATIVE_RULE_RE = re.compile(
+    r"^\W*(always|must|use|include|respond|reply|answer|keep|start|end|"
+    r"format|write|provide|greet|be)\b", re.I)
+
+
+def _is_affirmative_rule(rule: Any) -> bool:
+    """True for "always/must do X" rules with no prohibition in them.
+
+    For such a rule a keyword hit means the response *followed* it; only
+    prohibitive (or unclassifiable) rules turn a hit into hard evidence.
+    """
+    rl = _rule_text(rule).lower().strip()
+    if not rl or _NEGATIVE_RULE_RE.search(rl):
+        return False
+    return bool(_AFFIRMATIVE_RULE_RE.search(rl)
+                or any(t in rl for t in REQUIRED_TERMS))
+
+
 SECTION_RE = re.compile(r"^[ \t]*#{1,6}[ \t]*(.*\S)[ \t]*$", re.M)
 _LIST_ITEM_RE = re.compile(r"^[ \t]*(?:[-*•]|\d+[.)])[ \t]+\S", re.M)
 
@@ -568,12 +610,14 @@ class ConsistencyCritic(BaseCritic):
         sents = _sentences(text)
 
         # C4a: paired assertion/negation within the response.
-        for pos, neg in CONTRA_PAIRS:
-            has_pos = any(pos in s.lower() for s in sents)
-            has_neg = any(neg in s.lower() for s in sents)
+        for pos, neg, pos_re, neg_re in _CONTRA_RES:
+            pos_in = [bool(pos_re.search(s)) for s in sents]
+            neg_in = [bool(neg_re.search(s)) for s in sents]
+            has_pos = any(pos_in)
+            has_neg = any(neg_in)
             if has_pos and has_neg:
                 # same sentence is worse than separate sentences
-                same = any(pos in s.lower() and neg in s.lower() for s in sents)
+                same = any(a and b for a, b in zip(pos_in, neg_in))
                 penalty += 0.3 if same else 0.15
                 notes.append(f"contradiction pair: '{pos}' vs '{neg}'")
 
@@ -593,8 +637,8 @@ class ConsistencyCritic(BaseCritic):
         for s in sents:
             sl = s.lower()
             for topic in re.findall(r"\b(use|send|share|mention|include|skip)\b", sl):
-                won_t = bool(re.search(r"\b(won'?t|will not|never)\b", sl))
-                will = bool(re.search(r"\b(will|i'll|always)\b", sl))
+                won_t = bool(_WONT_RE.search(sl))
+                will = bool(_WILL_RE.search(sl))
                 if will and won_t:
                     # same sentence asserts and negates the same commitment
                     penalty += 0.2
@@ -789,8 +833,14 @@ class CriticEnsemble:
         # hard-evidence override: a severity-weighted rule hit is direct
         # proof the rule topic appeared in the response; it drags the
         # fused score down beyond what soft critic opinions imply.
-        if rule_hits:
-            hardest = max(rule_hits.values())
+        # Affirmative rules are excluded: "Must include a bullet list"
+        # hitting on "list" means the response complied, and penalising
+        # it pushed compliant answers toward a "violation" majority.
+        affirmative = {_rule_id(r) for r in rules if _is_affirmative_rule(r)}
+        hard_hits = {rid: h for rid, h in rule_hits.items()
+                     if rid not in affirmative}
+        if hard_hits:
+            hardest = max(hard_hits.values())
             fused = _clamp01(fused - 0.5 * hardest)
             notes.append(f"rule-hit override: -{0.5 * hardest:.2f}")
             # re-apply the hard-evidence fallback now that fused includes

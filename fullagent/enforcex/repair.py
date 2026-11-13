@@ -526,8 +526,14 @@ class RepairEngine:
             violations_before=viols_before,
             noop=bool(cfg.noop),
         )
-        # already clean or passthrough mode -> done
-        if cfg.noop or result.verified or not viols_before:
+        # already clean or passthrough mode -> done. A passing score is
+        # not "clean" when a high/critical finding is present: a single
+        # leaked API key scores ~75 (category "sensitive" has the default
+        # weight), so it was declared verified and returned unredacted.
+        serious = any(str(v.get("severity", "")).lower()
+                      in ("critical", "high") for v in viols_before
+                      if isinstance(v, dict))
+        if cfg.noop or (result.verified and not serious) or not viols_before:
             if not viols_before:
                 result.verified = True
                 result.verification_score = max(100.0, score_before) \

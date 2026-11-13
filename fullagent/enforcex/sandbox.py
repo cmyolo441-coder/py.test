@@ -312,6 +312,105 @@ class _Budget:
         return {"ops": self.ops, "max_ops": self.max_ops,
                 "timeout_s": self.timeout_s, "elapsed": round(time.monotonic() - self._start, 3)}
 
+class _SandboxAbort(BaseException):
+    """Internal: raised by the wall-clock tracer into a runaway check.
+
+    A BaseException (not Exception) so a check function's own
+    ``except Exception`` cannot swallow the abort and keep looping.
+    """
+
+
+class _WallClockTracer:
+    """sys.settrace hook that bounds non-cooperative check functions.
+
+    ``_Budget`` is cooperative: a check that never calls ``tick()`` (e.g.
+    ``while True: pass``) used to run forever despite ``timeout_s``.  While
+    the check runs, this tracer polls the clock every 256 line events and
+    raises ``_SandboxAbort`` once the budget's wall time is spent.  It is
+    only installed when no other tracer (debugger / coverage) is active.
+    """
+
+    __slots__ = ("budget", "events")
+
+    def __init__(self, budget: "_Budget") -> None:
+        self.budget = budget
+        self.events = 0
+
+    def __call__(self, frame: Any, event: str, arg: Any) -> Any:
+        self._poll()
+        return self._local
+
+    def _local(self, frame: Any, event: str, arg: Any) -> Any:
+        self._poll()
+        return self._local
+
+    def _poll(self) -> None:
+        self.events += 1
+        if self.events & 0xFF:
+            return
+        b = self.budget
+        if time.monotonic() - b._start >= b.timeout_s:
+            b.timed_out = True
+            raise _SandboxAbort(
+                f"wall-time budget exceeded ({b.timeout_s:.2f}s, "
+                "check function did not yield)")
+
+
+def _bindable(sig: Optional[inspect.Signature], args: tuple, kwargs: dict) -> Optional[bool]:
+    """True/False if ``sig`` accepts the call, None when unknown."""
+    if sig is None:
+        return None
+    try:
+        sig.bind(*args, **kwargs)
+        return True
+    except TypeError:
+        return False
+
+
+def _invoke_check(check_fn: Callable[..., Any], attempts: List[Callable[[], Tuple[tuple, dict]]],
+                  budget: "_Budget") -> Any:
+    """Call ``check_fn`` with the richest signature it accepts.
+
+    The signature is resolved with ``inspect.signature().bind`` *before*
+    calling, so the check runs exactly once.  The old loop called it and
+    retried with fewer arguments on any TypeError — re-running the check
+    (duplicating emitted violations and burning its budget) whenever its
+    own body raised a TypeError, and finally reporting a bogus pass.
+    Builtins without an introspectable signature keep the old probing.
+    """
+    try:
+        sig: Optional[inspect.Signature] = inspect.signature(check_fn)
+    except (TypeError, ValueError):
+        sig = None
+    tracer = _WallClockTracer(budget)
+    install = sys.gettrace() is None
+
+    def _call(args: tuple, kwargs: dict) -> Any:
+        if not install:
+            return check_fn(*args, **kwargs)
+        sys.settrace(tracer)
+        try:
+            return check_fn(*args, **kwargs)
+        finally:
+            sys.settrace(None)
+
+    for make in attempts:
+        try:
+            args, kwargs = make()
+        except AttenuatedAccessError:
+            continue
+        ok = _bindable(sig, args, kwargs)
+        if ok is False:
+            continue
+        if ok is True:
+            return _call(args, kwargs)
+        try:  # signature unknown: legacy probing
+            return _call(args, kwargs)
+        except TypeError:
+            continue
+    return _call((), {})
+
+
 # ── data model ───────────────────────────────────────────────────────────
 
 @dataclass
@@ -667,39 +766,27 @@ def evaluate_rule(
             "rule_id": rule_id,
         }
 
+        attempts: List[Callable[[], Tuple[tuple, dict]]] = [
+            lambda: ((resp_proxy, sys_proxy, vio_sink, budget, ext_proxy), {}),
+            lambda: ((resp_proxy, sys_proxy, vio_sink, budget), {}),
+            lambda: ((resp_proxy, sys_proxy, vio_sink), {}),
+            lambda: ((resp_proxy, sys_proxy), {}),
+            lambda: ((resp_proxy,), {}),
+            lambda: ((), {"response": resp_proxy, "system": sys_proxy,
+                          "violations": vio_sink, "budget": budget}),
+            # last resort: a plain-text keyword (only with read_response)
+            lambda: ((), {"text": str(resp_proxy) if "read_response" in caps else None}),
+        ]
         try:
-            # introspect arity by trying richest call first, then simpler
-            tried = False
-            for attempt in (
-                lambda: check_fn(resp_proxy, sys_proxy, vio_sink, budget, ext_proxy),
-                lambda: check_fn(resp_proxy, sys_proxy, vio_sink, budget),
-                lambda: check_fn(resp_proxy, sys_proxy, vio_sink),
-                lambda: check_fn(resp_proxy, sys_proxy),
-                lambda: check_fn(resp_proxy),
-                lambda: check_fn(response=resp_proxy, system=sys_proxy, violations=vio_sink, budget=budget),
-                lambda: check_fn(text=str(resp_proxy) if "read_response" in caps else None),  # last resort
-            ):
-                try:
-                    result = attempt()
-                    tried = True
-                    break
-                except TypeError:
-                    continue
-                except (AttenuatedAccessError, SandboxTimeoutError):
-                    raise
-                except Exception as exc:
-                    error = f"{type(exc).__name__}: {str(exc)[:120]}"
-                    tried = True
-                    result = None
-                    break
-            if not tried:
-                # fallback: call with no args if nothing matched (should not happen)
-                try:
-                    result = check_fn()
-                except (AttenuatedAccessError, SandboxTimeoutError):
-                    raise
-                except Exception as exc:
-                    error = f"{type(exc).__name__}: {str(exc)[:120]}"
+            try:
+                result = _invoke_check(check_fn, attempts, budget)
+            except (AttenuatedAccessError, SandboxTimeoutError):
+                raise
+            except _SandboxAbort as exc:
+                raise SandboxTimeoutError(str(exc))
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {str(exc)[:120]}"
+                result = None
         except AttenuatedAccessError as exc:
             return SandboxResult(
                 rule_id=rule_id, passed=False,
@@ -938,8 +1025,11 @@ def scan(response_text: str, rules: Any = None, system_text: str = "", **_kw: An
         text = response_text or ""
         sys_text = system_text or ""
         capabilities_map = _kw.get("capabilities_map") or _kw.get("capabilities") or None
-        max_ops = int(_kw.get("max_ops", _DEFAULT_MAX_OPS))
-        timeout_s = float(_kw.get("timeout_s", _DEFAULT_TIMEOUT_S))
+        # Sandbox() validates these itself; converting here used to raise
+        # on a malformed value and fall into the fail-open handler below
+        # (all_passed=True with every rule unevaluated).
+        max_ops = _kw.get("max_ops", _DEFAULT_MAX_OPS)
+        timeout_s = _kw.get("timeout_s", _DEFAULT_TIMEOUT_S)
         sb = Sandbox(rules, capabilities_map=capabilities_map, max_ops=max_ops, timeout_s=timeout_s)
         report = sb.evaluate(text, sys_text)
         violations: List[Dict[str, Any]] = []
@@ -990,8 +1080,8 @@ def scan(response_text: str, rules: Any = None, system_text: str = "", **_kw: An
             "all_passed": report.all_passed,
             "blocked_escalations": list(report.blocked_escalations),
         }
-    except Exception as exc:  # never raise
-        return {"violations": [], "findings": [], "report": {}, "all_passed": True,
+    except Exception as exc:  # never raise -- but fail closed: nothing was checked
+        return {"violations": [], "findings": [], "report": {}, "all_passed": False,
                 "blocked_escalations": [], "error": type(exc).__name__}
 
 # ── self-test ────────────────────────────────────────────────────────────

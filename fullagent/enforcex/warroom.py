@@ -71,6 +71,16 @@ SEVERITY_WEIGHTS: Dict[str, float] = {
 DEFAULT_CLUSTER_WINDOW_S = 900.0        # 15 minutes of time proximity
 DEFAULT_REOPEN_WINDOW_S = 3600.0
 
+# Retention caps. Every ingest re-persists the whole incident, so an
+# incident whose detection/timeline lists grew without bound made each
+# write O(n) and the JSONL file O(n^2) (1500 detections -> 280 MB, 6s of
+# ingest, 4s to reload). Lists keep their newest entries; the true
+# detection count lives in Incident.total_detections.
+MAX_DETECTIONS_PER_INCIDENT = 100
+MAX_TIMELINE_PER_INCIDENT = 200
+MAX_NOTES_PER_INCIDENT = 200
+MAX_INCIDENTS = 5000                    # oldest *closed* ones are evicted
+
 _TERM_RE = re.compile(r"[a-z][a-z0-9_\-']{3,}")
 
 
@@ -195,12 +205,27 @@ class Incident:
     tags: List[str] = field(default_factory=list)
     operator: str = ""
     notes: List[str] = field(default_factory=list)
+    total_detections: int = 0           # all detections, incl. trimmed ones
 
     # -- derived ------------------------------------------------------------
 
     @property
     def frequency(self) -> int:
-        return len(self.detections)
+        return max(int(self.total_detections or 0), len(self.detections))
+
+    def trim(self) -> None:
+        """Enforce the retention caps (keeps the newest entries)."""
+        self.total_detections = self.frequency
+        if len(self.detections) > MAX_DETECTIONS_PER_INCIDENT:
+            del self.detections[:-MAX_DETECTIONS_PER_INCIDENT]
+        if len(self.timeline) > MAX_TIMELINE_PER_INCIDENT:
+            # keep the "open" event for the postmortem's history
+            head = self.timeline[:1] if self.timeline[0].kind == "open" else []
+            self.timeline = head + self.timeline[-(MAX_TIMELINE_PER_INCIDENT - len(head)):]
+        for name in ("repair_actions", "notes"):
+            lst = getattr(self, name)
+            if len(lst) > MAX_NOTES_PER_INCIDENT:
+                del lst[:-MAX_NOTES_PER_INCIDENT]
 
     def priority(self) -> float:
         """severity x frequency — the escalation-queue sort key."""
@@ -238,6 +263,7 @@ class Incident:
             "operator": self.operator,
             "notes": list(self.notes),
             "frequency": self.frequency,
+            "total_detections": self.frequency,
             "priority": round(self.priority(), 3),
         }
 
@@ -284,8 +310,13 @@ class Incident:
             inc.closed_ts = float(d.get("closed_ts", 0.0) or 0.0)
         except (TypeError, ValueError):
             pass
+        try:
+            inc.total_detections = max(0, int(d.get("total_detections", 0) or 0))
+        except (TypeError, ValueError):
+            inc.total_detections = 0
         if inc.state not in STATES:
             inc.state = "open"
+        inc.trim()
         return inc
 
 
@@ -309,6 +340,7 @@ class IncidentStore:
         self._incidents: Dict[str, Incident] = {}
         self._lock = threading.RLock()
         self._fh = None
+        self._records = 0               # records in the file since compaction
         self._load()
 
     # -- persistence ----------------------------------------------------------
@@ -326,21 +358,69 @@ class IncidentStore:
                         rec = json.loads(line)
                     except ValueError:
                         continue
+                    self._records += 1
                     self._apply_record(rec, persist=False)
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             pass
+        self._evict()
+
+    def _compact_due(self) -> bool:
+        return self._records > max(64, 2 * len(self._incidents))
 
     def _persist(self, rec: Dict[str, Any]) -> None:
         if not self.path:
             return
         try:
+            if self._compact_due():
+                self._compact()
             if self._fh is None:
                 self._fh = open(self.path, "a", encoding="utf-8")
             self._fh.write(json.dumps(rec, ensure_ascii=False,
                                       sort_keys=True) + "\n")
             self._fh.flush()
+            self._records += 1
         except OSError:
             pass
+
+    def _compact(self) -> None:
+        """Rewrite the JSONL as one snapshot record per live incident.
+
+        Every ingest appends a full incident snapshot, so without this the
+        file (and reload time) grows with every detection ever seen even
+        though only the last snapshot per incident matters.
+        """
+        if not self.path:
+            return
+        import tempfile
+        directory = os.path.dirname(os.path.abspath(self.path)) or "."
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix=".warroom-",
+                                   suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                for inc in self._incidents.values():
+                    fh.write(json.dumps(
+                        {"type": "snapshot", "ts": inc.last_activity(),
+                         "data": inc.to_dict()},
+                        ensure_ascii=False, sort_keys=True) + "\n")
+            self.shutdown()
+            os.replace(tmp, self.path)
+            self._records = len(self._incidents)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    def _evict(self) -> None:
+        """Drop the oldest closed incidents beyond MAX_INCIDENTS."""
+        excess = len(self._incidents) - MAX_INCIDENTS
+        if excess <= 0:
+            return
+        closed = sorted((i for i in self._incidents.values()
+                         if i.state == "closed"),
+                        key=lambda i: (i.last_activity(), i.incident_id))
+        for inc in closed[:excess]:
+            self._incidents.pop(inc.incident_id, None)
 
     def _apply_record(self, rec: Any, *, persist: bool = True) -> None:
         if not isinstance(rec, dict):
@@ -360,6 +440,10 @@ class IncidentStore:
                     rec.get("event")))
 
     def _apply_event(self, inc: Incident, ev: IncidentEvent) -> None:
+        self._apply_event_inner(inc, ev)
+        inc.trim()
+
+    def _apply_event_inner(self, inc: Incident, ev: IncidentEvent) -> None:
         inc.timeline.append(ev)
         inc.updated_ts = ev.ts or _now()
         if ev.kind == "acknowledge":
@@ -472,6 +556,7 @@ class IncidentStore:
         else:
             target = best
         for det in cluster:
+            target.total_detections = target.frequency + 1
             target.detections.append(det)
             try:
                 det_ts = float(det.get("ts", now) or now)  # type: ignore[arg-type]
@@ -490,10 +575,17 @@ class IncidentStore:
             sid = str(det.get("session_id", "") or session_id)
             if sid and sid not in target.session_ids:
                 target.session_ids.append(sid)
-        # severity = worst seen so far
-        target.severity = target.worst_severity()
+        # severity = worst seen so far (the trimmed detections only hold
+        # the newest ones, so never downgrade below what was recorded)
+        worst = target.worst_severity()
+        if _sev_weight(worst) >= _sev_weight(target.severity) or \
+                target is not best:
+            target.severity = worst
+        target.trim()
         self._persist({"type": "incident", "ts": now,
                        "data": target.to_dict()})
+        if target is not best:
+            self._evict()
         return target.incident_id
 
     # -- lifecycle -------------------------------------------------------------
@@ -762,7 +854,7 @@ def _build_postmortem(snap: Dict[str, Any]) -> Dict[str, Any]:
         "per_category_counts": categories,
         "severity_counts": {s: severities.count(s)
                             for s in sorted(set(severities))},
-        "detection_count": len(dets),
+        "detection_count": max(len(dets), _safe_count(snap.get("total_detections"))),
         "timeline": timeline,
         "repair_actions": list(snap.get("repair_actions") or []),
         "notes": list(snap.get("notes") or []),
@@ -778,6 +870,13 @@ def _build_postmortem(snap: Dict[str, Any]) -> Dict[str, Any]:
                                             len(snap.get("repair_actions")
                                                 or [])),
     }
+
+
+def _safe_count(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _recommendations(category: str, state: str, n_repairs: int

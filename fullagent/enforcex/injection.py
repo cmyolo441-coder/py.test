@@ -110,7 +110,7 @@ _OVERRIDE_RES: Tuple[Tuple[str, re.Pattern], ...] = (
     # ordinary text and must not block a response (false positives).
     ("you_are_now", re.compile(
         r"\byou\s+are\s+now\s+(?:free|allowed|unfiltered|unrestricted|"
-        r"uncensored|jailbroken|no\s+longer)\b[^.!?]{0,80}"
+        r"uncensored|jailbroken|DAN|no\s+longer)\b[^.!?]{0,80}"
         r"|\byou\s+are\s+now\s+(?:a|an|in)\b[^.!?]{0,60}?"
         r"\b(?:mode|AI|assistant|chatbot|model|persona|character|DAN|"
         r"jailbr\w*|unrestricted|unfiltered|uncensored|"

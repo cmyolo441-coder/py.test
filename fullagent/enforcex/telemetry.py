@@ -29,6 +29,7 @@ Stdlib only, Python 3.9+.
 
 from __future__ import annotations
 
+import bisect
 import json
 import math
 import os
@@ -135,13 +136,13 @@ class Histogram:
             self.total += v
             self.minimum = min(self.minimum, v)
             self.maximum = max(self.maximum, v)
-            self.buckets[self._bucket_label(v)] = \
-                self.buckets.get(self._bucket_label(v), 0) + 1
+            label = self._bucket_label(v)
+            self.buckets[label] = self.buckets.get(label, 0) + 1
             self.samples.append(v)
             if len(self.samples) > max(100, int(self.max_samples)):
-                # trim oldest, keep totals correct
+                # trim oldest in place, keep totals correct
                 drop = len(self.samples) - int(self.max_samples)
-                self.samples = self.samples[drop:]
+                del self.samples[:drop]
 
     def _bucket_label(self, v: float) -> str:
         if not self.edges:
@@ -252,23 +253,45 @@ class Histogram:
             edges=tuple(edges) if edges else (10.0,),
             max_samples=max_samples,
         )
-        buckets = d.get("buckets") or {}
-        if isinstance(buckets, dict):
-            for k, v in buckets.items():
-                try:
-                    h.buckets[str(k)] = int(v)
-                except (TypeError, ValueError):
-                    continue
         samples = d.get("samples") or []
         if isinstance(samples, (list, tuple)):
             for s in samples:
                 h.observe(s)
-        # restore the true count/total beyond the trimmed samples
+        # The saved bucket counts are authoritative: they cover every
+        # observation, while re-observing the (trimmed) samples above
+        # bumped the buckets a second time (a round trip doubled them).
+        buckets = d.get("buckets") or {}
+        if isinstance(buckets, dict) and buckets:
+            restored: Dict[str, int] = {}
+            for k, v in buckets.items():
+                try:
+                    restored[str(k)] = int(v)
+                except (TypeError, ValueError):
+                    continue
+            if restored:
+                h.buckets = restored
+        # restore the true count/total/extremes beyond the trimmed samples
         try:
             h.count = max(h.count, int(d.get("count", 0)))
             h.total = max(h.total, float(d.get("total", 0.0)))
         except (TypeError, ValueError):
             pass
+        for key, pick in (("minimum", min), ("maximum", max)):
+            try:
+                raw = d.get(key)
+                if raw is None:
+                    continue
+                val = float(raw)
+                if math.isnan(val) or math.isinf(val):
+                    continue
+                cur = h.minimum if key == "minimum" else h.maximum
+                val = pick(cur, val)
+                if key == "minimum":
+                    h.minimum = val
+                else:
+                    h.maximum = val
+            except (TypeError, ValueError):
+                continue
         return h
 
 
@@ -276,6 +299,10 @@ class Histogram:
 
 class RateWindow:
     """Events-per-second over a sliding time window."""
+
+    #: hard cap on stored timestamps; a burst of many events inside one
+    #: window otherwise kept one float per event until the window aged.
+    MAX_EVENTS = 100_000
 
     def __init__(self, window_seconds: float = 60.0) -> None:
         try:
@@ -295,19 +322,24 @@ class RateWindow:
         except (TypeError, ValueError):
             n = 1
         with self._lock:
-            for _ in range(n):
-                self._events.append(now)
-            self._prune(now)
+            events = self._events
+            if not events or now >= events[-1]:
+                events.extend([now] * n)
+            else:
+                # an explicit, older ts: keep the list sorted so _prune's
+                # prefix cut stays correct
+                pos = bisect.bisect_right(events, now)
+                events[pos:pos] = [now] * n
+            self._prune(max(now, events[-1]))
+            if len(events) > self.MAX_EVENTS:
+                del events[:len(events) - self.MAX_EVENTS]
 
     def _prune(self, now: float) -> None:
         cutoff = now - self.window
         if self._events and cutoff > self._events[0]:
-            # events are appended in order; drop the prefix
-            i = 0
-            events = self._events
-            while i < len(events) and events[i] < cutoff:
-                i += 1
-            self._events = events[i:]
+            # events are kept sorted; drop the prefix in O(log n)
+            i = bisect.bisect_left(self._events, cutoff)
+            del self._events[:i]
 
     def rate(self) -> float:
         """Events per second over the window (0.0 when empty)."""
@@ -349,7 +381,8 @@ class RateWindow:
                     events.append(float(t))  # type: ignore[arg-type]
                 except (TypeError, ValueError):
                     continue
-        rw._events = events
+        events.sort()
+        rw._events = events[-cls.MAX_EVENTS:]
         return rw
 
 
@@ -575,21 +608,24 @@ class Telemetry:
             self._sessions.move_to_end(sid)
             while len(self._sessions) > max(16, self._max_sessions):
                 self._sessions.popitem(last=False)
-        st["evaluations"] += 1
-        try:
-            st["violations"] += max(0, int(violations or 0))  # type: ignore[arg-type]
-        except (TypeError, ValueError):
-            pass
-        a = str(action or "allow").lower()
-        st["actions"][a] = st["actions"].get(a, 0) + 1
-        try:
-            sc = float(getattr(score, "total", score))
-            if not math.isnan(sc) and not math.isinf(sc):
-                st["scores"].append(sc)
-                if len(st["scores"]) > 200:
-                    st["scores"] = st["scores"][-200:]
-        except (TypeError, ValueError):
-            pass
+            # Mutate under the lock: these read-modify-writes used to run
+            # after it was released, so concurrent record_session() calls
+            # for one session lost updates (and raced snapshot()).
+            st["evaluations"] += 1
+            try:
+                st["violations"] += max(0, int(violations or 0))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                pass
+            a = str(action or "allow").lower()
+            st["actions"][a] = st["actions"].get(a, 0) + 1
+            try:
+                sc = float(getattr(score, "total", score))
+                if not math.isnan(sc) and not math.isinf(sc):
+                    st["scores"].append(sc)
+                    if len(st["scores"]) > 200:
+                        del st["scores"][:-200]
+            except (TypeError, ValueError):
+                pass
         return self.session_summary(sid)
 
     def reset_session(self, session_id: str) -> bool:
@@ -599,15 +635,18 @@ class Telemetry:
     def session_summary(self, session_id: str) -> Dict[str, Any]:
         with self._lock:
             st = self._sessions.get(str(session_id or ""))
-        if not st:
-            return {"session_id": session_id, "evaluations": 0}
-        scores = st.get("scores", [])
+            if not st:
+                return {"session_id": session_id, "evaluations": 0}
+            scores = list(st.get("scores", []))
+            evaluations = st.get("evaluations", 0)
+            violations = st.get("violations", 0)
+            actions = dict(st.get("actions", {}))
         mean = round(sum(scores) / len(scores), 2) if scores else None
         return {
             "session_id": session_id,
-            "evaluations": st.get("evaluations", 0),
-            "violations": st.get("violations", 0),
-            "actions": dict(st.get("actions", {})),
+            "evaluations": evaluations,
+            "violations": violations,
+            "actions": actions,
             "score_mean": mean,
             "score_last": scores[-1] if scores else None,
         }
@@ -736,28 +775,40 @@ class Telemetry:
                 for sid, v in sessions.items():
                     if not isinstance(v, dict):
                         continue
-                    for _ in range(min(_mi(v.get("evaluations", 0)), 1000)):
-                        self.record_session(str(sid), action="allow",
-                                            violations=0)
-                    actions = v.get("actions") or {}
-                    if isinstance(actions, dict):
-                        for action, n in actions.items():
-                            for _ in range(min(_mi(n), 1000)):
-                                self.record_session(str(sid),
-                                                    action=str(action))
-                    # restore score series (latest 100)
+                    # Fold the counters in directly. The old code replayed
+                    # `evaluations` fake "allow" records AND one record per
+                    # action count, so a round trip doubled evaluations,
+                    # inflated "allow", and dropped the violation count.
+                    scores: List[float] = []
+                    raw_scores = v.get("scores") or ()
+                    if isinstance(raw_scores, (list, tuple)):
+                        for s in raw_scores:
+                            try:
+                                f = float(s)  # type: ignore[arg-type]
+                            except (TypeError, ValueError):
+                                continue
+                            if not (math.isnan(f) or math.isinf(f)):
+                                scores.append(f)
                     with self._lock:
-                        st = self._sessions.get(str(sid))
-                        if st is not None:
-                            scores: List[float] = []
-                            raw_scores = v.get("scores") or ()
-                            if isinstance(raw_scores, (list, tuple)):
-                                for s in raw_scores:
-                                    try:
-                                        scores.append(float(s))  # type: ignore[arg-type]
-                                    except (TypeError, ValueError):
-                                        continue
-                            st["scores"] = scores[-200:]
+                        key = str(sid)
+                        st = self._sessions.get(key)
+                        if st is None:
+                            st = {"evaluations": 0, "violations": 0,
+                                  "actions": {}, "scores": [],
+                                  "first_seen": time.time()}
+                            self._sessions[key] = st
+                        self._sessions.move_to_end(key)
+                        while len(self._sessions) > max(16, self._max_sessions):
+                            self._sessions.popitem(last=False)
+                        st["evaluations"] += max(0, _mi(v.get("evaluations", 0)))
+                        st["violations"] += max(0, _mi(v.get("violations", 0)))
+                        actions = v.get("actions") or {}
+                        if isinstance(actions, dict):
+                            for action, n in actions.items():
+                                a = str(action or "allow").lower()
+                                st["actions"][a] = st["actions"].get(a, 0) + \
+                                    max(0, _mi(n))
+                        st["scores"] = (st["scores"] + scores)[-200:]
             return True
         except Exception:
             return False

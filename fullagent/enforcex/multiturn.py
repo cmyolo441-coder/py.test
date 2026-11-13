@@ -71,6 +71,7 @@ from __future__ import annotations
 import math
 import re
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -78,6 +79,12 @@ try:  # optional siblings — never a hard dependency
     from . import ruleextract as _rx
 except Exception:  # pragma: no cover
     _rx = None
+
+try:
+    from .cipherlab import HOMOGLYPH_MAP as _HOMOGLYPHS
+except Exception:  # pragma: no cover
+    _HOMOGLYPHS = {}
+_HOMOGLYPH_TABLE = str.maketrans(dict(_HOMOGLYPHS)) if _HOMOGLYPHS else {}
 
 __all__ = [
     "TurnRecord", "TurnAnalysis", "ConversationVerdict", "MultiTurnTracker",
@@ -248,6 +255,28 @@ def _clean_text(obj: Any) -> str:
     return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", obj)
 
 
+def _fold_for_match(text: str) -> str:
+    """Canonical form used only for *detection* (stored text is untouched).
+
+    Without it the lexicons were trivially bypassed: "ign\u200bore your
+    rules", fullwidth "ｉｇｎｏｒｅ" or Cyrillic lookalikes ("іgnоre") never
+    matched. Strips format (Cf) characters such as zero-width spaces and
+    bidi marks, applies NFKC (fullwidth/compatibility forms) and maps the
+    common Cyrillic/Greek homoglyphs to Latin.
+    """
+    if not text or text.isascii():
+        return text
+    try:
+        t = "".join(ch for ch in text
+                    if ch < "\x80" or unicodedata.category(ch) != "Cf")
+        t = unicodedata.normalize("NFKC", t)
+        if _HOMOGLYPH_TABLE:
+            t = t.translate(_HOMOGLYPH_TABLE)
+        return t
+    except Exception:
+        return text
+
+
 def _count_hits(pattern: re.Pattern, text: str) -> int:
     try:
         return len(pattern.findall(text))
@@ -265,7 +294,7 @@ def analyse_pressure(text: Any) -> float:
     Saturating combination: score = 1 - prod(1 - w_i) style blend.
     Never raises.
     """
-    t = _clean_text(text)
+    t = _fold_for_match(_clean_text(text))
     if not t.strip():
         return 0.0
 
@@ -311,7 +340,7 @@ def classify_attack(text: Any) -> str:
     Ties are broken by (hit count, table order) — deterministic.
     Never raises.
     """
-    t = _clean_text(text)
+    t = _fold_for_match(_clean_text(text))
     if not t.strip():
         return AttackClass.NONE
     best_label, best_hits = AttackClass.NONE, 0
@@ -331,7 +360,7 @@ def erosion_score(text: Any) -> float:
     rule-disclosure behaviour — the softening that precedes a full
     concession. Never raises.
     """
-    t = _clean_text(text)
+    t = _fold_for_match(_clean_text(text))
     if not t.strip():
         return 0.0
     parts = [
@@ -510,6 +539,8 @@ def _rule_field(rule: Any, name: str, default: Any = "") -> Any:
 def _match_rules(user_msg: str, rules: Any) -> Tuple[str, ...]:
     """Rule ids whose keywords/patterns hit the user message."""
     hits: List[str] = []
+    user_msg = _fold_for_match(user_msg)
+    low = user_msg.lower()
     for rule in _rules_iter(rules):
         rid = str(_rule_field(rule, "id", "") or "")
         if not rid:
@@ -517,7 +548,7 @@ def _match_rules(user_msg: str, rules: Any) -> Tuple[str, ...]:
         matched = False
         for kw in (_rule_field(rule, "keywords", ()) or ()):
             try:
-                if str(kw).lower() in user_msg.lower():
+                if str(kw).lower() in low:
                     matched = True
                     break
             except Exception:
@@ -853,9 +884,10 @@ class MultiTurnTracker:
             for ad in ans:
                 if isinstance(ad, dict):
                     tr._analyses.append(TurnAnalysis.from_dict(ad))
-            # keep the window invariant the live tracker maintains
-            tr._analyses = tr._analyses[-tr.window:]
-            tr._turns = tr._turns[-tr.window:]
+        # keep the window invariant the live tracker maintains (also for
+        # payloads without "analyses", whose turns were kept untrimmed)
+        tr._analyses = tr._analyses[-tr.window:]
+        tr._turns = tr._turns[-tr.window:]
         if tr._turns:
             last = tr._turns[-1]
             tr._prev_pressure = last.pressure
