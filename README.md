@@ -498,3 +498,7 @@ pure fold. These are real engineering tools, not estimates.
 `python main.py` → banner · `~/.fullagent/config.json` → persistence · `FULLAGENT_HOME` → override
 
 </div>
+
+
+<!-- Push test: 2026-11-13T14:12:54Z -->
+Test push from Claude Code session.
