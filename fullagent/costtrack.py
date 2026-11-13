@@ -42,7 +42,6 @@ _FILENAME_RE = re.compile(r"[^A-Za-z0-9_.-]")
 # :func:`cost_of`).
 PRICING: Dict[str, tuple[float, float]] = {
     "deepseek-v4.1-flash-free": (0.0, 0.0),
-    "minimax-m3.1-flash-free": (0.0, 0.0),
 }
 
 USAGE = "usage:\n  /cost        show session token usage and estimated cost\n  /cost reset  clear this session's counters"

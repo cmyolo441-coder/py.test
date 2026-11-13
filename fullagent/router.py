@@ -42,9 +42,6 @@ MODEL_TABLE: dict[str, dict[str, Any]] = {
     "deepseek-v4.1-flash-free": {"capability": 0.95, "cost_in": 0.0,
                                  "cost_out": 0.0, "tools": True,
                                  "reasoning": True},
-    "minimax-m3.1-flash-free": {"capability": 0.9, "cost_in": 0.0,
-                                "cost_out": 0.0, "tools": True,
-                                "reasoning": True},
 }
 
 # the strongest model in the DEFAULT table — the escalation ceiling when no

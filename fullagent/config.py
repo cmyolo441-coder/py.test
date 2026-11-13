@@ -111,8 +111,11 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "deepseek-v4.1-flash-1017": 1_048_576,
     # upstream: google/gemini-4-argon (1,000,000-token window)
     "gemini-4-argon": 1_000_000,
-    # upstream: minimax/minimax-m3.1-flash:free (1,000,000-token window)
-    "minimax-m3.1-flash-free": 1_000_000,
+    # Mistral Large 4 model card (build.nvidia.com, 2026-11-13): 262,144
+    "mistralai/mistral-large-4-1t-a52b": 262_144,
+    "mistral-large-4": 262_144,
+    # no published served window yet: stay conservative
+    "ernie-5.5-flash-preview": 128_000,
 }
 # Default for models NOT in the table above: assume a small window rather
 # than risk a ~44s doomed request against an unknown cap. A request we can
@@ -222,6 +225,15 @@ PROVIDERS: dict[str, Provider] = {
         api_key=_provider_api_key("gwarden"),
         color="#bd93f9",
     ),
+    # NVIDIA API catalog (OpenAI-compatible). No key ships in the build:
+    # set NVIDIA_API_KEY or save it in ~/.fullagent/nvidia_api_key.
+    "nvidia": Provider(
+        key="nvidia",
+        name="NVIDIA API",
+        base_url="https://integrate.api.nvidia.com/v1",
+        api_key=_provider_api_key("nvidia"),
+        color="#76b900",
+    ),
 }
 
 MODELS: list[Model] = [
@@ -236,15 +248,23 @@ MODELS: list[Model] = [
     Model("gemini-4-argon", "gwarden", "Gemini 4 Argon",
           tag="gwarden", supports_tools=True, supports_reasoning=True,
           context_window=model_context_window("gemini-4-argon")),
+    # Kios routes (2026-11): exactly these three.
+    Model("mistral-large-4", "kios", "Mistral Large 4",
+          tag="kios", supports_tools=True,
+          context_window=model_context_window("mistral-large-4")),
+    Model("ernie-5.5-flash-preview", "kios", "ERNIE 5.5 Flash Preview",
+          tag="kios", supports_tools=True,
+          context_window=model_context_window("ernie-5.5-flash-preview")),
     Model("deepseek-v4.1-flash-free", "kios", "DeepSeek V4.1 Flash Free",
           tag="free", supports_tools=True, supports_reasoning=True,
           context_window=model_context_window("deepseek-v4.1-flash-free")),
-    Model("minimax-m3.1-flash-free", "kios", "MiniMax M3.1 Flash Free",
-          tag="free", supports_tools=True,
-          context_window=model_context_window("minimax-m3.1-flash-free")),
+    # NVIDIA catalog id confirmed on the public model list 2026-11-13
+    Model("mistralai/mistral-large-4-1t-a52b", "nvidia",
+          "Mistral Large 4 (NVIDIA)", tag="nvidia", supports_tools=True,
+          context_window=model_context_window(
+              "mistralai/mistral-large-4-1t-a52b")),
 ]
-# Fastest Kios free route measured 2026-10-21 (~1s first token vs ~3s for
-# MiniMax and ~40s for qwen3.8-flash-free): default to it.
+# Fastest route measured 2026-10-21: default to it.
 DEFAULT_MODEL_ID = "deepseek-v4.1-flash-1017"
 
 

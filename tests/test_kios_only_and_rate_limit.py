@@ -5,10 +5,14 @@ from fullagent.config import Model, Provider
 
 
 def test_configured_providers():
-    assert list(config.PROVIDERS) == ["kios", "gwarden"]
+    assert list(config.PROVIDERS) == ["kios", "gwarden", "nvidia"]
+    assert {m.id for m in config.MODELS if m.provider == "kios"} == {
+        "mistral-large-4", "ernie-5.5-flash-preview",
+        "deepseek-v4.1-flash-free"}
     assert {m.id for m in config.MODELS} == {
         "deepseek-v4.1-flash-1017", "gemini-4-argon",
-        "deepseek-v4.1-flash-free", "minimax-m3.1-flash-free"}
+        "mistral-large-4", "ernie-5.5-flash-preview",
+        "deepseek-v4.1-flash-free", "mistralai/mistral-large-4-1t-a52b"}
     assert config.DEFAULT_MODEL_ID == "deepseek-v4.1-flash-1017"
     gwarden = config.PROVIDERS["gwarden"]
     assert gwarden.base_url == "https://gwarden.su/v1"
@@ -123,3 +127,35 @@ def test_blocking_429_retries_and_closes_each_response(monkeypatch):
     assert session.calls == 2
     assert first.closed and second.closed
     assert waits == [0.0]
+
+
+def test_nvidia_provider_reads_key_from_environment_only(monkeypatch, tmp_path):
+    nvidia = config.PROVIDERS["nvidia"]
+    assert nvidia.base_url == "https://integrate.api.nvidia.com/v1"
+    assert "nvidia" not in config._EMBEDDED_KEYS, "no NVIDIA key may ship"
+    assert [m.id for m in config.MODELS if m.provider == "nvidia"] == [
+        "mistralai/mistral-large-4-1t-a52b"]
+    monkeypatch.setattr(config, "APP_DIR", tmp_path)
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    assert config._provider_api_key("nvidia") == ""
+    monkeypatch.setenv("NVIDIA_API_KEY", "  test-value  ")
+    assert config._provider_api_key("nvidia") == "test-value"
+    monkeypatch.delenv("NVIDIA_API_KEY")
+    (tmp_path / "nvidia_api_key").write_text("from-file\n")
+    assert config._provider_api_key("nvidia") == "from-file"
+
+
+def test_nvidia_without_key_gives_clear_error():
+    keyless = Provider(key="nvidia", name="NVIDIA API",
+                       base_url="https://integrate.api.nvidia.com/v1",
+                       api_key="", color="#76b900")
+    with pytest.raises(client.APIError, match="NVIDIA_API_KEY"):
+        client._check_api_key(keyless)
+
+
+def test_no_nvidia_key_in_source_tree():
+    import pathlib, re
+    root = pathlib.Path(config.__file__).resolve().parent.parent
+    pat = re.compile(r"nvapi-[A-Za-z0-9_-]{20,}")
+    for path in list(root.glob("fullagent/**/*.py")) + [root / "main.py"]:
+        assert not pat.search(path.read_text(errors="ignore")), path
