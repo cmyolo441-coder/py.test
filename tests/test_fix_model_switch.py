@@ -256,8 +256,16 @@ def test_typing_while_picker_open_never_switches_model(home):
 def test_deliberate_pick_is_announced_logged_and_shown(home):
     from prompt_toolkit.keys import Keys
 
+    import threading
+
+    def human_pause():  # a picker Enter is honoured only at human speed
+        threading.Event().wait(0.5)
+
     def body(ui):
-        _press(ui, Keys.ControlT, Keys.Down, Keys.Enter)
+        _press(ui, Keys.ControlT)       # a lone key, as a human presses it
+        _press(ui, Keys.Down)
+        human_pause()
+        _press(ui, Keys.Enter)
         assert ui.cfg.model_id == GEMINI
         assert ui._model().id == GEMINI          # status bar / header
         out = ui.output.getvalue()
@@ -268,7 +276,11 @@ def test_deliberate_pick_is_announced_logged_and_shown(home):
         assert changes[-1][1]["to"] == GEMINI
         # re-selecting the current model changes and logs nothing
         n = len(changes)
-        _press(ui, Keys.ControlT, Keys.Enter)
+        human_pause()
+        _press(ui, Keys.ControlT)
+        human_pause()
+        _press(ui, Keys.Enter)
+        assert "model unchanged" in ui._flash[0]
         assert ui.cfg.model_id == GEMINI
         assert len([a for a, _k in ui.agent.events
                     if a and a[0] == "model.changed"]) == n

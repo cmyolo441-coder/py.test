@@ -74,12 +74,16 @@ class ModelStaysPut(unittest.TestCase):
             self.assertTrue(_wait(lambda: len(calls) == 1
                                   and not ui._busy, 5))
             before = ui.cfg.model_id
+            threading.Event().wait(0.1)   # Ctrl+T as a lone, human key
             press(ui, Keys.ControlT)
             press(ui, Keys.Down)
+            # a picker Enter commits only once the menu was open a moment
+            # (fix_model_trigger) — a human-speed pause
+            threading.Event().wait(0.5)
             press(ui, Keys.ControlM)
             self.assertNotEqual(ui.cfg.model_id, before)
-            self.assertIn("you picked it in the Ctrl+T menu",
-                          ui.output.getvalue())
+            self.assertIn("chosen in the model menu (opened with Ctrl+T)",
+                          " ".join(ui.output.getvalue().split()))
             # nothing re-ran: the earlier message was not sent again
             threading.Event().wait(0.3)
             self.assertEqual(len(calls), 1)
@@ -93,7 +97,8 @@ class ModelStaysPut(unittest.TestCase):
             other = next(m for m in MODELS if m.id != ui.cfg.model_id)
             _submit(ui, f"/model {other.id}")
             self.assertTrue(_wait(lambda: ui.cfg.model_id == other.id, 3))
-            self.assertIn("you ran /model", ui.output.getvalue())
+            self.assertIn(f"set with /model {other.id}",
+                          " ".join(ui.output.getvalue().split()))
             threading.Event().wait(0.3)
             self.assertEqual(calls, [])
         run_with_ui(body, FakeManager(0))
