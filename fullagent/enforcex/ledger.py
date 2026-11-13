@@ -83,8 +83,24 @@ def sha256_hex(text: Any) -> str:
     if not isinstance(text, str):
         # attestation-style coercion: hash the canonical form of
         # non-string input instead of raising AttributeError on .encode
-        return hashlib.sha256(canonical_json(text).encode("utf-8")).hexdigest()
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+        text = canonical_json(text)
+    # surrogatepass: a payload string holding a lone surrogate (text
+    # decoded with surrogateescape) made seal() -- and so append() --
+    # raise UnicodeEncodeError despite the never-raises contract
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _jsonl_line(d: Dict[str, Any]) -> bytes:
+    """One on-disk JSONL record. Canonical UTF-8 normally; pure-ASCII
+    escapes when a lone surrogate cannot be encoded (json.loads restores
+    the exact string, so the entry hash still verifies on reload)."""
+    text = canonical_json(d)
+    try:
+        return (text + "\n").encode("utf-8")
+    except UnicodeEncodeError:
+        return (json.dumps(_sanitize(d), sort_keys=True,
+                           separators=(",", ":"), ensure_ascii=True,
+                           default=str, allow_nan=False) + "\n").encode("ascii")
 
 
 def _entry_hash(entry: Dict[str, Any]) -> str:
@@ -99,7 +115,9 @@ def merkle_root(hashes: Sequence[str]) -> str:
     Odd node counts promote the last node (duplicated) upward."""
     if not hashes:
         return GENESIS_HASH
-    level = [h.lstrip("0x") if isinstance(h, str) and h.startswith("0x")
+    # strip a literal "0x" prefix only: lstrip("0x") also ate leading
+    # zero digits, so "0x00ab" and "0xab" produced the same root
+    level = [h[2:] if isinstance(h, str) and h.startswith("0x")
              else str(h) for h in hashes]
     while len(level) > 1:
         nxt: List[str] = []
@@ -117,10 +135,13 @@ def merkle_root(hashes: Sequence[str]) -> str:
 class LedgerEntry:
     """One immutable enforcement event."""
     kind: str                          # decision | detection | score | event
-    ts: float                          # epoch seconds
-    seq: int                           # position in this ledger
-    prev_hash: str                     # previous entry's entry_sha256
-    payload: Dict[str, Any]            # opaque, JSON-serializable
+    # defaults let callers build a detached entry from kind + payload
+    # (foresight does LedgerEntry(kind=..., payload=...), which raised
+    # TypeError and was silently skipped)
+    ts: float = 0.0                    # epoch seconds
+    seq: int = 0                       # position in this ledger
+    prev_hash: str = GENESIS_HASH      # previous entry's entry_sha256
+    payload: Dict[str, Any] = field(default_factory=dict)  # JSON-serializable
     rule_id: str = ""
     severity: str = ""
     session_id: str = ""
@@ -177,15 +198,39 @@ class LedgerEntry:
         return _entry_hash(self.to_dict(without_hash=True)) == self.entry_sha256
 
 
-def verify_chain_dicts(dicts: Sequence[Dict[str, Any]]) -> Tuple[bool, str]:
+_ENTRY_KEYS = frozenset(("kind", "ts", "seq", "prev_hash", "payload",
+                         "rule_id", "severity", "session_id", "entry_sha256"))
+
+
+def _raw_matches_entry(raw: Any, entry: "LedgerEntry") -> bool:
+    """True when the raw record is exactly the sealed form of `entry`.
+
+    from_dict() drops unknown keys and coerces types, so without this
+    check a record with injected fields ("approved": true) or a
+    retyped value ("seq": "0") still verified as untampered.
+    """
+    if not isinstance(raw, dict) or not set(raw) <= _ENTRY_KEYS:
+        return False
+    try:
+        return canonical_json(raw) == canonical_json(entry.to_dict())
+    except Exception:
+        return False
+
+
+def verify_chain_dicts(dicts: Sequence[Dict[str, Any]], *,
+                       start_prev: str = GENESIS_HASH,
+                       start_seq: int = 0) -> Tuple[bool, str]:
     """Verify hash linkage + self-consistency over raw dicts.
-    Returns (ok, first_bad_reason)."""
+    Returns (ok, first_bad_reason). `start_prev` / `start_seq` anchor a
+    window that does not begin at genesis (a trimmed in-memory tail)."""
     if not isinstance(dicts, (list, tuple)):
         return False, "chain is not a list of dicts"
-    prev = GENESIS_HASH
-    expected_seq = 0
+    prev = start_prev
+    expected_seq = start_seq
     for i, raw in enumerate(dicts):
         entry = LedgerEntry.from_dict(raw)
+        if not _raw_matches_entry(raw, entry):
+            return False, f"entry {i}: fields do not match the sealed record"
         if entry.seq != expected_seq:
             return False, (f"entry {i}: seq {entry.seq} != expected "
                            f"{expected_seq}")
@@ -214,6 +259,19 @@ class Ledger:
         self._entries: List[LedgerEntry] = []
         self._seq: int = 0
         self._fh = None
+        # chain anchor of the in-memory window: genesis unless older
+        # entries were trimmed (memory cap) -- then the hash/seq the
+        # first retained entry must link to
+        self._anchor_prev: str = GENESIS_HASH
+        self._anchor_seq: int = 0
+        # on-disk repair state found by _load, applied on first write
+        self._repair_offset: Optional[int] = None
+        self._needs_newline = False
+        self._load_issue = ""
+        # entries sealed while the disk was unavailable, written (in
+        # order) on the next successful persist so the file never gets
+        # a hole in its hash chain
+        self._pending: List[LedgerEntry] = []
         if self.path and load_existing:
             self._load()
         # entries already on disk are trusted structurally; new appends
@@ -222,33 +280,88 @@ class Ledger:
     # ── loading ──────────────────────────────────────────────────────
 
     def _load(self) -> None:
+        entries: List[LedgerEntry] = []
         try:
-            with open(self.path, "r", encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    if len(line) > MAX_LINE_BYTES:
+            with open(self.path, "rb") as fh:
+                offset = 0
+                while True:
+                    bline = fh.readline(MAX_LINE_BYTES + 1)
+                    if not bline:
                         break
+                    if len(bline) > MAX_LINE_BYTES:
+                        self._repair_offset = offset
+                        break
+                    stripped = bline.strip()
+                    if not stripped:
+                        offset += len(bline)
+                        continue
                     try:
-                        raw = json.loads(line)
-                    except json.JSONDecodeError:
-                        break            # torn tail; keep what parsed
+                        raw = json.loads(stripped.decode("utf-8"))
+                    except (ValueError, UnicodeDecodeError):
+                        self._repair_offset = offset   # torn tail
+                        break
                     if not isinstance(raw, dict):
+                        self._repair_offset = offset
                         break
                     entry = LedgerEntry.from_dict(raw)
-                    self._entries.append(entry)
+                    if not self._load_issue and \
+                            not _raw_matches_entry(raw, entry):
+                        self._load_issue = (
+                            f"entry seq {entry.seq}: fields do not match "
+                            f"the sealed record")
+                    entries.append(entry)
+                    offset += len(bline)
+                    if not bline.endswith(b"\n"):
+                        self._needs_newline = True
         except FileNotFoundError:
             pass
         except (OSError, UnicodeDecodeError):
             pass
-        self._seq = len(self._entries)
-        # cap memory on absurd files
-        if len(self._entries) > self.max_entries:
-            self._entries = self._entries[-self.max_entries:]
-            self._seq = len(self._entries)
+        # cap memory on absurd files; keep the chain anchor of the
+        # retained window so verify() still works and new appends keep
+        # the on-disk seq numbering (it used to restart at max_entries,
+        # forking the file's chain and failing every verify)
+        if len(entries) > self.max_entries:
+            entries = entries[-self.max_entries:]
+            self._anchor_prev = entries[0].prev_hash
+            self._anchor_seq = entries[0].seq
+        self._entries = entries
+        self._seq = (entries[-1].seq + 1) if entries else 0
 
     # ── appending ────────────────────────────────────────────────────
+
+    def _repair_tail(self) -> None:
+        """Before the first append: move a torn/garbage tail found by
+        _load aside (to <path>.corrupt) and cut the file back to its
+        last good record. Appending after a torn line used to bury it
+        mid-file, so every later reload stopped there and silently lost
+        all entries written after it."""
+        if self._repair_offset is None and not self._needs_newline:
+            return
+        try:
+            with open(self.path, "r+b") as fh:
+                if self._repair_offset is not None:
+                    fh.seek(self._repair_offset)
+                    garbage = fh.read()
+                    if garbage:
+                        try:
+                            with open(self.path + CORRUPT_BACKUP_SUFFIX,
+                                      "ab") as bak:
+                                bak.write(garbage)
+                        except OSError:
+                            pass
+                    fh.truncate(self._repair_offset)
+                    fh.seek(0, os.SEEK_END)
+                if fh.tell() > 0:
+                    fh.seek(-1, os.SEEK_END)
+                    if fh.read(1) != b"\n":
+                        fh.write(b"\n")
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return          # retry on the next open
+        self._repair_offset = None
+        self._needs_newline = False
 
     def _open_fh(self):
         if self._fh is None and self.path:
@@ -258,61 +371,114 @@ class Ledger:
                     os.makedirs(parent, exist_ok=True)
                 except OSError:
                     return None
+            self._repair_tail()
             try:
-                self._fh = open(self.path, "a", encoding="utf-8")
+                self._fh = open(self.path, "ab")
             except OSError:
                 return None
         return self._fh
 
-    def _persist(self, entry: LedgerEntry) -> None:
+    def _persist(self, entry: Optional[LedgerEntry]) -> bool:
+        """Write pending entries plus `entry`; True when all reached the
+        file. A failed write is cut back so no torn line is left."""
+        if entry is not None:
+            self._pending.append(entry)
+        if not self._pending:
+            return True
         fh = self._open_fh()
         if fh is None:
-            return                      # memory-only; never crash caller
+            self._trim_pending()
+            return False                # memory-only; never crash caller
         try:
-            fh.write(canonical_json(entry.to_dict()) + "\n")
+            pos = fh.tell()
+        except OSError:
+            pos = None
+        try:
+            fh.write(b"".join(_jsonl_line(e.to_dict()) for e in self._pending))
             fh.flush()
             if self.fsync:
                 os.fsync(fh.fileno())
-        except OSError:
-            pass                        # disk trouble degrades to memory
+        except (OSError, ValueError):
+            try:
+                if pos is not None:
+                    fh.truncate(pos)
+            except (OSError, ValueError):
+                pass
+            try:
+                fh.close()
+            except (OSError, ValueError):
+                pass
+            self._fh = None
+            self._trim_pending()
+            return False                # disk trouble degrades to memory
+        self._pending.clear()
+        return True
+
+    def _trim_pending(self) -> None:
+        if len(self._pending) > self.max_entries:
+            del self._pending[:-self.max_entries]
+
+    def _trim_memory(self) -> None:
+        """Bound the in-memory window: the ledger is append-only, so
+        without this every entry of a long session stayed in RAM."""
+        slack = max(1, self.max_entries // 10)
+        if len(self._entries) > self.max_entries + slack:
+            drop = len(self._entries) - self.max_entries
+            self._anchor_prev = self._entries[drop - 1].entry_sha256
+            self._anchor_seq = self._entries[drop].seq
+            del self._entries[:drop]
 
     def append(self, kind: str, payload: Dict[str, Any], *,
                rule_id: str = "", severity: str = "",
                session_id: str = "", ts: Optional[float] = None,
                require_disk: bool = False) -> Optional[LedgerEntry]:
-        """Seal and append one entry. Returns the sealed entry, or None
-        if require_disk and persistence failed. Never raises otherwise."""
+        """Seal and append one entry. Returns the sealed entry; raises
+        LedgerError only when require_disk and persistence failed.
+        Never raises otherwise."""
         if not isinstance(payload, dict):
             payload = {"raw": str(payload)}
+        try:
+            ts_v = float(ts) if ts is not None else time.time()
+        except (TypeError, ValueError, OverflowError):
+            ts_v = time.time()
+        if ts_v != ts_v or ts_v in (float("inf"), float("-inf")):
+            # a NaN ts was hashed as null but reloaded as 0.0, so the
+            # entry could never verify again
+            ts_v = time.time()
         with self._lock:
+            if self._entries:
+                prev_hash = self._entries[-1].entry_sha256
+            else:
+                prev_hash = self._anchor_prev
             entry = LedgerEntry(
                 kind=str(kind or "event"),
-                ts=float(ts) if ts is not None else time.time(),
+                ts=ts_v,
                 seq=self._seq,
-                prev_hash=(self._entries[-1].entry_sha256
-                           if self._entries else GENESIS_HASH),
+                prev_hash=prev_hash,
                 payload=payload,
                 rule_id=str(rule_id or ""),
                 severity=str(severity or ""),
                 session_id=str(session_id or ""),
             )
             entry.seal()
-            # belt & braces: seq/prev must already be right, but if the
-            # caller supplied an explicit ts that reorders entries, the
-            # chain still holds because ts is inside the hash.
+            if require_disk:
+                parent_ok = bool(self.path) and os.path.isdir(
+                    os.path.dirname(os.path.abspath(self.path)) or ".")
+                if not parent_ok:
+                    # nothing written, nothing appended: the old code
+                    # created the directory, wrote the line and only
+                    # then rolled back memory, leaving a duplicate seq
+                    # on disk for the next append
+                    raise LedgerError(f"cannot persist ledger at {self.path}")
+                if not self._persist(entry):
+                    if self._pending and self._pending[-1] is entry:
+                        self._pending.pop()
+                    raise LedgerError(f"cannot persist ledger at {self.path}")
+            elif self.path:
+                self._persist(entry)
             self._entries.append(entry)
             self._seq += 1
-            before_ok = os.path.isdir(os.path.dirname(
-                os.path.abspath(self.path))) if self.path else True
-            self._persist(entry)
-            if require_disk:
-                fh = self._fh
-                if fh is None or not before_ok:
-                    # roll back the in-memory append so callers see a
-                    # consistent (unchanged) ledger after the failure
-                    self._entries.pop()
-                    self._seq -= 1
-                    raise LedgerError(f"cannot persist ledger at {self.path}")
+            self._trim_memory()
             return entry
 
     # convenience appenders -----------------------------------------------
@@ -347,7 +513,12 @@ class Ledger:
         """Full integrity check. Returns (ok, reason, merkle_root)."""
         with self._lock:
             dicts = [e.to_dict() for e in self._entries]
-        ok, reason = verify_chain_dicts(dicts)
+            anchor_prev, anchor_seq = self._anchor_prev, self._anchor_seq
+            load_issue = self._load_issue
+        ok, reason = verify_chain_dicts(dicts, start_prev=anchor_prev,
+                                        start_seq=anchor_seq)
+        if ok and load_issue:
+            ok, reason = False, load_issue
         root = self.merkle()
         return ok, reason, root
 
@@ -430,17 +601,30 @@ class Ledger:
     # ── compaction ───────────────────────────────────────────────────
 
     def compact(self, keep_last: int = 0,
-                new_path: Optional[str] = None) -> Dict[str, Any]:
+                new_path: Optional[str] = None, *,
+                force: bool = False) -> Dict[str, Any]:
         """Rewrite the ledger, keeping only the last `keep_last` entries
         (0 = all) re-chained from genesis, so the compacted file is
         fully verifiable on its own. Writes to new_path or replaces the
-        current file atomically. Returns a summary dict."""
+        current file atomically. Returns a summary dict.
+
+        The chain is verified first: resealing a tampered chain would
+        launder the tampering into a freshly valid file, so a broken
+        chain is refused unless ``force=True``. After compacting to
+        ``new_path`` the ledger continues in that file (appending to the
+        old file would chain onto entries it does not contain)."""
         keep_last = max(0, int(keep_last))
         target = os.fspath(new_path) if new_path else self.path
         if not target:
             return {"compacted": 0, "reason": "memory-only ledger"}
 
+        # one critical section: an append between the snapshot and the
+        # file replace used to be written to the old file and lost
         with self._lock:
+            ok, reason, _root = self.verify()
+            if not ok and not force:
+                return {"compacted": 0,
+                        "reason": f"chain verification failed: {reason}"}
             keep = list(self._entries[-keep_last:] if keep_last
                         else self._entries)
             resealed: List[LedgerEntry] = []
@@ -454,35 +638,37 @@ class Ledger:
                 resealed.append(fresh)
                 prev = fresh.entry_sha256
 
-        directory = os.path.dirname(os.path.abspath(target)) or "."
-        tmp_path = target + ".compact.tmp"
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as fh:
-                for e in resealed:
-                    fh.write(canonical_json(e.to_dict()) + "\n")
-                fh.flush()
-                os.fsync(fh.fileno())
-            if new_path:
-                os.replace(tmp_path, new_path)
-            else:
-                # close our handle before replacing under us
+            tmp_path = target + ".compact.tmp"
+            try:
+                with open(tmp_path, "wb") as fh:
+                    for e in resealed:
+                        fh.write(_jsonl_line(e.to_dict()))
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                # close our handle before replacing / switching files
                 if self._fh is not None:
                     try:
                         self._fh.close()
                     except OSError:
                         pass
                     self._fh = None
-                os.replace(tmp_path, self.path)
-        except OSError as exc:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            return {"compacted": 0, "reason": f"write failed: {exc}"}
+                os.replace(tmp_path, target)
+            except OSError as exc:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                return {"compacted": 0, "reason": f"write failed: {exc}"}
 
-        with self._lock:
+            self.path = target
             self._entries = resealed
             self._seq = len(resealed)
+            self._anchor_prev = GENESIS_HASH
+            self._anchor_seq = 0
+            self._pending = []
+            self._repair_offset = None
+            self._needs_newline = False
+            self._load_issue = ""
         return {"compacted": len(resealed), "path": target,
                 "merkle": merkle_root([e.entry_sha256 for e in resealed])}
 
@@ -512,7 +698,7 @@ class Ledger:
                 entry.prev_hash = prev   # tolerate genesis-less exports
             led._entries.append(entry)
             prev = entry.entry_sha256 or prev
-        led._seq = len(led._entries)
+        led._seq = (led._entries[-1].seq + 1) if led._entries else 0
         if verify:
             led._verified = verify_chain_dicts(
                 [e.to_dict() for e in led._entries])

@@ -37,9 +37,11 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import tempfile
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -67,6 +69,26 @@ LOCK_TIMEOUT = 5.0        # seconds before a stale lockfile is stolen
 LOCK_RETRY_DELAY = 0.05   # seconds between O_EXCL retries
 LOCK_STALE_AGE = 30.0     # lockfiles older than this are always stolen
 CORRUPT_BACKUP_SUFFIX = ".corrupt"
+
+
+try:
+    _HOSTNAME = socket.gethostname()
+except Exception:  # pragma: no cover
+    _HOSTNAME = ""
+
+
+def _pid_alive(pid: int) -> bool:
+    """True unless `pid` certainly does not exist on this host."""
+    if pid == os.getpid() or os.name != "posix":
+        # on Windows os.kill(pid, 0) is CTRL_C_EVENT, not a probe
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError, OverflowError, ValueError):
+        return True
+    return True
 
 
 class StoreError(Exception):
@@ -219,6 +241,12 @@ class RuleStore:
         self._lock = threading.RLock()
         self._doc: dict | None = None
         self._loaded = False
+        # re-entrant cross-process lock bookkeeping (owner thread + depth)
+        # so `with store: store.save_spec(...)` does not wait on its own
+        # lockfile until lock_timeout and then raise StoreError
+        self._lock_depth = 0
+        self._lock_owner: int | None = None
+        self._lock_token = ""
         parent = os.path.dirname(os.path.abspath(self.path))
         if parent and not os.path.isdir(parent):
             raise StoreError(f"store directory missing: {parent}")
@@ -244,9 +272,14 @@ class RuleStore:
                 raw = json.load(fh)
         except FileNotFoundError:
             raw = None
-        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+        except (json.JSONDecodeError, UnicodeDecodeError):
             raw = None
             self._quarantine_corrupt()
+        except OSError:
+            # EACCES / EISDIR / EIO are not corruption: moving the user's
+            # store aside on a transient read error lost it on the next
+            # write. Read soft as empty, leave the file where it is.
+            raw = None
         if isinstance(raw, dict):
             doc["specs"] = (raw.get("specs")
                             if isinstance(raw.get("specs"), dict) else {})
@@ -263,6 +296,9 @@ class RuleStore:
         try:
             if os.path.exists(self.path):
                 backup = self.path + CORRUPT_BACKUP_SUFFIX
+                if os.path.exists(backup):
+                    # never overwrite an earlier quarantined copy
+                    backup = f"{backup}.{int(time.time() * 1000)}"
                 os.replace(self.path, backup)
         except OSError:
             pass
@@ -294,16 +330,28 @@ class RuleStore:
     def _acquire_lock(self) -> None:
         """Create the lockfile atomically; steal it if stale.
 
-        Raises StoreError only after `lock_timeout` of a live
-        competitor's lock — in that case the caller must skip writing.
+        Re-entrant for the owning thread of this instance. Raises
+        StoreError only after `lock_timeout` of a live competitor's
+        lock — in that case the caller must skip writing.
         """
+        me = threading.get_ident()
+        with self._lock:
+            if self._lock_depth > 0 and self._lock_owner == me:
+                self._lock_depth += 1
+                return
+        token = f"{os.getpid()}-{uuid.uuid4().hex}"
         deadline = time.monotonic() + self.lock_timeout
         while True:
             try:
                 fd = os.open(self.lock_path,
                              os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    fh.write(f"{os.getpid()}\n{time.time()}\n")
+                    fh.write(f"{os.getpid()}\n{time.time()}\n{token}\n"
+                             f"{_HOSTNAME}\n")
+                with self._lock:
+                    self._lock_token = token
+                    self._lock_owner = me
+                    self._lock_depth = 1
                 return
             except FileExistsError:
                 self._steal_stale_lock()
@@ -314,15 +362,62 @@ class RuleStore:
             except OSError as exc:
                 raise StoreError(f"lock failed: {exc}") from exc
 
-    def _steal_stale_lock(self) -> None:
+    def _read_lock_info(self) -> list:
         try:
-            age = time.time() - os.path.getmtime(self.lock_path)
-            if age > LOCK_STALE_AGE:
+            with open(self.lock_path, "r", encoding="utf-8",
+                      errors="replace") as fh:
+                return fh.read(4096).splitlines()
+        except OSError:
+            return []
+
+    def _steal_stale_lock(self) -> None:
+        """Remove a lock left by a crashed writer.
+
+        Stolen when older than LOCK_STALE_AGE, or immediately when it
+        names a process on this host that no longer exists (before, a
+        crashed writer blocked every write for 30s, i.e. every write
+        failed with StoreError since LOCK_TIMEOUT < LOCK_STALE_AGE).
+        """
+        try:
+            st = os.stat(self.lock_path)
+        except OSError:
+            return
+        stale = (time.time() - st.st_mtime) > LOCK_STALE_AGE
+        if not stale:
+            info = self._read_lock_info()
+            host = info[3].strip() if len(info) > 3 else ""
+            try:
+                pid = int(info[0].strip()) if info else 0
+            except ValueError:
+                pid = 0
+            if pid > 0 and (not host or host == _HOSTNAME) \
+                    and not _pid_alive(pid):
+                stale = True
+        if not stale:
+            return
+        try:
+            # only unlink the exact file we judged stale (narrows the
+            # race with a competitor that just re-created the lock)
+            st2 = os.stat(self.lock_path)
+            if (st2.st_ino, st2.st_mtime_ns) == (st.st_ino, st.st_mtime_ns):
                 os.unlink(self.lock_path)
         except OSError:
             pass
 
     def _release_lock(self) -> None:
+        with self._lock:
+            if self._lock_depth > 1 and \
+                    self._lock_owner == threading.get_ident():
+                self._lock_depth -= 1
+                return
+            token = self._lock_token
+            self._lock_depth = 0
+            self._lock_owner = None
+            self._lock_token = ""
+        if token:
+            info = self._read_lock_info()
+            if len(info) > 2 and info[2].strip() != token:
+                return      # our lock was stolen; never delete theirs
         try:
             os.unlink(self.lock_path)
         except OSError:
@@ -444,8 +539,9 @@ class RuleStore:
 
     @staticmethod
     def _append_history_locked(doc: dict, event: dict) -> None:
-        if not isinstance(event, dict):
-            event = {"event": str(event)}
+        # copy: the caller's dict must not be mutated (ts injected)
+        event = dict(event) if isinstance(event, dict) \
+            else {"event": str(event)}
         event.setdefault("ts", round(time.time(), 3))
         doc["history"].append(event)
         del doc["history"][:-HISTORY_LIMIT]
@@ -453,7 +549,13 @@ class RuleStore:
     # context-manager sugar: exclusive batch updates
     def __enter__(self) -> "RuleStore":
         self._lock.acquire()
-        self._acquire_lock()
+        try:
+            self._acquire_lock()
+        except BaseException:
+            # a lock timeout used to leave the RLock held forever,
+            # deadlocking every other thread using this store
+            self._lock.release()
+            raise
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
