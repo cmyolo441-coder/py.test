@@ -19,6 +19,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,10 @@ _SKIP_DIRS = {
     ".tox", ".venv", "venv", ".env", "node_modules", "dist", "build",
     "target", ".idea", ".vscode", ".DS_Store", "coverage", ".next",
 }
+
+# Line counting reads at most this many bytes per file: a multi-GB
+# generated/vendored source file must not stall /init.
+_MAX_COUNT_BYTES = 8 * 1024 * 1024
 
 # filename (lowercased) -> display label for key files
 _KEY_FILES: dict[str, str] = {
@@ -130,6 +135,13 @@ def analyze_project(root: str | Path = ".") -> dict:
         if ext in (".py", ".js", ".ts", ".go", ".rs", ".java", ".rb", ".c",
                    ".cpp", ".sh"):
             try:
+                # regular files only: open() on a FIFO (or a symlink to
+                # one, or to a device) named like a source file blocked
+                # /init forever
+                st = os.stat(root / rel)
+                if not stat.S_ISREG(st.st_mode) \
+                        or st.st_size > _MAX_COUNT_BYTES:
+                    continue
                 with open(root / rel, "r", encoding="utf-8",
                           errors="ignore") as fh:
                     n = sum(1 for _ in fh)
@@ -160,9 +172,16 @@ def analyze_project(root: str | Path = ".") -> dict:
     }
 
 
+def _by_depth(key_files: list[str]) -> list[str]:
+    """Shallowest first: a nested manifest (docs/package.json,
+    examples/x/pyproject.toml) must not name the project just because
+    os.walk happened to list it first."""
+    return sorted(key_files, key=lambda kf: (kf.count("/"), kf))
+
+
 def _detect_name(root: Path, key_files: list[str]) -> str:
     """Best-effort project name: pyproject/package.json/go.mod, else dir."""
-    for kf in key_files:
+    for kf in _by_depth(key_files):
         if kf.endswith("pyproject.toml"):
             try:
                 txt = (root / kf).read_text(encoding="utf-8", errors="ignore")
@@ -203,7 +222,7 @@ def _detect_commands(root: Path, key_files: list[str]) -> tuple[list[str], list[
         if cmd and cmd not in cmds:
             cmds.append(cmd)
 
-    for kf in key_files:
+    for kf in _by_depth(key_files):
         p = root / kf
         if kf.endswith("pyproject.toml"):
             try:
@@ -417,17 +436,46 @@ def generate_agents_md(analysis: dict) -> str:
 # Agent tool registration
 # ---------------------------------------------------------------------------
 
+def _atomic_write(path: Path, text: str) -> None:
+    """Write via a temp file + os.replace: a crash / full disk mid-write
+    used to leave a truncated AGENTS.md behind (and clobber a good one)."""
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent),
+                               prefix="." + path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _init_project_handler(path: str = ".", output: str = "AGENTS.md") -> str:
     """Handler behind the InitProject tool: analyze + write file."""
-    root = Path(path).resolve()
+    root = Path(path or ".").resolve()
     if not root.is_dir():
         return f"error: not a directory: {path}"
+    output = str(output or "AGENTS.md")
     out = (root / output) if not Path(output).is_absolute() else Path(output)
+    # The tool is model-driven: confine the write to the analysed project.
+    # "../../.bashrc", an absolute path elsewhere, or a symlink pointing
+    # out of the tree used to be written straight through.
+    try:
+        resolved = out.resolve()
+    except (OSError, RuntimeError) as e:
+        return f"error: bad output path {output!r}: {e}"
+    if resolved == root or root not in resolved.parents:
+        return (f"error: output must be a file inside {root} "
+                f"(got {output!r})")
+    out = resolved
     try:
         out.parent.mkdir(parents=True, exist_ok=True)
         analysis = analyze_project(root)
         doc = generate_agents_md(analysis)
-        out.write_text(doc, encoding="utf-8")
+        _atomic_write(out, doc)
     except OSError as e:
         return f"error: could not write {out}: {e}"
     top = next(iter(analysis["languages"]), "unknown")
@@ -467,7 +515,8 @@ def run_init_command(ui: Any, arg: str) -> None:
     """
     root = Path.cwd()
     target = root / "AGENTS.md"
-    force = arg.strip().lower() in ("overwrite", "--force", "-f", "force")
+    force = (arg or "").strip().lower() in ("overwrite", "--force", "-f",
+                                            "force")
 
     if target.exists() and not force:
         ui.print_info(
@@ -478,7 +527,7 @@ def run_init_command(ui: Any, arg: str) -> None:
     try:
         analysis = analyze_project(root)
         doc = generate_agents_md(analysis)
-        target.write_text(doc, encoding="utf-8")
+        _atomic_write(target, doc)
     except OSError as e:
         ui.print_error(f"/init failed: {e}")
         return
@@ -535,6 +584,11 @@ def _selftest() -> None:
         res = tool.handler(path=str(tmp / "repo"), output="CLAUDE.md")
         assert res.startswith("wrote ")
         assert (tmp / "repo" / "CLAUDE.md").exists()
+
+        # writes are confined to the project tree
+        esc = tool.handler(path=str(tmp / "repo"), output="../escape.md")
+        assert esc.startswith("error:"), esc
+        assert not (tmp / "escape.md").exists()
 
         print("PASS")
     finally:

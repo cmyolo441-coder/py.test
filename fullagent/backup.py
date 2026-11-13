@@ -74,9 +74,27 @@ def _fmt_size(n: int) -> str:
     return f"{n:.1f} GB"
 
 
-def _iter_backup_files(app_dir: Path) -> List[Tuple[Path, str]]:
+def _unsafe_link(full: Path) -> bool:
+    """True for a symlink whose target is absolute or climbs with "..".
+
+    restore_backup() rejects such members (they could write outside the
+    app dir), so archiving one made the WHOLE backup unrestorable — one
+    `~/.fullagent/x -> /abs/path` link silently turned every later backup
+    into a dead file. They are skipped (and listed in the manifest)."""
+    try:
+        target = Path(os.readlink(full))
+    except OSError:
+        return True
+    return target.is_absolute() or ".." in target.parts
+
+
+def _iter_backup_files(app_dir: Path,
+                       skipped: Optional[List[str]] = None
+                       ) -> List[Tuple[Path, str]]:
     """Return ``[(absolute path, archive name)]`` for everything under
-    *app_dir* except the excluded top-level dirs."""
+    *app_dir* except the excluded top-level dirs. Symlinks are archived AS
+    links (never followed); unsafe ones are left out and their names are
+    appended to *skipped*."""
     out: List[Tuple[Path, str]] = []
     for root, dirs, names in os.walk(app_dir):
         root_p = Path(root)
@@ -87,7 +105,13 @@ def _iter_backup_files(app_dir: Path) -> List[Tuple[Path, str]]:
         for name in sorted(names):
             full = root_p / name
             arcname = (root_p / name).relative_to(app_dir).as_posix()
-            if full.is_file() or full.is_symlink():
+            if full.is_symlink():
+                if _unsafe_link(full):
+                    if skipped is not None:
+                        skipped.append(arcname)
+                    continue
+                out.append((full, arcname))
+            elif full.is_file():
                 out.append((full, arcname))
     return out
 
@@ -111,13 +135,16 @@ def create_backup(app_dir: Optional[Path] = None) -> Dict[str, Any]:
         dest = bdir / f"backup-{ts}-{i}.tar.gz"
         i += 1
 
-    files = _iter_backup_files(app_dir)
+    skipped_links: List[str] = []
+    files = _iter_backup_files(app_dir, skipped_links)
     manifest = {
         "version": BACKUP_VERSION,
         "created": datetime.now().isoformat(timespec="seconds"),
         "app_dir": str(app_dir),
         "files": [arc for _, arc in files],
     }
+    if skipped_links:
+        manifest["skipped_unsafe_links"] = skipped_links
     manifest_bytes = json.dumps(manifest, indent=2).encode("utf-8")
 
     # Write to a temp file and rename on success: a crash or full disk
@@ -162,9 +189,15 @@ def list_backups(app_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
     """List backups with size + date, newest first."""
     bdir = _backups_dir(app_dir)
     out: List[Dict[str, Any]] = []
-    for p in sorted(bdir.glob("backup-*.tar.gz"),
-                    key=lambda q: q.stat().st_mtime, reverse=True):
-        st = p.stat()
+    stats = []
+    for p in bdir.glob("backup-*.tar.gz"):
+        try:
+            # a backup deleted between glob() and stat() used to raise
+            # FileNotFoundError out of the sort key and kill the listing
+            stats.append((p, p.stat()))
+        except OSError:
+            continue
+    for p, st in sorted(stats, key=lambda ps: ps[1].st_mtime, reverse=True):
         out.append({
             "name": p.name,
             "path": str(p),
@@ -217,6 +250,36 @@ def _safe_members(tar: tarfile.TarFile) -> Tuple[List[tarfile.TarInfo],
             continue
         members.append(m)
     return members, problems
+
+
+def _install_atomic(member: tarfile.TarInfo, src: Path, dst: Path) -> None:
+    """Put one restored entry in place with a single os.replace().
+
+    The old code copied straight onto the destination: a crash mid-copy
+    left a truncated config/session file, and when the destination was an
+    existing symlink copy2() wrote THROUGH it — to wherever it pointed,
+    possibly outside the app dir. Now the entry is staged next to dst and
+    renamed over it, so dst is always either the old or the new entry and
+    a link at dst is replaced, never followed."""
+    fd, tmp_name = tempfile.mkstemp(dir=str(dst.parent),
+                                    prefix="." + dst.name + ".",
+                                    suffix=".restore")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        if member.issym():
+            tmp_path.unlink()
+            os.symlink(member.linkname, tmp_path)
+        else:
+            shutil.copy2(src, tmp_path, follow_symlinks=False)
+        os.replace(tmp_path, dst)
+    except BaseException:
+        try:
+            if tmp_path.is_symlink() or tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def restore_backup(ref: str, confirm: bool = False,
@@ -301,18 +364,14 @@ def restore_backup(ref: str, confirm: bool = False,
         try:
             for member, src, dst in targets:
                 dst.parent.mkdir(parents=True, exist_ok=True)
-                if member.issym():
-                    if dst.is_symlink() or dst.exists():
-                        dst.unlink()
-                    dst.symlink_to(member.linkname)
-                else:
-                    if dst.is_dir() and not dst.is_symlink():
-                        # copy2() into a directory silently writes
-                        # src's basename inside it instead of failing;
-                        # refuse rather than restore to a wrong path.
-                        raise IsADirectoryError(
-                            f"destination is a directory: {dst}")
-                    shutil.copy2(src, dst)
+                if dst.is_dir() and not dst.is_symlink():
+                    # copy2() into a directory silently writes src's
+                    # basename inside it instead of failing (and unlink()
+                    # of a dir fails half-way); refuse rather than restore
+                    # to a wrong path.
+                    raise IsADirectoryError(
+                        f"destination is a directory: {dst}")
+                _install_atomic(member, src, dst)
                 restored += 1
         except OSError as e:
             # E.g. the destination is a directory where the backup has

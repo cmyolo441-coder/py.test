@@ -206,6 +206,12 @@ class Healer:
 
     def heal(self, error_text: str, context: str = "") -> HealReport:
         """Run the full capture -> classify -> fix -> retry -> lesson loop."""
+        # tool results are not guaranteed str (None / bytes / dict from a
+        # misbehaving handler): error_text[:300] used to raise TypeError
+        if not isinstance(error_text, str):
+            error_text = "" if error_text is None else str(error_text)
+        if not isinstance(context, str):
+            context = "" if context is None else str(context)
         diag = classify(error_text)
         self.log.append("heal.captured",
                         {"error": error_text[:300], "context": context[:200],

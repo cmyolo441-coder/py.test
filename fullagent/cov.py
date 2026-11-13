@@ -36,12 +36,16 @@ _log = get_logger("cov")
 # Executable lines from the AST
 # ---------------------------------------------------------------------------
 
+# ast.Global / ast.Nonlocal are deliberately absent: they are compile-time
+# declarations that emit no bytecode, so no line event can ever fire for
+# them and they used to be reported as permanently "missed" (a function
+# with `global x` could never reach 100%).
 _STATEMENTS = (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Return,
                ast.Delete, ast.Raise, ast.Assert, ast.Import,
                ast.ImportFrom, ast.If, ast.For, ast.While, ast.Try,
                ast.With, ast.Expr, ast.Pass, ast.Break, ast.Continue,
-               ast.Global, ast.Nonlocal, ast.FunctionDef,
-               ast.AsyncFunctionDef, ast.ClassDef)
+               ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+               ast.AsyncFor, ast.AsyncWith)
 _STATEMENTS += (ast.Match,) if hasattr(ast, "Match") else ()  # py3.10+
 
 
@@ -53,11 +57,22 @@ def executable_lines(source: str) -> set[int]:
         tree = ast.parse(source)
     except SyntaxError:
         return set()
+    # A FUNCTION docstring is stored in co_consts and never executes (no
+    # line event), unlike module/class docstrings, which are assigned to
+    # __doc__ at run time. Counting it made every documented function
+    # show its docstring line as missed.
+    func_docstrings: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and node.body:
+            first = node.body[0]
+            if isinstance(first, ast.Expr) and isinstance(
+                    getattr(first, "value", None), ast.Constant) \
+                    and isinstance(first.value.value, str):
+                func_docstrings.add(id(first))
     lines: set[int] = set()
     for node in ast.walk(tree):
-        if isinstance(node, _STATEMENTS):
-            # a bare string Expr as the first body item is a docstring —
-            # it does execute, but we keep it simple and count it
+        if isinstance(node, _STATEMENTS) and id(node) not in func_docstrings:
             if hasattr(node, "lineno"):
                 lines.add(node.lineno)
     return lines
@@ -125,10 +140,20 @@ class CoverageEngine:
                 resolved[fn] = r
             return r == target_str
 
-        def tracer(frame, event, arg):
-            if event == "line" and _matches(frame.f_code.co_filename):
+        def local_tracer(frame, event, arg):
+            if event == "line":
                 hit.add(frame.f_lineno)
-            return tracer
+            return local_tracer
+
+        def tracer(frame, event, arg):
+            # global trace function: only frames OF THE TARGET FILE get a
+            # local (per-line) tracer. Returning a tracer for every frame
+            # of every module (the old code) fired a Python callback on
+            # every executed line of the whole program — subjects ran
+            # many times slower and kept doing so in threads they spawned.
+            if event == "call" and _matches(frame.f_code.co_filename):
+                return local_tracer
+            return None
 
         old_trace = sys.gettrace()
         old_thread_trace = threading.gettrace()

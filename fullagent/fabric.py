@@ -91,7 +91,18 @@ class KnowledgeFabric:
             raise ValueError("subject, predicate and object are "
                              "all required")
         now = time.time()
-        start = valid_from if valid_from is not None else now
+        if valid_from is None:
+            start = now
+        else:
+            # a string/None-ish timestamp stored verbatim crashed every
+            # later live()/sort comparison with TypeError
+            try:
+                start = float(valid_from)
+            except (TypeError, ValueError):
+                raise ValueError(f"valid_from must be a number, got "
+                                 f"{valid_from!r}") from None
+            if start != start:          # NaN never compares as live
+                raise ValueError("valid_from must not be NaN")
         # history() formats confidence with %.2f: a non-numeric
         # confidence (e.g. "high" from a caller) was stored verbatim
         # and crashed history() later with ValueError. Coerce here,
@@ -113,6 +124,16 @@ class KnowledgeFabric:
         # (future-dated) or that shares the exact start timestamp keeps its
         # window, so genuine overlaps still surface via contradictions().
         key = (subject, predicate)
+        for old in self._sp_index.get(key, ()):
+            if old.obj == obj and old.valid_to == _INFINITY \
+                    and old.valid_from <= start:
+                # re-asserting a fact that is already open-ended live
+                # adds nothing: the old code appended a duplicate every
+                # time, so a repeated assert grew the fabric (and every
+                # query result) without bound
+                if confidence > old.confidence:
+                    old.confidence = confidence
+                return old
         for old in self._sp_index.get(key, ()):
             if old.obj != obj and old.valid_to == _INFINITY \
                     and old.valid_from < start:
@@ -159,13 +180,16 @@ class KnowledgeFabric:
         """Live facts on the same (s, p) with different objects — only
         possible via explicit overlapping valid-times (e.g. a future-
         dated assert). Surfaced, never hidden."""
-        live = [f for f in self.facts if f.live(at)]
+        # pairs only ever form within one (s, p) — compare per index
+        # bucket instead of all live facts against all (O(n^2) overall)
+        t = time.time() if at is None else at
         out = []
-        for i, a in enumerate(live):
-            for b in live[i + 1:]:
-                if (a.subject, a.predicate) == (b.subject, b.predicate) \
-                        and a.obj != b.obj:
-                    out.append((a, b))
+        for bucket in self._sp_index.values():
+            live = [f for f in bucket if f.live(t)]
+            for i, a in enumerate(live):
+                for b in live[i + 1:]:
+                    if a.obj != b.obj:
+                        out.append((a, b))
         return out
 
     # -- reporting ---------------------------------------------------------------------

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -78,6 +79,10 @@ class DualProcess:
         self.brain = brain
         self.bar = bar
         self.cache: OrderedDict[str, tuple[str, float, bool]] = OrderedDict()
+        # ask() may run from several turn/worker threads: get() then
+        # move_to_end() raced with another thread's LRU eviction
+        # (KeyError), and the OrderedDict itself is not thread-safe
+        self._cache_lock = threading.Lock()
         self.stats = {"system1": 0, "system2": 0, "cache_hits": 0,
                       "escalations": 0}
 
@@ -94,10 +99,11 @@ class DualProcess:
     def _cache_put(self, key: str, value: tuple[str, float, bool]) -> None:
         """Insert/update with LRU semantics and a hard cap. Prevents the
         cache from growing without bound (DoS via unique-questions loop)."""
-        self.cache[key] = value
-        self.cache.move_to_end(key)
-        while len(self.cache) > _CACHE_MAX:
-            self.cache.popitem(last=False)
+        with self._cache_lock:
+            self.cache[key] = value
+            self.cache.move_to_end(key)
+            while len(self.cache) > _CACHE_MAX:
+                self.cache.popitem(last=False)
 
     # -- metacognition ------------------------------------------------------
 
@@ -140,9 +146,11 @@ class DualProcess:
             return RouteDecision2(1, "", 0.0, "empty question")
 
         key = self._cache_key(question)
-        cached = self.cache.get(key)
+        with self._cache_lock:
+            cached = self.cache.get(key)
+            if cached is not None:
+                self.cache.move_to_end(key)
         if cached is not None:
-            self.cache.move_to_end(key)
             answer, sealed_at, from_slow = cached
             age = time.time() - sealed_at
             conf = self._confidence(question, answer, age)
@@ -161,7 +169,16 @@ class DualProcess:
                                           (time.monotonic() - t0)
                                           * 1000))
 
-        fast = self.fast_fn(question)
+        # a failing or None-returning fast path is "no intuition", not a
+        # crash: it escalates (the old code hit TypeError in the hedge
+        # regex on None, or propagated the exception out of the router)
+        try:
+            fast = self.fast_fn(question)
+        except Exception as e:  # noqa: BLE001 — escalate instead
+            _log.warning("dual fast path failed: %s: %s",
+                         type(e).__name__, e)
+            fast = ""
+        fast = fast if isinstance(fast, str) else str(fast or "")
         conf = self._confidence(question, fast, None)
         if conf >= self.bar:
             self.stats["system1"] += 1
@@ -193,7 +210,10 @@ class DualProcess:
                          "confidence": round(conf, 3),
                          "escalated": True})
         slow = self.slow_fn(question)
-        self._cache_put(key, (slow, time.time(), True))
+        slow = slow if isinstance(slow, str) else str(slow or "")
+        if slow.strip():
+            # never cache an empty deep answer as "verified"
+            self._cache_put(key, (slow, time.time(), True))
         return RouteDecision2(2, slow, max(conf, 0.8),
                               "escalated: fast confidence "
                               f"{conf:.2f} < bar {self.bar:.2f}",

@@ -154,7 +154,14 @@ DEFAULT_PROPERTIES: tuple = (
 def trace_from_events(events) -> list[set[str]]:
     """Fold a real kernel event stream into a predicate trace."""
     trace: list[set[str]] = []
-    if not isinstance(events, (list, tuple)):
+    # any iterable of events (a generator, a filtered view) — the old
+    # list/tuple-only check returned an EMPTY trace for those, so an
+    # audit over them "passed" without checking a single event
+    if events is None or isinstance(events, (str, bytes, dict)):
+        return trace
+    try:
+        events = iter(events)
+    except TypeError:
         return trace
     for ev in events:
         if not hasattr(ev, "type"):

@@ -13,6 +13,7 @@ zero model calls):
 
 from __future__ import annotations
 
+import math
 import re
 import time
 from datetime import datetime
@@ -35,19 +36,36 @@ INTERESTING = ("user.message", "assistant.message", "tool.call",
 # ---------------------------------------------------------------------------
 
 def _safe_int(v: Any) -> int:
-    """int() that never raises on a malformed log value (→ 0)."""
+    """int() that never raises on a malformed log value (→ 0).
+
+    OverflowError too: int(float("inf")) — e.g. a token count of 1e999
+    in a corrupted line — used to escape and kill the whole export."""
     try:
         return int(v)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
 
 
 def _safe_float(v: Any) -> float:
-    """float() that never raises on a malformed log value (→ 0.0)."""
+    """float() that never raises on a malformed log value (→ 0.0);
+    NaN/inf also map to 0.0 so one bad value cannot poison a total."""
     try:
-        return float(v)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+        f = float(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
         return 0.0
+    return f if math.isfinite(f) else 0.0
+
+
+def _cell(v: Any, limit: int | None = None) -> str:
+    """One markdown table cell: newlines flattened and "|" escaped.
+
+    Tool and model names (and verdict/result fields) come from model
+    output or the provider; an unescaped "|" or newline in any of them
+    split the row and shifted every later column of the table."""
+    text = str(v)
+    if limit is not None:
+        text = text[:limit]
+    return text.replace("\r", " ").replace("\n", " ").replace("|", "\\|")
 
 
 def _gather(log: EventLog) -> dict:
@@ -62,7 +80,9 @@ def _gather(log: EventLog) -> dict:
         d = ev.data
         t = ev.type
         if t == "tool.call":
-            name = d.get("name", "?")
+            # str(): an unhashable name (a list/dict from a malformed
+            # tool call) used to raise TypeError as a dict key
+            name = str(d.get("name", "?"))
             tools[name] = tools.get(name, 0) + 1
         if t == "tool.result" and d.get("status") == "error":
             tool_errors += 1
@@ -125,13 +145,13 @@ def export_markdown(log: EventLog, title: str = "FullAgent session report"
         lines += ["", "## Model usage", "| model | calls | tokens in | "
                   "tokens out |", "|---|---|---|---|"]
         for m, d in sorted(g["models"].items()):
-            lines.append(f"| {m} | {d['calls']} | {d['tokens_in']:,} | "
-                         f"{d['tokens_out']:,} |")
+            lines.append(f"| {_cell(m)} | {d['calls']} | "
+                         f"{d['tokens_in']:,} | {d['tokens_out']:,} |")
 
     if g["tools"]:
         lines += ["", "## Tool calls", "| tool | count |", "|---|---|"]
         for name, n in sorted(g["tools"].items(), key=lambda kv: -kv[1]):
-            lines.append(f"| {name} | {n} |")
+            lines.append(f"| {_cell(name)} | {n} |")
 
     goal = st.goal
     if goal:
@@ -146,7 +166,7 @@ def export_markdown(log: EventLog, title: str = "FullAgent session report"
         stamp = time.strftime("%H:%M:%S", time.localtime(row["ts"]))
         d = row["data"]
         if row["type"] in ("user.message", "assistant.message"):
-            detail = str(d.get("text", ""))[:80].replace("|", "\\|")
+            detail = str(d.get("text", ""))[:80]
         elif row["type"] == "tool.call":
             detail = str(d.get("name", ""))
         elif row["type"] == "tool.result":
@@ -155,8 +175,8 @@ def export_markdown(log: EventLog, title: str = "FullAgent session report"
             detail = f"{'PASS' if d.get('passed') else 'FAIL'} " \
                      f"{d.get('kind', '')}: {str(d.get('detail', ''))[:60]}"
         else:
-            detail = str(d)[:80].replace("|", "\\|")
-        detail = detail.replace("\n", " ")
+            detail = str(d)[:80]
+        detail = _cell(detail)
         lines.append(f"| {row['seq']} | {stamp} | {row['type']} | "
                      f"{detail} |")
 
@@ -276,10 +296,21 @@ def forecast(log: EventLog) -> dict:
 
     goal = st.goal
     if goal and goal.get("clauses"):
-        distance_measures = st.distance_measures
+        # malformed measures (non-dicts, None / "n/a" / NaN distances)
+        # used to raise ValueError/TypeError/AttributeError out of
+        # /forecast; unusable entries are skipped instead
+        distance_measures = []
+        for m in (st.distance_measures or []):
+            dv = m.get("distance") if isinstance(m, dict) else None
+            try:
+                fv = float(dv)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(fv):
+                distance_measures.append({"distance": fv})
         if len(distance_measures) >= 2:
-            first = float(distance_measures[0].get("distance", 1.0))
-            last = float(distance_measures[-1].get("distance", first))
+            first = distance_measures[0]["distance"]
+            last = distance_measures[-1]["distance"]
             span = max(1, len(distance_measures) - 1)
             delta_per_tick = (first - last) / span
             result["goal_distance"] = last
@@ -290,8 +321,15 @@ def forecast(log: EventLog) -> dict:
             else:
                 result["est_ticks_remaining"] = None  # stalled
         else:
-            result["goal_distance"] = float(
-                goal.get("distance", 1.0)) if "distance" in goal else None
+            gd = None
+            if "distance" in goal:
+                try:
+                    gd = float(goal.get("distance"))
+                except (TypeError, ValueError, OverflowError):
+                    gd = None
+                if gd is not None and not math.isfinite(gd):
+                    gd = None
+            result["goal_distance"] = gd
     return result
 
 

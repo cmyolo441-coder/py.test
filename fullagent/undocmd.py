@@ -55,62 +55,103 @@ def _under_cwd(path: Path, cwd: Path) -> bool:
     return resolved == cwd or cwd in resolved.parents
 
 
+def _location(path: Path) -> Path | None:
+    """Absolute location of ``path`` WITHOUT following a symlink at the
+    final component: the parent directory is resolved, the name is kept.
+
+    Manifest keys were resolved when the snapshot was taken, so they name
+    the entry itself. If the undone mutation turned that entry into a
+    symlink, following it would delete or overwrite the symlink's TARGET
+    (possibly an unrelated file) instead of the entry the snapshot names.
+    """
+    try:
+        return path.parent.resolve() / path.name
+    except (OSError, RuntimeError):
+        return None
+
+
+def _inside(loc: Path, cwd: Path) -> bool:
+    return loc == cwd or cwd in loc.parents
+
+
 def _restore_tree(store: Any, manifest: dict, cwd: Path) -> dict:
     """Materialise a tree manifest restricted to paths under ``cwd``.
 
     Same blob-restore semantics as SnapshotStore.materialise, but any
     path resolving outside the working directory is refused (reported,
     never touched). Returns a summary dict.
+
+    A ``None`` entry means "not a regular file at snapshot time" — the
+    path was absent OR it was a directory (SnapshotStore.take records
+    directories as None too). So a directory is only removed when it is
+    empty: copy_path/move_path of a directory, or create_directory on an
+    existing one, used to make /undo ``rmtree`` the user's pre-existing
+    directory (the copy SOURCE included) with everything in it.
     """
     restored: list[str] = []
     removed: list[str] = []
     skipped: list[str] = []
+    kept_dirs: list[str] = []
     missing = 0
     for key, blob in manifest.items():
         p = Path(key)
-        if not _under_cwd(p, cwd):
+        if not p.is_absolute():
+            p = cwd / p
+        loc = _location(p)
+        if loc is None or not _inside(loc, cwd) or loc == cwd:
             skipped.append(key)
             continue
-        try:
-            rp = p.resolve()
-        except OSError:
-            missing += 1
-            continue
         if blob is None:
-            # The file did not exist at snapshot time: it was created
-            # by the undone mutation, so remove it if still present.
+            # Not a regular file at snapshot time: a file/symlink there
+            # now was created by the undone mutation, so remove it (the
+            # entry itself, never a symlink's target).
             try:
-                if rp.is_symlink() or rp.is_file():
-                    rp.unlink()
-                    removed.append(_display(rp, cwd))
-                elif rp.is_dir():
-                    shutil.rmtree(rp, ignore_errors=True)
-                    removed.append(_display(rp, cwd))
+                if loc.is_symlink() or loc.is_file():
+                    loc.unlink()
+                    removed.append(_display(loc, cwd))
+                elif loc.is_dir():
+                    try:
+                        loc.rmdir()     # empty only — never rmtree
+                        removed.append(_display(loc, cwd))
+                    except OSError:
+                        kept_dirs.append(_display(loc, cwd))
             except OSError:
                 missing += 1
+            continue
+        if not isinstance(blob, str):
+            missing += 1                # corrupt manifest entry
             continue
         data = store.get_blob(blob)
         if data is None:
             missing += 1
             continue
         try:
-            current = rp.read_bytes() if rp.is_file() else None
+            current = (loc.read_bytes()
+                       if loc.is_file() and not loc.is_symlink() else None)
         except OSError:
             current = None
         if current == data:
             continue  # already matches the snapshot — nothing to do
         try:
-            rp.parent.mkdir(parents=True, exist_ok=True)
+            loc.parent.mkdir(parents=True, exist_ok=True)
             # Append, don't replace, the suffix (see snapshots.py:
             # with_suffix("") is a no-op and would clobber the target).
-            tmp = rp.with_name(rp.name + ".undo-tmp")
-            tmp.write_bytes(data)
-            os.replace(tmp, rp)
-            restored.append(_display(rp, cwd))
+            tmp = loc.with_name(loc.name + ".undo-tmp")
+            try:
+                tmp.write_bytes(data)
+                os.replace(tmp, loc)    # replaces a symlink, not its target
+            except OSError:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                raise
+            restored.append(_display(loc, cwd))
         except OSError:
             missing += 1
     return {"restored": restored, "removed": removed,
-            "skipped": skipped, "missing_blobs": missing}
+            "skipped": skipped, "missing_blobs": missing,
+            "kept_dirs": kept_dirs}
 
 
 def _summarise(result: dict) -> str:
@@ -137,6 +178,12 @@ def _summarise(result: dict) -> str:
         parts.append(
             f"(refused {len(skipped)} path{'s' if len(skipped) != 1 else ''} "
             "outside the working directory)")
+    kept_dirs = result.get("kept_dirs") or []
+    if kept_dirs:
+        parts.append(
+            f"(left {len(kept_dirs)} non-empty director"
+            f"{'ies' if len(kept_dirs) != 1 else 'y'} in place: "
+            + ", ".join(kept_dirs) + ")")
     if not parts:
         return "nothing changed — files already match the last snapshot"
     return "\n".join(parts)

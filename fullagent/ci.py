@@ -22,6 +22,7 @@ to DO about a red build is the agent's job (and it gets told).
 
 from __future__ import annotations
 
+import os
 import re
 import threading
 import time
@@ -35,6 +36,18 @@ _log = get_logger("ci")
 
 _POLL_SECONDS = 2.0
 _TEST_NAME = re.compile(r"^(test_[a-z0-9_]+|[a-z0-9_]+_test)\.py$")
+# Directories the watch never descends into. The old scan walked every
+# file under .git/, node_modules/, virtualenvs… every 2 s (only filtering
+# the results afterwards), and impacted_tests() treated the test_*.py
+# files of installed packages inside a venv as project tests.
+_SKIP_DIRS = frozenset({
+    ".git", ".hg", ".svn", "__pycache__", "node_modules", ".venv", "venv",
+    ".tox", ".nox", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    "site-packages", ".eggs"})
+# RunRecords kept in memory: the watch runs for the whole session and the
+# list used to grow without bound (each record holds up to 400 chars of
+# output plus the changed/test lists).
+_MAX_RECORDS = 200
 
 
 @dataclass
@@ -65,6 +78,7 @@ class CIPilot:
         self._snapshot: dict[str, tuple[float, int]] | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._check_lock = threading.Lock()
         self.records: list[RunRecord] = []
         self.streak_green = 0
         self.streak_red = 0
@@ -75,18 +89,31 @@ class CIPilot:
 
     # -- the file map -----------------------------------------------------------
 
+    def _walk_files(self):
+        """Yield (abs_path, rel_posix) for every regular file under root,
+        pruning _SKIP_DIRS before descending (symlinked dirs are not
+        followed)."""
+        root = str(self.root)
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+            rel_dir = os.path.relpath(dirpath, root)
+            for fn in filenames:
+                full = os.path.join(dirpath, fn)
+                rel = fn if rel_dir == "." else \
+                    os.path.join(rel_dir, fn).replace(os.sep, "/")
+                yield full, rel
+
     def _scan(self) -> dict[str, tuple[float, int]]:
         out: dict[str, tuple[float, int]] = {}
         try:
-            for p in self.root.rglob("*"):
-                if p.is_file() and ".git" not in p.parts and \
-                        "__pycache__" not in p.parts:
-                    try:
-                        st = p.stat()
-                        rel = p.relative_to(self.root).as_posix()
-                        out[rel] = (st.st_mtime, st.st_size)
-                    except OSError:
-                        continue
+            for full, rel in self._walk_files():
+                try:
+                    st = os.stat(full)
+                except OSError:
+                    continue
+                if not os.path.isfile(full):
+                    continue
+                out[rel] = (st.st_mtime, st.st_size)
         except OSError:
             pass
         return out
@@ -115,9 +142,8 @@ class CIPilot:
         (test_x.py AND x_test.py), importers of the changed module, and
         same-directory tests. Paths are posix-normalised everywhere
         (Windows-safe)."""
-        tests = {p.relative_to(self.root).as_posix()
-                 for p in self.root.rglob("*.py")
-                 if _TEST_NAME.match(p.name)}
+        tests = {rel for _full, rel in self._walk_files()
+                 if _TEST_NAME.match(rel.rsplit("/", 1)[-1])}
         # prune the text cache: entries for test files that no longer
         # exist would otherwise pin their contents forever on a
         # long-running watch
@@ -137,9 +163,17 @@ class CIPilot:
                         t == f"{mod}_test.py" or \
                         t.endswith(f"/{mod}_test.py"):
                     picked.add(t)
-            for t, text in test_text.items():
-                if mod and mod in text:
-                    picked.add(t)       # imports/mentions the module
+            # import/mention scan: only a changed PYTHON module can be
+            # imported, and the stem must match as a whole word — the old
+            # bare substring test made "a.py"/"io.py"/"x.py" (or any
+            # README/config stem) impact every test that contained those
+            # letters anywhere.
+            if mod and path.suffix == ".py":
+                rx = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(mod)
+                                + r"(?![A-Za-z0-9_])")
+                for t, text in test_text.items():
+                    if rx.search(text):
+                        picked.add(t)   # imports/mentions the module
             dirn = path.parent.as_posix()
             for t in tests:
                 if str(Path(t).parent).replace("\\", "/") == dirn:
@@ -149,7 +183,15 @@ class CIPilot:
     # -- one cycle -----------------------------------------------------------------
 
     def check_once(self) -> RunRecord | None:
-        """Diff the tree since the last look; run impacted tests."""
+        """Diff the tree since the last look; run impacted tests.
+
+        Serialised: the watch thread and a manual call (or a second
+        start()) used to race on _snapshot / records / streaks, double-
+        running the same change and corrupting the streak counters."""
+        with self._check_lock:
+            return self._check_once_locked()
+
+    def _check_once_locked(self) -> RunRecord | None:
         current = self._scan()
         if self._snapshot is not None:
             changed = sorted(
@@ -170,6 +212,8 @@ class CIPilot:
                     record.passed = bool(ok)
                     record.output = str(output)[:400]
                 self.records.append(record)
+                if len(self.records) > _MAX_RECORDS:
+                    del self.records[:len(self.records) - _MAX_RECORDS]
                 if record.passed:
                     self.streak_green += 1
                     self.streak_red = 0
@@ -194,22 +238,24 @@ class CIPilot:
         """Begin the watch loop in the background."""
         if self._thread is not None:
             return
-        # a previous stop() leaves the flag set — clear it so a
-        # start() after stop() actually restarts the loop instead of
-        # spawning a thread that exits immediately
-        self._stop.clear()
-        self._snapshot = self._scan()
+        # a FRESH stop event per loop: clearing the shared one revived a
+        # previous loop thread that stop() gave up joining (runner still
+        # busy after the 5 s join), leaving two watch loops running
+        self._stop = threading.Event()
+        stop = self._stop
+        with self._check_lock:
+            self._snapshot = self._scan()
         self.log.append("ci.watch",
                         {"root": str(self.root),
                          "files": len(self._snapshot)}, actor="human")
 
         def loop():
-            while not self._stop.is_set():
+            while not stop.is_set():
                 try:
                     self.check_once()
                 except Exception:
                     pass          # the pilot never dies mid-watch
-                self._stop.wait(self.poll)
+                stop.wait(self.poll)
 
         self._thread = threading.Thread(target=loop, name="ci:pilot",
                                         daemon=True)

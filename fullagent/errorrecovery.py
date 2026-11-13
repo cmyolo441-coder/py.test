@@ -146,7 +146,7 @@ def _repair_tool_pairing(messages: list[dict]) -> int:
             answered.add(str(m["tool_call_id"]))
     # ids issued by assistant messages (in order)
     issued: list[str] = []
-    for m in messages:
+    for idx, m in enumerate(messages):
         if not isinstance(m, dict) or m.get("role") != "assistant":
             continue
         tcs = m.get("tool_calls")
@@ -157,12 +157,20 @@ def _repair_tool_pairing(messages: list[dict]) -> int:
         kept = [tc for tc in tcs
                 if isinstance(tc, dict)
                 and str(tc.get("id", "")) in answered]
-        if len(kept) != len(list(tcs if isinstance(tcs, list) else [tcs])):
+        if len(kept) != len(tcs):
             fixed += 1
-        if kept:
-            m["tool_calls"] = kept
-        else:
-            m.pop("tool_calls", None)
+            # Replace the entry with a modified COPY. The list is the
+            # request view, but its assistant dicts are the very objects
+            # of the canonical session history (prune_messages only
+            # copies tool messages) — mutating them in place stripped
+            # tool_calls from agent.messages and orphaned the tool
+            # results that stayed there.
+            m = dict(m)
+            if kept:
+                m["tool_calls"] = kept
+            else:
+                m.pop("tool_calls", None)
+            messages[idx] = m
         for tc in kept:
             issued.append(str(tc.get("id", "")))
     issued_set = set(issued)

@@ -29,8 +29,19 @@ def _force_utf8() -> None:
             pass
 
 
+_HEADLESS_CMDS = frozenset({"verify-log", "replay", "rewind", "revert",
+                            "cost", "why", "goal", "stats", "forge"})
+
+
 def _headless(argv: list[str]) -> int:
     """Run a headless subcommand against the persistent event log."""
+    if argv[0] not in _HEADLESS_CMDS:
+        # reject a typo BEFORE building the Agent: construction opens the
+        # event log, registers ~50 feature modules and starts a session —
+        # all for a command that only prints usage
+        print(f"unknown command: {argv[0]}", file=sys.stderr)
+        print(__doc__, file=sys.stderr)
+        return 2
     from . import config
     from .agent import Agent
     from .config import Config
@@ -198,17 +209,28 @@ def _headless_print(prompt: str, ns) -> int:
             if text:
                 print(text, file=sys.stderr, flush=True)
 
-    turn = agent.run_turn(
-        prompt,
-        on_token=_noop, on_reasoning=_noop,
-        on_tool_call=_noop, on_tool_update=_noop,
-        on_status=_on_status, approve=lambda tool, args: True,
-    )
+    try:
+        turn = agent.run_turn(
+            prompt,
+            on_token=_noop, on_reasoning=_noop,
+            on_tool_call=_noop, on_tool_update=_noop,
+            on_status=_on_status, approve=lambda tool, args: True,
+        )
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+    except Exception as e:  # noqa: BLE001 — a clean error, not a traceback
+        # (no API key, provider down, cancelled turn ...)
+        print(f"error: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
     if getattr(ns, "output_format", "text") == "json":
         from . import jsonout
         jsonout.emit_json(jsonout.turn_to_json(
             turn, getattr(agent, "session_id", None),
             extra={"agent": agent}))
+        # same exit status as text mode: scripts must be able to tell a
+        # failed turn from a good one without parsing the JSON
+        return 1 if turn.error else 0
     else:
         print(turn.assistant_text or "(no response)")
         if turn.error:

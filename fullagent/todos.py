@@ -67,13 +67,23 @@ class TodoManager:
             self._todos = []
 
     def save(self) -> None:
+        # Atomic write (temp file + os.replace): writing the target in
+        # place left a truncated/empty JSON file when the process died or
+        # the disk filled mid-write, and load() then silently started the
+        # session with NO todos.
+        path = _persist_path(self.session_id)
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
         try:
             os.makedirs(TODOS_DIR, exist_ok=True)
-            with open(_persist_path(self.session_id), "w",
-                      encoding="utf-8") as fh:
+            with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(self._todos, fh, ensure_ascii=False, indent=2)
-        except OSError:
-            pass  # persistence is best-effort; never break a tool call
+            os.replace(tmp, path)
+        except (OSError, TypeError, ValueError):
+            # persistence is best-effort; never break a tool call
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
     # -- mutation -------------------------------------------------------
     @staticmethod

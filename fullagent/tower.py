@@ -34,6 +34,10 @@ from ._foundation import get_logger
 
 _log = get_logger("tower")
 
+_LOOPBACK = {"127.0.0.1", "localhost", "::1"}
+_MAX_BODY = 64 * 1024          # a command is a sentence, not a payload
+_MAX_PENDING_TURNS = 4
+
 _PAGE = r"""<!doctype html>
 <html><head><meta charset="utf-8"><title>FullAgent Control Tower</title>
 <style>
@@ -108,7 +112,7 @@ $('cards').innerHTML=[['cost',s.cost],['tokens',s.tokens],
 $('branch').textContent=' · '+s.branch;
 $('brain').innerHTML=esc(s.brain||'brain is idle');}catch(e){}}
 async function pollEvents(){try{const r=await fetch(
-'/api/events?since='+lastSeq);const evs=await r.json();
+'/api/events?since='+lastSeq);const evs=((await r.json()).events)||[];
 for(const e of evs){lastSeq=Math.max(lastSeq,e.seq);
 const d=document.createElement('div');
 d.className=e.type.includes('error')||e.type.includes('fail')?'err':
@@ -148,6 +152,9 @@ class Tower:
         # web turns run in background threads — serialize them so two
         # rapid SENDs can't interleave inside a non-thread-safe agent
         self._turn_lock = threading.Lock()
+        # turns launched but not finished (running + waiting on the lock)
+        self._pending = 0
+        self._pending_lock = threading.Lock()
 
     # -- state assembly ----------------------------------------------------------
 
@@ -185,27 +192,87 @@ class Tower:
         text = str(payload.get("text", "")).strip()
         if not text:
             return {"ok": False, "error": "empty command"}
+        with self._pending_lock:
+            # every POST used to start a thread that queued on the turn
+            # lock — a burst of requests piled up unbounded threads (and
+            # unbounded future turns)
+            if self._pending >= _MAX_PENDING_TURNS:
+                return {"ok": False, "error": "busy: too many queued turns"}
+            self._pending += 1
 
         def _run() -> None:
             # serialized: concurrent web turns would interleave agent
             # state; a second SEND waits for the first turn to finish
-            with self._turn_lock:
-                try:
-                    ag.run_turn(text, on_token=lambda t: None,
-                                on_reasoning=lambda r: None,
-                                on_tool_call=lambda e: None,
-                                on_tool_update=lambda e: None,
-                                on_status=lambda s: None,
-                                approve=lambda tool, args: False)
-                except Exception:
-                    # the river shows the sealed error when the turn got
-                    # far enough to seal one — but a failure BEFORE that
-                    # would vanish completely, so it is logged server-side
-                    _log.exception("tower: background turn failed")
+            try:
+                self._run_turn(ag, text)
+            finally:
+                with self._pending_lock:
+                    self._pending -= 1
 
         threading.Thread(target=_run, name="tower:turn",
                          daemon=True).start()
         return {"ok": True, "launched": text[:100]}
+
+    def _run_turn(self, ag, text: str) -> None:
+        """One web turn, serialized with every other web turn."""
+        with self._turn_lock:
+            try:
+                ag.run_turn(text, on_token=lambda t: None,
+                            on_reasoning=lambda r: None,
+                            on_tool_call=lambda e: None,
+                            on_tool_update=lambda e: None,
+                            on_status=lambda s: None,
+                            approve=lambda tool, args: False)
+            except Exception:
+                # the river shows the sealed error when the turn got
+                # far enough to seal one — but a failure BEFORE that
+                # would vanish completely, so it is logged server-side
+                _log.exception("tower: background turn failed")
+
+    # -- request authentication ---------------------------------------------------
+
+    def _allowed_hosts(self) -> set[str]:
+        """Host header values this server answers to. Bound to loopback,
+        the only names are the loopback ones — a DNS-rebinding page
+        (evil.example resolving to 127.0.0.1) arrives with its own name
+        in Host and is refused."""
+        if self.server is None:
+            return set()
+        port = self.server.server_port
+        names = {self.host}
+        if self.host in _LOOPBACK:
+            names |= _LOOPBACK
+        out = set()
+        for n in names:
+            n = f"[{n}]" if ":" in n and not n.startswith("[") else n
+            out.add(f"{n}:{port}".lower())
+        return out
+
+    def request_allowed(self, headers, method: str) -> bool:
+        """Anti-DNS-rebinding + anti-CSRF gate. Any web page the user
+        visits can POST to 127.0.0.1 (a text/plain "simple request"
+        needs no CORS preflight), and /api/command launches a REAL agent
+        turn — so a foreign Origin is refused, and so is a POST that
+        is not application/json."""
+        loopback_bind = self.host in _LOOPBACK
+        host = (headers.get("Host") or "").strip().lower()
+        if loopback_bind and host not in self._allowed_hosts():
+            return False
+        origin = (headers.get("Origin") or "").strip().lower()
+        if origin and origin != "null":
+            netloc = origin.split("://", 1)[-1].rstrip("/")
+            if loopback_bind:
+                if netloc not in self._allowed_hosts():
+                    return False
+            elif netloc != host:
+                return False
+        elif origin == "null":
+            return False
+        if method == "POST":
+            ctype = (headers.get("Content-Type") or "").split(";")[0]
+            if ctype.strip().lower() != "application/json":
+                return False
+        return True
 
     # -- HTTP plumbing ----------------------------------------------------------------
 
@@ -225,7 +292,15 @@ class Tower:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _refuse(self) -> bool:
+                if tower.request_allowed(self.headers, self.command):
+                    return False
+                self._json({"error": "forbidden"}, 403)
+                return True
+
             def do_GET(self):
+                if self._refuse():
+                    return
                 if self.path == "/" or self.path.startswith("/index"):
                     body = _PAGE.encode("utf-8")
                     self.send_response(200)
@@ -274,8 +349,13 @@ class Tower:
                 if self.path != "/api/command":
                     self._json({"error": "not found"}, 404)
                     return
+                if self._refuse():
+                    return
                 try:
                     n = int(self.headers.get("Content-Length", 0))
+                    if n > _MAX_BODY:
+                        self._json({"error": "body too large"}, 413)
+                        return
                     # a negative length would make rfile.read() block
                     # until EOF and hang this handler thread
                     payload = json.loads(self.rfile.read(max(0, n))

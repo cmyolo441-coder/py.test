@@ -50,19 +50,64 @@ _agent_lock = threading.Lock()
 _turn_lock = threading.Lock()
 
 
-def get_token() -> str:
-    os.makedirs(CLOUD_DIR, exist_ok=True)
-    if os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE, "r", encoding="utf-8") as f:
-            tok = f.read().strip()
-        if tok:
-            return tok
+_token_cache: "tuple[float, str] | None" = None  # (mtime, token)
+_token_lock = threading.Lock()
+
+
+def _create_token() -> str:
     tok = secrets.token_urlsafe(32)
     fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(tok + "\n")
     os.chmod(TOKEN_FILE, 0o600)
     return tok
+
+
+def get_token(_created: "list | None" = None) -> str:
+    """The server's auth token (generated on first run).
+
+    Cached and re-read only when the token file's mtime changes: the old
+    version read (and could re-create) the file on EVERY request, from
+    every handler thread — two concurrent first requests could each mint
+    a different token, and deleting the file at runtime silently rotated
+    the token. A token file that disappears while serving keeps the
+    cached token. ``_created`` (internal) gets True appended when a new
+    token was minted by this call.
+    """
+    global _token_cache
+    with _token_lock:
+        try:
+            mtime = os.stat(TOKEN_FILE).st_mtime
+        except OSError:
+            mtime = None
+        if _token_cache is not None and (mtime is None
+                                         or mtime == _token_cache[0]):
+            return _token_cache[1]
+        tok = ""
+        if mtime is not None:
+            try:
+                with open(TOKEN_FILE, "r", encoding="utf-8") as f:
+                    tok = f.read().strip()
+            except (OSError, UnicodeDecodeError):
+                tok = ""
+        if not tok:
+            if _token_cache is not None:
+                return _token_cache[1]
+            os.makedirs(CLOUD_DIR, mode=0o700, exist_ok=True)
+            tok = _create_token()
+            if _created is not None:
+                _created.append(True)
+            try:
+                mtime = os.stat(TOKEN_FILE).st_mtime
+            except OSError:
+                mtime = 0.0
+        _token_cache = (mtime if mtime is not None else 0.0, tok)
+        return tok
+
+
+def _is_loopback(host: str) -> bool:
+    h = (host or "").strip().strip("[]").lower()
+    return h in ("localhost", "::1") or h.startswith("127.")
 
 
 def _ensure_working_model(cfg) -> str:
@@ -111,6 +156,12 @@ def get_agent():
 
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "FullAgentCloud/1.0"
+    # Socket timeout for every read/write on the connection. Without it a
+    # client that connects and never sends its request line (or stalls
+    # mid-body) pinned a handler thread forever — unauthenticated, so
+    # anyone who can reach the port could exhaust threads. The SSE
+    # stream writes a keepalive every 15s, well inside this.
+    timeout = 60
 
     def log_message(self, fmt, *args):  # quieter logs
         msg = fmt % args
@@ -262,7 +313,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.wfile.write(payload)
                     self.wfile.flush()
                     return True
-                except (BrokenPipeError, ConnectionResetError):
+                except OSError:  # broken pipe, reset, socket timeout
                     return False
 
             try:
@@ -320,8 +371,20 @@ def main() -> int:
     ap.add_argument("--host", default=default_host)
     args = ap.parse_args()
 
-    tok = get_token()
-    print(f"[cloud] token: {tok}", flush=True)
+    created: list = []
+    tok = get_token(created)
+    if created:
+        # shown once, when it is minted — the file is the source of truth
+        print(f"[cloud] new token: {tok}", flush=True)
+        print(f"[cloud] (saved to {TOKEN_FILE}, mode 600)", flush=True)
+    else:
+        # never echo the credential into service logs on every restart
+        print(f"[cloud] token: in {TOKEN_FILE}", flush=True)
+    if not _is_loopback(args.host):
+        print(f"[cloud] WARNING: listening on {args.host} — reachable from "
+              "the network; tool calls are auto-approved, so anyone with "
+              "the token can run commands as this user", file=sys.stderr,
+              flush=True)
     get_agent()  # fail fast if the agent can't initialise
     print(f"[cloud] agent ready; listening on {args.host}:{args.port}",
           flush=True)

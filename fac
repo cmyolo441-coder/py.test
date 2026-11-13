@@ -25,6 +25,7 @@ import urllib.request
 
 CFG_DIR = os.path.expanduser("~/.fullagent-cloud")
 CFG_FILE = os.path.join(CFG_DIR, "config.json")
+STREAM_IDLE_TIMEOUT = 120  # seconds without any byte from the server
 
 
 def load_cfg() -> dict:
@@ -96,7 +97,10 @@ def cmd_chat(prompt: str) -> int:
             cfg["url"] + "/chat", data=body,
             headers={"Content-Type": "application/json",
                      "Authorization": "Bearer " + cfg["token"]})
-        resp = urllib.request.urlopen(req)  # no timeout: turns take minutes
+        # Turns take minutes, but the server writes an SSE keepalive every
+        # 15s while one runs, so an idle read this long means the server
+        # or the tunnel is dead. No timeout used to hang the client forever.
+        resp = urllib.request.urlopen(req, timeout=STREAM_IDLE_TIMEOUT)
     except urllib.error.HTTPError as e:
         try:
             detail = json.loads(e.read().decode("utf-8", "replace"))
@@ -180,7 +184,9 @@ def main() -> int:
 
     prompt = " ".join(args.prompt).strip()
     if not prompt and not sys.stdin.isatty():
-        prompt = sys.stdin.read().strip()
+        # bytes + replace: a non-UTF-8 pipe (latin-1 file, binary junk)
+        # used to crash with a UnicodeDecodeError traceback
+        prompt = sys.stdin.buffer.read().decode("utf-8", "replace").strip()
     if not prompt:
         ap.print_help()
         return 2

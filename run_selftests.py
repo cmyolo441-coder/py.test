@@ -2,6 +2,7 @@
 import ast
 import concurrent.futures
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -29,28 +30,61 @@ def _has_main_block(path: Path) -> bool:
     )
 
 
-def _run_one(m: str) -> tuple[str, bool, str]:
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Kill the self-test's whole process group (it runs in its own
+    session — never ours), falling back to the child alone."""
     try:
-        with tempfile.TemporaryDirectory(
-            prefix=f"fullagent-selftest-{m}-"
-        ) as data_home:
-            env = os.environ.copy()
-            env["FULLAGENT_HOME"] = data_home
-            r = subprocess.run(
-                [sys.executable, "-m", f"fullagent.{m}"],
-                capture_output=True,
-                text=True,
-                cwd=str(PKG),
-                env=env,
-                timeout=300,
-            )
-    except subprocess.TimeoutExpired as e:
-        partial = e.stdout or e.stderr or ""
-        if isinstance(partial, bytes):
-            partial = partial.decode("utf-8", errors="replace")
-        tail = partial.strip().splitlines()
-        detail = tail[-1][:80] if tail else "no output before timeout"
-        return m, False, f"timed out after 300s: {detail}"
+        if os.name == "posix" and os.getpgid(proc.pid) != os.getpgrp():
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        else:
+            proc.kill()
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def _run_one(m: str) -> tuple[str, bool, str]:
+    with tempfile.TemporaryDirectory(
+        prefix=f"fullagent-selftest-{m}-"
+    ) as data_home:
+        env = os.environ.copy()
+        env["FULLAGENT_HOME"] = data_home
+        # stdin=DEVNULL: four self-tests run at once from one terminal; one
+        # that reads stdin must get EOF, not steal the terminal and hang.
+        # Own session: a timed-out self-test's servers/children are killed
+        # with it instead of outliving the run (subprocess.run only killed
+        # the direct child).
+        proc = subprocess.Popen(
+            [sys.executable, "-m", f"fullagent.{m}"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=str(PKG),
+            env=env,
+            start_new_session=(os.name == "posix"),
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=300)
+        except subprocess.TimeoutExpired:
+            _kill_tree(proc)
+            try:
+                stdout, stderr = proc.communicate(timeout=10)
+            except Exception:  # noqa: BLE001
+                stdout, stderr = "", ""
+            partial = stdout or stderr or ""
+            tail = partial.strip().splitlines()
+            detail = tail[-1][:80] if tail else "no output before timeout"
+            return m, False, f"timed out after 300s: {detail}"
+        except BaseException:
+            _kill_tree(proc)
+            raise
+        r = subprocess.CompletedProcess(proc.args, proc.returncode,
+                                        stdout or "", stderr or "")
 
     out = (r.stdout + r.stderr).strip().splitlines()
     tail = out[-1] if out else "(no output)"
@@ -74,7 +108,11 @@ def main() -> int:
         for path in (PKG / "fullagent").glob("*.py")
         if path.stem not in skip and _has_main_block(path)
     )
-    workers = max(1, min(4, int(os.environ.get("FULLAGENT_SELFTEST_JOBS", "4"))))
+    try:
+        jobs = int(os.environ.get("FULLAGENT_SELFTEST_JOBS", "4"))
+    except ValueError:  # a typo'd env var must not crash the runner
+        jobs = 4
+    workers = max(1, min(4, jobs))
     failed = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         for m, ok, detail in pool.map(_run_one, mods):

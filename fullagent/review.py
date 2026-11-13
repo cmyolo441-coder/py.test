@@ -93,6 +93,20 @@ class _AddedLine:
     text: str
 
 
+def _diff_lines(text: str) -> list[str]:
+    r"""Split diff text into lines on "\n" ONLY (CRLF tolerated).
+
+    str.splitlines() also breaks on \x0b, \x0c (form feed — common in
+    Python/C sources), \x1c-\x1e, \x85, \u2028 and \u2029. A diff line
+    holding one of those was split in two: the tail lost its "+"/"-"/" "
+    prefix, was counted as an extra context line, and every later line
+    number of the hunk (and the hunk-end bookkeeping) was off."""
+    lines = (text or "").split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return [ln[:-1] if ln.endswith("\r") else ln for ln in lines]
+
+
 def _parse_diff(diff_text: str) -> tuple[list[_AddedLine], list[tuple[str, int]]]:
     """Split a unified diff into added lines and (file, added-count) hunks.
 
@@ -107,7 +121,7 @@ def _parse_diff(diff_text: str) -> tuple[list[_AddedLine], list[tuple[str, int]]
     in_hunk = False
     old_left = new_left = 0
 
-    for raw in (diff_text or "").splitlines():
+    for raw in _diff_lines(diff_text):
         if raw.startswith("diff --git "):
             in_hunk = False
             continue
@@ -275,10 +289,16 @@ def format_report(findings: list[dict], title: str = "Code review") -> str:
 def _git_diff(args: list[str], repo: str) -> str | None:
     """Run git diff; return None when repo isn't a git working tree."""
     try:
+        # stdin=DEVNULL: a child must never read (or grab) the TUI's
+        # terminal. Explicit utf-8/replace: a diff of a latin-1 or binary-ish
+        # file used to raise UnicodeDecodeError straight out of
+        # review_git()/the ReviewChanges tool (only OSError/Timeout were
+        # caught), and the locale's default codec could differ from utf-8.
         p = subprocess.run(
             ["git", "-C", repo, *args],
-            capture_output=True, text=True, timeout=30)
-    except (OSError, subprocess.TimeoutExpired) as e:
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", stdin=subprocess.DEVNULL, timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
         _log.warning("review: git diff failed: %s", e)
         return None
     if p.returncode != 0:
@@ -333,7 +353,7 @@ def review_files(paths: list[str]) -> str:
             findings.append(_finding(p, 0, "low", f"Could not read file: {e}",
                                      "Check permissions and retry."))
             continue
-        lines = text.splitlines()
+        lines = _diff_lines(text)
         fake_diff = (f"--- /dev/null\n+++ b/{p}\n"
                      + f"@@ -0,0 +1,{len(lines)} @@\n"
                      + "".join(f"+{ln}\n" for ln in lines))

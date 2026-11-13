@@ -112,8 +112,12 @@ _SEV_ORDER = {"critical": 3, "high": 2, "medium": 1, "low": 0}
 _SEV_NAMES = ("low", "medium", "high", "critical")
 
 # fake structural tags that must never leak into a response
+# NOTE: the C-style comment markers ``/*`` and ``*/`` used to be part of
+# this pattern; every C/JS/CSS code block in a normal answer then raised a
+# HIGH "leak" (and the stream gate aborts immediately on leak/high), so
+# they are no longer treated as structural tags.
 _LEAK_TAG_RE = re.compile(
-    r"(\*/|/\*|<\s*/?\s*(system|system_prompt|prompt|instructions|"
+    r"(<\s*/?\s*(system|system_prompt|prompt|instructions|"
     r"SYS|INST|assistant|developer)\s*>|\[/?\s*(system|system_prompt|"
     r"instructions|INST)\s*\])",
     re.I,
@@ -131,8 +135,14 @@ _SECRET_RES: Tuple[Tuple[str, re.Pattern], ...] = (
      re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
     ("password_kv",
      re.compile(r"\b(?:password|passwd|pwd)\s*[:=]\s*\S{4,}", re.I)),
+    # A bare 40-64 char hex string is a git SHA / sha256 digest far more
+    # often than a secret; only flag hex that is assigned to a secret-ish
+    # name (the old bare pattern made every commit hash "critical").
     ("generic_hex_secret",
-     re.compile(r"\b[0-9a-f]{40,64}\b")),
+     re.compile(r"\b(?:secret|token|api[_-]?key|access[_-]?key|"
+                r"private[_-]?key|client[_-]?secret|password|passwd|auth)"
+                r"[A-Za-z0-9_-]{0,20}[\"']?\s{0,3}[:=]\s{0,3}[\"']?"
+                r"[0-9a-fA-F]{32,64}\b", re.I)),
 )
 
 # refusal markers (benign-job refusal heuristics)
@@ -149,16 +159,25 @@ _ALTERNATIVE_RE = re.compile(
 )
 
 # contradiction markers: the response vows to break a rule
+# "I will not"/"won't" alone is an ordinary sentence ("I won't use tabs"),
+# not a vow to break a rule: require the rule-breaking object.
 _CONTRA_RE = re.compile(
-    r"\b(i will not|won't|ignore (?:the )?(?:rule|rules|instruction|instructions)|"
+    r"\b((?:i will not|i won't|won't) (?:follow|obey|comply with|respect|"
+    r"adhere to|stick to|honou?r)\b|"
+    r"ignore (?:the )?(?:rule|rules|instruction|instructions)|"
     r"forget (?:the )?(?:rule|rules|format|formatting|instructions)|"
     r"(?:rule|rules) (?:do|does) not apply|no (?:need to )?(?:follow|obey)"
     r")[^.!?]{0,120}",
     re.I,
 )
+# "From now on you can call api.get()" / "You are now free to merge" are
+# normal assistant prose; only flag overrides that change the rules.
 _OVERRIDE_RE = re.compile(
     r"\b(new (?:rule|rules|instructions)|updated (?:policy|instructions)|"
-    r"as of now you|from now on you|you are now (?:allowed|free|instructed))\b",
+    r"(?:as of now|from now on),? you (?:are|must|will|shall|should) "
+    r"(?:no longer|not|only|ignore|disregard|obey|follow)|"
+    r"you are now (?:allowed|free|instructed|permitted) to "
+    r"(?:ignore|bypass|break|disregard|reveal|violate|say anything|do anything))\b",
     re.I,
 )
 
@@ -173,10 +192,15 @@ _SENSITIVE_TOPIC_RES: Tuple[Tuple[str, re.Pattern], ...] = (
     ("profanity", re.compile(
         r"\b(damn it|bastard|asshole|idiot moron|stupid [a-z]{3,12}\b){1}",
         re.I)),
+    # Bounded quantifiers + a left anchor on the e-mail local part: the
+    # old ``[\w.+-]+@`` re-scanned the rest of a long word from every
+    # start position (O(n^2): >3s on 20k plain letters), and the card
+    # part's unbounded ``[ -]*?`` backtracked on long digit/dash runs.
     ("pii", re.compile(
         r"\b\d{3}-\d{2}-\d{4}\b"                                    # SSN-ish
-        r"|\b(?:\d[ -]*?){13,19}\b"                                  # card-ish
-        r"|[\w.+-]+@[\w-]+\.[A-Za-z]{2,}\s*[,;]\s*ph[:.]?\s*\+?\d{8,}", re.I)),
+        r"|\b(?:\d[ -]{0,2}){12,18}\d\b"                               # card-ish
+        r"|(?<![\w.+-])[\w.+-]{1,64}@[\w-]{1,63}(?:\.[\w-]{1,63}){0,4}"
+        r"\.[A-Za-z]{2,24}\s{0,8}[,;]\s{0,8}ph[:.]?\s{0,8}\+?\d{8,20}", re.I)),
 )
 
 # tone drift signals
@@ -186,6 +210,7 @@ _EMOJI_WALL_MIN = 8
 _PROFANITY_TONE_RE = re.compile(
     r"\b(wtf|stfu|gtfo|wth|bs)\b", re.I)
 _WALL_RE = re.compile(r"[^\n]{400,}")
+_HIGH_CHAR_RE = re.compile("[\u2001-\U0010ffff]")
 
 _MAX_TEXT = 200_000          # hard input cap (chars)
 _MAX_DETECTIONS = 128        # hard output cap
@@ -263,6 +288,78 @@ class Detection:
 def _clip(text: str, n: int = _MAX_EVIDENCE) -> str:
     text = re.sub(r"\s+", " ", text or "").strip()
     return text if len(text) <= n else text[: n - 1] + "…"
+
+
+# ── evasion folding ──────────────────────────────────────────────────────
+# Zero-width / bidi / tag characters, fullwidth forms and mixed-script
+# homoglyphs let "<ｓｙｓｔｅｍ>" or "<sys\u200btem>" slip past every
+# ASCII pattern. fold_text() undoes those (NFKC, strip invisible format
+# chars, map Cyrillic/Greek look-alikes inside Latin words) and keeps an
+# index map so detections found on the folded text report spans in the
+# ORIGINAL text.
+
+_INVISIBLE_RE = re.compile(
+    "[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f"
+    "\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f"
+    "\ufeff\uffa0\U000e0000-\U000e007f]")
+
+_HOMOGLYPHS: Dict[int, str] = {
+    0x0430: "a", 0x0435: "e", 0x043e: "o", 0x0440: "p", 0x0441: "c",
+    0x0443: "y", 0x0445: "x", 0x0456: "i", 0x0455: "s", 0x04bb: "h",
+    0x0458: "j", 0x0501: "d", 0x051b: "q", 0x051d: "w",
+    0x0410: "A", 0x0412: "B", 0x0415: "E", 0x041a: "K", 0x041c: "M",
+    0x041d: "H", 0x041e: "O", 0x0420: "P", 0x0421: "C", 0x0422: "T",
+    0x0425: "X", 0x0406: "I", 0x0405: "S", 0x0408: "J",
+    0x03b1: "a", 0x03b5: "e", 0x03bf: "o", 0x03c1: "p", 0x03c2: "c",
+    0x03c5: "y", 0x03c7: "x", 0x03b9: "i", 0x03ba: "k", 0x03bd: "v",
+    0x0391: "A", 0x0392: "B", 0x0395: "E", 0x0396: "Z", 0x0397: "H",
+    0x0399: "I", 0x039a: "K", 0x039c: "M", 0x039d: "N", 0x039f: "O",
+    0x03a1: "P", 0x03a4: "T", 0x03a5: "Y", 0x03a7: "X",
+}
+_WORD_RE = re.compile(r"[^\W\d_]+")
+
+
+def _fold_word(m: "re.Match") -> str:
+    w = m.group(0)
+    if w.isascii():
+        return w
+    mapped = w.translate(_HOMOGLYPHS)
+    # only a word that MIXES Latin letters with look-alikes is an evasion
+    # attempt; genuine Cyrillic/Greek prose is left untouched.
+    if mapped != w and any("a" <= c.lower() <= "z" for c in w):
+        return mapped
+    if mapped != w and mapped.isascii():
+        return mapped
+    return w
+
+
+def fold_text(text: str) -> str:
+    """Fold common detection-evasion tricks out of `text` (never raises)."""
+    try:
+        if not text or text.isascii():
+            return text or ""
+        t = _INVISIBLE_RE.sub("", text)
+        t = unicodedata.normalize("NFKC", t)
+        return _WORD_RE.sub(_fold_word, t)
+    except Exception:
+        return text or ""
+
+
+def _fold_with_map(text: str) -> Tuple[str, List[int]]:
+    """fold_text plus, per folded char, the index of its source char."""
+    out: List[str] = []
+    idx: List[int] = []
+    for i, ch in enumerate(text):
+        if _INVISIBLE_RE.match(ch):
+            continue
+        n = unicodedata.normalize("NFKC", ch) if not ch.isascii() else ch
+        for c in n:
+            out.append(c)
+            idx.append(i)
+    folded = _WORD_RE.sub(_fold_word, "".join(out))
+    if len(folded) != len(idx):        # defensive: keep spans sane
+        idx = (idx + [len(text)] * len(folded))[:len(folded)]
+    return folded, idx
 
 
 def severity_of(kind: str, rule_severity: str = "") -> str:
@@ -487,6 +584,11 @@ def _detect_sensitive(text: str, rules: Any) -> List[Detection]:
     base_conf = _CONF_SENSITIVE if has_policy else _CONF_SENSITIVE * 0.5
     for name, pat in _SENSITIVE_TOPIC_RES:
         m = pat.search(text)
+        if m and name == "pii":
+            # a long digit run (timestamp, id, port list) is only a card
+            # number when it passes the Luhn check
+            m = next((x for x in pat.finditer(text) if _pii_ok(x.group(0))),
+                     None)
         if m:
             sev = "medium" if not has_policy else "high"
             if name == "pii":
@@ -503,14 +605,37 @@ def _detect_sensitive(text: str, rules: Any) -> List[Detection]:
     return out
 
 
+def _luhn_ok(digits: str) -> bool:
+    total = 0
+    for i, ch in enumerate(reversed(digits)):
+        d = ord(ch) - 48
+        if i % 2:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
+
+
+def _pii_ok(match_text: str) -> bool:
+    """SSN / e-mail+phone matches always count; card-ish digit runs only
+    when they are 13-19 digits and Luhn-valid."""
+    if "@" in match_text or re.fullmatch(r"\d{3}-\d{2}-\d{4}", match_text):
+        return True
+    digits = re.sub(r"\D", "", match_text)
+    return 13 <= len(digits) <= 19 and _luhn_ok(digits)
+
+
 def _detect_tone_drift(text: str) -> List[Detection]:
     """Tone/style heuristics: shouting, emoji walls, profanity, walls."""
     out: List[Detection] = []
     # shouting
-    letters = [c for c in text if c.isalpha()]
-    caps = [c for c in letters if c.isupper()]
-    if len(letters) >= _SHOUT_MIN_WORDS and letters:
-        ratio = len(caps) / max(1, len(letters))
+    # C-level counting: the old per-char list comprehensions dominated
+    # every streaming check (they ran on each scan window).
+    n_letters = sum(map(str.isalpha, text))
+    n_caps = sum(map(str.isupper, text))
+    if n_letters >= _SHOUT_MIN_WORDS:
+        ratio = n_caps / max(1, n_letters)
         if ratio >= _SHOUT_RATIO_MIN:
             out.append(Detection(
                 rule_id="", kind=KINDS.TONE_DRIFT, confidence=_CONF_TONE,
@@ -521,8 +646,9 @@ def _detect_tone_drift(text: str) -> List[Detection]:
                 meta={"caps_ratio": round(ratio, 3)},
             ))
     # emoji wall
-    emojis = [c for c in text
-              if unicodedata.category(c) == "So" and ord(c) > 0x2000]
+    emojis = [] if text.isascii() else [
+        c for c in _HIGH_CHAR_RE.findall(text)
+        if unicodedata.category(c) == "So"]
     if len(emojis) >= _EMOJI_WALL_MIN:
         out.append(Detection(
             rule_id="", kind=KINDS.TONE_DRIFT, confidence=0.5,
@@ -606,22 +732,26 @@ class DetectEngine:
         if not text.strip():
             return []
         layers = set(self.config.layers or KINDS.ALL)
-        dets: List[Detection] = []
-        try:
-            if KINDS.LEAK_TAG in layers:
-                dets.extend(_detect_leak_tags(text))
-            if KINDS.FORBIDDEN_CONTENT in layers:
-                dets.extend(_detect_forbidden(text, rules))
-            if KINDS.REFUSAL in layers:
-                dets.extend(_detect_refusal(text))
-            if KINDS.CONTRADICTION in layers:
-                dets.extend(_detect_contradiction(text, rules))
-            if self.config.check_sensitive and KINDS.SENSITIVE_LEAK in layers:
-                dets.extend(_detect_sensitive(text, rules))
-            if KINDS.TONE_DRIFT in layers:
-                dets.extend(_detect_tone_drift(text))
-        except Exception:
-            pass  # never raise on any response shape
+        dets = self._run_layers(text, rules, layers, tone=True)
+        # second pass over the evasion-folded text (zero-width chars,
+        # fullwidth forms, mixed-script homoglyphs). Only runs when the
+        # folding actually changed something, so plain text pays nothing.
+        if not text.isascii() and fold_text(text) != text:
+            try:
+                folded, idx = _fold_with_map(text)
+                seen_spans = {(d.kind, d.span) for d in dets}
+                for d in self._run_layers(folded, rules, layers, tone=False):
+                    s0, e0 = d.span
+                    if idx:
+                        s1 = idx[min(max(s0, 0), len(idx) - 1)]
+                        e1 = idx[min(max(e0 - 1, 0), len(idx) - 1)] + 1
+                        d.span = (s1, max(s1, e1))
+                    if (d.kind, d.span) in seen_spans:
+                        continue
+                    d.meta = dict(d.meta, folded=True)
+                    dets.append(d)
+            except Exception:
+                pass
         dets = _dedup(dets)
         minc = float(self.config.min_confidence or 0.0)
         if minc > 0:
@@ -630,6 +760,31 @@ class DetectEngine:
         # deterministic order: span, then severity desc
         dets.sort(key=lambda d: (d.span[0], -_SEV_ORDER.get(d.severity, 0)))
         return dets[:cap]
+
+    def _run_layers(self, text: str, rules: Any, layers: set,
+                    tone: bool) -> List[Detection]:
+        """Run each layer in isolation: one layer failing on an odd
+        rule/text shape used to silently drop every later layer."""
+        steps = []
+        if KINDS.LEAK_TAG in layers:
+            steps.append(lambda: _detect_leak_tags(text))
+        if KINDS.FORBIDDEN_CONTENT in layers:
+            steps.append(lambda: _detect_forbidden(text, rules))
+        if KINDS.REFUSAL in layers:
+            steps.append(lambda: _detect_refusal(text))
+        if KINDS.CONTRADICTION in layers:
+            steps.append(lambda: _detect_contradiction(text, rules))
+        if self.config.check_sensitive and KINDS.SENSITIVE_LEAK in layers:
+            steps.append(lambda: _detect_sensitive(text, rules))
+        if tone and KINDS.TONE_DRIFT in layers:
+            steps.append(lambda: _detect_tone_drift(text))
+        dets: List[Detection] = []
+        for step in steps:
+            try:
+                dets.extend(step())
+            except Exception:
+                continue  # never raise on any response shape
+        return dets
 
     def scan_violations(self, response_text: Optional[str],
                         rules: Any = None) -> List[Dict[str, Any]]:
@@ -676,13 +831,18 @@ def run_all(response_text: Optional[str], rules: Any = None,
     Returns {"violations": [...], "findings": [...], "aggregate": {...}}.
     Never raises, whatever the input.
     """
+    # One scan, two views: run_all used to scan the full text twice
+    # (once for the violation dicts, once more for the aggregate).
     try:
-        vios = scan(response_text, rules if rules is not None else None)
+        dets = _ENGINE.scan(response_text, rules)
+    except Exception:
+        dets = []
+    try:
+        vios = [d.to_violation() for d in dets]
     except Exception:
         vios = []
     agg: Dict[str, Any] = {}
     try:
-        dets = _ENGINE.scan(response_text, rules)
         agg = _ENGINE.aggregate(dets)
     except Exception:
         agg = {"total": len(vios)}

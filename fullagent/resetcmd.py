@@ -164,6 +164,15 @@ def reset_conversation(agent: Any) -> dict:
         filestat.clear(agent)
     except Exception:  # noqa: BLE001
         pass
+    # retryhint's per-tool failure streaks are module-global (the agent
+    # loop never clears them at a turn boundary); after a reset they
+    # would make the first failure of the clean history read as a repeat
+    try:
+        from . import retryhint
+
+        retryhint.reset_turn()
+    except Exception:  # noqa: BLE001
+        pass
     # stall/focus history: session-long wedge signal — start clean
     try:
         fh = getattr(agent, "_focus_history", None)

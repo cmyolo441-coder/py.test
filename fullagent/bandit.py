@@ -63,6 +63,10 @@ def _context_of(task: str) -> str:
 
 def _gamma_draw(shape: float, rng: random.Random) -> float:
     """Marsaglia-Tsang Gamma sampler (shape >= 1 branch + boost)."""
+    if not (shape > 0.0) or not math.isfinite(shape):
+        # defensive: a non-positive / NaN shape has no Gamma distribution
+        # (and used to recurse or divide by zero) — fall back to the prior
+        shape = 1.0
     if shape < 1.0:
         u = rng.random()
         while u <= 1e-12:
@@ -129,10 +133,14 @@ class BanditRouter:
                 continue
             key = (str(ev.data.get("context", "chat")),
                    str(ev.data.get("arm", "")))
-            self.alpha[key] = _safe_float(ev.data.get("alpha"),
-                                          _PRIOR[0])
-            self.beta[key] = _safe_float(ev.data.get("beta"),
-                                         _PRIOR[1])
+            # Beta parameters must be > 0: a corrupt/hand-edited 0 or
+            # negative value used to make every later recommend() for that
+            # context crash (ZeroDivisionError in the Gamma sampler's
+            # u ** (1/shape) — or infinite shape+1 recursion for <0)
+            a = _safe_float(ev.data.get("alpha"), _PRIOR[0])
+            b = _safe_float(ev.data.get("beta"), _PRIOR[1])
+            self.alpha[key] = a if a > 0 else _PRIOR[0]
+            self.beta[key] = b if b > 0 else _PRIOR[1]
 
     def _posterior(self, context: str, arm: str) -> tuple[float, float]:
         return (self.alpha.get((context, arm), _PRIOR[0]),

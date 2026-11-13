@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import os
 from ._foundation import get_logger
 
 _log = get_logger("nexus")
@@ -69,6 +70,10 @@ class Nexus:
         # __init__.py contents per package dir — _is_exported() used to
         # re-read from disk on every symbol
         self._init_cache: dict[str, str | None] = {}
+        # path -> symbol keys defined there: _drop_file used to scan the
+        # whole symbol table per (re)indexed file — O(files x symbols)
+        # on a first index of a large repo
+        self._path_keys: dict[str, list[str]] = {}
 
     # -- indexing --------------------------------------------------------------
 
@@ -76,10 +81,34 @@ class Nexus:
         """Parse every .py file under root. Content-hash keyed: a second
         call on an unchanged repo reparses nothing (§15.5)."""
         root = Path(root).expanduser().resolve()
-        files = [p for p in root.rglob("*.py")
-                 if not any(part in SKIP_DIRS for part in p.parts)]
-        for p in files[:max_files]:
+        if root.is_file():
+            self.index_file(root)
+            return self.idx
+        # os.walk with pruning: rglob descended into node_modules/.venv
+        # completely before the filter threw the results away, and the
+        # filter tested ABSOLUTE parts — a repo living under ~/build or
+        # ~/dist indexed nothing at all.
+        files: list[Path] = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+            for fn in sorted(filenames):
+                if fn.endswith(".py"):
+                    files.append(Path(dirpath) / fn)
+                    if len(files) >= max_files:
+                        break
+            if len(files) >= max_files:
+                break
+        for p in files:
             self.index_file(p)
+        # files deleted since the last index must leave the graph —
+        # otherwise their symbols and call sites live forever
+        if len(files) < max_files:
+            present = {str(p) for p in files}
+            prefix = str(root).rstrip(os.sep) + os.sep
+            for path in [k for k in self.idx.file_hashes
+                         if k.startswith(prefix) and k not in present]:
+                self._drop_file(path)
+                self.idx.file_hashes.pop(path, None)
         return self.idx
 
     def index_file(self, path: str | Path) -> bool:
@@ -112,8 +141,8 @@ class Nexus:
         return True
 
     def _drop_file(self, path: str) -> None:
-        for key in [k for k in self.idx.symbols if k.startswith(path + ":")]:
-            del self.idx.symbols[key]
+        for key in self._path_keys.pop(path, ()):
+            self.idx.symbols.pop(key, None)
         self.idx.calls.pop(path, None)
         self.idx.imports.pop(path, None)
         self.idx.errors.pop(path, None)
@@ -123,6 +152,18 @@ class Nexus:
         pstr = str(path)
         self.idx.calls.setdefault(pstr, [])
         self.idx.imports.setdefault(pstr, set())
+        keys = self._path_keys.setdefault(pstr, [])
+
+        def add(sym: Symbol) -> None:
+            # two same-named definitions in one file (every class's
+            # __init__, overloaded helpers) used to overwrite each other
+            # under one key — find_symbol() lost all but the last
+            key = sym.key
+            if key in self.idx.symbols:
+                key = f"{key}@{sym.lineno}"
+            self.idx.symbols[key] = sym
+            keys.append(key)
+
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 kind = "method" if node.col_offset > 0 else "def"
@@ -130,12 +171,12 @@ class Nexus:
                              lineno=node.lineno,
                              params=[a.arg for a in node.args.args],
                              docstring=(ast.get_docstring(node) or "")[:200])
-                self.idx.symbols[sym.key] = sym
+                add(sym)
             elif isinstance(node, ast.ClassDef):
                 sym = Symbol(name=node.name, kind="class", path=pstr,
                              lineno=node.lineno,
                              docstring=(ast.get_docstring(node) or "")[:200])
-                self.idx.symbols[sym.key] = sym
+                add(sym)
             elif isinstance(node, ast.Call):
                 name = self._call_name(node)
                 if name:

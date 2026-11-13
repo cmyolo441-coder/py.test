@@ -46,7 +46,10 @@ def _tool_versions() -> dict[str, str]:
         if not exe:
             continue
         try:
+            # stdin=DEVNULL: a probed tool (or a wrapper script on PATH)
+            # that reads stdin must not grab the TUI's terminal
             out = subprocess.run([exe, "--version"], capture_output=True,
+                                 stdin=subprocess.DEVNULL,
                                  text=True, timeout=5, errors="replace")
             first = (out.stdout or out.stderr or "").splitlines()
             versions[tool] = first[0][:80] if first else "?"

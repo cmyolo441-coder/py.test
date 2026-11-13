@@ -125,7 +125,13 @@ def should_block_mutating_tool(tool_name: str, risk: str,
 # Tool: PlanWrite
 # ---------------------------------------------------------------------------
 def _make_plan_write_tool(agent: Any) -> Tool:
-    def plan_write(plan: str) -> str:
+    def plan_write(plan: str = "") -> str:
+        # a model that sends null / a list / a number for "plan" used to
+        # crash the handler on .splitlines() (AttributeError)
+        if not isinstance(plan, str):
+            plan = "" if plan is None else str(plan)
+        if not plan.strip():
+            return "ERROR: plan must be a non-empty markdown string"
         agent.plan_text = plan
         n_lines = len(plan.splitlines())
         return (f"Plan recorded ({n_lines} lines). "

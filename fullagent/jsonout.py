@@ -56,6 +56,8 @@ Turn objects never raise.
 from __future__ import annotations
 
 import json
+import math
+import sys
 from typing import Any, Dict, List, Optional
 
 RESULT_TRUNCATE = 2000  # chars of tool result kept in result_truncated
@@ -78,18 +80,57 @@ def _as_dict(value: Any) -> Dict[str, Any]:
         return {"value": value}
 
 
-def _json_safe(value: Any) -> Any:
-    """Coerce anything into a JSON-serialisable value (never raises)."""
-    try:
-        json.dumps(value, ensure_ascii=False)
+_MAX_DEPTH = 64
+
+
+def _json_safe(value: Any, _depth: int = 0,
+               _seen: Optional[set] = None) -> Any:
+    """Coerce anything into a STRICT-JSON-serialisable value (never raises).
+
+    One recursive walk instead of the old "try json.dumps, recurse on
+    failure", which
+      * let NaN/Infinity through (json.dumps accepts them by default and
+        emits the bare tokens NaN/Infinity — invalid JSON for every
+        strict consumer); non-finite floats now become null,
+      * recursed forever on a self-referencing dict/list (json.dumps
+        fails with "Circular reference", the retry recursed into the same
+        object → RecursionError),
+      * re-serialised every subtree at every level (quadratic).
+    """
+    if value is None or isinstance(value, (bool, str)):
         return value
-    except (TypeError, ValueError):
-        pass
-    if isinstance(value, dict):
-        return {str(_json_safe(k)): _json_safe(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(v) for v in value]
-    return str(value)
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, float):
+        return float(value) if math.isfinite(value) else None
+    if _depth >= _MAX_DEPTH:
+        return str(value)[:200]
+    if isinstance(value, (dict, list, tuple)):
+        seen = _seen if _seen is not None else set()
+        if id(value) in seen:
+            return "<circular>"
+        seen.add(id(value))
+        try:
+            if isinstance(value, dict):
+                out: Dict[str, Any] = {}
+                for k, v in value.items():
+                    if isinstance(k, str):
+                        key = k
+                    elif k is None or isinstance(k, (bool, int, float)):
+                        # json.dumps' own key rendering (True -> "true")
+                        key = json.dumps(_json_safe(k))
+                        key = key.strip('"')
+                    else:
+                        key = str(k)
+                    out[key] = _json_safe(v, _depth + 1, seen)
+                return out
+            return [_json_safe(v, _depth + 1, seen) for v in value]
+        finally:
+            seen.discard(id(value))
+    try:
+        return str(value)
+    except Exception:  # noqa: BLE001 — a hostile __str__ must not escape
+        return f"<{type(value).__name__}>"
 
 
 def _usage(turn: Any) -> Dict[str, int]:
@@ -177,9 +218,33 @@ def turn_to_json(turn: Any, session_id: Optional[str],
     return _json_safe(obj)
 
 
+def _dumps_line(obj: Any) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError):
+        # anything that slipped past turn_to_json (NaN, a set, a cycle)
+        return json.dumps(_json_safe(obj), ensure_ascii=False,
+                          allow_nan=False)
+
+
 def emit_json(obj: Dict[str, Any]) -> None:
-    """Print one JSON object as a single line; no other output."""
-    print(json.dumps(obj, ensure_ascii=False))
+    """Print one JSON object as a single line; no other output.
+
+    Always strict JSON (no NaN/Infinity tokens). If stdout cannot encode
+    the text — an ASCII/latin-1 locale, or a lone surrogate from a
+    surrogateescape'd tool result — the line is re-emitted with
+    ensure_ascii=True (\\uXXXX escapes are valid JSON and survive any
+    encoding) instead of raising UnicodeEncodeError and emitting nothing.
+    """
+    line = _dumps_line(obj)
+    try:
+        print(line)
+    except UnicodeEncodeError:
+        safe = json.dumps(json.loads(line), ensure_ascii=True,
+                          allow_nan=False)
+        out = sys.stdout
+        out.write(safe + "\n")
+        out.flush()
 
 
 def register(agent: Any) -> None:

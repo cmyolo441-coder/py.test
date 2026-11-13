@@ -262,9 +262,24 @@ class IntentCompiler:
                           for it in wave])
             remaining = [it for it in remaining if it["id"] not in placed]
         if remaining:                          # last resort: final wave
+            # dependency order inside the overflow wave (draft order is
+            # arbitrary): the lock pass pushes each item past its deps,
+            # which only works when deps are visited first
+            ordered: list[dict] = []
+            done = set(placed)
+            pending = list(remaining)
+            while pending:
+                ready = [it for it in pending
+                         if all(d in done for d in it["depends_on"])]
+                if not ready:
+                    ready = [pending[0]]
+                for it in ready:
+                    ordered.append(it)
+                    done.add(it["id"])
+                pending = [it for it in pending if it["id"] not in done]
             waves.append([{k: v for k, v in it.items()
                            if k not in ("_raw_deps", "_draft_idx")}
-                          for it in remaining])
+                          for it in ordered])
         return waves
 
     def _lockpass(self, waves: list[list[dict]]
@@ -278,8 +293,13 @@ class IntentCompiler:
         the plan reports them — the old code only sealed a log event and
         left plan.dropped / format() under-reporting the loss."""
         out: list[list[dict]] = [[] for _ in waves] if waves else [[]]
-        locked: list[set[str]] = [set() for _ in waves]
+        locked: list[set[str]] = [set() for _ in waves] if waves \
+            else [set()]
         dropped: list[dict] = []
+        # final wave of every placed item: pushing a writer to a later
+        # wave must push its dependents past it too — otherwise an item
+        # ran in a wave BEFORE (or alongside) the work it depends on
+        placed_at: dict[str, int] = {}
         for wi, wave in enumerate(waves):
             for item in wave:
                 paths = set(item.get("paths") or [])
@@ -287,6 +307,12 @@ class IntentCompiler:
                     "coder", "architect", "refactorer", "documenter",
                     "devops", "integrator")
                 cur = wi
+                for dep in item.get("depends_on") or []:
+                    if dep in placed_at:
+                        cur = max(cur, placed_at[dep] + 1)
+                while cur >= len(out):
+                    out.append([])
+                    locked.append(set())
                 # walk forward until we land on a wave whose locked-path
                 # set does not overlap with this writer's paths. Cap by
                 # _MAX_WAVES + 4 to bound the work; if even the last wave
@@ -314,6 +340,8 @@ class IntentCompiler:
                 if writer:
                     locked[cur] |= paths
                 out[cur].append(item)
+                if "id" in item:
+                    placed_at[item["id"]] = cur
         # surface dropped items at the end so the executor / TUI can
         # report them, rather than vanishing them silently
         if dropped:

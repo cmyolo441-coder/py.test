@@ -43,6 +43,14 @@ _FORBIDDEN_NAMES = re.compile(
     r"setattr|delattr|__subclasses__|__globals__|__builtins__|"
     r"breakpoint|input)\b")
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{2,30}$")
+# Introspection attributes that are NOT dunders but walk out of the
+# sandbox: generator/coroutine frames (gi_frame / cr_frame / ag_frame),
+# frame links and namespaces (f_back / f_globals / f_builtins /
+# f_locals), traceback frames (tb_frame) and code objects (co_*). With
+# these, `g.gi_frame.f_back.f_back.f_globals` reached this module's
+# globals (inspect -> inspect.os.system) from "validated" code.
+_FORBIDDEN_ATTR_RE = re.compile(r"^(gi|cr|ag|f|tb|co|func)_")
+_FORBIDDEN_ATTRS = frozenset({"mro"})
 
 
 @dataclass
@@ -132,6 +140,11 @@ class ProgramSynthesizer:
             if isinstance(node, ast.Attribute) \
                     and node.attr.startswith("__"):
                 return "", f"dunder access .{node.attr!r} is not allowed"
+            if isinstance(node, ast.Attribute) and (
+                    _FORBIDDEN_ATTR_RE.match(node.attr)
+                    or node.attr in _FORBIDDEN_ATTRS):
+                return "", (f"introspection attribute .{node.attr} is "
+                            "not allowed")
         args = [a.arg for a in fn.args.args]
         if not args:
             return "", "function must take at least one argument"
@@ -205,6 +218,16 @@ class ProgramSynthesizer:
         if not spec.examples:
             return SynthResult(False, spec.name,
                                "at least one example is required")
+        existing = self.registry.get(spec.name)
+        if existing is not None and spec.name not in self.synthesized \
+                and not str(getattr(existing, "description", "")
+                            ).startswith("[synthesized]"):
+            # registry is the LIVE agent tool dict: a draft named
+            # "write_file" or "bash" would silently replace a built-in
+            # tool with model-written code
+            return SynthResult(False, spec.name,
+                               f"tool name {spec.name!r} is already taken "
+                               "by a built-in tool")
         # normalize ONCE: validate_source() parses the dedented text,
         # so exec() must run the same string — otherwise an indented
         # draft passes validation and then dies with IndentationError
@@ -242,7 +265,8 @@ class ProgramSynthesizer:
                                    failures[:2]))
 
         self._register(spec, fn)
-        self.synthesized.append(spec.name)
+        if spec.name not in self.synthesized:
+            self.synthesized.append(spec.name)
         self.log.append("synth.tool.registered",
                         {"name": spec.name,
                          "examples": len(spec.examples)}, actor="kernel")

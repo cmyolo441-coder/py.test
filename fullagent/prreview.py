@@ -43,6 +43,7 @@ USAGE = (
 DIFF_HEAD_LIMIT = 8000   # chars of diff handed to the model
 GH_TIMEOUT = 30
 API_TIMEOUT = 20
+API_MAX_BYTES = 20 * 1024 * 1024  # cap on a diff fetched over the API
 SIZE_WARNING_LINES = 500   # > this many changed lines → size warning
 BIG_FILE_LINES = 200       # > this many added lines in one file → high
 
@@ -57,6 +58,15 @@ _GITHUB_URL_RE = re.compile(
     re.IGNORECASE)
 _OWNER_REPO_NUM_RE = re.compile(r"^([^/\s#]+)/([^/\s#]+)#(\d+)$")
 _BARE_NUM_RE = re.compile(r"^#?(\d+)$")
+# GitHub owner / repository names: letters, digits, "-", "_", "." only.
+# Anything else ("?", "/", "%", spaces, "..") would be spliced verbatim into
+# the API URL path (query injection / path traversal on api.github.com).
+_GH_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
+
+
+def _valid_gh_name(name: Optional[str]) -> bool:
+    return bool(name) and bool(_GH_NAME_RE.match(name)) \
+        and name not in (".", "..") and not name.startswith("-")
 
 
 def _clean_repo_name(name: str) -> str:
@@ -75,10 +85,12 @@ def parse_pr_ref(pr_ref: str) -> Tuple[Optional[str], Optional[str],
     """
     text = (pr_ref or "").strip()
     m = _GITHUB_URL_RE.search(text)
-    if m:
+    if m and _valid_gh_name(m.group(1)) \
+            and _valid_gh_name(_clean_repo_name(m.group(2))):
         return m.group(1), _clean_repo_name(m.group(2)), m.group(3)
     m = _OWNER_REPO_NUM_RE.match(text)
-    if m:
+    if m and _valid_gh_name(m.group(1)) \
+            and _valid_gh_name(_clean_repo_name(m.group(2))):
         return m.group(1), _clean_repo_name(m.group(2)), m.group(3)
     m = _BARE_NUM_RE.match(text)
     if m:
@@ -96,11 +108,14 @@ def _normalize_repo(repo: str) -> str:
                 return f"{owner}/{name}"
         else:
             m = _GIT_REMOTE_RE.search(text)
-            if m:
+            if m and _valid_gh_name(m.group(1)) \
+                    and _valid_gh_name(_clean_repo_name(m.group(2))):
                 return f"{m.group(1)}/{_clean_repo_name(m.group(2))}"
     parts = text.split("/")
     if len(parts) == 2 and all(p.strip() for p in parts):
-        return f"{parts[0].strip()}/{_clean_repo_name(parts[1])}"
+        owner, name = parts[0].strip(), _clean_repo_name(parts[1])
+        if _valid_gh_name(owner) and _valid_gh_name(name):
+            return f"{owner}/{name}"
     return ""
 
 
@@ -113,15 +128,19 @@ def _repo_from_git() -> str:
     try:
         proc = subprocess.run(
             ["git", "remote", "get-url", "origin"],
-            capture_output=True, text=True, timeout=10)
-    except (OSError, subprocess.SubprocessError):
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", stdin=subprocess.DEVNULL, timeout=10)
+    except (OSError, subprocess.SubprocessError, ValueError):
         return ""
     if proc.returncode != 0:
         return ""
     m = _GIT_REMOTE_RE.search((proc.stdout or "").strip())
     if not m:
         return ""
-    return f"{m.group(1)}/{_clean_repo_name(m.group(2))}"
+    owner, name = m.group(1), _clean_repo_name(m.group(2))
+    if not (_valid_gh_name(owner) and _valid_gh_name(name)):
+        return ""
+    return f"{owner}/{name}"
 
 
 # ---------------------------------------------------------------------------
@@ -134,9 +153,16 @@ def _fetch_via_gh(number: str, repo_full: str) -> Optional[str]:
     if repo_full:
         cmd += ["--repo", repo_full]
     try:
+        # stdin=DEVNULL: gh can prompt (auth, repo picker) and must never
+        # read the TUI's terminal. utf-8/replace: a PR touching a latin-1
+        # file used to raise UnicodeDecodeError here, which skipped the
+        # API fallback entirely (the caller's catch-all turned it into an
+        # ERROR string).
         proc = subprocess.run(cmd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace",
+                              stdin=subprocess.DEVNULL,
                               timeout=GH_TIMEOUT)
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, ValueError):
         return None  # gh missing / timed out → caller tries the API
     out = (proc.stdout or "").strip()
     if proc.returncode == 0 and out:
@@ -155,7 +181,12 @@ def _fetch_via_api(owner: str, repo_name: str, number: str) -> Optional[str]:
         with urllib.request.urlopen(req, timeout=API_TIMEOUT) as resp:
             if resp.status != 200:
                 return None
-            return resp.read().decode("utf-8", errors="replace").strip()
+            # bounded read: an enormous PR diff must not be pulled into
+            # RAM whole — only DIFF_HEAD_LIMIT chars reach the model anyway
+            data = resp.read(API_MAX_BYTES + 1)
+            if len(data) > API_MAX_BYTES:
+                data = data[:API_MAX_BYTES]
+            return data.decode("utf-8", errors="replace").strip()
     except Exception:
         return None
 
@@ -237,7 +268,15 @@ def parse_diff(diff: str) -> List[Dict[str, Any]]:
     new_lineno = 0
     in_hunk = False
     old_left = new_left = 0
-    for line in (diff or "").splitlines():
+    # split on "\n" only: str.splitlines() also breaks on form feeds,
+    # \x0b, \x1c-\x1e, \x85, \u2028/9 inside a line's content, which
+    # shifted every later line number and corrupted the hunk bookkeeping
+    raw_lines = (diff or "").split("\n")
+    if raw_lines and raw_lines[-1] == "":
+        raw_lines.pop()
+    for line in raw_lines:
+        if line.endswith("\r"):
+            line = line[:-1]
         m = _DIFF_FILE_RE.match(line)
         if m:
             cur = {"file": m.group(2), "added": [],
@@ -299,6 +338,24 @@ def _finding(severity: str, file: str, line: int, message: str) -> Dict:
             "message": message}
 
 
+def _mask_secret(match: str) -> str:
+    """Show WHERE a secret is without repeating the secret itself.
+
+    The finding text lands in the report header, the TUI scrollback and
+    the model's context; echoing the matched credential verbatim (as the
+    old ``m.group(0)[:60]`` did) copied it into all of them."""
+    text = match.strip()
+    m = re.match(r"(?s)(.*?[:=]\s*)(\S.*)$", text)
+    if m:
+        head, value = m.group(1), m.group(2)
+    elif text.startswith("-----BEGIN"):
+        return text[:60]                      # PEM header, no key bytes
+    else:
+        head, value = "", text
+    keep = 3 if len(value) > 8 else 0
+    return f"{head[:40]}{value[:keep]}…[redacted {len(value)} chars]"
+
+
 def quick_heuristics(diff: str) -> List[Dict[str, Any]]:
     """Quick file-level checks over a unified diff.
 
@@ -328,7 +385,7 @@ def quick_heuristics(diff: str) -> List[Dict[str, Any]]:
                 if m:
                     findings.append(_finding(
                         "critical", f["file"], lineno,
-                        f"{label}: {m.group(0)[:60]}"))
+                        f"{label}: {_mask_secret(m.group(0))}"))
                     break
             if _TODO_RE.search(text):
                 findings.append(_finding(
@@ -527,8 +584,8 @@ class _FakeResp:
         self._data = data
         self.status = status
 
-    def read(self):
-        return self._data
+    def read(self, amt=None):
+        return self._data if amt is None else self._data[:amt]
 
     def __enter__(self):
         return self

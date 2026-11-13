@@ -104,27 +104,53 @@ def _check_provider_keys() -> List[Dict[str, Any]]:
     return results
 
 
+def _probe_one(key: str, provider: Any) -> Dict[str, Any]:
+    try:
+        url = str(provider.base_url or "").rstrip("/") + "/models"
+        reachable, status, latency_ms = _probe(url, CONNECT_TIMEOUT)
+    except Exception as exc:  # a misbehaving probe must not raise
+        reachable, status, latency_ms = (
+            False, f"probe error: {type(exc).__name__}: {exc}", 0.0)
+    if reachable:
+        detail = f"reachable ({status}, {latency_ms:.0f} ms)"
+    else:
+        detail = f"unreachable ({status}, {latency_ms:.0f} ms)"
+    return _result(f"net:{key}", reachable, detail)
+
+
 def _check_connectivity() -> List[Dict[str, Any]]:
-    """Probe the configured HTTP providers."""
-    results = []
-    for key, provider in PROVIDERS.items():
-        url = provider.base_url.rstrip("/") + "/models"
-        try:
-            reachable, status, latency_ms = _probe(url, CONNECT_TIMEOUT)
-        except Exception as exc:  # a misbehaving probe must not raise
-            reachable, status, latency_ms = (
-                False, f"probe error: {type(exc).__name__}: {exc}", 0.0)
-        if reachable:
-            detail = f"reachable ({status}, {latency_ms:.0f} ms)"
-        else:
-            detail = f"unreachable ({status}, {latency_ms:.0f} ms)"
-        results.append(_result(f"net:{key}", reachable, detail))
-    return results
+    """Probe the configured HTTP providers — concurrently.
+
+    The probes used to run one after another, so /doctor froze the TUI
+    for up to CONNECT_TIMEOUT x len(PROVIDERS) seconds when the network
+    was down. Results keep PROVIDERS order."""
+    items = list(PROVIDERS.items())
+    if len(items) <= 1:
+        return [_probe_one(k, p) for k, p in items]
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(8, len(items)),
+                            thread_name_prefix="doctor-probe") as pool:
+        futs = [pool.submit(_probe_one, k, p) for k, p in items]
+        return [f.result() for f in futs]
+
+
+def _app_dir() -> str:
+    """The directory the app ACTUALLY uses (config.APP_DIR).
+
+    Re-deriving it from $FULLAGENT_HOME / ~ reported the wrong directory
+    whenever config fell back (unwritable $FULLAGENT_HOME or home, or the
+    tmp fallback) — /doctor flagged a dir the app never touches and said
+    nothing about the one it does."""
+    try:
+        from . import config
+        return str(config.APP_DIR)
+    except Exception:  # noqa: BLE001 — diagnostics must not raise
+        return os.environ.get("FULLAGENT_HOME") or os.path.join(
+            os.path.expanduser("~"), ".fullagent")
 
 
 def _check_app_dir() -> Dict[str, Any]:
-    app_dir = os.environ.get("FULLAGENT_HOME") or os.path.join(
-        os.path.expanduser("~"), ".fullagent")
+    app_dir = _app_dir()
     exists = os.path.isdir(app_dir)
     writable = os.access(app_dir, os.W_OK) if exists else False
     ok = exists and writable
@@ -134,12 +160,16 @@ def _check_app_dir() -> Dict[str, Any]:
 
 
 def _check_disk() -> Dict[str, Any]:
-    home = os.path.expanduser("~")
+    # measure the filesystem the app writes to (logs, sessions, event
+    # log), not $HOME — they differ when APP_DIR lives elsewhere
+    target = _app_dir()
+    if not os.path.isdir(target):
+        target = os.path.expanduser("~")
     try:
-        usage = shutil.disk_usage(home)
+        usage = shutil.disk_usage(target)
         free_gb = usage.free / (1024 ** 3)
         ok = usage.free >= DISK_WARN_BYTES
-        detail = f"{free_gb:.1f} GB free on home dir" + (
+        detail = f"{free_gb:.1f} GB free on app dir" + (
             "" if ok else " (WARNING: below 1 GB threshold)")
     except OSError as exc:
         return _result("disk", False, f"could not read disk usage: {exc}")
@@ -298,8 +328,13 @@ def _selftest() -> None:
     assert _check_app_dir()["name"] == "app-dir"
 
     # 8. handle_doctor renders ✓/✗ lines + "N/M checks passing" summary
+    #    (probe mocked: the self-test promises no real network traffic)
+    _probe = lambda url, timeout: (True, "HTTP 200", 1.0)  # noqa: E731
     ui = _FakeUI()
-    handle_doctor(ui, "")
+    try:
+        handle_doctor(ui, "")
+    finally:
+        _probe = real_probe
     all_lines = ui.infos + ui.errors
     body, summary = all_lines[:-1], all_lines[-1]
     passed_lines = sum(1 for line in body if line.startswith("✓"))
@@ -317,7 +352,11 @@ def _selftest() -> None:
     agent = _FakeAgent()
     register(agent)
     assert hasattr(agent, "doctor")
-    assert isinstance(agent.doctor.run(), list)
+    _probe = lambda url, timeout: (True, "HTTP 200", 1.0)  # noqa: E731
+    try:
+        assert isinstance(agent.doctor.run(), list)
+    finally:
+        _probe = real_probe
 
     print("PASS")
 

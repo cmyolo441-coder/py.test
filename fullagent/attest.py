@@ -51,6 +51,15 @@ def content_hash(text: str) -> str:
 
 # ── chain records ────────────────────────────────────────────────────────
 
+def _hash_basis(stage: str, payload: str, prev: str, meta: dict) -> str:
+    # default=str: a non-JSON value in meta (a Path, an exception, a set)
+    # used to raise TypeError out of own_hash/append/verify — the module
+    # contract is "never raises"
+    return json.dumps({"stage": stage, "payload": payload,
+                       "prev": prev, "meta": meta},
+                      sort_keys=True, default=str)
+
+
 @dataclass
 class Attestation:
     stage: str            # "compile" | "wrap" | "ledger" | "seal" |
@@ -59,16 +68,17 @@ class Attestation:
     prev_hash: str        # hash link to the previous record
     ts: float             # time.time()
     meta: dict = field(default_factory=dict)
+    # own_hash as computed when the record was SEALED (by AttestChain.
+    # append). own_hash is a live property, so without this snapshot a
+    # tampered record always "re-verified" against itself — the
+    # "record tampered" check in verify_chain() could never fire and a
+    # mutation of the LAST record (no successor link) went undetected.
+    sealed_hash: str = ""
 
     @property
     def own_hash(self) -> str:
-        basis = json.dumps({
-            "stage": self.stage,
-            "payload": self.payload_hash,
-            "prev": self.prev_hash,
-            "meta": self.meta,
-        }, sort_keys=True)
-        return content_hash(basis)
+        return content_hash(_hash_basis(self.stage, self.payload_hash,
+                                        self.prev_hash, self.meta))
 
 
 @dataclass
@@ -84,6 +94,7 @@ class AttestChain:
                           prev_hash=prev,
                           ts=time.time(),
                           meta=dict(meta or {}))
+        rec.sealed_hash = rec.own_hash
         self.records.append(rec)
         return rec
 
@@ -116,16 +127,21 @@ def verify_chain(chain: AttestChain) -> ChainReport:
                 ok=False, broken_at=i,
                 reason=f"link break at {i}: prev {rec.prev_hash[:8]}… "
                        f"!= expected {prev[:8]}…", checked=i)
-        # 2. payload integrity: hash must be reproducible (meta is part
-        #    of own_hash, so a tampered meta breaks here too)
-        if rec.own_hash != content_hash(json.dumps({
-                "stage": rec.stage, "payload": rec.payload_hash,
-                "prev": rec.prev_hash, "meta": rec.meta},
-                sort_keys=True)):
+        # 2. record integrity: the record's current content must reproduce
+        #    the hash it was sealed with (stage, payload hash, prev link
+        #    and meta are all covered). Records built by hand without a
+        #    seal (sealed_hash == "") can only be checked via the links.
+        try:
+            own = rec.own_hash
+        except Exception as exc:  # noqa: BLE001 — never raises
+            return ChainReport(ok=False, broken_at=i,
+                               reason=f"record unhashable at {i}: "
+                                      f"{type(exc).__name__}", checked=i)
+        if rec.sealed_hash and own != rec.sealed_hash:
             return ChainReport(ok=False, broken_at=i,
                                reason=f"record tampered at {i}",
                                checked=i)
-        prev = rec.own_hash
+        prev = own
     return ChainReport(ok=True, checked=len(chain.records))
 
 
@@ -170,7 +186,8 @@ def open_envelope(sealed: str) -> tuple[str | None, ChainReport]:
         return None, ChainReport(ok=False, reason="unterminated header")
     header = sealed[start:header_end + 1]
     expect_hash = ""
-    for tok in header.split():
+    expect_chars = -1
+    for tok in header.rstrip("]").split():
         if tok.startswith("h="):
             expect_hash = tok[2:]
         elif tok.startswith("chars="):
@@ -178,12 +195,29 @@ def open_envelope(sealed: str) -> tuple[str | None, ChainReport]:
                 expect_chars = int(tok[6:])
             except ValueError:
                 expect_chars = -1
-    close = sealed.find(_ENVELOPE_CLOSE, header_end)
-    if close < 0:
-        return None, ChainReport(ok=False, reason="no envelope footer")
-    body = sealed[header_end + 1:close].strip("\n")
+    if not expect_hash:
+        # an envelope that carries no hash cannot be verified: the old
+        # code returned its body as ok=True, so simply deleting "h=…"
+        # from the header defeated the tamper check entirely
+        return None, ChainReport(ok=False,
+                                 reason="envelope header has no hash")
+    # exact framing first: header "\n" body(chars) "\n" footer — a body
+    # that itself mentions the footer marker must not be cut short there
+    # (that was reported as tampering of a perfectly intact envelope)
+    body = None
+    if expect_chars >= 0:
+        b0 = header_end + 2
+        b1 = b0 + expect_chars
+        if sealed[header_end + 1:b0] == "\n" and sealed.startswith(
+                "\n" + _ENVELOPE_CLOSE, b1):
+            body = sealed[b0:b1]
+    if body is None:
+        close = sealed.find(_ENVELOPE_CLOSE, header_end)
+        if close < 0:
+            return None, ChainReport(ok=False, reason="no envelope footer")
+        body = sealed[header_end + 1:close].strip("\n")
     actual = content_hash(body)
-    if expect_hash and actual != expect_hash:
+    if actual != expect_hash:
         return None, ChainReport(
             ok=False,
             reason=f"tamper: expected {expect_hash[:16]}… got {actual[:16]}…")
@@ -267,14 +301,23 @@ def _self_test() -> int:
     rep = verify_chain(chain)
     assert rep.ok and rep.checked == 3, rep.reason
 
-    # tamper detection: mutate a record's meta — its own_hash changes,
-    # so the NEXT record's prev link breaks first (link at index 1)
+    # tamper detection: mutate a record's meta — it no longer matches the
+    # hash it was sealed with, so the break is attributed to THAT record
+    # (index 0), not merely to its successor's link
     chain2 = AttestChain(subject="x")
     chain2.append("compile", doc)
     chain2.append("wrap", doc + "extra")
     chain2.records[0].meta = {"injected": True}   # meta is hash-covered
     rep2 = verify_chain(chain2)
-    assert not rep2.ok and rep2.broken_at == 1, rep2.reason
+    assert not rep2.ok and rep2.broken_at == 0, rep2.reason
+    assert "tampered" in rep2.reason, rep2.reason
+    # …and tampering with the LAST record (no successor link) is caught too
+    chain2b = AttestChain(subject="x")
+    chain2b.append("compile", doc)
+    chain2b.append("wrap", doc)
+    chain2b.records[-1].payload_hash = content_hash("swapped")
+    rep2b = verify_chain(chain2b)
+    assert not rep2b.ok and rep2b.broken_at == 1, rep2b.reason
 
     # link break detection
     chain3 = AttestChain(subject="y")
@@ -299,6 +342,13 @@ def _self_test() -> int:
     tricky = "the docs say " + _ENVELOPE_OPEN + " is a marker"
     tb, tr = open_envelope(tricky)
     assert tb is None
+    # stripping the hash from the header is tampering, not a free pass
+    nohash = sealed.replace(" h=" + content_hash(doc), "")
+    assert open_envelope(nohash)[0] is None
+    # a body that quotes the footer marker still round-trips intact
+    quoting = "see " + _ENVELOPE_CLOSE + " for the end marker"
+    qb, qr = open_envelope(seal_envelope(quoting))
+    assert qr.ok and qb == quoting, qr.reason
 
     # wire attest
     sealed_prompt = "DIRECTIVES " + doc

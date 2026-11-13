@@ -36,13 +36,57 @@ from __future__ import annotations
 import threading
 from typing import Any
 
+# The agent loop injects harness guidance into the conversation as
+# ``user``-role messages mid-turn (retryhint / earlyexit runtime notes,
+# the compliance-gate repair note). They are NOT the user's prompt: a
+# derailed turn full of repeated failures is exactly when retryhint adds
+# them, so treating the newest one as "the prompt" made /retry restart
+# the turn with the runtime note as its prompt and keep every failed
+# attempt that preceded it.
+_HARNESS_PREFIXES = ("[RUNTIME NOTE", "[compliance-gate]")
+
+
+def _prompt_text(msg: Any) -> str | None:
+    """The user's prompt text if ``msg`` is a real user prompt, else None.
+
+    Skips harness-injected user-role notes. Multimodal (list) content
+    yields its joined text parts.
+    """
+    try:
+        if msg.get("role") != "user":
+            return None
+        content = msg.get("content")
+    except AttributeError:
+        return None
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                parts.append(block["text"])
+            elif isinstance(block, str):
+                parts.append(block)
+        content = "\n".join(p for p in parts if p)
+    if not isinstance(content, str) or not content.strip():
+        return None
+    if content.lstrip().startswith(_HARNESS_PREFIXES):
+        return None
+    return content
+
+
+def _last_prompt_index(messages: list) -> int:
+    for i in range(len(messages) - 1, -1, -1):
+        if _prompt_text(messages[i]) is not None:
+            return i
+    return -1
+
 
 def repair_conversation(messages: list) -> list:
     """Drop the failed turn's tool attempts + errors, keep the prompt.
 
-    Everything after the last ``user`` message — assistant text,
-    ``tool_calls`` blocks, ``tool`` result/error messages — belongs to
-    the derailed turn and is removed. Earlier history (including prior
+    Everything after the last real ``user`` prompt — assistant text,
+    ``tool_calls`` blocks, ``tool`` result/error messages and the
+    harness's own user-role runtime notes — belongs to the derailed
+    turn and is removed. Earlier history (including prior
     turns) is untouched. The original user prompt message stays, so the
     result is ready for a fresh attempt.
 
@@ -51,14 +95,7 @@ def repair_conversation(messages: list) -> list:
     all, returns a copy unchanged.
     """
     src = list(messages or [])
-    last_user = -1
-    for i in range(len(src) - 1, -1, -1):
-        try:
-            if src[i].get("role") == "user":
-                last_user = i
-                break
-        except AttributeError:
-            continue
+    last_user = _last_prompt_index(src)
     if last_user < 0:
         return src
     return src[: last_user + 1]
@@ -66,15 +103,9 @@ def repair_conversation(messages: list) -> list:
 
 def _original_prompt(agent: Any) -> str | None:
     """The user prompt of the failed turn — the retry goal."""
-    for m in reversed(getattr(agent, "messages", None) or []):
-        try:
-            if m.get("role") == "user":
-                content = m.get("content")
-                if isinstance(content, str) and content.strip():
-                    return content
-        except AttributeError:
-            continue
-    return None
+    msgs = list(getattr(agent, "messages", None) or [])
+    i = _last_prompt_index(msgs)
+    return _prompt_text(msgs[i]) if i >= 0 else None
 
 
 def handle_retry(ui: Any, arg: str) -> None:
@@ -114,6 +145,13 @@ def handle_retry(ui: Any, arg: str) -> None:
         # trailing user message was the failed turn's prompt; the fresh
         # turn re-appends it.
         agent.messages = repaired[:-1]
+        # the failed attempts are gone, so their per-tool failure streaks
+        # must not make the fresh attempt's first error look like a repeat
+        try:
+            from . import retryhint
+            retryhint.reset_turn()
+        except Exception:
+            pass
         try:
             log = getattr(agent, "log", None)
             if log is not None:

@@ -40,6 +40,7 @@ import time
 from typing import Any
 
 from .tools import RISK_CONFIRM, Tool
+from .tools import _kill_process_tree, _popen_kwargs as _tree_kwargs
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -53,6 +54,10 @@ DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_BASE_DELAY = 1.0
 DEFAULT_MAX_DELAY = 60.0
 DEFAULT_TIMEOUT = 120.0  # per-attempt process timeout (seconds)
+# Upper bound on attempts: each attempt adds a line to the tool result,
+# and with a tiny max_delay a model-supplied max_attempts of 10**6 turned
+# one call into a 10-minute busy loop with a multi-MB attempt log.
+MAX_ATTEMPTS_CAP = 50
 
 # ---------------------------------------------------------------------------
 # Engine
@@ -108,39 +113,47 @@ def _run_once(command: Any, shell: bool,
                 return (2, "", f"invalid command: {e}", "invalid command")
         popen_args = argv
         popen_kwargs = {"shell": False}
+    # stdin=DEVNULL: an interactive command (a prompt, a pager) must not
+    # grab the agent's terminal and hang until the timeout. Own session:
+    # on timeout the WHOLE process tree is killed — subprocess.run only
+    # killed the direct child, so `sh -c "sleep 999 | cat"` style
+    # commands left orphaned grandchildren running after every timeout.
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             popen_args,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=timeout,
+            **_tree_kwargs,
             **popen_kwargs,
         )
     except FileNotFoundError:
         return (NOT_FOUND_RC, "",
                 f"command not found: {command!r}",
                 "command not found")
-    except subprocess.TimeoutExpired as e:
-        # text=True may leave stdout/stderr as str OR bytes depending on
-        # how far communicate() got before the timeout — handle both.
-        def _as_text(v):
-            if v is None:
-                return ""
-            if isinstance(v, bytes):
-                return v.decode("utf-8", "replace")
-            return str(v)
-
-        out = _as_text(e.stdout)
-        err = _as_text(e.stderr)
-        return (-1, out, err + f"\n[attempt timed out after {timeout:g}s]",
-                "timeout")
     except OSError as e:
         return (NOT_FOUND_RC, "", f"failed to start process: {e}",
                 "spawn failed")
-    return proc.returncode, proc.stdout or "", proc.stderr or "", ""
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(proc)
+        try:
+            # the tree is dead, so the pipes hit EOF promptly
+            out, err = proc.communicate(timeout=5)
+        except Exception:  # noqa: BLE001 — partial output is best effort
+            out, err = "", ""
+        return (-1, out or "",
+                (err or "") + f"\n[attempt timed out after {timeout:g}s]",
+                "timeout")
+    except BaseException:
+        # KeyboardInterrupt / cancellation mid-attempt: never leak the tree
+        _kill_process_tree(proc)
+        raise
+    return proc.returncode, out or "", err or "", ""
 
 
 def _render_output(out: str, err: str) -> str:
@@ -162,7 +175,7 @@ def run_with_retry(command: Any, *, shell: bool = False,
     attempt's merged stdout+stderr), ``elapsed_s``, ``cap_exceeded``
     and ``attempts_log`` (timestamped per-attempt entries).
     """
-    max_attempts = max(1, int(max_attempts))
+    max_attempts = min(MAX_ATTEMPTS_CAP, max(1, int(max_attempts)))
     base_delay = max(0.01, float(base_delay))
     max_delay = max(0.01, float(max_delay))  # strict cap, even if < base_delay
     timeout = max(1.0, float(timeout))
@@ -175,7 +188,12 @@ def run_with_retry(command: Any, *, shell: bool = False,
 
     for n in range(1, max_attempts + 1):
         started = time.time()
-        rc, out, err, note = _run_once(command, shell, timeout)
+        # TOTAL_TIME_CAP is a hard budget: the old code only checked it
+        # before sleeping, so one attempt could still run for the full
+        # (model-supplied, unbounded) per-attempt timeout past the cap.
+        remaining = TOTAL_TIME_CAP - (started - start_total)
+        rc, out, err, note = _run_once(command, shell,
+                                       max(1.0, min(timeout, remaining)))
         dur = time.time() - started
         log.append({
             "attempt": n,

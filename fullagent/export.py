@@ -25,6 +25,7 @@ import html as _html
 import json
 import os
 import re
+import tempfile
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -54,6 +55,17 @@ def scrub_keys(text: str) -> str:
     for pat in _KEY_PATTERNS:
         text = pat.sub(REDACTED, str(text))
     return text
+
+
+def _fence(text: str, lang: str = "") -> List[str]:
+    """Markdown code fence that the content cannot close early.
+
+    A tool result containing a ``` line used to end the fence mid-result,
+    so the rest rendered as live markdown (headings, links, images) and
+    every later section's fences were inverted."""
+    longest = max((len(m) for m in re.findall(r"`{3,}", text)), default=2)
+    bar = "`" * max(3, longest + 1)
+    return [bar + lang, text, bar]
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -96,7 +108,7 @@ def _pretty_args(fn: Dict[str, Any]) -> str:
     else:
         parsed = raw
     if isinstance(parsed, (dict, list)):
-        return json.dumps(parsed, ensure_ascii=False, indent=2)
+        return json.dumps(parsed, ensure_ascii=False, indent=2, default=str)
     return str(parsed)
 
 
@@ -120,6 +132,9 @@ class Exporter:
         ``{"kind": "user"|"assistant"|"system"|"tool", ...}``.
         """
         # Map tool_call_id -> tool result content, first pass.
+        # non-dict entries (a stray string / None in the history) used to
+        # raise AttributeError out of the /export handler
+        messages = [m for m in (messages or []) if isinstance(m, dict)]
         tool_results: Dict[str, str] = {}
         for m in messages:
             if m.get("role") == "tool":
@@ -134,20 +149,39 @@ class Exporter:
                 continue  # folded into the matching tool call below
             text = _content_text(m.get("content"))
             calls: List[Dict[str, Any]] = []
-            for tc in (m.get("tool_calls") or []):
+            raw_calls = m.get("tool_calls") or []
+            if not isinstance(raw_calls, list):
+                raw_calls = []
+            for tc in raw_calls:
                 if not isinstance(tc, dict):
                     continue
                 fn = tc.get("function") or {}
+                if not isinstance(fn, dict):
+                    fn = {}
                 name = str(fn.get("name", "") or "")
                 tid = str(tc.get("id", "") or "")
                 calls.append({
                     "name": name,
-                    "args": _pretty_args(fn) if isinstance(fn, dict) else "",
+                    "args": _pretty_args(fn),
                     "result": tool_results.get(tid, ""),
                 })
             if role not in ("user", "assistant", "system", "developer"):
                 role = "system"
             sections.append({"role": role, "text": text, "tool_calls": calls})
+        return sections
+
+    def _render_sections(self, messages: List[Dict[str, Any]]
+                         ) -> List[Dict[str, Any]]:
+        """collect() + redaction, BEFORE any truncation: scrubbing only
+        the final page missed a key that _truncate() had cut short (the
+        surviving "sk-abc12" prefix was too short for the pattern)."""
+        sections = self.collect(messages)
+        for sec in sections:
+            sec["text"] = scrub_keys(sec["text"])
+            for tc in sec["tool_calls"]:
+                tc["name"] = scrub_keys(tc["name"])
+                tc["args"] = scrub_keys(tc["args"])
+                tc["result"] = scrub_keys(tc["result"])
         return sections
 
     # -- markdown ----------------------------------------------------------
@@ -161,7 +195,7 @@ class Exporter:
             f"- **exported:** {now}",
             "",
         ]
-        sections = self.collect(messages)
+        sections = self._render_sections(messages)
         for sec in sections:
             role = sec["role"]
             heading = {"user": "## User", "assistant": "## Assistant"}.get(
@@ -176,16 +210,13 @@ class Exporter:
                 lines.append(f"### 🔧 Tool call: `{name}`")
                 lines.append("")
                 lines.append("**Arguments:**")
-                lines.append("```json")
-                lines.append(_truncate(tc["args"], MD_ARGS_LIMIT))
-                lines.append("```")
+                lines.extend(_fence(_truncate(tc["args"], MD_ARGS_LIMIT),
+                                    "json"))
                 lines.append("")
                 lines.append("**Result:**")
-                lines.append("```")
                 result = tc["result"]
-                lines.append(_truncate(result, MD_RESULT_LIMIT)
-                             if result else "_(no result recorded)_")
-                lines.append("```")
+                lines.extend(_fence(_truncate(result, MD_RESULT_LIMIT)
+                                    if result else "_(no result recorded)_"))
                 lines.append("")
         return scrub_keys("\n".join(lines).rstrip() + "\n")
 
@@ -202,16 +233,17 @@ class Exporter:
                 f"</pre></section>"
             )
 
+        sections = self._render_sections(messages)  # once, not twice
         parts: List[str] = [block(
             {"user": "User", "assistant": "Assistant"}.get(
                 s["role"], "System"),
             {"user": "user", "assistant": "asst"}.get(s["role"], "sys"),
             s["text"],
-        ) for s in self.collect(messages)]
+        ) for s in sections]
 
         # Interleave tool-call cards right after their assistant section.
         rendered: List[str] = []
-        for sec, part in zip(self.collect(messages), parts):
+        for sec, part in zip(sections, parts):
             rendered.append(part)
             for tc in sec["tool_calls"]:
                 name = esc(tc["name"] or "unknown")
@@ -285,18 +317,51 @@ header dd {{ margin: 0; font-family: monospace; }}
     def default_path(self, fmt: str) -> str:
         suffix = "html" if fmt == "html" else "md"
         ts = time.strftime("%Y%m%d-%H%M%S")
+        # the session id is spliced into a FILE NAME: a "/" or ".." in it
+        # used to steer the default export outside the home directory
+        sid = re.sub(r"[^A-Za-z0-9_.-]", "_", str(self.session_id))[:64]
+        sid = sid.strip(".") or "default"
         return os.path.join(
             os.path.expanduser("~"),
-            f"fullagent-export-{self.session_id}-{ts}.{suffix}")
+            f"fullagent-export-{sid}-{ts}.{suffix}")
 
     def export_to_path(self, messages: List[Dict[str, Any]],
                        path: str, fmt: str = "markdown") -> str:
         fmt = (fmt or "markdown").lower()
         text = self.to_html(messages) if fmt == "html" \
             else self.to_markdown(messages)
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(text)
+        _atomic_write_private(path, text)
         return path
+
+
+def _atomic_write_private(path: str, text: str) -> None:
+    """Temp file in the target dir + os.replace.
+
+    The old open(path, "w") truncated an existing export first, so a crash
+    or full disk mid-write left a half-written file; it also wrote THROUGH
+    a symlink at the destination. New files are created 0600 — a transcript
+    holds whatever the user and tools said, so it is not world-readable."""
+    path = os.fspath(path)
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".fullagent-export-",
+                               suffix=".tmp")
+    try:
+        try:
+            # keep an existing regular file's permission bits
+            st = os.stat(path)
+            if not os.path.islink(path):
+                os.fchmod(fd, st.st_mode & 0o777)
+        except (OSError, AttributeError):
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def register(agent: Any) -> None:
@@ -351,6 +416,9 @@ def handle_export(ui: Any, arg: str) -> None:
         out = exporter.export_to_path(messages, path, fmt)
     except OSError as e:
         ui.print_error(f"cannot write export: {e}")
+        return
+    except Exception as e:  # noqa: BLE001 — never crash the TUI
+        ui.print_error(f"export failed: {type(e).__name__}: {e}")
         return
     ui.print_info(f"✓ conversation exported → {out}")
 
