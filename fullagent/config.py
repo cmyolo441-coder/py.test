@@ -114,8 +114,8 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     # Mistral Large 4 model card (build.nvidia.com, 2026-11-13): 262,144
     "mistralai/mistral-large-4-1t-a52b": 262_144,
     "mistral-large-4": 262_144,
-    # Kimi K3.1 Pro model card (build.nvidia.com, 2026-11-13): 1,048,576
-    "moonshotai/kimi-k3.1-pro": 1_048_576,
+    # Kimi K2.6 — verified live on integrate.api.nvidia.com/v1/models
+    "moonshotai/kimi-k2.6": 262_144,
     # no published served window yet: stay conservative
     "ernie-5.5-flash-preview": 128_000,
 }
@@ -275,11 +275,11 @@ MODELS: list[Model] = [
           "Mistral Large 4 (NVIDIA)", tag="nvidia", supports_tools=True,
           context_window=model_context_window(
               "mistralai/mistral-large-4-1t-a52b")),
-    # Listed on build.nvidia.com (2026-11-13); its page says API access is
-    # preview-only for now, so calls may be refused until NVIDIA opens it.
-    Model("moonshotai/kimi-k3.1-pro", "nvidia", "Kimi K3.1 Pro (NVIDIA)",
+    # Live-verified id on the public NVIDIA model list (the earlier
+    # kimi-k3.1-pro id 404'd — it was never in the catalog)
+    Model("moonshotai/kimi-k2.6", "nvidia", "Kimi K2.6 (NVIDIA)",
           tag="nvidia", supports_tools=True,
-          context_window=model_context_window("moonshotai/kimi-k3.1-pro")),
+          context_window=model_context_window("moonshotai/kimi-k2.6")),
     # Devin CLI swe-2-flash family — the free tier model. 262K context per
     # `devin models list`. Tool calling is bridged through <tool_call>
     # markup by fullagent.devincli.
