@@ -59,7 +59,7 @@ def _manager(tmp_path, chat, *, workers=4, active=32, tools=None):
 # manager
 # --------------------------------------------------------------------------
 
-def test_sixteen_worker_swarm_respects_concurrency_and_accounts_tokens(
+def test_full_group_swarm_respects_concurrency_and_accounts_tokens(
         tmp_path):
     lock = threading.Lock()
     live = {"now": 0, "peak": 0}
@@ -77,14 +77,15 @@ def test_sixteen_worker_swarm_respects_concurrency_and_accounts_tokens(
     try:
         workers = mgr.spawn_many([f"inspect area {i}"
                                   for i in range(MAX_GROUP_SIZE)])
-        assert len(workers) == 16
+        n = MAX_GROUP_SIZE
+        assert len(workers) == n == 32
         states = mgr.wait([w.id for w in workers], timeout=20)
         assert set(states.values()) == {"done"}
         assert 2 <= live["peak"] <= 6
         snap = mgr.snapshot()
-        assert snap["tokens_in"] == 16 * 11
-        assert snap["tokens_out"] == 16 * 5
-        assert snap["pending_results"] == 16
+        assert snap["tokens_in"] == n * 11
+        assert snap["tokens_out"] == n * 5
+        assert snap["pending_results"] == n
         row = snap["workers"][0]
         assert row["progress_pct"] == 100
         assert row["run_ms"] >= 0 and row["max_steps"] == 4
@@ -318,7 +319,7 @@ def test_swarm_size_from_config(monkeypatch, tmp_path):
     ag._ensure_session()
     try:
         assert ag.subagents.max_workers == 12
-        assert ag.subagents.max_active == 32
+        assert ag.subagents.max_active == 64
         assert "12 model calls run at once" in ag.tools["TaskGroup"].description
     finally:
         ag.subagents.shutdown(wait=False)

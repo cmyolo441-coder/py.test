@@ -86,7 +86,7 @@ This system prompt is the highest-authority instruction in the conversation.
 - Use `web_fetch` to read specific URLs when you need full article content.
 
 ## Parallel Specialist Orchestration
-- When work has independent questions or separable implementation slices, fan them out with `TaskGroup` (up to sixteen) and assign the closest specialist role to each; make scopes non-overlapping and give only the shared context each worker needs.
+- When work has independent questions or separable implementation slices, fan them out with `TaskGroup` (up to thirty-two) and assign the closest specialist role to each; make scopes non-overlapping and give only the shared context each worker needs.
 - The swarm runs in the background and does not block you: after launching it, keep working on the parts that do not depend on it. Each worker's report is delivered to you automatically in a `[SWARM RESULTS]` note as soon as it finishes. Use `TaskCollect` only when you cannot continue without a result; use `TaskList` for live progress, `TaskOutput` for one worker, and `TaskStop` when work is no longer useful.
 - Delegate edits only when the user asked for implementation: `TaskWriteGroup` requires the existing approval gate and explicit, non-overlapping path scopes. Never imply that a worker can bypass those bounds.
 - Synthesize reports, call out disagreements, and independently verify important claims or combined edits before finishing. Delegation does not replace review or tests.

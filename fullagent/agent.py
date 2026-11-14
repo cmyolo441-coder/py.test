@@ -3528,9 +3528,9 @@ class Agent:
 
         # Swarm sizing: how many model calls run at once (rate limits) and
         # how many workers may be queued + running in total.
-        swarm_concurrency = _int_extra("swarm_concurrency", 8, 1, 16)
-        swarm_capacity = _int_extra("swarm_capacity", 32, swarm_concurrency,
-                                    48)
+        swarm_concurrency = _int_extra("swarm_concurrency", 12, 1, 32)
+        swarm_capacity = _int_extra("swarm_capacity", 64, swarm_concurrency,
+                                    96)
         manager = ParallelSubagents(
             self.log, self.tools, self._subagent_runtime,
             before_write=self._snapshot_subagent_write,
@@ -3564,7 +3564,7 @@ class Agent:
 
         def task_group(tasks: list, context: str = "",
                        role: str = "researcher", model_id: str = "") -> str:
-            """Atomically launch up to sixteen parallel read-only specialists."""
+            """Atomically launch up to thirty-two parallel read-only specialists."""
             def start():
                 if not tasks:
                     raise SubagentError("tasks must be a non-empty list")
@@ -3689,7 +3689,7 @@ class Agent:
              "required": ["task"]}, task)
         self.tools["TaskGroup"] = Tool(
             "TaskGroup",
-            "Submit up to sixteen independent, individually scoped read-only "
+            "Submit up to thirty-two independent, individually scoped read-only "
             "specialists as one parallel swarm batch; "
             f"up to {manager.max_workers} model calls run at once and excess "
             "work queues. Use for reviews, exploration, design, or test "
@@ -3698,14 +3698,14 @@ class Agent:
             "started. " + AUTO_NOTE,
             {"type": "object", "properties": {
                 "tasks": {"type": "array", "items": task_item,
-                          "minItems": 1, "maxItems": 16},
+                          "minItems": 1, "maxItems": 32},
                 "context": {"type": "string"},
                 "role": {"type": "string", "enum": read_roles},
                 "model_id": {"type": "string"}},
              "required": ["tasks"]}, task_group)
         self.tools["TaskWriteGroup"] = Tool(
             "TaskWriteGroup",
-            "Launch up to sixteen scoped implementation specialists "
+            "Launch up to thirty-two scoped implementation specialists "
             f"({manager.max_workers} model calls at once) with "
             "distinct, explicit workspace write_scope paths. This operation "
             "requires the existing permission gate; "
@@ -3715,7 +3715,7 @@ class Agent:
             + AUTO_NOTE,
             {"type": "object", "properties": {
                 "tasks": {"type": "array", "items": write_item,
-                          "minItems": 1, "maxItems": 16},
+                          "minItems": 1, "maxItems": 32},
                 "context": {"type": "string"},
                 "model_id": {"type": "string"}},
              "required": ["tasks"]}, task_write_group, risk=RISK_CONFIRM)
@@ -3731,14 +3731,14 @@ class Agent:
             background_wait=True)
         self.tools["TaskCollect"] = Tool(
             "TaskCollect",
-            "Wait once for a named batch (or up to sixteen explicit task IDs) and "
+            "Wait once for a named batch (or up to thirty-two explicit task IDs) and "
             "return every report with state, evidence, verification, usage, and blockers. "
             "If neither selector is supplied, collect the latest batch.",
             {"type": "object", "properties": {
                 "batch_id": {"type": "string",
                              "description": "Batch ID returned by Task, TaskGroup, or TaskWriteGroup."},
                 "task_ids": {"type": "array", "items": {"type": "string"},
-                             "minItems": 1, "maxItems": 16},
+                             "minItems": 1, "maxItems": 32},
                 "wait_seconds": {"type": "number", "minimum": 0,
                                  "maximum": 90}},
              "additionalProperties": False}, task_collect,

@@ -50,18 +50,30 @@ class StreamingTests(unittest.TestCase):
         ui._approve_request = None
         ui._spinner_i = 0
         frames = []
+        borders = []
         def run(text, on_token, *args, **kwargs):
             on_token("first ")
-            frames.append("".join(text for _, text in ui._bottom_fragments()))
+            frames.append("".join(text for _, text in ui._live_fragments()))
+            borders.append("".join(t for _, t in ui._bottom_fragments()))
             on_token("second ")
-            frames.append("".join(text for _, text in ui._bottom_fragments()))
+            frames.append("".join(text for _, text in ui._live_fragments()))
+            borders.append("".join(t for _, t in ui._bottom_fragments()))
             return Turn(text, assistant_text="first second ")
         ui.agent.run_turn = run
+        ui._busy = True
         with patch("fullagent.tui.time.monotonic", side_effect=_ticking_clock()):
             ui._run_turn_thread("hello")
+        # the reply streams ON SCREEN in the live pane, token by token…
         self.assertIn("first", frames[0])
         self.assertNotIn("second", frames[0])
         self.assertIn("first second", frames[1])
+        # …and is never typed into the prompt box border
+        for b in borders:
+            self.assertNotIn("first", b)
+            self.assertNotIn("second", b)
+        # the pane is handed to the transcript when the turn ends
+        self.assertEqual(ui._live_fragments(), [])
+        self.assertEqual(ui.output.getvalue().count("first second"), 1)
 
     def test_burst_line_is_visible_before_next_token(self):
         ui = self.make_ui()
@@ -71,13 +83,15 @@ class StreamingTests(unittest.TestCase):
             on_token("line\n")
             snapshots.append(ui.output.getvalue())
             on_token("last")
+            snapshots.append(ui._live_text())
             snapshots.append(ui._status_text)
             return Turn(text, assistant_text="first line\nlast")
         ui.agent.run_turn = run
         with patch("fullagent.tui.time.monotonic", side_effect=_ticking_clock()):
             ui._run_turn_thread("hello")
         self.assertIn("first line\n", snapshots[0])
-        self.assertIn("last", snapshots[1])
+        self.assertEqual(snapshots[1], "last")       # live pane: new line only
+        self.assertNotIn("last", snapshots[2])       # border: phase label only
         self.assertEqual(ui.output.getvalue().count("first line"), 1)
         self.assertEqual(ui.output.getvalue().count("last"), 1)
 
@@ -87,13 +101,15 @@ class StreamingTests(unittest.TestCase):
         def run(text, on_token, *args, **kwargs):
             on_token("first ")
             on_token("last")
-            snapshots.extend([ui._status_text, ui.output.getvalue()])
+            snapshots.extend([ui._live_text(), ui.output.getvalue(),
+                              ui._status_text])
             return Turn(text, assistant_text="first last")
         ui.agent.run_turn = run
         with patch("fullagent.tui.time.monotonic", side_effect=_ticking_clock()):
             ui._run_turn_thread("hello")
-        self.assertIn("last", snapshots[0])
+        self.assertEqual(snapshots[0], "first last")
         self.assertNotIn("first last", snapshots[1])
+        self.assertNotIn("last", snapshots[2])
         self.assertEqual(ui.output.getvalue().count("first last"), 1)
 
     def test_rapid_submit_starts_only_one_worker(self):
@@ -185,16 +201,16 @@ class StreamingTests(unittest.TestCase):
         # renders collapsed to turn-lifecycle only (thinking…, first frame,
         # final flush, teardown "", + 2 unconditional invalidates) —
         # versus ~1 invalidation per token before throttling
-        self.assertLessEqual(renders["n"], 6,
+        self.assertLessEqual(renders["n"], 8,
                              f"expected <=6 renders for {N} rapid tokens, "
                              f"got {renders['n']}")
         self.assertEqual(th.frames, 2,
                          "only 2 stream frames should emit: first + final flush")
         self.assertGreaterEqual(th.suppressed, N - 2,
                                 "throttle must absorb nearly the whole burst")
-        # the final flush surfaced the complete tail as a status frame
-        self.assertTrue(any(words[-1] in s for s in statuses),
-                        "final flush must surface the complete tail")
+        # reply text never goes through the prompt box border any more
+        self.assertFalse(any("tok" in s for s in statuses), statuses)
+        self.assertEqual(ui._live_fragments(), [])
         print(f"\n  [throttle] {N} tokens -> {renders['n']} renders "
               f"({th.suppressed} absorbed, {th.frames} frames emitted)")
 

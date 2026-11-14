@@ -235,6 +235,27 @@ press `y` (yes), `n` (no), or `a` (always). Toggle globally with `/approve`.
 The **autonomy ladder** (`/autonomy 0-5`) controls how much the agent may do
 without asking, from read-only observer to fully autonomous.
 
+## v4.2 — live streaming, aurora prompt box, bigger swarm
+
+- **Replies stream on screen, not in the prompt box.** The unfinished line
+  of the reply (and the model's thinking, when shown) renders token by
+  token in a live pane directly under the transcript. The prompt box
+  border only shows a phase label (`thinking…` / `writing…`). Finished
+  lines are committed to the scrollback word-wrapped; code fences keep
+  soft wrapping so copied code never gains fake newlines.
+- **Aurora prompt box.** Gradient border that flows while a turn runs,
+  placeholder hint in an empty prompt, borders on every row of a
+  multi-line prompt, one-row height when empty. Turn the gradient off with
+  `"aurora_border": false` in the config `extra` block.
+- **Signature.** `BITTU CHAUHAN` is on the welcome screen and pinned in
+  the HUD row above the prompt.
+- **Swarm.** Up to 32 tasks per `TaskGroup` / `TaskWriteGroup`, 12 model
+  calls at once by default (`swarm_concurrency`, max 32), 64 workers
+  queued + running (`swarm_capacity`, max 96), 40 steps and 200 tool calls
+  per worker. The dashboard adds a throughput sparkline, ETA, slot usage,
+  per-role chip colours and a moving highlight on running bars; the
+  compact board shows whole-swarm progress in its header.
+
 ## Keys
 
 | Key | Action |

@@ -83,7 +83,21 @@ SHORT_ROLE = {
     "planner": "Plan", "security": "Security",
 }
 
-PANEL_LIMIT = 6          # compact board: worker rows before "+N more"
+# Every specialist keeps its own chip colour (a palette key) so a big
+# swarm reads at a glance: who is who never depends on reading the label.
+ROLE_COLOR = {
+    "researcher": "cyan", "coder": "green", "tester": "yellow",
+    "reviewer": "accent", "analyst": "cyan", "architect": "pink",
+    "debugger": "orange", "optimizer": "yellow", "refactorer": "green",
+    "documenter": "fg", "devops": "orange", "integrator": "pink",
+    "planner": "accent", "security": "red",
+}
+
+SPARK = "▁▂▃▄▅▆▇█"
+SPARK_CELLS = 12         # throughput history cells in the stats row
+SPARK_PERIOD_S = 0.5     # one history sample per this many seconds
+
+PANEL_LIMIT = 8          # compact board: worker rows before "+N more"
 BOARD_HOLD_S = 1.5       # compact board stays this long after settling
 DETAIL_ROWS = 7          # fixed height of the expanded detail panel
 SELECTED_BG = "bg:#2c3352"
@@ -189,6 +203,37 @@ def short_role(role: Any) -> str:
 # ---------------------------------------------------------------------------
 # Value helpers
 # ---------------------------------------------------------------------------
+
+def role_color(role: Any, colors: dict) -> str:
+    """Palette colour for a role chip (unknown roles fall back to cyan)."""
+    key = ROLE_COLOR.get(str(role or "").strip().lower(), "cyan")
+    return colors.get(key, "") or colors.get("cyan", "")
+
+
+def sparkline(values: Sequence[float], cells: int) -> str:
+    """The last ``cells`` samples as ▁▂▃▄▅▆▇█, scaled to their own peak,
+    left-padded so the newest sample is always the right-most cell."""
+    cells = max(0, int(cells))
+    vals = [max(0.0, _num(v)) for v in list(values)[-cells:]] if cells else []
+    peak = max(vals) if vals else 0.0
+    out = []
+    for v in vals:
+        idx = 0 if peak <= 0 else int(round(v / peak * (len(SPARK) - 1)))
+        out.append(SPARK[max(0, min(len(SPARK) - 1, idx))])
+    return SPARK[0] * (cells - len(out)) + "".join(out)
+
+
+def fmt_eta(overall_pct: float, elapsed_s: float) -> str:
+    """Rough time left from progress so far; "" until it means something."""
+    pct = _num(overall_pct)
+    elapsed = _num(elapsed_s)
+    if pct < 5.0 or pct >= 100.0 or elapsed < 3.0:
+        return ""
+    left = elapsed * (100.0 - pct) / pct
+    if left > 6 * 3600:
+        return ""
+    return fmt_clock(left * 1000)
+
 
 def _num(value: Any, default: float = 0.0) -> float:
     try:
@@ -343,9 +388,16 @@ def _gradient(colors: dict) -> List[str]:
 
 
 def bar_fragments(pct: Any, cells: int, colors: dict, state: str = "running",
-                  palette: Optional[List[str]] = None) -> Row:
+                  palette: Optional[List[str]] = None,
+                  now: Optional[float] = None) -> Row:
+    """Gradient progress bar. With ``now`` a running bar gets a highlight
+    that sweeps across the filled part, so live work visibly moves even
+    between progress updates."""
     filled, empty = bar_text(pct, cells)
     out: Row = []
+    glint = -1
+    if now is not None and state == "running" and len(filled) >= 2:
+        glint = int(_num(now) * 9) % (len(filled) + 5)
     if state in FAILED_STATES:
         tint = [colors.get("red", "")]
     elif state == "cancelled":
@@ -360,6 +412,8 @@ def bar_fragments(pct: Any, cells: int, colors: dict, state: str = "running",
     for i, ch in enumerate(filled):
         color = tint[min(len(tint) - 1, int(i * len(tint) / n))]
         style = f"{color}"
+        if i == glint:
+            style = f"bold {colors.get('fg', '') or color}"
         if style != run_style and run_text:
             out.append((run_style or "", "".join(run_text)))
             run_text = []
@@ -387,6 +441,20 @@ class DashState:
     reserved: int = 0
     order: List[str] = field(default_factory=list)
     eased: dict = field(default_factory=dict)
+    tps_hist: List[float] = field(default_factory=list)
+    tps_at: float = 0.0
+
+    def note_tps(self, tps: Any, now: float) -> List[float]:
+        """Record swarm throughput (at most one sample per period) and
+        return the bounded history for the sparkline."""
+        now = _num(now)
+        if not self.tps_hist or now - self.tps_at >= SPARK_PERIOD_S \
+                or now < self.tps_at:
+            self.tps_hist.append(max(0.0, _num(tps)))
+            self.tps_at = now
+            if len(self.tps_hist) > 4 * SPARK_CELLS:
+                del self.tps_hist[:-2 * SPARK_CELLS]
+        return self.tps_hist
 
     def toggle(self) -> bool:
         if self.open:
@@ -399,6 +467,8 @@ class DashState:
         self.open = True
         self.reserved = 0
         self.top = 0
+        self.tps_hist = []
+        self.tps_at = 0.0
 
     def close(self) -> None:
         self.open = False
@@ -541,12 +611,13 @@ def _worker_row(w: dict, *, inner: int, cols: _Cols, colors: dict,
     row.append(("", " "))
     if "chip" in cols.show:
         chip = ellipsize(short_role(w.get("role")), cols.chip)
-        chip_style = (f"bold {colors.get('cyan', '')}" if not finished
-                      else dim)
+        chip_style = (f"bold {role_color(w.get('role'), colors)}"
+                      if not finished else dim)
         row.append((chip_style, _pad_cols(chip, cols.chip)))
         row.append(("", " "))
     if "bar" in cols.show:
-        row.extend(bar_fragments(pct, cols.bar, colors, state))
+        row.extend(bar_fragments(pct, cols.bar, colors, state,
+                                 now=now + index * 0.37))
         row.append(("", " "))
     if "pct" in cols.show:
         row.append((f"bold {color}" if not finished else dim,
@@ -620,15 +691,18 @@ def _hline(left: str, fill: str, right: str, width: int, style: str) -> Row:
 
 
 def _title_line(width: int, colors: dict, right_text: str,
-                border_style: str) -> Row:
-    """╭─ ⚡ SWARM ───────── 02:31 ─╮ with a gradient title."""
+                border_style: str, now: float = 0.0,
+                live: bool = False) -> Row:
+    """╭─ ⚡ SWARM ───────── 02:31 ─╮ with a gradient title that flows
+    through the palette while the swarm is live."""
     title = " ⚡ SWARM "
     pal = _gradient(colors)
     frags: Row = [(border_style, "╭─")]
     n = max(1, len(title))
+    shift = int(_num(now) * 6) if live else 0
     for i, ch in enumerate(title):
-        frags.append((f"bold {pal[min(len(pal) - 1, int(i * len(pal) / n))]}",
-                      ch))
+        base = min(len(pal) - 1, int(i * len(pal) / n))
+        frags.append((f"bold {pal[(base + shift) % len(pal)]}", ch))
     right = f" {right_text} " if right_text else ""
     used = 2 + display_width(title) + display_width(right) + 2
     if used > width:
@@ -642,7 +716,9 @@ def _title_line(width: int, colors: dict, right_text: str,
 
 
 def _stats_rows(shown: Sequence[dict], snapshot: dict, *, inner: int,
-                colors: dict, now_wall: float) -> Tuple[Row, Row, str]:
+                colors: dict, now_wall: float,
+                state: Optional["DashState"] = None,
+                now: float = 0.0) -> Tuple[Row, Row, str]:
     counts = {s: 0 for s in STATE_GLYPH}
     for w in shown:
         counts[worker_state(w)] += 1
@@ -655,7 +731,10 @@ def _stats_rows(shown: Sequence[dict], snapshot: dict, *, inner: int,
         (f"bold {colors.get('pink', '')}",
          f"◉ {active}/{max_active or '?'} active"),
         (dim, "  "),
-        (f"bold {colors.get('green', '')}", f"● {counts['running']} running"),
+        (f"bold {colors.get('green', '')}",
+         f"● {counts['running']}"
+         + (f"/{_int(snapshot.get('max_workers'))}"
+            if _int(snapshot.get("max_workers")) else "") + " running"),
         (dim, "  "),
         (colors.get("fg", ""), f"○ {counts['queued']} queued"),
         (dim, "  "),
@@ -689,6 +768,14 @@ def _stats_rows(shown: Sequence[dict], snapshot: dict, *, inner: int,
         (dim, " · "),
         (f"bold {colors.get('green', '')}", f"{_num(tps):.0f} tok/s"),
     ]
+    live_any = any(worker_state(w) in ACTIVE_STATES for w in shown)
+    if state is not None and inner >= 84:
+        # throughput history: the swarm's pulse over the last few seconds
+        hist = (state.note_tps(tps, now) if live_any else state.tps_hist)
+        if hist:
+            right += [(dim, " "),
+                      (colors.get("green", "") if live_any else dim,
+                       sparkline(hist, SPARK_CELLS))]
     if pending:
         right += [(dim, " · "),
                   (f"bold {colors.get('yellow', '')}",
@@ -708,7 +795,11 @@ def _stats_rows(shown: Sequence[dict], snapshot: dict, *, inner: int,
 
     started = _num(snapshot.get("swarm_started_at"))
     if started > 0:
-        wall = fmt_clock(max(0.0, now_wall - started) * 1000)
+        elapsed = max(0.0, now_wall - started)
+        wall = fmt_clock(elapsed * 1000)
+        eta = fmt_eta(overall, elapsed) if live_any else ""
+        if eta and inner >= 56:
+            wall = f"{wall} · ETA {eta}"
     else:
         live = [run_ms_of(w) for w in shown
                 if worker_state(w) in ACTIVE_STATES]
@@ -872,8 +963,10 @@ def _render_dashboard(snapshot: Any, *, width: int, colors: dict,
 
     rows: List[Row] = []
     row_a, row_b, wall = _stats_rows(shown, snap, inner=inner, colors=colors,
-                                     now_wall=wall_now)
-    rows.append(_title_line(width, colors, wall, border))
+                                     now_wall=wall_now, state=state, now=now)
+    rows.append(_title_line(
+        width, colors, wall, border, now=now,
+        live=any(worker_state(w) in ACTIVE_STATES for w in shown)))
     rows.append(_boxed(row_a, colors, inner, border))
     rows.append(_boxed(row_b, colors, inner, border))
 
@@ -1094,6 +1187,15 @@ def _compact_rows(snapshot: Any, plan: BoardPlan, *, width: int, colors: dict,
     tail: Row = [(colors.get("dim", ""), " ↓ to manage · ^G ")]
     if width < 48:
         tail = [(colors.get("dim", ""), " ↓ to manage ")]
+    if width >= 72 and members:
+        # whole-swarm progress at a glance, right in the header
+        overall = sum(progress_of(w) for w in members) / len(members)
+        tail = ([("", " ")]
+                + bar_fragments(overall, 10, colors,
+                                "done" if plan.settled else "running",
+                                now=None if plan.settled else now)
+                + [(f"bold {colors.get('fg', '')}",
+                    f" {int(round(overall)):>3d}%")] + tail)
     rows: List[Row] = [_align(head, tail, width, "─",
                               colors.get("border", ""))]
 
@@ -1143,12 +1245,14 @@ def _compact_row(w: dict, *, width: int, colors: dict, now: float,
     chip = short_role(w.get("role"))
     left: Row = [
         (f"bold {color}", f" {icon} "),
-        (dim if finished else f"bold {colors.get('cyan', '')}", chip),
+        (dim if finished else f"bold {role_color(w.get('role'), colors)}",
+         chip),
         (dim, " · "),
     ]
     right: Row = []
     if width >= 56:
-        right.extend(bar_fragments(progress_of(w), 8, colors, state))
+        right.extend(bar_fragments(progress_of(w), 8, colors, state,
+                                   now=now + index * 0.37))
         right.append((dim, " "))
     if width >= 44:
         right.append((colors.get("yellow", "") if state == "running" else dim,

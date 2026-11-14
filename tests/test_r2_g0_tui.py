@@ -42,14 +42,19 @@ def test_render_markdown_status_preview_is_single_line():
 
     ui._set_status = spy
 
+    live = []
+
     def fake_run(text, on_token, *a, **k):
         on_token("# Title\n\nHello world")
+        live.append("".join(t for _, t in ui._live_fragments()))
         return Turn(text, assistant_text="# Title\n\nHello world")
 
     ui.agent = SimpleNamespace(save_session=lambda: None, run_turn=fake_run)
     ui._run_turn_thread("hi")
-    assert "# Title Hello world" in seen
-    assert not any("\n" in s for s in seen), seen
+    # the raw reply streams in the live pane, never in the one-row border
+    assert "# Title" in live[0] and "Hello world" in live[0]
+    assert "writing…" in seen
+    assert not any("\n" in s or "Title" in s for s in seen), seen
 
 
 def test_verify_log_lists_violations_line_by_line():

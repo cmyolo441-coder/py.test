@@ -46,20 +46,23 @@ from .client import (
 from .roles import ROLES, role_label
 from .tools import RISK_SAFE, Tool, parse_tool_arguments
 
-MAX_GROUP_SIZE = 16
+MAX_GROUP_SIZE = 32
+# Hard ceilings for the pool (config can lower, never exceed these).
+MAX_WORKERS_CAP = 32
+MAX_ACTIVE_CAP = 96
 # Real concurrency limit. MAX_GROUP_SIZE is the largest batch the tools
 # accept, so the pool must be able to run that whole batch at once —
 # otherwise "8 parallel specialists" would silently be 4 running + 4
 # queued (the TUI shows the exact split, but the capability should be real).
 DEFAULT_WORKERS = MAX_GROUP_SIZE
 DEFAULT_ACTIVE_LIMIT = MAX_GROUP_SIZE
-MAX_RETAINED = 64
+MAX_RETAINED = 128
 MAX_TASK_CHARS = 12_000
 MAX_CONTEXT_CHARS = 24_000
 MAX_TOOL_OUTPUT_CHARS = 12_000
-MAX_CALLS_PER_STEP = 12
-MAX_TOTAL_TOOL_CALLS = 80
-MAX_STEPS = 20
+MAX_CALLS_PER_STEP = 16
+MAX_TOTAL_TOOL_CALLS = 200
+MAX_STEPS = 40
 CALL_TIMEOUT = 120.0
 DRAIN_TIMEOUT = 5.0
 
@@ -358,8 +361,8 @@ class ParallelSubagents:
         self.workspace = Path(workspace or Path.cwd()).expanduser().resolve()
         self._scope_registry = PathScopeRegistry(self.workspace)
         self.blackboard = SharedBlackboard()
-        self.max_workers = max(1, min(16, int(max_workers)))
-        self.max_active = max(1, min(48, int(max_active)))
+        self.max_workers = max(1, min(MAX_WORKERS_CAP, int(max_workers)))
+        self.max_active = max(1, min(MAX_ACTIVE_CAP, int(max_active)))
         self.max_steps = max(1, min(64, int(max_steps)))
         self.chat = chat or chat_with_retry
         self._session_id = str(getattr(log, "session", "") or "")
@@ -411,7 +414,7 @@ class ParallelSubagents:
 
     def scale_workers(self, new_max_workers: int) -> int:
         """Dynamically adjust max_workers for future batches."""
-        val = max(1, min(16, int(new_max_workers)))
+        val = max(1, min(MAX_WORKERS_CAP, int(new_max_workers)))
         with self._lock:
             self.max_workers = val
         return val

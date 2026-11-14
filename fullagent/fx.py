@@ -7,6 +7,8 @@ in try/except and fall back to plain output.
 Effects:
 - gradient_text      per-character truecolor gradient (rainbow / custom)
 - spinner_color      color-cycling spinner so the busy glyph shimmers
+- aurora_color       seamless looping gradient (flows when phase advances)
+- gradient_fragments prompt_toolkit fragments with a per-char gradient
 - boot_reveal        line-by-line reveal of the welcome card (typewriter)
 - shimmer_flash      one-shot "✦" flash with a rising gradient
 
@@ -48,6 +50,56 @@ def gradient_text(text: str, palette: list[str] | None = None) -> object:
     for i, ch in enumerate(text):
         t.append(ch, style=_hex(pal[int(i * (len(pal) - 1) / max(1, n - 1))]))
     return t
+
+
+# Aurora palette for the prompt-box border and brand marks (truecolor).
+AURORA = ["#c084fc", "#818cf8", "#22d3ee", "#34d399", "#f472b6"]
+
+
+def lerp_hex(a: str, b: str, t: float) -> str:
+    """Linear blend of two #rrggbb colors; bad input returns ``a``."""
+    try:
+        t = max(0.0, min(1.0, float(t)))
+        ar, ag, ab = int(a[1:3], 16), int(a[3:5], 16), int(a[5:7], 16)
+        br, bg, bb = int(b[1:3], 16), int(b[3:5], 16), int(b[5:7], 16)
+        return "#%02x%02x%02x" % (round(ar + (br - ar) * t),
+                                  round(ag + (bg - ag) * t),
+                                  round(ab + (bb - ab) * t))
+    except Exception:
+        return a
+
+
+def aurora_color(pos: float, phase: float = 0.0,
+                 palette: list[str] | None = None) -> str:
+    """Color at ``pos`` (0..1) along a SEAMLESS looping gradient.
+
+    ``phase`` shifts the loop, so advancing it every frame makes the
+    gradient flow. The palette wraps (last blends back into first), so
+    there is never a hard seam.
+    """
+    pal = palette or AURORA
+    n = len(pal)
+    if n == 0:
+        return "#ffffff"
+    if n == 1:
+        return pal[0]
+    x = ((float(pos) + float(phase)) % 1.0) * n
+    i = int(x) % n
+    return lerp_hex(pal[i], pal[(i + 1) % n], x - int(x))
+
+
+def gradient_fragments(text: str, palette: list[str] | None = None,
+                       phase: float = 0.0, extra: str = "bold",
+                       span: int | None = None, offset: int = 0) -> list:
+    """prompt_toolkit ``(style, text)`` fragments with a per-character
+    aurora gradient. ``span``/``offset`` place the text inside a wider
+    gradient (so several pieces on one row share a single sweep)."""
+    total = max(1, span if span else len(text))
+    out = []
+    for i, ch in enumerate(text):
+        color = aurora_color((offset + i) / total, phase, palette)
+        out.append((f"{extra} {color}".strip(), ch))
+    return out
 
 
 def spinner_color(i: int) -> str:

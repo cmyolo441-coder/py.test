@@ -32,6 +32,70 @@ LOGO: Tuple[str, ...] = (
     " ╚═╝     ╚═╝  ╚═╝",
 )
 
+# ---------------------------------------------------------------------------
+# Signature — the owner's name, shown on the welcome screen and pinned in
+# the HUD row above the prompt for the whole session.
+# ---------------------------------------------------------------------------
+
+BRAND = "BITTU CHAUHAN"
+
+# 3-row half-block wordmark, 47 columns: fits a 50-column phone terminal.
+BRAND_ART: Tuple[str, ...] = (
+    "█▀▄ █ ▀█▀ ▀█▀ █ █   █▀▀ █ █ ▄▀█ █ █ █ █ ▄▀█ █▄ █",
+    "█▀▄ █  █   █  █ █   █   █▀█ █▀█ █ █ █▀█ █▀█ █ ▀█",
+    "▀▀  ▀  ▀   ▀  ▀▀▀   ▀▀▀ ▀ ▀ ▀ ▀ ▀▀▀ ▀ ▀ ▀ ▀ ▀  ▀",
+)
+
+
+def brand_fragments(width: int, phase: float = 0.0) -> List[Fragment]:
+    """The signature chip for the HUD row: `` ✦ BITTU CHAUHAN ✦ `` with an
+    aurora gradient, shortened only when the terminal is too narrow."""
+    for text in (f" ✦ {BRAND} ✦ ", f" {BRAND} ", f" {BRAND.split()[0]} "):
+        if display_width(text) <= max(0, int(width)):
+            break
+    else:
+        return []
+    try:
+        from .fx import gradient_fragments
+        return gradient_fragments(text, phase=phase)
+    except Exception:
+        return [("bold", text)]
+
+
+def brand_mark(width: int):
+    """The welcome-screen signature as a rich Text: the block wordmark when
+    it fits, a spaced one-line ribbon on narrow terminals."""
+    from rich.text import Text
+
+    art_w = max(display_width(line) for line in BRAND_ART)
+    out = Text()
+    try:
+        from .fx import AURORA, aurora_color
+    except Exception:
+        AURORA, aurora_color = None, None
+
+    def paint(line: str, total: int) -> None:
+        for i, ch in enumerate(line):
+            style = "bold"
+            if aurora_color is not None:
+                style = f"bold {aurora_color(i / max(1, total) * 0.85)}"
+            out.append(ch, style=style)
+
+    if width >= art_w + 2:
+        for line in BRAND_ART:
+            out.append(" ")
+            paint(line, art_w)
+            out.append("\n")
+        return out
+    ribbon = f"✦ {' '.join(BRAND.split()[0])}  {' '.join(BRAND.split()[1])} ✦"
+    if display_width(ribbon) + 2 > width:
+        ribbon = f"✦ {BRAND} ✦"
+    out.append(" ")
+    paint(ribbon, len(ribbon))
+    out.append("\n")
+    return out
+
+
 LOGO_STYLES: Tuple[str, ...] = (
     "accent", "accent", "pink", "cyan", "cyan", "pink",
 )
@@ -269,15 +333,20 @@ def welcome(
         expand=False,
     )
 
+    try:
+        sig = brand_mark(width)
+    except Exception:
+        sig = Text(f" ✦ {BRAND} ✦\n", style="bold")
+
     if width >= logo_w + card_w + 8:
         grid = Table.grid(padding=(0, 3))
         grid.add_column(no_wrap=True)
         grid.add_column(no_wrap=True)
         grid.add_row(Group(logo, identity), card)
-        return grid
+        return Group(sig, grid)
 
     # Narrow terminals: stack logo over card, never wrap the block art.
-    return Group(logo, identity, Text("\n"), card)
+    return Group(sig, logo, identity, Text("\n"), card)
 
 
 # ---------------------------------------------------------------------------
@@ -320,20 +389,46 @@ def hud_fragments(
     skills: int,
     agents_running: int = 0,
     agents_queued: int = 0,
+    brand_phase: float = 0.0,
 ) -> List[Fragment]:
-    """The row above the prompt: mode chip, ⇧Tab hint, skills counter."""
+    """The row above the prompt: mode chip, ⇧Tab hint, signature, skills."""
     level = _mode_level(autonomy)
-    left: List[Fragment] = mode_badge(level, colors)
+    dim = colors.get("dim", "")
     hint = " ⇧Tab pilot " if level < 4 else " ⇧Tab exit pilot "
-    left.append((colors.get("dim", ""), hint))
-    if agents_running or agents_queued:
-        left.append((f"bold {colors.get('pink', '')}",
-                     f"· ◎ {int(agents_running)} running "
-                     f"· {int(agents_queued)} queued "))
-        left.append((colors.get("dim", ""), "· ^G swarm "))
-    right: List[Fragment] = [
+    live = bool(agents_running or agents_queued)
+
+    def build_left(hints: bool) -> List[Fragment]:
+        out: List[Fragment] = mode_badge(level, colors)
+        out.append((dim, hint if hints else " "))
+        if live:
+            out.append((f"bold {colors.get('pink', '')}",
+                        f"· ◎ {int(agents_running)} running "
+                        f"· {int(agents_queued)} queued "))
+            if hints:
+                out.append((dim, "· ^G swarm "))
+        return out
+
+    skills_seg: List[Fragment] = [
         (f"bold {colors.get('cyan', '')}", f" {max(0, int(skills))} skills "),
     ]
+    # The signature is pinned here for the whole session. When the row is
+    # tight the key hints go first (live state and the skills counter are
+    # information, hints are not), then the counter, and only on a very
+    # narrow terminal does the name itself shorten.
+    width = max(1, int(width))
+    brand = brand_fragments(width - 1, phase=brand_phase)
+    both: List[Fragment] = list(brand) + [(dim, "·")] + skills_seg
+    left = build_left(True)
+    if not brand:
+        right: List[Fragment] = skills_seg
+    elif _pad(left) + _pad(both) + 1 <= width:
+        right = both
+    elif _pad(build_left(False)) + _pad(both) + 1 <= width:
+        left, right = build_left(False), both
+    else:
+        right = list(brand)
+        if _pad(left) + _pad(right) + 1 > width:
+            left = build_left(False)
     return align(left, right, width, fill="─")
 
 

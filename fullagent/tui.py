@@ -346,8 +346,16 @@ STYLE = Style.from_dict({
     "box.sep": C["dim"],
     "box.goalbar": f"bold {C['green']}",
     "arrow": f"bold {C['green']}",
+    "placeholder": f"italic {C['dim']}",
     "cont": C["dim"],
     "stream.preview": C["fg"],
+    "live.text": C["fg"],
+    "live.cursor": f"bold {C['accent']}",
+    "live.more": f"italic {C['dim']}",
+    "live.think": f"italic {C['dim']}",
+    "live.think.head": f"bold italic {C['accent']}",
+    "live.think.meta": C["dim"],
+    "live.think.gutter": C["border"],
     "overlay.border": C["accent"],
     "overlay.item": C["fg"],
     "overlay.item.selected": f"bg:#44475a bold {C['fg']}",
@@ -384,6 +392,13 @@ _BG_LOCK = threading.Lock()
 # Orders status writes between the turn thread and the spinner's
 # trailing-edge throttle drain (see UI._start_spinner).
 _STATUS_LOCK = threading.Lock()
+
+# Live stream pane (the on-screen area right above the prompt box where
+# the reply and the model's thinking appear token by token).
+_LIVE_MD_TAIL = 8000        # raw chars kept for the Markdown-mode live tail
+_LIVE_MAX_ROWS = 14         # tallest the live reply pane may grow
+_LIVE_THINK_ROWS = 6        # thought rows shown under the "Thinking" header
+_LIVE_WRAP_CHARS = 6000     # only the tail of a huge partial line is wrapped
 
 
 def _register_terminal_reports() -> None:
@@ -1143,6 +1158,213 @@ class UI:
         self._status_text = text
         self._invalidate()
 
+    # -- live stream pane ---------------------------------------------------------
+    #
+    # A non-fullscreen prompt_toolkit app can only print COMPLETE lines above
+    # itself, so an unfinished line used to be previewed inside the prompt
+    # box border — the reply looked like it was being typed into the box and
+    # only "landed" on screen afterwards. The unfinished line (and the live
+    # thinking) now render in this pane, which sits directly under the
+    # transcript: text appears on screen as it streams, then is committed to
+    # the scrollback line by line.
+
+    def _live_set(self, kind: str, parts: list) -> None:
+        """Point the pane at a live list of text chunks (never copied —
+        the renderer joins it at frame rate, not per token)."""
+        self._live_state = (kind, parts)
+
+    def _live_clear(self) -> None:
+        self._live_state = None
+
+    def _live_kind(self) -> str:
+        st = self.__dict__.get("_live_state")
+        return st[0] if st else ""
+
+    def _live_text(self) -> str:
+        st = self.__dict__.get("_live_state")
+        if not st:
+            return ""
+        try:
+            return "".join(list(st[1]))
+        except Exception:
+            return ""
+
+    def _live_visible(self) -> bool:
+        st = self.__dict__.get("_live_state")
+        if not st:
+            return False
+        try:
+            return any(p.strip() for p in list(st[1]))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _wrap_rows(text: str, width: int) -> list:
+        """Word-aware wrap by DISPLAY width (wide chars count two)."""
+        width = max(4, width)
+        rows: list = []
+        for line in text.split("\n"):
+            line = line.replace("\t", "    ").replace("\r", "")
+            if not line:
+                rows.append("")
+                continue
+            cur, cur_w, last_sp = [], 0, -1
+            for ch in line:
+                w = _disp_width(ch)
+                if cur_w + w > width:
+                    if last_sp > 0 and ch != " ":
+                        head = cur[:last_sp]
+                        rest = cur[last_sp + 1:]
+                        rows.append("".join(head))
+                        cur = rest
+                        cur_w = sum(_disp_width(c) for c in cur)
+                    else:
+                        rows.append("".join(cur))
+                        cur, cur_w = [], 0
+                        if ch == " ":
+                            last_sp = -1
+                            continue
+                    last_sp = -1
+                if ch == " ":
+                    last_sp = len(cur)
+                cur.append(ch)
+                cur_w += w
+            rows.append("".join(cur))
+        return rows
+
+    def _live_width(self) -> int:
+        """Real terminal columns for the pane (``_width`` is floored at 60
+        for the box chrome; text wrapped wider than the screen would be
+        clipped, i.e. lost)."""
+        w = self._width()
+        try:
+            app = get_app()
+            if getattr(app, "is_running", False):
+                w = min(w, int(app.output.get_size().columns))
+        except Exception:
+            pass
+        return max(8, w)
+
+    def _live_fragments(self) -> list:
+        st = self.__dict__.get("_live_state")
+        if not st:
+            return []
+        kind = st[0]
+        text = self._live_text()
+        if not text.strip():
+            return []
+        if len(text) > _LIVE_WRAP_CHARS:
+            text = "…" + text[-_LIVE_WRAP_CHARS:]
+        width = self._live_width()
+        try:
+            cap = max(3, min(_LIVE_MAX_ROWS, self._term_rows() // 3))
+        except Exception:
+            cap = 8
+        blink = (self.__dict__.get("_spinner_i", 0) // 3) % 2 == 0
+        cursor = "▌" if blink else " "
+        frags: list = []
+        if kind == "think":
+            body = " ".join(text.split())
+            rows = self._wrap_rows(body, width - 5)
+            rows = rows[-min(cap, _LIVE_THINK_ROWS):]
+            n = len(text)
+            size = f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+            frame = SPINNER_FRAMES[self.__dict__.get("_spinner_i", 0)
+                                   % len(SPINNER_FRAMES)]
+            frags.append(("class:live.think.head", f" {frame} Thinking"))
+            frags.append(("class:live.think.meta", f"  · {size} chars\n"))
+            for i, row in enumerate(rows):
+                last = i == len(rows) - 1
+                frags.append(("class:live.think.gutter", "  ┆ "))
+                frags.append(("class:live.think", row))
+                if last:
+                    frags.append(("class:live.cursor", cursor))
+                else:
+                    frags.append(("", "\n"))
+            return frags
+        rows = self._wrap_rows(text.strip("\n"), width)
+        hidden = max(0, len(rows) - cap)
+        if hidden:
+            rows = rows[-(cap - 1):]
+            frags.append(("class:live.more",
+                          f" ⋮ {hidden + 1} more lines streaming above\n"))
+        for i, row in enumerate(rows):
+            last = i == len(rows) - 1
+            frags.append(("class:live.text", row))
+            if last:
+                frags.append(("class:live.cursor", cursor))
+            else:
+                frags.append(("", "\n"))
+        return frags
+
+    # -- aurora border ------------------------------------------------------------
+
+    def _aurora_phase(self) -> float:
+        """Gradient phase: flows while a turn is running, rests when idle
+        (an idle prompt must not need a redraw loop)."""
+        if self.__dict__.get("_busy"):
+            return (time.monotonic() * 0.22) % 1.0
+        return 0.0
+
+    def _aurora_palette(self) -> list:
+        return [C["accent"], C["cyan"], C["green"], C["pink"]]
+
+    def _aurora(self, frags: list) -> list:
+        """Recolor the plain border runs (``class:box``) of one chrome row
+        with a per-column aurora gradient. Text segments keep their own
+        styles; only box-drawing fill is touched, so widths never change."""
+        try:
+            if not self.cfg.extra.get("aurora_border", True):
+                return frags
+            width = max(1, self._width())
+            phase = self._aurora_phase()
+            pal = self._aurora_palette()
+            out: list = []
+            col = 0
+            for frag in frags:
+                style, text = frag[0], frag[1]
+                if style != "class:box":
+                    out.append(frag)
+                    col += _disp_width(text)
+                    continue
+                # runs of 2 columns: smooth to the eye, half the fragments
+                i = 0
+                while i < len(text):
+                    chunk = text[i:i + 2]
+                    out.append((fx.aurora_color(col / width, phase, pal),
+                                chunk))
+                    col += _disp_width(chunk)
+                    i += 2
+            return out
+        except Exception:
+            return frags
+
+    def _side_fragments(self, right: bool) -> list:
+        text = " │" if right else "│ "
+        try:
+            if not self.cfg.extra.get("aurora_border", True):
+                return [("class:box", "\n".join([text] * 10))]
+            pos = 1.0 - 1.0 / max(2, self._width()) if right else 0.0
+            style = fx.aurora_color(pos, self._aurora_phase(),
+                                    self._aurora_palette())
+        except Exception:
+            style = "class:box"
+        return [(style, "\n".join([text] * 10))]
+
+    def _placeholder_fragments(self) -> list:
+        """Ghost hint inside an empty prompt (never part of the buffer)."""
+        try:
+            if self.buffer.text or self._busy and self._width() < 50:
+                return []
+        except Exception:
+            return []
+        if self._busy:
+            text = "type to queue a follow-up…"
+        else:
+            text = "Ask anything  ·  / commands  ·  @file to attach"
+        room = max(0, self._width() - 8)
+        return [("class:placeholder", _truncate_w(text, room))]
+
     # -- box border fragments -----------------------------------------------------
 
     def _top_fragments(self) -> list:
@@ -1235,9 +1457,12 @@ class UI:
             frags.append(("class:box", "──" if i else "─"))
             frags.append((style, text))
         frags.append(("class:box", "─" * fill + "╮"))
-        return frags
+        return self._aurora(frags)
 
     def _bottom_fragments(self) -> list:
+        return self._aurora(self._bottom_fragments_plain())
+
+    def _bottom_fragments_plain(self) -> list:
         width = self._width()
         inner = width - 2
 
@@ -1311,7 +1536,9 @@ class UI:
             segs = [(box, " ⏎ "), (key, "send"), (dim, " ")]
         frags: list = [(box, "╰")]
         frags.extend(segs)
-        used = 1 + sum(_disp_width(t) for _, t in segs)
+        # inner already excludes both corners (it used to subtract one
+        # more, leaving the ╯ a column short of the right-hand │)
+        used = sum(_disp_width(t) for _, t in segs)
         frags.append((box, "─" * max(0, inner - used) + "╯"))
         return frags
 
@@ -1838,7 +2065,8 @@ class UI:
                 width=self._width(), colors=C,
                 autonomy=getattr(self.agent, "autonomy", 3),
                 skills=self._skills_count(),
-                agents_running=running, agents_queued=queued)
+                agents_running=running, agents_queued=queued,
+                brand_phase=self._aurora_phase())
         except Exception as exc:  # noqa: BLE001
             self._log_chrome_error("hud", exc)
             return []
@@ -1995,21 +2223,38 @@ class UI:
 
         def get_line_prefix(line: int, wrap_count: int):
             if line == 0 and wrap_count == 0:
-                return [("class:arrow", "❯ ")]
+                # the arrow breathes through the aurora while a turn runs
+                try:
+                    color = fx.aurora_color(0.0, self._aurora_phase() * 2,
+                                            self._aurora_palette())
+                    if not self._busy:
+                        color = C["green"]
+                    return [(f"bold {color}", "❯ ")]
+                except Exception:
+                    return [("class:arrow", "❯ ")]
             if wrap_count > 0:
                 return [("class:cont", "↪ ")]
             return [("class:cont", "┃ ")]
 
+        processors = []
+        try:
+            from prompt_toolkit.layout.processors import AfterInput
+            processors = [AfterInput(self._placeholder_fragments)]
+        except Exception:  # noqa: BLE001 — stub prompt_toolkit / old version
+            processors = []
         self.input_control = BufferControl(
             buffer=self.buffer,
             search_buffer_control=self.search_toolbar.control,
             preview_search=True,
+            input_processors=processors,
         )
         input_window = Window(
             self.input_control,
             height=Dimension(min=1, max=10),
             wrap_lines=True,
             get_line_prefix=get_line_prefix,
+            # hug the text: an empty prompt is one row, never a tall void
+            dont_extend_height=True,
         )
         self.input_window = input_window
 
@@ -2030,10 +2275,17 @@ class UI:
             dont_extend_height=True)
         bottom_window = Window(FormattedTextControl(self._bottom_fragments),
                                height=1, dont_extend_height=True)
+        # The side bars carry one │ per possible input row (10) but ask
+        # for a single row, so the input alone decides the box height and
+        # a multi-line prompt keeps its border on every row.
         left_window = Window(FormattedTextControl(
-            lambda: [("class:box", "│ ")]), width=2, dont_extend_width=True)
+            lambda: self._side_fragments(False)),
+            width=2, dont_extend_width=True,
+            height=Dimension(min=1, preferred=1))
         right_window = Window(FormattedTextControl(
-            lambda: [("class:box", " │")]), width=2, dont_extend_width=True)
+            lambda: self._side_fragments(True)),
+            width=2, dont_extend_width=True,
+            height=Dimension(min=1, preferred=1))
         overlay_window = Window(
             FormattedTextControl(self._overlay_fragments),
             dont_extend_height=True)
@@ -2042,8 +2294,17 @@ class UI:
             FormattedTextControl(self._background_fragments),
             dont_extend_height=True)
 
+        # live stream pane: the reply / thinking as it streams, directly
+        # under the transcript and above every piece of prompt chrome
+        live_window = Window(
+            FormattedTextControl(self._live_fragments),
+            dont_extend_height=True, wrap_lines=False)
+
         root = FloatContainer(
             HSplit([
+                ConditionalContainer(
+                    live_window,
+                    filter=Condition(self._live_visible)),
                 ConditionalContainer(
                     overlay_window,
                     filter=Condition(self._overlay_open)),
@@ -5218,9 +5479,35 @@ class UI:
         # line grew. Parts accumulate in a list; we only join when a
         # newline arrives (to split off complete lines) and keep a bounded
         # live preview, so per-token cost stays O(len(piece)).
-        stream_tail = {"parts": [], "blank": False, "pv": ""}
+        stream_tail = {"parts": [], "blank": False, "fence": False}
+
+        def _commit(block: str) -> None:
+            """Commit finished reply lines to the transcript. Prose is
+            word-wrapped exactly like the live pane (no mid-word breaks,
+            no jump when a line lands); lines inside a ``` code fence stay
+            soft-wrapped so copied code never gains fake newlines."""
+            run: list[str] = []
+            run_soft = stream_tail["fence"]
+
+            def flush_run() -> None:
+                if run:
+                    self.console.print(Text("\n".join(run)),
+                                       soft_wrap=run_soft)
+                    run.clear()
+
+            for ln in block.split("\n"):
+                is_fence = ln.lstrip().startswith("```")
+                soft = stream_tail["fence"] or is_fence
+                if soft != run_soft:
+                    flush_run()
+                    run_soft = soft
+                run.append(ln)
+                if is_fence:
+                    stream_tail["fence"] = not stream_tail["fence"]
+            flush_run()
         render_md = bool(self.cfg.extra.get("render_markdown", False))
-        md_preview = ""
+        md_parts: list[str] = []
+        self._live_clear()
 
         # SPEED: the status preview used to invalidate the whole
         # prompt_toolkit app on EVERY token — a full-screen re-render per
@@ -5232,6 +5519,10 @@ class UI:
         self._stream_throttle = _throttle  # diagnostics / tests
 
         def _stream_status(text: str) -> None:
+            # LIVE ON SCREEN: the reply text itself streams in the live
+            # pane ABOVE the prompt box (see _live_fragments) — never in
+            # the box border. The border only carries a short phase label;
+            # the throttle now just paces redraws of the live pane.
             _throttle.update(text)
             frame = _throttle.maybe_flush()
             if self.__dict__.get("_active_throttle") is not _throttle:
@@ -5239,35 +5530,41 @@ class UI:
                     # content took over from the thinking phase: a pending
                     # reasoning frame must not surface over the reply
                     self._active_throttle = _throttle
+                    self._active_sink = _live_sink
                     rt = self.__dict__.get("_reasoning_throttle")
                     if rt is not None and rt is not _throttle:
                         rt.discard()
             if frame is not None:
-                self._set_status(frame)
+                _live_sink(frame)
+
+        def _live_sink(_frame: str) -> None:
+            self._set_status("writing…")
+            self._invalidate()
 
         def on_token(piece: str):
-            nonlocal md_preview
             if not think["answer"]:
                 # first answer token of this model call: its Thinking
                 # block goes into the transcript ABOVE the reply
                 think["answer"] = True
                 _flush_thinking()
-            self._stream_tokens_count = getattr(self, "_stream_tokens_count", 0) + 1
+            n_tok = getattr(self, "_stream_tokens_count", 0) + 1
+            self._stream_tokens_count = n_tok
             if render_md:
-                # Keep a bounded preview; the agent owns the complete reply.
-                maxw = max(1, self._width() - 26)
-                md_preview = (md_preview + piece)[-maxw:]
-                # the status lives in a one-row border: an embedded
-                # newline would push the closing ╯ off the row
-                preview = " ".join(md_preview.split())
-                _stream_status(preview if preview else "writing…")
+                # The finished reply is rendered once as Markdown; until
+                # then the raw text streams live in the pane (bounded tail
+                # — the agent owns the complete reply).
+                md_parts.append(piece)
+                if len(md_parts) > 512:
+                    md_parts[:] = ["".join(md_parts)[-_LIVE_MD_TAIL:]]
+                self._live_set("answer", md_parts)
+                _stream_status(str(n_tok))
                 return
             # patch_stdout can only interleave output safely when every
-            # write ends in a newline, so emit complete lines here and keep
-            # the partial line as a live preview inside the box border.
+            # write ends in a newline, so complete lines go to the
+            # scrollback here and the unfinished line streams token by
+            # token in the live pane right below them.
             parts = stream_tail["parts"]
             parts.append(piece)
-            maxw = max(1, self._width() - 26)
             if "\n" in piece:
                 # the unfinished tail never contains "\n" (it is the text
                 # after the last newline seen), so a newline can only have
@@ -5286,18 +5583,16 @@ class UI:
                     else:
                         stream_tail["blank"] = False
                     out.append(ln)
-                if out:
-                    self.console.print(Text("\n".join(out)), soft_wrap=True)
                 if rem:
                     parts.append(rem)
-                pv = rem[-maxw:] if rem else ""
+                # live pane first (it now holds only the new partial
+                # line), then the finished lines — never both at once
+                self._live_set("answer", parts)
+                if out:
+                    _commit("\n".join(out))
             else:
-                pv = stream_tail["pv"] + piece
-                if len(pv) > maxw:
-                    pv = pv[-maxw:]
-            stream_tail["pv"] = pv
-            preview = pv.strip("\n")
-            _stream_status(preview if preview else "writing…")
+                self._live_set("answer", parts)
+            _stream_status(str(n_tok))
 
         # Live-reasoning stream state — one accumulator per turn; the TUI
         # feeds client.py's on_reasoning chunks and shows a bounded tail
@@ -5329,6 +5624,9 @@ class UI:
             with think["lock"]:
                 body = "".join(think["pending"])
                 think["pending"].clear()
+            # the live Thinking pane hands over to the transcript block
+            if self._live_kind() == "think":
+                self._live_clear()
             if not body.strip():
                 return
             # resolved at print time, like the old turn-end panel: the
@@ -5353,16 +5651,22 @@ class UI:
                 except Exception:
                     pass
 
+        def _reasoning_sink(_frame: str) -> None:
+            self._set_status("thinking…" if _reasoning_visible
+                             else "reasoning…")
+            self._invalidate()
+
         def _reasoning_status() -> None:
-            _reasoning_throttle.update(
-                reasoning_stream.preview() if _reasoning_visible
-                else "reasoning…")
+            # the thoughts stream in the live pane above the prompt box;
+            # the border keeps a plain phase label
+            _reasoning_throttle.update(str(reasoning_stream.chars))
             frame = _reasoning_throttle.maybe_flush()
             if self.__dict__.get("_active_throttle") is not _reasoning_throttle:
                 with _STATUS_LOCK:
                     self._active_throttle = _reasoning_throttle
+                    self._active_sink = _reasoning_sink
             if frame is not None and frame:
-                self._set_status(frame)
+                _reasoning_sink(frame)
 
         def on_reasoning(piece: str):
             # LIVE REASONING: stream the model's thoughts into the status
@@ -5377,6 +5681,8 @@ class UI:
                 with think["lock"]:
                     think["pending"].append(str(piece))
                     think["streamed"] += len(str(piece))
+                if _reasoning_visible and not think["answer"]:
+                    self._live_set("think", think["pending"])
             _reasoning_status()
 
         # live shell streaming state — one tool runs at a time, so a plain
@@ -5507,6 +5813,7 @@ class UI:
                     if self.__dict__.get("_active_throttle") is not _args_throttle:
                         with _STATUS_LOCK:
                             self._active_throttle = _args_throttle
+                            self._active_sink = None
                     if frame is not None:
                         self._set_status(frame)
 
@@ -5517,17 +5824,19 @@ class UI:
             # must never surface over it afterwards
             with _STATUS_LOCK:
                 self._active_throttle = None
+                self._active_sink = None
                 _throttle.discard()
                 _reasoning_throttle.discard()
                 _args_throttle.discard()
             rem = "".join(stream_tail["parts"]).strip("\n")
             stream_tail["parts"].clear()
-            stream_tail["pv"] = ""
             stream_tail["blank"] = False
+            if not render_md:
+                self._live_clear()
             if not think["answer"]:
                 _flush_thinking()   # this step's thinking, then its tool
             if rem:
-                self.console.print(Text(rem), soft_wrap=True)
+                _commit(rem)
             # reasoning a provider interleaved AFTER content (rare) lands
             # under the reply it followed, never splitting a line
             _flush_thinking()
@@ -5559,6 +5868,7 @@ class UI:
             self._invalidate_agents()  # worker progress/finish is real state
             with _STATUS_LOCK:
                 self._active_throttle = None
+                self._active_sink = None
                 _args_throttle.discard()
             if ev.name in ("write_file", "edit_file", "MultiEdit", "multiedit", "apply_patch") \
                     and ev.status in ("done", "error"):
@@ -5660,20 +5970,19 @@ class UI:
         finally:
             with _STATUS_LOCK:
                 self._active_throttle = None
+                self._active_sink = None
                 _reasoning_throttle.discard()
             rem = "".join(stream_tail["parts"]).strip("\n")
             stream_tail["parts"].clear()
-            # Final flush: apply any preview frame the throttle absorbed so
-            # the last render reflects the complete stream before teardown.
-            frame = _throttle.flush()
-            if frame is not None:
-                self._set_status(frame)
+            # the live pane hands its last partial line to the transcript
+            _throttle.flush()
+            self._live_clear()
             if not think["answer"]:
                 # reasoning with no answer after it (reasoning-only call,
                 # cancel or error mid-thought) still gets its block
                 _flush_thinking()
             if rem:
-                self.console.print(Text(rem), soft_wrap=True)
+                _commit(rem)
             else:
                 self.console.print()
             _flush_thinking()   # interleaved late reasoning, if any
@@ -5813,7 +6122,8 @@ class UI:
                         th = self.__dict__.get("_active_throttle")
                         frame = th.take_due() if th is not None else None
                         if frame:
-                            self._set_status(frame)
+                            sink = self.__dict__.get("_active_sink")
+                            (sink or self._set_status)(frame)
                 except Exception:
                     pass
                 self._invalidate()
