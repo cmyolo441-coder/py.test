@@ -1253,25 +1253,36 @@ class UI:
         text = self._live_text()
         if not text.strip():
             return []
-        if len(text) > _LIVE_WRAP_CHARS:
-            text = "…" + text[-_LIVE_WRAP_CHARS:]
+        total_chars = len(text)
+        if total_chars > _LIVE_WRAP_CHARS:
+            # Only the tail is wrapped — but from a STABLE origin. Cutting
+            # at "the last N chars" moved the origin on every token, so
+            # every visible row re-wrapped (and was re-sent) each frame
+            # once the text passed N. The origin now advances in 2000-char
+            # steps, snapped to a word boundary.
+            start = ((total_chars - _LIVE_WRAP_CHARS) // 2000 + 1) * 2000
+            sp = text.find(" ", start, start + 200)
+            text = text[sp + 1 if sp >= 0 else start:]
         width = self._live_width()
         try:
             cap = max(3, min(_LIVE_MAX_ROWS, self._term_rows() // 3))
         except Exception:
             cap = 8
-        blink = (self.__dict__.get("_spinner_i", 0) // 3) % 2 == 0
-        cursor = "▌" if blink else " "
+        # steady cursor and a static header glyph: the bottom border
+        # already animates one spinner cell — a second spinner plus a
+        # blinking cursor doubled the bytes sent on every idle frame
+        cursor = "▌"
         frags: list = []
         if kind == "think":
             body = " ".join(text.split())
             rows = self._wrap_rows(body, width - 5)
             rows = rows[-min(cap, _LIVE_THINK_ROWS):]
-            n = len(text)
+            # the REAL total: this used to count the truncated tail, so
+            # the counter froze at "6.0k chars" and long thinking looked
+            # like a hang
+            n = total_chars
             size = f"{n / 1000:.1f}k" if n >= 1000 else str(n)
-            frame = SPINNER_FRAMES[self.__dict__.get("_spinner_i", 0)
-                                   % len(SPINNER_FRAMES)]
-            frags.append(("class:live.think.head", f" {frame} Thinking"))
+            frags.append(("class:live.think.head", " ✻ Thinking"))
             frags.append(("class:live.think.meta", f"  · {size} chars\n"))
             for i, row in enumerate(rows):
                 last = i == len(rows) - 1
@@ -1300,10 +1311,19 @@ class UI:
     # -- aurora border ------------------------------------------------------------
 
     def _aurora_phase(self) -> float:
-        """Gradient phase: flows while a turn is running, rests when idle
-        (an idle prompt must not need a redraw loop)."""
-        if self.__dict__.get("_busy"):
-            return (time.monotonic() * 0.22) % 1.0
+        """Gradient phase. STATIC by default: a phase that moved every
+        frame changed the colour of every border cell 11 times a second,
+        so the terminal was sent ~43 KB/s of repaint for the whole turn
+        (v4.1.5 sent 2-5 KB/s) — on a remote, Docker or phone terminal
+        that made the UI lag and look stuck. A static gradient costs
+        nothing after the first paint. ``aurora_flow`` opts back into a
+        slow drift (one step per second, never per frame)."""
+        try:
+            if (self.__dict__.get("_busy")
+                    and self.cfg.extra.get("aurora_flow", False)):
+                return (int(time.monotonic()) % 12) / 12.0
+        except Exception:
+            pass
         return 0.0
 
     def _aurora_palette(self) -> list:
@@ -1327,14 +1347,17 @@ class UI:
                     out.append(frag)
                     col += _disp_width(text)
                     continue
-                # runs of 2 columns: smooth to the eye, half the fragments
+                # runs of 12 columns: every run costs a colour escape
+                # whenever the row is repainted (each time a line is
+                # committed above the prompt), so finer runs made each
+                # repaint much larger for no visible gain
                 i = 0
                 while i < len(text):
-                    chunk = text[i:i + 2]
+                    chunk = text[i:i + 12]
                     out.append((fx.aurora_color(col / width, phase, pal),
                                 chunk))
                     col += _disp_width(chunk)
-                    i += 2
+                    i += 12
             return out
         except Exception:
             return frags
@@ -1364,6 +1387,45 @@ class UI:
             text = "Ask anything  ·  / commands  ·  @file to attach"
         room = max(0, self._width() - 8)
         return [("class:placeholder", _truncate_w(text, room))]
+
+    # -- stream speed -------------------------------------------------------------
+
+    def _note_stream_chunk(self) -> None:
+        """One chunk (thinking, answer or tool arguments) just arrived."""
+        marks = self.__dict__.get("_rate_marks")
+        if marks is None:
+            marks = self._rate_marks = deque(maxlen=4000)
+        marks.append(time.monotonic())
+
+    def _stream_rate_label(self) -> str:
+        """Live provider speed for the status bar.
+
+        The old figure was (answer tokens) / (seconds since the turn
+        began): it showed nothing at all while the model was thinking and
+        averaged the thinking time into the answer speed. This is the
+        real rate over the last 5 seconds, for every kind of chunk — and
+        when the provider goes silent it says so, with the seconds, so a
+        slow provider is never mistaken for a frozen app."""
+        marks = self.__dict__.get("_rate_marks")
+        if not marks:
+            return ""
+        now = time.monotonic()
+        try:
+            last = marks[-1]
+        except IndexError:
+            return ""
+        silent = now - last
+        if silent >= 4.0:
+            return f" · ⏳ provider silent {int(silent)}s"
+        n = 0
+        for ts in reversed(marks):
+            if now - ts > 5.0:
+                break
+            n += 1
+        span = min(5.0, max(1.0, now - marks[0]))
+        if n < 2:
+            return ""
+        return f" · ⚡{max(1, int(round(n / span)))} tok/s"
 
     # -- box border fragments -----------------------------------------------------
 
@@ -1426,10 +1488,13 @@ class UI:
         # ctxmeter: visual context bar (falls back to text % on any error)
         try:
             from . import ctxmeter
-            segs.append((f" ◉ ctx {pct}% ",
+            # label + bar are ONE segment: as three they were joined by
+            # border dashes ("ctx 0% ──░░░░░── ── session"), which read
+            # as a broken border
+            bar = "".join(t for t, _ in ctxmeter.render_meter(
+                pct, width=ctxmeter.DEFAULT_WIDTH // 2))
+            segs.append((f" ◉ ctx {pct}% {bar} ",
                          f"bold {ctxmeter.meter_color(pct)}"))
-            segs.extend(ctxmeter.render_meter(pct, width=ctxmeter.DEFAULT_WIDTH // 2))
-            segs.append((" ", "class:box"))
         except Exception:
             ctx_color = (C["green"] if pct < 60
                          else C["yellow"] if pct < 85
@@ -1491,9 +1556,7 @@ class UI:
             if self._turn_start_ts:
                 dt = max(0.001, time.time() - self._turn_start_ts)
                 elapsed = f" · {max(0, int(dt))}s"
-                n_tok = getattr(self, "_stream_tokens_count", 0)
-                if n_tok > 2 and dt >= 0.2:
-                    tok_rate = f" · ⚡{int(n_tok / dt)} tok/s"
+                tok_rate = self._stream_rate_label()
             pending = self._pending_count()
             queued = f" · {pending} msg queued" if pending else ""
             tail = (f"{tok_rate}{elapsed}{queued} · Enter queue · "
@@ -2223,12 +2286,10 @@ class UI:
 
         def get_line_prefix(line: int, wrap_count: int):
             if line == 0 and wrap_count == 0:
-                # the arrow breathes through the aurora while a turn runs
+                # green when ready, accent while a turn runs (a state
+                # colour, not an animation: no per-frame repaint)
                 try:
-                    color = fx.aurora_color(0.0, self._aurora_phase() * 2,
-                                            self._aurora_palette())
-                    if not self._busy:
-                        color = C["green"]
+                    color = C["accent"] if self._busy else C["green"]
                     return [(f"bold {color}", "❯ ")]
                 except Exception:
                     return [("class:arrow", "❯ ")]
@@ -5468,6 +5529,7 @@ class UI:
         another turn should run, else None."""
         self._turn_start_ts = time.time()
         self._stream_tokens_count = 0
+        self._rate_marks = deque(maxlen=4000)
         self._invalidate_agents()
         self._set_status("thinking…")
         self._start_spinner()
@@ -5549,6 +5611,7 @@ class UI:
                 _flush_thinking()
             n_tok = getattr(self, "_stream_tokens_count", 0) + 1
             self._stream_tokens_count = n_tok
+            self._note_stream_chunk()
             if render_md:
                 # The finished reply is rendered once as Markdown; until
                 # then the raw text streams live in the pane (bounded tail
@@ -5678,6 +5741,7 @@ class UI:
             # status so the user sees no reasoning text at all.
             reasoning_stream.feed(piece)
             if piece:
+                self._note_stream_chunk()
                 with think["lock"]:
                     think["pending"].append(str(piece))
                     think["streamed"] += len(str(piece))
@@ -5764,6 +5828,7 @@ class UI:
                 _lf_flush()
 
         def on_tool_args(name: str, chunk: str):
+            self._note_stream_chunk()
             if not think["answer"] and think["pending"]:
                 # a live diff header may print below — thinking goes first
                 _flush_thinking()
@@ -5863,6 +5928,7 @@ class UI:
             else:
                 self.console.print(self._tool_call_line(ev))
             self._set_status(f"running {ev.name}…")
+            self._rate_marks = deque(maxlen=4000)   # tool time ≠ silence
 
         def on_tool_update(ev: ToolEvent):
             self._invalidate_agents()  # worker progress/finish is real state
@@ -6032,7 +6098,12 @@ class UI:
             # Feature: smart follow-up suggestions after each turn
             try:
                 from .help import build_turn_summary, suggest_followups
-                for hint in suggest_followups(build_turn_summary(turn)):
+                # a failed turn (no API key, provider error) changed
+                # nothing: "/review changed files · run tests" after an
+                # error panel was noise
+                hints = ([] if turn.error and turn.error != "cancelled"
+                         else suggest_followups(build_turn_summary(turn)))
+                for hint in hints:
                     self.print_info(f"  › {hint}", C["dim"])
             except Exception:
                 pass
@@ -6127,7 +6198,9 @@ class UI:
                 except Exception:
                     pass
                 self._invalidate()
-                time.sleep(0.09)
+                # ~8 fps: every tick repaints the spinner cell (plus the
+                # cursor round trip) over the wire for the whole turn
+                time.sleep(0.12)
         threading.Thread(target=tick, daemon=True).start()
     def _stop_spinner(self) -> None:
         self._spinner_on = False

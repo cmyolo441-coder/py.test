@@ -256,6 +256,16 @@ without asking, from read-only observer to fully autonomous.
   per-role chip colours and a moving highlight on running bars; the
   compact board shows whole-swarm progress in its header.
 
+### v4.2.1 — terminal traffic fix
+
+4.2.0 animated the gradient border every frame, which sent ~43 KB/s of
+repaint to the terminal for the whole turn (4.1.5: 2–5 KB/s) and made the
+UI lag on remote, Docker and phone terminals. The gradient is now static
+(`"aurora_flow": true` opts into a slow drift), the thinking counter no
+longer freezes at `6.0k chars`, long streams no longer re-wrap every row
+on every token, and the status bar shows the real speed of the last 5
+seconds — or `⏳ provider silent Ns` when the provider stops sending.
+
 ## Keys
 
 | Key | Action |

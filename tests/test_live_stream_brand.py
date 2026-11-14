@@ -272,3 +272,108 @@ def test_swarm_capacity_ceilings():
     assert subagents.MAX_GROUP_SIZE == 32
     assert subagents.MAX_WORKERS_CAP == 32 and subagents.MAX_ACTIVE_CAP == 96
     assert subagents.MAX_STEPS == 40
+
+
+# -- long streams stay cheap and honest ---------------------------------------
+
+def test_thinking_counter_keeps_counting_past_the_wrap_window():
+    ui = _ui(width=100)
+    ui._term_rows = lambda: 40
+    parts = ["thought number %d and more. " % i for i in range(1000)]
+    ui._live_set("think", parts)
+    text = _text(ui._live_fragments())
+    total = sum(len(p) for p in parts)
+    assert total > 20000
+    assert f"{total / 1000:.1f}k chars" in text      # not frozen at 6.0k
+    assert "thought number 999" in text              # newest thought shown
+
+
+def test_long_stream_rows_do_not_rewrap_on_every_token():
+    """Past the wrap window the visible rows must stay put while a row
+    fills; a moving wrap origin re-sent every row on every frame."""
+    ui = _ui(width=100)
+    ui._term_rows = lambda: 40
+    parts = ["thought number %d and more. " % i for i in range(400)]
+    changed = 0
+    prev = None
+    for i in range(60):
+        parts.append("w%d " % i)
+        ui._live_set("think", parts)
+        rows = _text(ui._live_fragments()).split("\n")[1:-1]  # settled rows
+        if prev is not None and rows != prev:
+            changed += 1
+        prev = rows
+    assert changed <= 6, changed    # only when a row actually wraps
+
+
+def test_aurora_border_is_static_unless_flow_is_enabled():
+    ui = _ui()
+    ui._busy = True
+    ui._status_text = "thinking…"
+    import fullagent.tui as tui_mod
+    frames = []
+    real = tui_mod.time.monotonic
+    try:
+        for t in (10.0, 10.1, 10.7, 13.3):
+            tui_mod.time.monotonic = lambda t=t: t
+            frames.append([s for s, _ in ui._bottom_fragments()
+                           if s.startswith("#")])
+    finally:
+        tui_mod.time.monotonic = real
+    assert all(f == frames[0] for f in frames)       # no per-frame repaint
+    assert ui._aurora_phase() == 0.0
+    ui.cfg.extra["aurora_flow"] = True
+    assert 0.0 <= ui._aurora_phase() < 1.0
+
+
+def test_stream_rate_label_shows_speed_and_provider_silence():
+    import fullagent.tui as tui_mod
+    ui = _ui()
+    assert ui._stream_rate_label() == ""
+    real = tui_mod.time.monotonic
+    clock = [100.0]
+    tui_mod.time.monotonic = lambda: clock[0]
+    try:
+        for _ in range(50):                 # 10 chunks/s for 5 seconds
+            clock[0] += 0.1
+            ui._note_stream_chunk()
+        assert ui._stream_rate_label() == " · ⚡10 tok/s"
+        clock[0] += 12.0                    # the provider stops sending
+        assert ui._stream_rate_label() == " · ⏳ provider silent 12s"
+    finally:
+        tui_mod.time.monotonic = real
+
+
+def test_reasoning_counts_toward_the_live_speed():
+    ui = _ui()
+
+    def run(text, on_token, on_reasoning, *a, **k):
+        for _ in range(5):
+            on_reasoning("thinking ")
+        return Turn(text, assistant_text="")
+
+    ui.agent.run_turn = run
+    ui._run_turn_thread("hi")
+    assert len(ui._rate_marks) == 5
+
+
+def test_failed_turn_prints_no_followup_suggestions():
+    ui = _ui()
+    ui.agent.run_turn = lambda text, *a, **k: Turn(
+        text, error="no API key configured")
+    ui._run_turn_thread("hi")
+    assert "›" not in ui.output.getvalue()
+
+
+def test_context_meter_is_one_border_segment():
+    ui = _ui(width=160)
+    ui.agent = SimpleNamespace(autonomy=3, session_id="abc",
+                               goal=SimpleNamespace(status=lambda: None))
+    ui._model = lambda: SimpleNamespace(label="M", tag="", provider="x")
+    ui._effort = lambda: SimpleNamespace(key="high", label="High")
+    ui._agents_snapshot = lambda: {}
+    ui._bg_cached = lambda *a, **k: None
+    ui._context_percent = lambda: 40
+    text = _text(ui._top_fragments())
+    assert "── ──" not in text
+    assert "ctx 40% " in text and _disp_width(text) == 160

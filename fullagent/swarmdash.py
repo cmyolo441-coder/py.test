@@ -397,7 +397,9 @@ def bar_fragments(pct: Any, cells: int, colors: dict, state: str = "running",
     out: Row = []
     glint = -1
     if now is not None and state == "running" and len(filled) >= 2:
-        glint = int(_num(now) * 9) % (len(filled) + 5)
+        # 3 steps a second: each step repaints two cells per running bar,
+        # so a faster sweep multiplies terminal traffic on a big swarm
+        glint = int(_num(now) * 3) % (len(filled) + 5)
     if state in FAILED_STATES:
         tint = [colors.get("red", "")]
     elif state == "cancelled":
@@ -699,7 +701,7 @@ def _title_line(width: int, colors: dict, right_text: str,
     pal = _gradient(colors)
     frags: Row = [(border_style, "╭─")]
     n = max(1, len(title))
-    shift = int(_num(now) * 6) if live else 0
+    shift = int(_num(now)) if live else 0
     for i, ch in enumerate(title):
         base = min(len(pal) - 1, int(i * len(pal) / n))
         frags.append((f"bold {pal[(base + shift) % len(pal)]}", ch))
