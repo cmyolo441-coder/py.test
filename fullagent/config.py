@@ -114,7 +114,13 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     # Mistral Large 4 model card (build.nvidia.com, 2026-11-13): 262,144
     "mistralai/mistral-large-4-1t-a52b": 262_144,
     "mistral-large-4": 262_144,
-    # Kimi K2.6 — verified live on integrate.api.nvidia.com/v1/models
+    # Kimi K3.1 Pro — REAL model (3T-class, 1M ctx, released 2026-11-04)
+    # BUT NVIDIA has not opened programmatic API access yet: the catalog
+    # page says "preview/playground only — no API key will authorize it"
+    # and calls currently return 404 until NVIDIA grants access (or the
+    # account is whitelisted via the developer forum). Kept in the menu
+    # so it works the moment access opens.
+    "moonshotai/kimi-k3.1-pro": 1_048_576,
     "moonshotai/kimi-k2.6": 262_144,
     # no published served window yet: stay conservative
     "ernie-5.5-flash-preview": 128_000,
@@ -275,8 +281,11 @@ MODELS: list[Model] = [
           "Mistral Large 4 (NVIDIA)", tag="nvidia", supports_tools=True,
           context_window=model_context_window(
               "mistralai/mistral-large-4-1t-a52b")),
-    # Live-verified id on the public NVIDIA model list (the earlier
-    # kimi-k3.1-pro id 404'd — it was never in the catalog)
+    # Real model, 1M context — but API-gated by NVIDIA (404 until they
+    # open programmatic access; see MODEL_CONTEXT_WINDOWS note).
+    Model("moonshotai/kimi-k3.1-pro", "nvidia", "Kimi K3.1 Pro (NVIDIA)",
+          tag="nvidia", supports_tools=True,
+          context_window=model_context_window("moonshotai/kimi-k3.1-pro")),
     Model("moonshotai/kimi-k2.6", "nvidia", "Kimi K2.6 (NVIDIA)",
           tag="nvidia", supports_tools=True,
           context_window=model_context_window("moonshotai/kimi-k2.6")),
