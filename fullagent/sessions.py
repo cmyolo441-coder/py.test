@@ -197,7 +197,24 @@ def resume_into(agent: Any, data: dict[str, Any]) -> str:
     except Exception:  # noqa: BLE001 — resume must never fail on cleanup
         pass
     sid = str(data.get("session_id") or getattr(agent, "session_id", ""))
+    # Pairing repair on the way in: a session saved mid-turn or hand-
+    # edited can carry orphan tool responses / unanswered calls — the
+    # wire layer heals it per-request, but canonical history stayed
+    # corrupt and pruners could crash on it. Drop non-dict entries,
+    # then reuse the agent's own repair.
+    messages = [m for m in messages if isinstance(m, dict)]
     agent.messages = messages
+    try:
+        repair = getattr(agent, "_repair_message_pairing", None)
+        if callable(repair):
+            repair("sealed — session resume pairing repair")
+        else:
+            from .client import (_repair_role_sequence,
+                                 _sanitize_messages)
+            _repair_role_sequence(messages)
+            _sanitize_messages(messages)
+    except Exception:
+        pass
     if sid:
         agent.session_id = sid
         log = getattr(agent, "log", None)

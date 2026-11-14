@@ -1411,6 +1411,16 @@ class AutoContinueGate:
             self.fired += 1
             return True
 
+    def rollback(self, fp: Any) -> None:
+        """Un-commit a fingerprint whose follow-up turn failed to start —
+        check() consumes the fingerprint BEFORE the caller launches the
+        thread, so a failed start used to suppress that result set
+        forever."""
+        with self._lock:
+            if self._last_fp == fp:
+                self._last_fp = None
+                self.fired = max(0, self.fired - 1)
+
     def waiting(self) -> bool:
         with self._lock:
             return self._since is not None

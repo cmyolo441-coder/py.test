@@ -223,6 +223,17 @@ def _headless_print(prompt: str, ns) -> int:
         # (no API key, provider down, cancelled turn ...)
         print(f"error: {type(e).__name__}: {e}", file=sys.stderr)
         return 1
+    finally:
+        # headless exits must not strand the subagent pool: worker
+        # threads are non-daemon and a still-running worker (or one stuck
+        # in a model retry) would hang interpreter exit forever, and
+        # settled reports sitting in the inbox would be silently lost
+        try:
+            sm = getattr(agent, "subagents", None)
+            if sm is not None:
+                sm.shutdown(wait=False)
+        except Exception:
+            pass
     if getattr(ns, "output_format", "text") == "json":
         from . import jsonout
         jsonout.emit_json(jsonout.turn_to_json(

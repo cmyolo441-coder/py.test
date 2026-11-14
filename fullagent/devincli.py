@@ -75,7 +75,8 @@ class _Acp:
             self._proc = subprocess.Popen(
                 [_DEVIN_PATH] + args, cwd=cwd or None,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, text=True, bufsize=1)
+                stderr=subprocess.PIPE, text=True, bufsize=1,
+                errors="replace")
         except FileNotFoundError:
             raise APIError(
                 f"devin CLI not found ({_DEVIN_PATH}). Install it and run "
@@ -110,13 +111,27 @@ class _Acp:
         return max(0.0, self._deadline - time.monotonic())
 
     def _send(self, obj: dict) -> None:
-        assert self._proc.stdin is not None
-        self._proc.stdin.write(json.dumps(obj) + "\n")
-        self._proc.stdin.flush()
+        try:
+            assert self._proc.stdin is not None
+            self._proc.stdin.write(json.dumps(obj) + "\n")
+            self._proc.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError, AssertionError) as e:
+            # a dead devin process must surface as APIError so the agent's
+            # error handling (and its retry layer) sees it — a raw
+            # BrokenPipeError escapes every except APIError upstream
+            raise APIError(f"devin acp pipe closed: {e}", status=0) from e
 
     def call(self, method: str, params: dict,
-             on_update: Callable[[dict], None] | None = None) -> dict:
-        """Send a request; dispatch notifications; return the result."""
+             on_update: Callable[[dict], None] | None = None,
+             timeout: float | None = None) -> dict:
+        """Send a request; dispatch notifications; return the result.
+
+        ``timeout`` extends the deadline for THIS call — the
+        session/prompt generation phase gets a fresh budget instead of
+        whatever the initialize/session/new handshake left over."""
+        if timeout is not None:
+            self._deadline = max(self._deadline,
+                                 time.monotonic() + timeout)
         self._next_id += 1
         rid = self._next_id
         self._send({"jsonrpc": "2.0", "id": rid,
@@ -254,6 +269,46 @@ def build_prompt(model_id: str, messages: list[dict],
     return "\n".join(b)
 
 
+def _json_span(text: str, start: int):
+    """Locate a JSON payload inside a <tool_call> body.
+
+    Returns (json_start, json_end) when a JSON object/array can be decoded
+    exactly — either the body itself starts with ``{``/``[`` or a loose
+    ``name {json}`` / ``name with {json}`` form follows. Returns None for
+    ``key: value`` bodies, which have no JSON to anchor on. Decoding with
+    raw_decode means markup literals (``</tool_call>``, ``</function>``)
+    inside string arguments can NEVER truncate the block — the #1 cause
+    of corrupted writes and stranded turns.
+    """
+    j = start
+    while j < len(text) and text[j] in " \t\r\n":
+        j += 1
+    if j >= len(text):
+        return None
+    candidates = [j] if text[j] in "{[" else []
+    # ^-anchored patterns can't use pos= — slice instead
+    m = _LOOSE_NAME.match(text[j:])
+    if m:
+        k = j + m.end()
+        # peel filler words between the tool name and its JSON args
+        while True:
+            while k < len(text) and text[k] in " \t\r\n":
+                k += 1
+            fm = _FILLER.match(text[k:])
+            if not fm:
+                break
+            k += fm.end()
+        if k < len(text) and text[k] in "{[":
+            candidates.append(k)
+    for c in candidates:
+        try:
+            _obj, end = _JSON.raw_decode(text, c)
+            return c, end
+        except ValueError:
+            continue
+    return None
+
+
 def _parse_tool_calls(text: str, schemas: dict | None = None):
     """Split streamed text into (plain_text, [tool_call dicts]).
 
@@ -261,6 +316,11 @@ def _parse_tool_calls(text: str, schemas: dict | None = None):
     model invented (</think>, </arg_value>, ...), the next <tool_call>, or
     end of text. Without the stray/next-open terminators an unclosed block
     swallows every following call and the args JSON corrupts.
+
+    When the body contains a decodable JSON payload the block boundary is
+    computed JSON-aware (see _json_span) so markup inside string arguments
+    is harmless; the legacy terminator scan is only a fallback for
+    brace-free ``key: value`` bodies.
 
     schemas maps tool name -> set of declared parameter names; when the
     model writes loose `key: value` arguments, only declared parameters
@@ -277,20 +337,33 @@ def _parse_tool_calls(text: str, schemas: dict | None = None):
         if seg:
             blocks.append(seg)
         start = m.end()
-        ends = []
-        c = _TOOL_CALL_CLOSE.search(text, start)
-        if c:
-            ends.append((c.start(), c.end()))
-        s = _STRAY_CLOSE.search(text, start)
-        if s:
-            ends.append((s.start(), s.end()))
-        if i + 1 < len(opens):
-            ends.append((opens[i + 1].start(), opens[i + 1].start()))
-        if ends:
-            content_end, block_end = min(ends)
+        span = _json_span(text, start)
+        if span is not None:
+            _js, jend = span
+            raw = text[start:jend].strip()
+            # consume optional whitespace + one closing tag
+            k = jend
+            while k < len(text) and text[k] in " \t\r\n":
+                k += 1
+            cm = _TOOL_CALL_CLOSE.match(text, k)
+            if cm is None:
+                cm = _STRAY_CLOSE.match(text, k)
+            block_end = cm.end() if cm else jend
         else:
-            content_end = block_end = len(text)
-        raw = text[start:content_end].strip()
+            ends = []
+            c = _TOOL_CALL_CLOSE.search(text, start)
+            if c:
+                ends.append((c.start(), c.end()))
+            s = _STRAY_CLOSE.search(text, start)
+            if s:
+                ends.append((s.start(), s.end()))
+            if i + 1 < len(opens):
+                ends.append((opens[i + 1].start(), opens[i + 1].start()))
+            if ends:
+                content_end, block_end = min(ends)
+            else:
+                content_end = block_end = len(text)
+            raw = text[start:content_end].strip()
         valid = (schemas or {}).get(_guess_tool_name(raw))
         tc = _parse_one_call(raw, valid)
         if tc is not None:
@@ -303,6 +376,90 @@ def _parse_tool_calls(text: str, schemas: dict | None = None):
         if seg:
             blocks.append(seg)
     return _ORPHAN_CLOSE.sub("", "\n\n".join(blocks)).strip(), calls
+
+
+# The flattened history renders past assistant tool calls as
+# "[called tool NAME with {args}]" (see _flatten_messages). The model
+# sometimes imitates THAT notation instead of emitting <tool_call>
+# markup, so the "call" arrives as plain text, no tool_calls come back,
+# and the turn ends after one tool — the recurring "agent stops" bug.
+# _extract_inline_calls recovers those into real tool calls.
+_INLINE_CALL = re.compile(
+    r"\[\s*called\s+tool\s+([A-Za-z_][\w.\-]*)\s+with\s+", re.IGNORECASE)
+
+
+def _mk_call(name: str, args: dict) -> dict:
+    _parse_one_call._seq[0] += 1  # type: ignore[attr-defined]
+    return {"id": f"call_{_parse_one_call._seq[0]}",  # type: ignore[attr-defined]
+            "type": "function",
+            "function": {"name": name,
+                         "arguments": json.dumps(args, ensure_ascii=False)}}
+
+
+def _extract_inline_calls(text: str, schemas: dict | None):
+    """Recover ``[called tool NAME with ARGS]`` spans written as plain text.
+
+    Returns (clean_text, [tool_call dicts]). A span only converts when
+    NAME is a declared tool (when schemas are known) and ARGS parses as a
+    JSON object or loose ``key: value`` pairs — quoted/log text that merely
+    looks similar stays untouched. The matched span is removed from the
+    text so it never reaches the user as literal markup.
+    """
+    if not text or not schemas or "[called tool" not in text.lower():
+        return text, []
+    # case-insensitive tool lookup — the model may capitalise the name
+    lookup = {k.lower(): k for k in schemas}
+    out: list[str] = []
+    calls: list[dict] = []
+    pos = 0
+    for m in _INLINE_CALL.finditer(text):
+        if m.start() < pos:
+            continue
+        name = m.group(1)
+        real_name = lookup.get(name.lower())
+        # Only declared tools convert — anything else is prose quoting
+        # the notation, not a real call.
+        if real_name is None:
+            continue
+        valid = schemas[real_name]
+        rest = text[m.end():]
+        lead = len(rest) - len(rest.lstrip())
+        args_obj = None
+        end = -1
+        try:
+            obj, end = _JSON.raw_decode(rest, lead)
+            if isinstance(obj, dict):
+                args_obj = obj
+        except ValueError:
+            pass
+        if args_obj is None:
+            # loose `key: value` form — the span ends at the LAST "]"
+            # before the next "[called tool" marker (or end of text), so
+            # a "]" inside a quoted arg value can't truncate the args
+            nxt = text.lower().find("[called tool", m.end())
+            region_end = nxt if nxt > 0 else len(text)
+            close = text.rfind("]", m.end(), region_end)
+            if close < 0:
+                continue
+            parsed = _parse_loose_args(text[m.end():close].strip(), valid)
+            if not isinstance(parsed, dict):
+                continue
+            args_obj = parsed
+            end = close - m.end() + 1
+        else:
+            # consume a trailing "]" when the model closed the span
+            tail = rest[end:]
+            stripped = tail.lstrip()
+            if stripped.startswith("]"):
+                end += len(tail) - len(stripped) + 1
+        calls.append(_mk_call(real_name, args_obj))
+        out.append(text[pos:m.start()])
+        # `end` is relative to `rest`, which starts at m.end()
+        pos = m.end() + end
+    if not calls:
+        return text, []
+    out.append(text[pos:])
+    return "".join(out).strip(), calls
 
 
 def _guess_tool_name(raw: str) -> str:
@@ -455,52 +612,84 @@ def _run(provider, model: config.Model, messages: list[dict],
         raise TurnCancelled("devin call cancelled by user")
 
     prompt = build_prompt(model.id, messages, tools)
-    acp = _Acp(model.id, os.getcwd(), timeout)
     text_parts: list[str] = []
     think_parts: list[str] = []
+    # One retry for transient subprocess failures (spawn race, pipe
+    # closed, ACP timeout) — the HTTP path retries via chat_with_retry,
+    # this path bypasses it, so a single flaky `devin acp` used to kill
+    # the whole turn.
+    result = None
+    last_err: APIError | None = None
+    for attempt in range(2):
+        acp = _Acp(model.id, os.getcwd(), timeout)
+        # a retry must not duplicate the partial stream from attempt 1
+        del text_parts[:]
+        del think_parts[:]
 
-    def on_msg(msg: dict) -> None:
-        if msg.get("method") != "session/update":
-            return
-        upd = (msg.get("params") or {}).get("update") or {}
-        kind = upd.get("sessionUpdate")
-        content = upd.get("content") or {}
-        chunk = content.get("text") or ""
-        if not chunk:
-            return
-        if kind == "agent_message_chunk":
-            text_parts.append(chunk)
-            if on_token:
-                on_token(chunk)
-        elif kind == "agent_thought_chunk":
-            think_parts.append(chunk)
-            if on_reasoning:
-                on_reasoning(chunk)
+        def on_msg(msg: dict) -> None:
+            if msg.get("method") != "session/update":
+                return
+            upd = (msg.get("params") or {}).get("update") or {}
+            kind = upd.get("sessionUpdate")
+            content = upd.get("content") or {}
+            chunk = content.get("text") or ""
+            if not chunk:
+                return
+            if kind == "agent_message_chunk":
+                text_parts.append(chunk)
+                if on_token:
+                    on_token(chunk)
+            elif kind == "agent_thought_chunk":
+                think_parts.append(chunk)
+                if on_reasoning:
+                    on_reasoning(chunk)
 
-    try:
-        acp.call("initialize", {
-            "protocolVersion": 1,
-            "clientCapabilities": {
-                "fs": {"readTextFile": False, "writeTextFile": False},
-                "terminal": False}}, on_update=on_msg)
-        session = acp.call("session/new", {
-            "cwd": os.getcwd(), "mcpServers": []}, on_update=on_msg)
-        sid = session.get("sessionId")
-        if not sid:
-            raise APIError("devin acp: session/new returned no sessionId",
-                           status=0)
-        result = acp.call("session/prompt", {
-            "sessionId": sid,
-            "prompt": [{"type": "text", "text": prompt}]}, on_update=on_msg)
-    finally:
-        acp.close()
+        try:
+            acp.call("initialize", {
+                "protocolVersion": 1,
+                "clientCapabilities": {
+                    "fs": {"readTextFile": False, "writeTextFile": False},
+                    "terminal": False}}, on_update=on_msg)
+            session = acp.call("session/new", {
+                "cwd": os.getcwd(), "mcpServers": []}, on_update=on_msg)
+            sid = session.get("sessionId")
+            if not sid:
+                raise APIError(
+                    "devin acp: session/new returned no sessionId",
+                    status=0)
+            # generation gets its OWN full budget — the shared deadline
+            # used to let a slow handshake starve session/prompt down to
+            # seconds and kill long turns at the 300s mark
+            result = acp.call("session/prompt", {
+                "sessionId": sid,
+                "prompt": [{"type": "text", "text": prompt}]},
+                on_update=on_msg, timeout=timeout)
+            break
+        except APIError as e:
+            last_err = e
+            transient = ("timed out" in str(e) or "exited" in str(e)
+                         or "pipe closed" in str(e))
+            if attempt == 0 and transient:
+                time.sleep(0.5)
+                continue
+            raise
+        finally:
+            acp.close()
+    if result is None:
+        raise last_err or APIError("devin acp: no result", status=0)
 
     if should_cancel is not None and should_cancel():
         from .cancelguard import TurnCancelled
         raise TurnCancelled("devin call cancelled by user")
 
     raw = "".join(text_parts)
-    content, calls = _parse_tool_calls(raw, _tool_schemas(tools))
+    schemas = _tool_schemas(tools)
+    content, calls = _parse_tool_calls(raw, schemas)
+    # The model sometimes imitates the flattened-history notation
+    # "[called tool NAME with {...}]" instead of <tool_call> markup —
+    # recover those so the turn keeps going instead of ending early.
+    content, inline = _extract_inline_calls(content, schemas)
+    calls.extend(inline)
     for i, tc in enumerate(calls, 1):
         tc["id"] = f"call_{i}"
         if on_tool_start:
@@ -515,6 +704,11 @@ def _run(provider, model: config.Model, messages: list[dict],
         usage = {"prompt_tokens": int(u.get("inputTokens") or 0),
                  "completion_tokens": int(u.get("outputTokens") or 0)}
     stop = str(result.get("stopReason") or "end_turn")
+    if "cancelled" in stop:
+        from .cancelguard import TurnCancelled
+        raise TurnCancelled("devin acp cancelled the prompt")
+    if "refusal" in stop:
+        raise APIError("devin acp refused the prompt", status=0)
     finish = "tool_calls" if calls else ("length" if "max" in stop
                                          else "stop")
     return StreamResult(content=content, reasoning="".join(think_parts),

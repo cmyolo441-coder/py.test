@@ -50,6 +50,11 @@ RETRY_STATUSES = {408, 429, 500, 502, 503, 504}
 MAX_RETRIES = 3
 RATE_LIMIT_BASE_WAIT = 2.0
 RATE_LIMIT_MAX_WAIT = 60.0
+# Total wall-clock budget for consecutive rate-limit waits within ONE
+# call. Without a cap a sustained 429 storm retried FOREVER (each wait
+# reset the per-attempt deadline), so a swarm of subagents could sit in
+# "running/retrying" indefinitely and the parent turn looked dead.
+RATE_LIMIT_MAX_TOTAL_WAIT = 600.0
 # Fail fast on TCP/TLS connect; the (long) read budget stays untouched for
 # slow streams. A dead provider hangs 10s here, not the full 300s timeout.
 CONNECT_TIMEOUT = 10.0
@@ -100,7 +105,7 @@ def _http() -> requests.Session:
             if _SESSION is None:
                 s = requests.Session()
                 adapter = requests.adapters.HTTPAdapter(
-                    pool_connections=8, pool_maxsize=16, max_retries=0)
+                    pool_connections=8, pool_maxsize=64, max_retries=0)
                 s.mount("https://", adapter)
                 s.mount("http://", adapter)
                 _SESSION = s
@@ -198,7 +203,10 @@ def _is_permanent_error(error: APIError) -> bool:
 
 def _wait_for_rate_limit(error: APIError, attempt: int,
                          should_cancel: Callable[[], bool] | None,
-                         on_status: Callable[[str], None] | None = None) -> None:
+                         on_status: Callable[[str], None] | None = None
+                         ) -> float:
+    """Sleep out a rate limit; returns the seconds waited so callers can
+    enforce RATE_LIMIT_MAX_TOTAL_WAIT across consecutive 429s."""
     delay = _rate_limit_delay(error, attempt)
     if on_status:
         try:
@@ -207,6 +215,7 @@ def _wait_for_rate_limit(error: APIError, attempt: int,
         except Exception:
             pass
     sleep_cancellable(delay, should_cancel)
+    return delay
 
 
 def _base_headers(provider: Provider, stream: bool) -> dict[str, str]:
@@ -1015,6 +1024,12 @@ def build_payload(model: Model, effort: Effort, messages: list[dict],
     # instead of sending a request we can prove the backend will reject
     # with invalid_request_error after ~44s.
     input_tokens = _ensure_window_fit(model, messages, tools, effort)
+    # _ensure_window_fit prunes a contiguous tail — the slice can start
+    # on a tool response whose assistant call was cut, REINTRODUCING an
+    # orphan the sanitize pass above already removed. Re-run the pairing
+    # repair as the last step before the wire.
+    _repair_role_sequence(messages)
+    _sanitize_messages(messages)
     payload: dict[str, Any] = {
         "model": model.id,
         "messages": messages,
@@ -2463,6 +2478,7 @@ def _chat_stream_with_retries(
             on_tool_args(name, chunk)
 
     rate_attempt = 0
+    rate_waited = 0.0
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -2481,7 +2497,13 @@ def _chat_stream_with_retries(
         except APIError as e:
             last_error = e
             if _is_rate_limited(e) and not emitted["out"]:
-                _wait_for_rate_limit(e, rate_attempt, should_cancel, on_status)
+                rate_waited += _wait_for_rate_limit(
+                    e, rate_attempt, should_cancel, on_status)
+                if rate_waited >= RATE_LIMIT_MAX_TOTAL_WAIT:
+                    raise APIError(
+                        f"rate limit persisted for "
+                        f"{rate_waited:.0f}s — giving up instead of "
+                        f"retrying forever") from e
                 rate_attempt += 1
                 attempt = 0
                 deadline = time.monotonic() + timeout
@@ -2827,7 +2849,21 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
                     # dispatch to a real tool anyway).
                     _name = fn["name"]
                     if isinstance(_name, str) and _name:
-                        acc.name_parts.append(_name)
+                        # Some OpenAI-compatible gateways resend the FULL
+                        # name (or the cumulative arguments) in every
+                        # delta instead of sending each piece once —
+                        # appending blindly produced "read_fileread_file"
+                        # and '{"a":1}{"a":1}…' garbage calls. Treat an
+                        # identical resend as a no-op and a strictly
+                        # growing resend as cumulative (replace, not
+                        # concat); only genuine fragments append.
+                        _cur_name = acc.name
+                        if _name == _cur_name:
+                            pass
+                        elif _cur_name and _name.startswith(_cur_name):
+                            acc.name_parts = [_name]
+                        else:
+                            acc.name_parts.append(_name)
                         stall.token_received()  # visible activity
                         if idx not in announced_tools and on_tool_start:
                             announced_tools.add(idx)
@@ -2845,7 +2881,16 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
                             _args = str(_args)
                     else:
                         _args = str(_args)
-                    acc.arguments_parts.append(_args)
+                    # same resend-vs-fragment guard as the name above:
+                    # identical or cumulative-prefix resends replace the
+                    # accumulator instead of corrupting it
+                    _cur_args = acc.arguments
+                    if _args == _cur_args:
+                        pass
+                    elif _cur_args and _args.startswith(_cur_args):
+                        acc.arguments_parts = [_args]
+                    else:
+                        acc.arguments_parts.append(_args)
                     stall.token_received()  # visible activity
                     if on_tool_args:
                         on_tool_args(acc.name, _args)
@@ -3075,6 +3120,7 @@ def _post_blocking(url: str, headers: dict, payload: dict,
     deadline = time.monotonic() + timeout
     attempt = 0
     rate_attempt = 0
+    rate_waited = 0.0
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -3145,7 +3191,13 @@ def _post_blocking(url: str, headers: dict, payload: dict,
             raise
         except APIError as e:
             if _is_rate_limited(e):
-                _wait_for_rate_limit(e, rate_attempt, should_cancel, on_status)
+                rate_waited += _wait_for_rate_limit(
+                    e, rate_attempt, should_cancel, on_status)
+                if rate_waited >= RATE_LIMIT_MAX_TOTAL_WAIT:
+                    raise APIError(
+                        f"rate limit persisted for "
+                        f"{rate_waited:.0f}s — giving up instead of "
+                        f"retrying forever") from e
                 rate_attempt += 1
                 attempt = 0
                 deadline = time.monotonic() + timeout
@@ -3244,8 +3296,12 @@ def chat_with_retry(provider: Provider, model: Model, effort: Effort,
                     messages: list[dict], tools: list[dict] | None,
                     timeout: float, should_cancel=None,
                     on_status: Callable[[str], None] | None = None) -> StreamResult:
-    """Use blocking chat; keep retrying rate limits until success/cancel."""
+    """Use blocking chat; keep retrying rate limits until success/cancel.
+
+    Bounded by RATE_LIMIT_MAX_TOTAL_WAIT — a sustained 429 storm used to
+    retry forever and freeze every subagent waiting on this provider."""
     rate_attempt = 0
+    rate_waited = 0.0
     while True:
         try:
             return chat_blocking(
@@ -3256,7 +3312,12 @@ def chat_with_retry(provider: Provider, model: Model, effort: Effort,
         except APIError as err:
             if not _is_rate_limited(err):
                 raise
-            _wait_for_rate_limit(err, rate_attempt, should_cancel, on_status)
+            rate_waited += _wait_for_rate_limit(
+                err, rate_attempt, should_cancel, on_status)
+            if rate_waited >= RATE_LIMIT_MAX_TOTAL_WAIT:
+                raise APIError(
+                    f"rate limit persisted for {rate_waited:.0f}s — "
+                    f"giving up instead of retrying forever") from err
             rate_attempt += 1
 
 

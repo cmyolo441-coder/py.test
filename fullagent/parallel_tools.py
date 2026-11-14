@@ -176,13 +176,25 @@ def dispatch_block(
                 i = j
                 continue
         tc, ev = pending[i]
-        execute(
-            ev,
-            approve,
-            on_status,
-            causation_id=causation_id,
-            on_tool_output=on_tool_output,
-        )
+        try:
+            execute(
+                ev,
+                approve,
+                on_status,
+                causation_id=causation_id,
+                on_tool_output=on_tool_output,
+            )
+        except TurnCancelled:
+            raise
+        except Exception as exc:
+            # Same contract as the parallel path (_run_batch): a bug in
+            # the executor must degrade to a tool error, never kill the
+            # whole turn with remaining calls left unexecuted.
+            try:
+                ev.status = "error"
+                ev.result = f"ERROR: {type(exc).__name__}: {exc}"
+            except Exception:
+                pass
         if finish(tc, ev):
             return
         i += 1

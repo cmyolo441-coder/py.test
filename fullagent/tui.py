@@ -2126,7 +2126,16 @@ class UI:
                              buffer_empty=self._swarm_buffer_empty(),
                              enabled=enabled):
             return False
-        return self._swarm_start_followup(pending)
+        if self._swarm_start_followup(pending):
+            return True
+        # start failed (busy race / thread error) — release the
+        # fingerprint so the next poll retries instead of suppressing
+        # this result set forever
+        try:
+            rt.gate.rollback(fp)
+        except Exception:
+            pass
+        return False
 
     def _swarm_start_followup(self, pending: int) -> bool:
         """Hand the follow-up to the normal turn path, atomically: the same

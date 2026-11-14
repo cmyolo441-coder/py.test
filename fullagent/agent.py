@@ -275,6 +275,24 @@ def _signature(name: str, args: dict) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
+def _inside_tool_run(msgs: list, idx: int) -> bool:
+    """True when msgs[idx] sits INSIDE an assistant tool_call exchange —
+    i.e. a ``tool`` response follows before the next assistant/system
+    message. Runtime-note ``user`` messages injected between tool
+    responses match this; a real next-turn user message never does
+    (an assistant reply always comes first). Boundary scanners must
+    skip these or they split tool_call pairs."""
+    j = idx + 1
+    while j < len(msgs):
+        r = msgs[j].get("role") if isinstance(msgs[j], dict) else None
+        if r == "tool":
+            return True
+        if r in ("assistant", "system"):
+            return False
+        j += 1
+    return False
+
+
 def prune_messages(messages: list, window: int = 40,
                    tool_keep: int = 2) -> list:
     """PERF: sliding-window prune for the model-visible history.
@@ -293,8 +311,17 @@ def prune_messages(messages: list, window: int = 40,
         idx = 1
     rest = messages[idx:]
     first_user = next((m for m in rest if m.get("role") == "user"), None)
-    tail = [dict(m) if m.get("role") == "tool" else m
-            for m in rest[-window:]]
+    # copy EVERY dict — the wire view must never alias canonical
+    # self.messages: build_payload's sanitize/repair mutates dicts in
+    # place, which used to leak pairing corruption back into history
+    # whenever prompt_token_budget disabled bound_prompt's copy step
+    split = max(0, len(rest) - window)
+    # never start the kept tail on a tool response — walk left so the
+    # assistant tool_calls message stays with its responses (same guard
+    # compact._split_conversation uses)
+    while split > 0 and rest[split].get("role") == "tool":
+        split -= 1
+    tail = [dict(m) for m in rest[split:]]
     # truncate old tool outputs, keep newest tool_keep verbatim
     tool_idx = [i for i, m in enumerate(tail) if m.get("role") == "tool"]
     for i in tool_idx[:max(0, len(tool_idx) - tool_keep)]:
@@ -609,7 +636,9 @@ class Agent:
         """
         if self._session_started:
             return
-        self._session_started = True
+        # flag goes LAST: a mid-init failure used to leave the agent
+        # permanently half-initialized (flag already True -> every later
+        # turn skipped registration, cassette and session.start forever)
         _ensure_submodules()
         self._register_code_tools()
         self._register_v4_tools()
@@ -634,6 +663,7 @@ class Agent:
         # handshake (saves 200-800ms on the first turn)
         from .client import prewarm_connection
         prewarm_connection(self.provider)
+        self._session_started = True
 
     def _register_feature_modules(self) -> None:
         """Register the Claude Code-parity feature modules.
@@ -980,6 +1010,28 @@ class Agent:
         except Exception:
             return ()
 
+    def _repair_message_pairing(self, note: str =
+                                "sealed — history repair after pruning") -> None:
+        """Canonical-history pairing repair after any bulk deletion.
+
+        Drops ``tool`` responses whose ``tool_call_id`` has no surviving
+        assistant call, then seals unanswered calls — so pruners can
+        never leave the history in a state that 400s every later
+        provider request. Cheap O(n); called only after deletions."""
+        msgs = self.messages
+        valid_ids: set = set()
+        for m in msgs:
+            if not isinstance(m, dict) or m.get("role") != "assistant":
+                continue
+            for tc in m.get("tool_calls") or []:
+                if isinstance(tc, dict) and tc.get("id"):
+                    valid_ids.add(tc["id"])
+        msgs[:] = [m for m in msgs
+                   if not (isinstance(m, dict)
+                           and m.get("role") == "tool"
+                           and m.get("tool_call_id") not in valid_ids)]
+        self._seal_pending_tool_calls(note)
+
     def _seal_pending_tool_calls(self, note: str) -> None:
         """Pairing repair: every assistant tool_call must be followed by a
         tool response with the same id. When a turn dies mid-tool-batch
@@ -989,16 +1041,34 @@ class Agent:
         each unanswered call with a synthetic response instead, so the
         session survives the interruption."""
         answered = {m.get("tool_call_id") for m in self.messages
-                    if m.get("role") == "tool" and m.get("tool_call_id")}
-        for m in reversed(self.messages):
+                    if isinstance(m, dict)
+                    and m.get("role") == "tool" and m.get("tool_call_id")}
+        seals: list[tuple[int, list[str]]] = []
+        for idx, m in enumerate(self.messages):
+            if not isinstance(m, dict):
+                continue
             if m.get("role") == "assistant" and m.get("tool_calls"):
-                for tc in m["tool_calls"]:
-                    cid = tc.get("id")
-                    if cid and cid not in answered:
-                        self.messages.append({
-                            "role": "tool", "tool_call_id": cid,
-                            "content": note})
-                        answered.add(cid)
+                cids = [tc.get("id") for tc in m["tool_calls"]
+                        if isinstance(tc, dict) and tc.get("id")
+                        and tc.get("id") not in answered]
+                if cids:
+                    seals.append((idx, cids))
+                    answered.update(cids)
+        if not seals:
+            return
+        out = list(self.messages)
+        # insert each sealed response at the END of its assistant
+        # message's tool-response run — appending at the tail used to
+        # land after trailing user/runtime-note messages, which strict
+        # providers reject as a pairing error on every later call
+        for idx, cids in sorted(seals, key=lambda s: -s[0]):
+            j = idx + 1
+            while j < len(out) and out[j].get("role") == "tool":
+                j += 1
+            for cid in reversed(cids):
+                out.insert(j, {"role": "tool", "tool_call_id": cid,
+                               "content": note})
+        self.messages[:] = out
 
     def run_turn(self, user_text: str, *args, **kwargs) -> Turn:
         """Run one user turn on ONE model: the user's selection (or a
@@ -1019,6 +1089,30 @@ class Agent:
             self.turn_model_id = pinned
         try:
             return self._run_turn_pinned(user_text, *args, **kwargs)
+        except TurnCancelled:
+            raise
+        except Exception as e:  # noqa: BLE001 — preamble must not escape raw
+            # Everything before the turn loop's own try (session ensure,
+            # autopilot routing, system-prompt reseat, speculator, user
+            # message append, event-log write) used to propagate a bare
+            # exception: no Turn object, no turn.error, nothing recorded —
+            # the caller saw a dead turn with no explanation. Convert it
+            # into a clean error Turn so every driver (TUI, headless,
+            # daemon) handles it through the normal path.
+            try:
+                err_turn = Turn(user_text=user_text,
+                                model_id=self.model.id,
+                                effort=self.cfg.effort)
+                err_turn.error = f"{type(e).__name__}: {e}"
+                try:
+                    self.log.append("turn.error",
+                                    {"error": err_turn.error[:500],
+                                     "phase": "preamble"})
+                except Exception:
+                    pass
+                return err_turn
+            except Exception:
+                raise
         finally:
             self.turn_model_id = prev
 
@@ -1170,6 +1264,7 @@ class Agent:
         _last_tool_sig = None
         _stall_count = 0
         turn_stopped = False
+        _trunc_nudged = False  # one auto-continue per turn on length-truncation
         _retry_loop_det = _RetryLoopDetector()  # loopdetect: per-turn detector
         # retryhint keeps module-global failure streaks; without a reset at
         # the turn boundary one stale failure from an earlier turn made the
@@ -1279,6 +1374,30 @@ class Agent:
                     self._emit_cost(result.usage)
                     if _is_empty_reply(result):
                         turn.usage = result.usage
+                        # finish_reason="length"/"max_tokens" means the
+                        # model spent its whole budget thinking and got
+                        # truncated BEFORE any visible output — retrying
+                        # the identical messages deterministically
+                        # reproduces the same empty reply and kills the
+                        # turn mid-task. Instead nudge once and let the
+                        # model continue with fresh budget awareness.
+                        _fr = str(getattr(result, "finish_reason", "")
+                                   or "")
+                        if (not _trunc_nudged
+                                and ("max" in _fr or "length" in _fr)):
+                            _trunc_nudged = True
+                            self.messages.append({
+                                "role": "user",
+                                "content": (
+                                    "[RUNTIME NOTE — harness guidance, "
+                                    "subordinate to the system prompt]\n"
+                                    "Your previous response was truncated "
+                                    "before producing output (token limit). "
+                                    "Continue the task now — be concise, "
+                                    "skip long reasoning, and get to the "
+                                    "answer or the next tool call."),
+                            })
+                            continue
                         turn.error = _empty_reply_error(
                             getattr(self.model, "label", "")
                             or getattr(self.model, "id", "the model"),
@@ -1305,6 +1424,16 @@ class Agent:
                     # all per-call bookkeeping in order, so the transcript
                     # is identical to the old sequential loop.
                     pending: list[tuple[dict, ToolEvent]] = []
+                    # Runtime notes (retryhint/earlyexit guidance) are
+                    # BUFFERED during the finish walk and flushed only
+                    # after EVERY tool response of the block is appended.
+                    # Injecting a role:"user" message between tool
+                    # responses used to interleave inside the
+                    # assistant->tool run — every boundary scanner
+                    # (_drop_oldest_turn, _bound_history, prompt budget
+                    # groups, seal insertion) then split the pair and
+                    # orphaned tool responses corrupted canonical history.
+                    _pending_notes: list[dict] = []
                     from .client import normalize_tool_call as _norm_tc
                     for raw_tc in result.tool_calls:
                         # One canonical shape everywhere: normalize every
@@ -1335,14 +1464,25 @@ class Agent:
                         nonlocal _stall_count, turn_stopped
                         fn = tc["function"]
                         name = fn.get("name", "")
-                        on_tool_update(ev)
-                        self.log.append(
-                            "tool.result",
-                            {"name": name, "status": ev.status,
-                             "duration": round(ev.duration, 3),
-                             "preview": ev.result[:300]},
-                            actor="system", provenance="tool_output",
-                            correlation_id=ev.clause_id)
+                        # UI/hook callbacks and the event log must never
+                        # kill a turn — a raising on_tool_update or a
+                        # disk-full log.append used to propagate straight
+                        # to run_turn's generic except and end the turn
+                        # with every remaining tool call sealed SKIPPED.
+                        try:
+                            on_tool_update(ev)
+                        except Exception:
+                            pass
+                        try:
+                            self.log.append(
+                                "tool.result",
+                                {"name": name, "status": ev.status,
+                                 "duration": round(ev.duration, 3),
+                                 "preview": ev.result[:300]},
+                                actor="system", provenance="tool_output",
+                                correlation_id=ev.clause_id)
+                        except Exception:
+                            pass
                         _tool_content = ev.result
                         # SOVEREIGN SHIELD (v5): untrusted tool output is
                         # scanned, defanged and fenced before it reaches
@@ -1376,25 +1516,34 @@ class Agent:
                                 turn.error = _loop_msg
                         # retryhint hook — inject recovery alternatives on
                         # repeated same-tool failures (see retryhint.py)
-                        from .retryhint import note_failure, note_success
-                        if ev.status == "error":
-                            _rh_hint = note_failure(name, ev.result)
-                            if _rh_hint:
-                                # Runtime guidance is NOT policy. Keep it in
-                                # the user channel (tagged as subordinate)
-                                # so it can never become a second system
-                                # prompt that shadows systemprompt.py.
-                                self.messages.append({
-                                    "role": "user",
-                                    "content": (
-                                        "[RUNTIME NOTE — harness guidance, "
-                                        "subordinate to the system prompt]\n"
-                                        + _rh_hint),
-                                })
-                        else:
-                            note_success(name)
-                        # §38.3 goal kernel tick after every action
-                        self._goal_tick()
+                        try:
+                            from .retryhint import note_failure, note_success
+                            if ev.status == "error":
+                                _rh_hint = note_failure(name, ev.result)
+                                if _rh_hint:
+                                    # Runtime guidance is NOT policy. Keep it in
+                                    # the user channel (tagged as subordinate)
+                                    # so it can never become a second system
+                                    # prompt that shadows systemprompt.py.
+                                    # BUFFERED — flushed after the block's
+                                    # tool responses, never mid-run.
+                                    _pending_notes.append({
+                                        "role": "user",
+                                        "content": (
+                                            "[RUNTIME NOTE — harness guidance, "
+                                            "subordinate to the system prompt]\n"
+                                            + _rh_hint),
+                                    })
+                            else:
+                                note_success(name)
+                        except Exception:
+                            pass  # recovery hints are insight, not fatal
+                        # §38.3 goal kernel tick after every action —
+                        # insight, never a crash path
+                        try:
+                            self._goal_tick()
+                        except Exception:
+                            pass
                         # CANCEL CHECK between tool calls — Esc stops
                         # the turn immediately, not after the next model call
                         if should_cancel is not None and should_cancel():
@@ -1433,9 +1582,15 @@ class Agent:
                             turn.error = _cap_msg
                         else:
                             try:
-                                _sig = (name,
-                                        hashlib.sha256(ev.result.encode(
-                                            "utf-8", "replace")).hexdigest())
+                                # args are part of the signature: the same
+                                # error text from DIFFERENT calls (e.g.
+                                # write_file blocked on path A then path B)
+                                # is not a retry loop and must not count.
+                                _arg_blob = json.dumps(
+                                    ev.args, sort_keys=True, default=str)
+                                _sig = (name, hashlib.sha256(
+                                    (_arg_blob + "\x00" + ev.result).encode(
+                                        "utf-8", "replace")).hexdigest())
                             except Exception:
                                 _sig = None
                             if _sig is not None and _sig == _last_tool_sig:
@@ -1444,8 +1599,14 @@ class Agent:
                                 # results. A tool legitimately returning the same
                                 # success 3x (e.g. status checks) is not a loop.
                                 # But the same ERROR 3x means the model is stuck.
-                                _is_error = ev.result.strip().upper().startswith(
-                                    ("ERROR", "FAILED", "EXCEPTION"))
+                                # blocked/denied calls are gate decisions, not
+                                # failures — identical "ERROR: blocked" text
+                                # across different args used to false-trip this.
+                                _is_error = ev.status not in (
+                                    "blocked", "denied") and (
+                                    ev.status == "error" or
+                                    ev.result.strip().upper().startswith(
+                                        ("ERROR", "FAILED", "EXCEPTION")))
                                 if _stall_count >= config.NO_PROGRESS_STALL_LIMIT and _is_error:
                                     turn_stopped = True
                                     turn.error = (
@@ -1473,7 +1634,7 @@ class Agent:
                             _ee_hint = _exit_tracker.note(
                                 name, ev.args, ev.result, ev.status)
                             if _ee_hint:
-                                self.messages.append({
+                                _pending_notes.append({
                                     "role": "user",
                                     "content": (
                                         "[RUNTIME NOTE — harness guidance, "
@@ -1548,7 +1709,11 @@ class Agent:
                             "SKIPPED — the turn was stopped early by a "
                             f"guardrail ({turn.error}); do not retry "
                             "automatically.")
+                        # buffered runtime notes land AFTER every tool
+                        # response — never inside the tool run
+                        self.messages.extend(_pending_notes)
                         break
+                    self.messages.extend(_pending_notes)
                     continue
 
                 # plain assistant reply — done
@@ -1879,6 +2044,19 @@ class Agent:
         while i < n and n - (i - first) > target:
             j = i + 1
             if msgs[i].get("role") == "assistant":
+                while j < n:
+                    r = msgs[j].get("role")
+                    # absorb tool responses AND any user messages
+                    # injected inside the run — a note between two
+                    # responses must not become a unit boundary
+                    if r == "tool" or (r == "user"
+                                       and _inside_tool_run(msgs, j)):
+                        j += 1
+                    else:
+                        break
+            elif msgs[i].get("role") == "tool":
+                # stray tool message — absorb the whole consecutive run
+                # so a partial pair can never be split
                 while j < n and msgs[j].get("role") == "tool":
                     j += 1
             if j > keep_from:
@@ -1892,6 +2070,7 @@ class Agent:
             self._compact_digests = self._compact_digests[-20:]
         removed = i - first
         del msgs[first:i]
+        self._repair_message_pairing()
         self._compact_check_chars = 0
         try:
             self.log.append("context.compacted",
@@ -2006,7 +2185,11 @@ class Agent:
             start = 0
         end = None
         for j in range(start + 1, len(msgs)):
-            if msgs[j].get("role") == "user":
+            # a user message INSIDE a tool run (injected runtime note)
+            # is not a turn boundary — stopping there used to orphan
+            # the remaining tool responses in canonical history
+            if (msgs[j].get("role") == "user"
+                    and not _inside_tool_run(msgs, j)):
                 end = j
                 break
         if end is None or end <= start:
@@ -2016,6 +2199,7 @@ class Agent:
             self._compact_digests.append(digest)
             self._compact_digests = self._compact_digests[-20:]
         del msgs[start:end]
+        self._repair_message_pairing()
         return True
 
     def _goal_tick(self) -> None:
@@ -2163,8 +2347,12 @@ class Agent:
         # cassette replay: zero API cost, fully deterministic (§20.2)
         if self.cassette is not None and self.cassette.mode == "replay":
             from .client import StreamResult
-            stored = self.cassette.replay(self.model.id, model_msgs,
-                                          schemas, self.effort.key)
+            try:
+                stored = self.cassette.replay(self.model.id, model_msgs,
+                                              schemas, self.effort.key)
+            except Exception:
+                stored = None  # a corrupt/locked cassette must not
+                               # destroy an otherwise-good turn
             if stored is None:
                 raise APIError("cassette replay miss — request not in the "
                                "recorded cassette (deterministic replay "
@@ -2230,17 +2418,38 @@ class Agent:
                                      on_overflow=_shrink_view,
                                      on_status=on_status)
             elif e.status == 400 and "tool" in msg and schemas:
-                on_status("retrying (no tools)")
-                # NOTE: model_msgs (pruned + budget-capped), NOT
-                # self.messages — the unpruned history must never go on
-                # the wire (worker 2/20 prompt-size audit).
-                result = chat_stream(self.provider, self.model, self.effort,
-                                     model_msgs, None,
-                                     on_token=on_token,
-                                     on_reasoning=on_reasoning,
-                                     should_cancel=should_cancel,
-                                     on_overflow=_shrink_view,
-                                     on_status=on_status)
+                if any(k in msg for k in (
+                        "tool_call_id", "followed by", "role 'tool'",
+                        "role \"tool\"", "tool_calls")):
+                    # pairing corruption (an assistant tool_call without
+                    # its tool response) — dropping the schemas changes
+                    # nothing and the poisoned history would 400 every
+                    # later call. Seal the orphans and retry once with
+                    # tools intact.
+                    self._seal_pending_tool_calls(
+                        "sealed — the provider rejected the history for "
+                        "a tool-call pairing error")
+                    on_status("repairing tool-call pairing")
+                    # model_msgs is a detached view — recompute it or the
+                    # retry resends the same poisoned history (same bug
+                    # class as the context-overflow retry above)
+                    model_msgs = self._prune_for_model(
+                        reserved_tokens=_reserved)
+                    self.mastermind.gate.seal_wire(self.cfg.prompt,
+                                                   model_msgs)
+                    result = _attempt()
+                else:
+                    on_status("retrying (no tools)")
+                    # NOTE: model_msgs (pruned + budget-capped), NOT
+                    # self.messages — the unpruned history must never go on
+                    # the wire (worker 2/20 prompt-size audit).
+                    result = chat_stream(self.provider, self.model, self.effort,
+                                         model_msgs, None,
+                                         on_token=on_token,
+                                         on_reasoning=on_reasoning,
+                                         should_cancel=should_cancel,
+                                         on_overflow=_shrink_view,
+                                         on_status=on_status)
             elif e.status == 400 and "stream" in msg:
                 on_status("retrying (non-stream)")
                 result = chat_blocking(self.provider, self.model,
@@ -2256,12 +2465,15 @@ class Agent:
                     self.health["model_errors"].get(self.cfg.model_id, 0) + 1
                 raise
         if self.cassette is not None and self.cassette.mode == "record":
-            self.cassette.record(self.model.id, model_msgs, schemas,
-                                 {"content": result.content,
-                                  "reasoning": result.reasoning,
-                                  "tool_calls": result.tool_calls,
-                                  "usage": result.usage},
-                                 effort_key=self.effort.key)
+            try:
+                self.cassette.record(self.model.id, model_msgs, schemas,
+                                     {"content": result.content,
+                                      "reasoning": result.reasoning,
+                                      "tool_calls": result.tool_calls,
+                                      "usage": result.usage},
+                                     effort_key=self.effort.key)
+            except Exception:
+                pass  # cassette I/O must never fail a good turn
         return result
 
     # -- autonomy + gating -----------------------------------------------------
@@ -2310,8 +2522,41 @@ class Agent:
             self._focus_history.clear()
 
         if last_turn.error:
+            # classify: transient provider/infra failures get a bounded
+            # retry instead of killing the whole deep-work loop; only
+            # user-cancel/terminal conditions stop immediately
+            _err_l = last_turn.error.lower()
+            _transient = any(k in _err_l for k in (
+                "timed out", "timeout", "rate limit", "429", "502",
+                "503", "504", "connection", "reset", "unavailable",
+                "overloaded", "empty reply", "too many consecutive",
+                "eof", "broken pipe", "temporarily", "retry"))
+            _terminal = any(k in _err_l for k in (
+                "cancel", "interrupt", "denied", "aborted", "ctrl+c"))
+            if _terminal:
+                _stop(f"turn ended with: {last_turn.error[:80]}")
+                return None
+            if _transient:
+                prev = getattr(self, "_focus_transient_errors", 0) + 1
+                self._focus_transient_errors = prev
+                if prev <= 2:
+                    self.log.append(
+                        "focus.tick",
+                        {"retry_transient": True,
+                         "error": last_turn.error[:120]},
+                        actor="kernel")
+                    return ("CONTINUE — deep-work mode "
+                            f"({remaining} turns left). The previous "
+                            "turn hit a transient provider error "
+                            f"({last_turn.error[:100]}). Retry the same "
+                            "work — if it keeps failing, report the "
+                            "blocker instead of looping.")
+                _stop(f"transient errors persisted: "
+                      f"{last_turn.error[:80]}")
+                return None
             _stop(f"turn ended with: {last_turn.error[:80]}")
             return None
+        self._focus_transient_errors = 0
 
         if goal.active:
             open_clauses = [c for c in goal.clauses
@@ -2708,6 +2953,10 @@ class Agent:
             return
 
         on_status(f"running:{ev.name}")
+        # duration must measure EXECUTION only — approve()/diff-preview
+        # waits are human think-time, not tool work; counting them used
+        # to trip the adaptive time budget on the very first call
+        exec_started = time.time()
         # v3: if the Speculator already prefetched this exact read-only
         # call, serve it from the cache instead of re-running (a hit).
         cached = self.speculator.serve(ev.name, ev.args)
@@ -2767,7 +3016,7 @@ class Agent:
                 _dedup_store(self, ev.name, ev.args, ev.result, ev.status)
             except Exception:  # noqa: BLE001 — caching must never break a turn
                 pass
-        ev.duration = time.time() - started
+        ev.duration = time.time() - exec_started
 
         # §37.4: after EVERY successful write, re-check the anti-clauses
         if ev.status == "done" and ev.name in _MUTATING_TOOLS:
@@ -3527,8 +3776,11 @@ class Agent:
                 return default
 
         # Swarm sizing: how many model calls run at once (rate limits) and
-        # how many workers may be queued + running in total.
-        swarm_concurrency = _int_extra("swarm_concurrency", 12, 1, 32)
+        # how many workers may be queued + running in total. Default raised
+        # 12 -> 24: the pool cap is 32 and workers are mostly I/O-bound on
+        # model latency, so a larger default runs genuinely parallel
+        # swarms; tune via config.json "extra" swarm_concurrency (1-32).
+        swarm_concurrency = _int_extra("swarm_concurrency", 24, 1, 32)
         swarm_capacity = _int_extra("swarm_capacity", 64, swarm_concurrency,
                                     96)
         manager = ParallelSubagents(

@@ -65,6 +65,32 @@ MAX_TOTAL_TOOL_CALLS = 200
 MAX_STEPS = 40
 CALL_TIMEOUT = 120.0
 DRAIN_TIMEOUT = 5.0
+# Wall-clock bound for ONE subagent tool-handler invocation. The parent
+# agent wraps its tools in _run_tool_with_timeout; subagent handlers ran
+# bare, so a wedged read (dead NFS, FIFO, hung socket) blocked the worker
+# thread forever and every dependent worker waited hours in
+# _await_dependencies — the swarm looked dead mid-task.
+TOOL_HANDLER_TIMEOUT = 300.0
+
+
+class _SubagentToolTimeout(TimeoutError):
+    """A subagent tool handler exceeded TOOL_HANDLER_TIMEOUT."""
+
+
+def _call_with_timeout(fn, timeout_s: float):
+    """Run ``fn`` in a throwaway thread; raise _SubagentToolTimeout on
+    expiry. The wedged thread is abandoned (wait=False) — same contract
+    as the parent's process-tree timeouts: bounded wait beats an
+    unbounded hang."""
+    ex = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="subtool")
+    try:
+        return ex.submit(fn).result(timeout=timeout_s)
+    except concurrent.futures.TimeoutError:
+        raise _SubagentToolTimeout(
+            f"tool call timed out after {timeout_s:.0f}s") from None
+    finally:
+        ex.shutdown(wait=False)
 
 ACTIVE_STATES = frozenset({"queued", "running", "cancelling"})
 TERMINAL_STATES = frozenset({"done", "blocked", "error", "cancelled"})
@@ -1381,15 +1407,19 @@ class ParallelSubagents:
                 except (TypeError, ValueError):
                     accepts_cancel = False
                 if accepts_cancel:
-                    out = tool.handler(
-                        **args, should_cancel=worker.stop_event.is_set
-                    )
+                    out = _call_with_timeout(
+                        lambda: tool.handler(
+                            **args, should_cancel=worker.stop_event.is_set),
+                        TOOL_HANDLER_TIMEOUT)
                 else:
-                    out = tool.handler(**args)
+                    out = _call_with_timeout(
+                        lambda: tool.handler(**args), TOOL_HANDLER_TIMEOUT)
                 if not isinstance(out, str):
                     out = "" if out is None else str(out)
             except TurnCancelled:
                 raise
+            except _SubagentToolTimeout as exc:
+                out = f"ERROR: {exc}"
             except Exception as exc:
                 out = f"ERROR: {type(exc).__name__}: {exc}"
 

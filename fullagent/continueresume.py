@@ -55,8 +55,21 @@ _CONTINUE_RE = re.compile(
 
 
 def is_continue_request(text: str) -> bool:
-    """True when the user text is a bare "continue"-style request."""
-    return bool(text) and bool(_CONTINUE_RE.match(str(text)))
+    """True when the user text is a bare "continue"-style request —
+    including harness-generated continuations (focus mode "CONTINUE —
+    deep-work mode", swarm "[SWARM RESULTS", capped-turn auto-continue)."""
+    if not text:
+        return False
+    s = str(text).lstrip()
+    if _CONTINUE_RE.match(s):
+        return True
+    # harness-generated continuation prompts — these must still reseed
+    # the capped-history window or they replay the identical oversized
+    # context and hit the same 400
+    if s.startswith(("CONTINUE", "[SWARM RESULTS",
+                     "[SUMMARY OF PRIOR TURN")):
+        return True
+    return False
 
 
 # a previous turn counts as "capped" when its error is one of the stop
