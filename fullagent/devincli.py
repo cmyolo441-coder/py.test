@@ -29,6 +29,11 @@ _AGENT_TYPE = "summarizer"  # tool-less agent: raw model I/O, we own tools
 
 _TOOL_CALL_OPEN = re.compile(r"<tool_call>")
 _TOOL_CALL_CLOSE = re.compile(r"</tool_call>")
+# The model sometimes closes a <tool_call> block with a stray tag from its
+# own markup vocabulary instead of </tool_call> — or omits the closer
+# entirely before the next <tool_call>. Any of these ends the block.
+_STRAY_CLOSE = re.compile(
+    r"</(?:think|arg_value|arg|parameters?|invoke|function|response|json)>\s*")
 _LOOSE_CALL = re.compile(r"^([A-Za-z_][\w.\-]*)[ \t]*(\{[\s\S]*\})?")
 
 
@@ -231,30 +236,46 @@ def build_prompt(model_id: str, messages: list[dict],
 
 
 def _parse_tool_calls(text: str):
-    """Split streamed text into (plain_text, [tool_call dicts])."""
+    """Split streamed text into (plain_text, [tool_call dicts]).
+
+    A block ends at the FIRST of: </tool_call>, a stray closing tag the
+    model invented (</think>, </arg_value>, ...), the next <tool_call>, or
+    end of text. Without the stray/next-open terminators an unclosed block
+    swallows every following call and the args JSON corrupts.
+    """
     blocks: list[str] = []
     calls: list[dict] = []
-    last = 0
-    for m in _TOOL_CALL_OPEN.finditer(text):
-        if m.start() < last:
+    opens = list(_TOOL_CALL_OPEN.finditer(text))
+    pos = 0
+    for i, m in enumerate(opens):
+        if m.start() < pos:
             continue
+        seg = text[pos:m.start()].strip()
+        if seg:
+            blocks.append(seg)
         start = m.end()
-        close = _TOOL_CALL_CLOSE.search(text, start)
-        end_content = close.start() if close else len(text)
-        end_block = close.end() if close else len(text)
-        if m.start() > last:
-            seg = text[last:m.start()].strip()
-            if seg:
-                blocks.append(seg)
-        raw = text[start:end_content].strip()
+        ends = []
+        c = _TOOL_CALL_CLOSE.search(text, start)
+        if c:
+            ends.append((c.start(), c.end()))
+        s = _STRAY_CLOSE.search(text, start)
+        if s:
+            ends.append((s.start(), s.end()))
+        if i + 1 < len(opens):
+            ends.append((opens[i + 1].start(), opens[i + 1].start()))
+        if ends:
+            content_end, block_end = min(ends)
+        else:
+            content_end = block_end = len(text)
+        raw = text[start:content_end].strip()
         tc = _parse_one_call(raw)
         if tc is not None:
             calls.append(tc)
         elif raw:
-            blocks.append(text[m.start():end_block].strip())
-        last = end_block
-    if last < len(text):
-        seg = text[last:].strip()
+            blocks.append(text[m.start():block_end].strip())
+        pos = block_end
+    if pos < len(text):
+        seg = text[pos:].strip()
         if seg:
             blocks.append(seg)
     return "\n\n".join(blocks).strip(), calls
