@@ -34,7 +34,23 @@ _TOOL_CALL_CLOSE = re.compile(r"</tool_call>")
 # entirely before the next <tool_call>. Any of these ends the block.
 _STRAY_CLOSE = re.compile(
     r"</(?:think|arg_value|arg|parameters?|invoke|function|response|json)>\s*")
-_LOOSE_CALL = re.compile(r"^([A-Za-z_][\w.\-]*)[ \t]*(\{[\s\S]*\})?")
+# Orphan closing tags left in plain text after block extraction.
+_ORPHAN_CLOSE = re.compile(
+    r"</(?:tool_call|think|arg_value|arg|parameters?|invoke|function|"
+    r"response|json)>\s*")
+# Inside a block the model writes the call in several shapes:
+#   {"name": "x", "arguments": {...}}   read_file{"path": "a"}
+#   read_file {"path": "a"}             read_file with {"path": "a"}
+#   read_file path: "a" count: 2        (key: value pairs, no JSON at all)
+_LOOSE_NAME = re.compile(r"^([A-Za-z_][\w.\-]*)")
+_FILLER = re.compile(
+    r"^(?:with|using|via|call|invoke|arguments?|args|parameters?|input|to)\b[\s:=]*",
+    re.IGNORECASE)
+_ARG_PAIR = re.compile(
+    r"([A-Za-z_]\w*)\s*[:=]\s*"
+    r"(\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'|\{[^{}]*\}|\[[^\]]*\]|"
+    r"true\b|false\b|null\b|-?\d+(?:\.\d+)?|[^\s,]+)")
+_JSON = json.JSONDecoder()
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +294,7 @@ def _parse_tool_calls(text: str):
         seg = text[pos:].strip()
         if seg:
             blocks.append(seg)
-    return "\n\n".join(blocks).strip(), calls
+    return _ORPHAN_CLOSE.sub("", "\n\n".join(blocks)).strip(), calls
 
 
 def _parse_one_call(raw: str) -> dict | None:
@@ -290,15 +306,15 @@ def _parse_one_call(raw: str) -> dict | None:
             a = obj.get("arguments", {})
             args = a if isinstance(a, str) else json.dumps(a, ensure_ascii=False)
     except (ValueError, TypeError):
-        m = _LOOSE_CALL.match(raw)
-        if m:
-            name = m.group(1)
-            if m.group(2):
-                try:
-                    json.loads(m.group(2))
-                    args = m.group(2)
-                except ValueError:
-                    args = json.dumps({"_raw": m.group(2)})
+        text = raw.strip()
+        m = _LOOSE_NAME.match(text)
+        if not m:
+            return None
+        name = m.group(1)
+        rest = text[m.end():].strip()
+        parsed = _parse_loose_args(rest)
+        if parsed is not None:
+            args = json.dumps(parsed, ensure_ascii=False)
     if not name:
         return None
     _parse_one_call._seq[0] += 1
@@ -308,6 +324,74 @@ def _parse_one_call(raw: str) -> dict | None:
 
 
 _parse_one_call._seq = [0]  # type: ignore[attr-defined]
+
+
+def _parse_loose_args(rest: str):
+    """Parse the text after a loose tool name into an arguments dict.
+
+    Accepts a JSON object (with optional filler like "with" before it) or
+    `key: value` / `key=value` pairs. Returns None when nothing parseable
+    is present so the caller falls back to {}.
+    """
+    rest = rest.strip()
+    # peel filler words: "with", "arguments", "args", ... (repeatedly)
+    while True:
+        m = _FILLER.match(rest)
+        if not m:
+            break
+        rest = rest[m.end():].lstrip(" \t:=")
+    if not rest:
+        return None
+    if rest.startswith("{") or rest.startswith("["):
+        try:
+            obj, _ = _JSON.raw_decode(rest)
+            if isinstance(obj, dict):
+                return obj
+            if isinstance(obj, list) and obj and all(
+                    isinstance(p, dict) for p in obj):
+                # [ {"key": "value"}, ... ] -> merge single-pair objects
+                merged = {}
+                for p in obj:
+                    merged.update(p)
+                return merged
+        except ValueError:
+            pass
+    pairs = _ARG_PAIR.findall(rest)
+    if not pairs:
+        return None
+    out = {}
+    for k, v in pairs:
+        v = v.strip()
+        if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+            try:
+                out[k] = json.loads(v)
+                continue
+            except ValueError:
+                out[k] = v[1:-1]
+                continue
+        if len(v) >= 2 and v[0] == "'" and v[-1] == "'":
+            out[k] = v[1:-1]
+            continue
+        if v == "true":
+            out[k] = True
+        elif v == "false":
+            out[k] = False
+        elif v == "null":
+            out[k] = None
+        elif v[:1] in "{[":
+            try:
+                out[k], _ = _JSON.raw_decode(v)
+            except ValueError:
+                out[k] = v
+        else:
+            try:
+                out[k] = int(v)
+            except ValueError:
+                try:
+                    out[k] = float(v)
+                except ValueError:
+                    out[k] = v
+    return out or None
 
 
 # ---------------------------------------------------------------------------
