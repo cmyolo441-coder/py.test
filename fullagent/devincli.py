@@ -50,6 +50,9 @@ _ARG_PAIR = re.compile(
     r"([A-Za-z_]\w*)\s*[:=]\s*"
     r"(\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'|\{[^{}]*\}|\[[^\]]*\]|"
     r"true\b|false\b|null\b|-?\d+(?:\.\d+)?|[^\s,]+)")
+# A `key:`/`key=` token. The lookbehind keeps `self.path = ...` inside file
+# contents from looking like an argument boundary.
+_KEY_TOKEN = re.compile(r"(?<![\w.])([A-Za-z_]\w*)\s*[:=]")
 _JSON = json.JSONDecoder()
 
 
@@ -251,13 +254,17 @@ def build_prompt(model_id: str, messages: list[dict],
     return "\n".join(b)
 
 
-def _parse_tool_calls(text: str):
+def _parse_tool_calls(text: str, schemas: dict | None = None):
     """Split streamed text into (plain_text, [tool_call dicts]).
 
     A block ends at the FIRST of: </tool_call>, a stray closing tag the
     model invented (</think>, </arg_value>, ...), the next <tool_call>, or
     end of text. Without the stray/next-open terminators an unclosed block
     swallows every following call and the args JSON corrupts.
+
+    schemas maps tool name -> set of declared parameter names; when the
+    model writes loose `key: value` arguments, only declared parameters
+    are accepted so file contents can't be misparsed as arguments.
     """
     blocks: list[str] = []
     calls: list[dict] = []
@@ -284,7 +291,8 @@ def _parse_tool_calls(text: str):
         else:
             content_end = block_end = len(text)
         raw = text[start:content_end].strip()
-        tc = _parse_one_call(raw)
+        valid = (schemas or {}).get(_guess_tool_name(raw))
+        tc = _parse_one_call(raw, valid)
         if tc is not None:
             calls.append(tc)
         elif raw:
@@ -297,7 +305,20 @@ def _parse_tool_calls(text: str):
     return _ORPHAN_CLOSE.sub("", "\n\n".join(blocks)).strip(), calls
 
 
-def _parse_one_call(raw: str) -> dict | None:
+def _guess_tool_name(raw: str) -> str:
+    """Best-effort tool name from a raw <tool_call> body, for schema lookup."""
+    text = raw.strip()
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict) and obj.get("name"):
+            return str(obj["name"])
+    except (ValueError, TypeError):
+        pass
+    m = _LOOSE_NAME.match(text)
+    return m.group(1) if m else ""
+
+
+def _parse_one_call(raw: str, valid: set | None = None) -> dict | None:
     name, args = "", "{}"
     try:
         obj = json.loads(raw)
@@ -312,7 +333,7 @@ def _parse_one_call(raw: str) -> dict | None:
             return None
         name = m.group(1)
         rest = text[m.end():].strip()
-        parsed = _parse_loose_args(rest)
+        parsed = _parse_loose_args(rest, valid)
         if parsed is not None:
             args = json.dumps(parsed, ensure_ascii=False)
     if not name:
@@ -326,12 +347,15 @@ def _parse_one_call(raw: str) -> dict | None:
 _parse_one_call._seq = [0]  # type: ignore[attr-defined]
 
 
-def _parse_loose_args(rest: str):
+def _parse_loose_args(rest: str, valid: set | None = None):
     """Parse the text after a loose tool name into an arguments dict.
 
     Accepts a JSON object (with optional filler like "with" before it) or
-    `key: value` / `key=value` pairs. Returns None when nothing parseable
-    is present so the caller falls back to {}.
+    `key: value` / `key=value` pairs. When `valid` (the tool's declared
+    parameter names) is given, only those keys are accepted and each
+    value runs to the next declared key — so a big `content="..."` blob
+    keeps its embedded `x = y` lines instead of exploding into bogus
+    arguments. Returns None when nothing parseable is present.
     """
     rest = rest.strip()
     # peel filler words: "with", "arguments", "args", ... (repeatedly)
@@ -356,42 +380,66 @@ def _parse_loose_args(rest: str):
                 return merged
         except ValueError:
             pass
-    pairs = _ARG_PAIR.findall(rest)
-    if not pairs:
+    return _parse_pairs(rest, valid)
+
+
+def _parse_pairs(rest: str, valid: set | None):
+    """Parse `key: value` / `key=value` pairs.
+
+    With `valid` set, only declared parameter names count as keys and a
+    value runs until the next declared key — file contents survive
+    intact. Without it, every `word:`/`word=` token is a boundary (the
+    old, lossier behaviour kept as a fallback).
+    """
+    matches = None
+    if valid:
+        matches = [m for m in _KEY_TOKEN.finditer(rest)
+                   if m.group(1) in valid]
+    if not matches:
+        # No declared keys found — either no schema or the model invented
+        # its own argument names. Fall back to every token as a boundary.
+        matches = list(_KEY_TOKEN.finditer(rest))
+    if not matches:
         return None
     out = {}
-    for k, v in pairs:
-        v = v.strip()
-        if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
-            try:
-                out[k] = json.loads(v)
-                continue
-            except ValueError:
-                out[k] = v[1:-1]
-                continue
-        if len(v) >= 2 and v[0] == "'" and v[-1] == "'":
-            out[k] = v[1:-1]
-            continue
-        if v == "true":
-            out[k] = True
-        elif v == "false":
-            out[k] = False
-        elif v == "null":
-            out[k] = None
-        elif v[:1] in "{[":
-            try:
-                out[k], _ = _JSON.raw_decode(v)
-            except ValueError:
-                out[k] = v
-        else:
-            try:
-                out[k] = int(v)
-            except ValueError:
-                try:
-                    out[k] = float(v)
-                except ValueError:
-                    out[k] = v
+    for i, m in enumerate(matches):
+        k = m.group(1)
+        vend = matches[i + 1].start() if i + 1 < len(matches) else len(rest)
+        out[k] = _coerce_value(rest[m.end():vend].strip())
     return out or None
+
+
+def _coerce_value(v: str):
+    """Unquote and type a loose `key: value` argument value."""
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        inner = v[1:-1]
+        if v[0] == '"':
+            try:
+                return json.loads(v)
+            except ValueError:
+                return inner
+        return inner
+    if v == "true":
+        return True
+    if v == "false":
+        return False
+    if v == "null":
+        return None
+    if v[:1] in "{[":
+        try:
+            obj, _ = _JSON.raw_decode(v)
+            return obj
+        except ValueError:
+            return v
+    try:
+        return int(v)
+    except ValueError:
+        pass
+    try:
+        return float(v)
+    except ValueError:
+        pass
+    return v
 
 
 # ---------------------------------------------------------------------------
@@ -452,7 +500,7 @@ def _run(provider, model: config.Model, messages: list[dict],
         raise TurnCancelled("devin call cancelled by user")
 
     raw = "".join(text_parts)
-    content, calls = _parse_tool_calls(raw)
+    content, calls = _parse_tool_calls(raw, _tool_schemas(tools))
     for i, tc in enumerate(calls, 1):
         tc["id"] = f"call_{i}"
         if on_tool_start:
@@ -472,6 +520,20 @@ def _run(provider, model: config.Model, messages: list[dict],
     return StreamResult(content=content, reasoning="".join(think_parts),
                         tool_calls=calls, finish_reason=finish,
                         usage=usage, model=model.id)
+
+
+def _tool_schemas(tools: list[dict] | None) -> dict:
+    """Map tool name -> set of declared parameter names, for scoped
+    loose-argument parsing."""
+    out = {}
+    for t in tools or []:
+        fn = t.get("function") or t
+        name = fn.get("name")
+        if not name:
+            continue
+        props = ((fn.get("parameters") or {}).get("properties") or {})
+        out[str(name)] = set(props)
+    return out
 
 
 def chat_stream(provider, model: config.Model, effort: config.Effort,
