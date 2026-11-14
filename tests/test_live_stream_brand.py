@@ -377,3 +377,121 @@ def test_context_meter_is_one_border_segment():
     text = _text(ui._top_fragments())
     assert "── ──" not in text
     assert "ctx 40% " in text and _disp_width(text) == 160
+
+
+# -- transport: tokens are delivered when they arrive -------------------------
+
+class _FakeRaw:
+    """A non-chunked urllib3-like body that returns what "arrived"."""
+    chunked = False
+
+    def __init__(self, pieces):
+        self.pieces = list(pieces)
+        self.calls = 0
+
+    def read1(self, amt=None, decode_content=None):
+        self.calls += 1
+        return self.pieces.pop(0) if self.pieces else b""
+
+
+class _FakeResp:
+    def __init__(self, pieces):
+        self.raw = _FakeRaw(pieces)
+        self.headers = {}
+
+    def iter_lines(self):
+        raise AssertionError("non-chunked bodies must use read1")
+
+
+def test_prompt_line_reader_handles_split_lines_and_crlf():
+    from fullagent.client import _iter_lines_prompt
+    resp = _FakeResp([b"data: a", b"bc\r", b"\n\r\ndata: x\n", b"\n",
+                      b"tail"])
+    assert list(_iter_lines_prompt(resp)) == [
+        b"data: abc", b"", b"data: x", b"", b"tail"]
+
+
+def test_prompt_line_reader_yields_each_event_without_waiting_for_more():
+    from fullagent.client import _iter_lines_prompt
+    resp = _FakeResp([b"data: one\n\n", b"data: two\n\n"])
+    it = _iter_lines_prompt(resp)
+    assert next(it) == b"data: one" and next(it) == b""
+    assert resp.raw.calls == 1          # delivered after ONE socket read
+
+
+def test_chunked_and_fake_responses_keep_the_iter_lines_path():
+    from fullagent.client import _iter_lines_prompt
+
+    class Plain:
+        def iter_lines(self):
+            return iter([b"data: x", b""])
+
+    assert list(_iter_lines_prompt(Plain())) == [b"data: x", b""]
+
+
+def test_close_delimited_stream_is_not_delivered_in_bursts():
+    """Real socket, body without chunked framing, one small event every
+    60 ms: every event must reach on_token right away (it used to wait
+    for 512 buffered bytes — bursts roughly a second apart)."""
+    import json
+    import socket
+    import time
+    from fullagent import client
+    from fullagent.config import Effort, Model, Provider
+
+    sent = []
+
+    def serve(conn):
+        req = b""
+        while b"\r\n\r\n" not in req:
+            req += conn.recv(65536)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream"
+                     b"\r\nConnection: close\r\n\r\n")
+        for i in range(12):
+            sent.append(time.monotonic())
+            conn.sendall(b"data: " + json.dumps(
+                {"choices": [{"delta": {"content": f"w{i} "}}]}).encode()
+                + b"\n\n")
+            time.sleep(0.06)
+        conn.sendall(b"data: [DONE]\n\n")
+        conn.close()
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(2)
+
+    def accept():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=serve, args=(conn,), daemon=True).start()
+
+    threading.Thread(target=accept, daemon=True).start()
+    try:
+        prov = Provider(key="t", name="t", api_key="k", color="red",
+                        base_url=f"http://127.0.0.1:{srv.getsockname()[1]}")
+        got = []
+        client._chat_stream_once(
+            prov.base_url + "/chat/completions",
+            client._base_headers(prov, stream=True),
+            {"model": "t", "messages": [], "stream": True},
+            lambda p: got.append(time.monotonic()),
+            None, None, None, None, 30.0)
+    finally:
+        srv.close()
+    assert len(got) == 12
+    lag = max(g - s for g, s in zip(got, sent[-12:]))
+    assert lag < 0.25, f"token delivered {lag * 1000:.0f} ms late"
+
+
+def test_stream_requests_ask_for_uncompressed_events():
+    from fullagent import client
+    from fullagent.config import Provider
+    prov = Provider(key="t", name="t", api_key="k", color="red",
+                    base_url="http://x")
+    assert client._base_headers(prov, stream=True)["Accept-Encoding"] \
+        == "identity"
+    assert "Accept-Encoding" not in client._base_headers(prov, stream=False)
+    assert client.STREAM_STALL_TIMEOUT >= 120

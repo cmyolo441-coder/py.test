@@ -589,6 +589,38 @@ class _StdoutProxy:
             return True
 
 
+import contextlib
+
+
+@contextlib.contextmanager
+def _patched_stdout():
+    """patch_stdout(raw=True) with a short write batch window.
+
+    prompt_toolkit's proxy sleeps 0.2 s after every flush, batching
+    whatever was printed meanwhile. A finished reply line leaves the live
+    pane on the next frame but could then wait up to 0.2 s to be printed
+    above the prompt — the line vanished and came back, and a steady
+    stream landed in 5-per-second clumps. 0.04 s keeps output in step
+    with the frame rate."""
+    try:
+        from prompt_toolkit.patch_stdout import StdoutProxy
+        proxy = StdoutProxy(raw=True, sleep_between_writes=0.04)
+    except Exception:  # noqa: BLE001 — stub / old prompt_toolkit
+        with patch_stdout(raw=True):
+            yield
+        return
+    orig_out, orig_err = sys.stdout, sys.stderr
+    sys.stdout = proxy   # type: ignore[assignment]
+    sys.stderr = proxy   # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        try:
+            proxy.close()
+        finally:
+            sys.stdout, sys.stderr = orig_out, orig_err
+
+
 def make_console() -> Console:
     # lock in terminal-ness now; patch_stdout later swaps sys.stdout for a
     # proxy that would otherwise make rich think it lost its terminal
@@ -6479,7 +6511,7 @@ class UI:
         from ._foundation import capture_logs_to_file
         with capture_logs_to_file(tui_log_path()) as log_path:
             self.log_path = log_path
-            with patch_stdout(raw=True):
+            with _patched_stdout():
                 try:
                     self.app.run()
                 except KeyboardInterrupt:

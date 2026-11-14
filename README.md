@@ -266,6 +266,19 @@ longer freezes at `6.0k chars`, long streams no longer re-wrap every row
 on every token, and the status bar shows the real speed of the last 5
 seconds — or `⏳ provider silent Ns` when the provider stops sending.
 
+### v4.2.2 — stop-and-go streams and false "stream stalled"
+
+- A stream that is not sent with chunked framing was read 512 bytes at a
+  time, so tokens (and the provider's keepalives) reached the app in
+  bursts — events sent every 100 ms arrived up to 1000 ms apart. Bytes are
+  now delivered as they arrive (measured lag: 1 ms).
+- Streams ask for uncompressed events (`Accept-Encoding: identity`), so a
+  compressing proxy cannot hold tokens back until a block fills.
+- The stall watchdog waits 180 s instead of 60 s: a model that thinks for
+  more than a minute without sending anything no longer dies with
+  `stream stalled: no data for 60s`.
+- Printed lines are flushed every 0.04 s instead of 0.2 s.
+
 ## Keys
 
 | Key | Action |

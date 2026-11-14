@@ -58,7 +58,13 @@ CONNECT_TIMEOUT = 10.0
 # out the full read budget. requests' read timeout is per socket read, so
 # a server dribbling one byte just under the read budget could otherwise
 # hold the call open forever; this closes that hole.
-STREAM_STALL_TIMEOUT = 60.0
+#
+# 180 s, not 60: a reasoning model routinely thinks for more than a minute
+# without sending a byte (many gateways forward no keepalives), and 60 s
+# killed those healthy calls with "stream stalled" — a /retry then hit the
+# same wall. The status bar shows "provider silent Ns" meanwhile, and
+# Esc/Ctrl+C still cancels instantly.
+STREAM_STALL_TIMEOUT = 180.0
 
 class APIError(Exception):
     def __init__(self, message: str, status: int | None = None,
@@ -211,6 +217,12 @@ def _base_headers(provider: Provider, stream: bool) -> dict[str, str]:
         headers["Authorization"] = f"Bearer {provider.api_key}"
     if stream:
         headers["Accept"] = "text/event-stream"
+        # A compressed event stream is buffered by the compressor (and by
+        # every proxy that re-compresses it) until a block fills, so the
+        # tokens arrive in bursts. requests asks for gzip by default;
+        # streams ask for the plain bytes instead.
+        headers["Accept-Encoding"] = "identity"
+        headers["Cache-Control"] = "no-cache"
     return headers
 
 
@@ -1618,6 +1630,88 @@ _KEEPALIVE = object()
 _SSE_QUEUE_BATCH_SIZE = 32
 
 
+_PROMPT_READ = 16384
+
+
+def _iter_lines_prompt(resp: Any) -> Iterator[bytes]:
+    """Yield body lines the moment their bytes arrive.
+
+    ``resp.iter_lines()`` reads through ``raw.stream(512)``. For a
+    chunked response urllib3 hands over each HTTP chunk as it lands, but
+    for a body that is NOT chunked (close-delimited: many gateways and
+    HTTP/1.0-style proxies) it blocks until a full 512 bytes are
+    buffered. A streaming model sends ~50-300 bytes per event, so tokens
+    reached the UI in clumps — measured: events sent every 100 ms were
+    delivered in bursts up to 1000 ms apart. That is the "stop-and-go"
+    stream.
+
+    ``read1`` returns whatever the socket has (at most one read), so each
+    event is delivered as soon as it is received. Anything that is not a
+    real urllib3 response (tests, fakes) or is chunked keeps the
+    ``iter_lines`` path.
+    """
+    raw = getattr(resp, "raw", None)
+    reader = None
+    if raw is not None and getattr(raw, "chunked", True) is False:
+        read1 = getattr(raw, "read1", None)
+        if callable(read1):                       # urllib3 >= 2.0
+            def reader() -> bytes:
+                return read1(_PROMPT_READ, decode_content=True)
+        else:                                     # urllib3 1.x
+            fp = getattr(raw, "_fp", None)
+            fp_read1 = getattr(fp, "read1", None)
+            try:
+                enc = str(resp.headers.get("content-encoding", "")).lower()
+            except Exception:  # noqa: BLE001
+                enc = "?"
+            if callable(fp_read1) and enc in ("", "identity"):
+                def reader() -> bytes:
+                    return fp_read1(_PROMPT_READ)
+    if reader is None:
+        yield from resp.iter_lines()
+        return
+
+    # Same exception surface as requests' iter_content, so the retry
+    # layer keeps seeing the types it already handles.
+    try:
+        from urllib3 import exceptions as _u3
+    except Exception:  # noqa: BLE001
+        _u3 = None
+    pending = b""
+    while True:
+        try:
+            data = reader()
+        except Exception as exc:  # noqa: BLE001 — re-typed below
+            if _u3 is not None:
+                if isinstance(exc, _u3.ProtocolError):
+                    raise requests.exceptions.ChunkedEncodingError(exc)
+                if isinstance(exc, _u3.DecodeError):
+                    raise requests.exceptions.ContentDecodingError(exc)
+                if isinstance(exc, _u3.ReadTimeoutError):
+                    raise requests.exceptions.ConnectionError(exc)
+                if isinstance(exc, _u3.SSLError):
+                    raise requests.exceptions.SSLError(exc)
+            raise
+        if not data:
+            break
+        pending += data
+        if b"\n" not in pending and b"\r" not in pending:
+            continue
+        # bytes.splitlines breaks on \n, \r\n and bare \r only. The last
+        # piece is held back unless it ends in \n: it is either an
+        # unfinished line or ends in a \r that may be half of a \r\n.
+        parts = pending.splitlines(True)
+        pending = b"" if parts[-1].endswith(b"\n") else parts.pop()
+        for part in parts:
+            yield part.rstrip(b"\r\n")
+    if pending:
+        yield pending.rstrip(b"\r\n")
+    try:
+        resp._content_consumed = True
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _iter_sse_events(resp: requests.Response) -> Iterator[dict]:
     """Yield parsed JSON data objects from an SSE stream.
 
@@ -1653,7 +1747,7 @@ def _iter_sse_events(resp: requests.Response) -> Iterator[dict]:
             return None
         return parsed
 
-    lines = resp.iter_lines()
+    lines = _iter_lines_prompt(resp)
     for raw in lines:
         line = raw.decode("utf-8", errors="replace")
         if line.startswith("\ufeff"):
