@@ -281,11 +281,9 @@ MODELS: list[Model] = [
           "Mistral Large 4 (NVIDIA)", tag="nvidia", supports_tools=True,
           context_window=model_context_window(
               "mistralai/mistral-large-4-1t-a52b")),
-    # Real model, 1M context — but API-gated by NVIDIA (404 until they
-    # open programmatic access; see MODEL_CONTEXT_WINDOWS note).
-    Model("moonshotai/kimi-k3.1-pro", "nvidia", "Kimi K3.1 Pro (NVIDIA)",
-          tag="nvidia", supports_tools=True,
-          context_window=model_context_window("moonshotai/kimi-k3.1-pro")),
+    # Kimi K3.1 Pro is NOT listed: it exists upstream but NVIDIA has not
+    # opened programmatic API access — every call returns 404 for every
+    # key, so offering it in the menu is a guaranteed dead end.
     Model("moonshotai/kimi-k2.6", "nvidia", "Kimi K2.6 (NVIDIA)",
           tag="nvidia", supports_tools=True,
           context_window=model_context_window("moonshotai/kimi-k2.6")),
