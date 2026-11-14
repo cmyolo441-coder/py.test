@@ -392,6 +392,8 @@ _BG_LOCK = threading.Lock()
 # Orders status writes between the turn thread and the spinner's
 # trailing-edge throttle drain (see UI._start_spinner).
 _STATUS_LOCK = threading.Lock()
+# Guards the stream-rate counters (turn thread writes, UI thread reads).
+_RATE_LOCK = threading.Lock()
 
 # Live stream pane (the on-screen area right above the prompt box where
 # the reply and the model's thinking appear token by token).
@@ -600,11 +602,11 @@ def _patched_stdout():
     whatever was printed meanwhile. A finished reply line leaves the live
     pane on the next frame but could then wait up to 0.2 s to be printed
     above the prompt — the line vanished and came back, and a steady
-    stream landed in 5-per-second clumps. 0.04 s keeps output in step
-    with the frame rate."""
+    stream landed in 5-per-second clumps. 0.1 s keeps output close
+    to the frame rate without redrawing the prompt for every line."""
     try:
         from prompt_toolkit.patch_stdout import StdoutProxy
-        proxy = StdoutProxy(raw=True, sleep_between_writes=0.04)
+        proxy = StdoutProxy(raw=True, sleep_between_writes=0.1)
     except Exception:  # noqa: BLE001 — stub / old prompt_toolkit
         with patch_stdout(raw=True):
             yield
@@ -1423,11 +1425,33 @@ class UI:
     # -- stream speed -------------------------------------------------------------
 
     def _note_stream_chunk(self) -> None:
-        """One chunk (thinking, answer or tool arguments) just arrived."""
-        marks = self.__dict__.get("_rate_marks")
-        if marks is None:
-            marks = self._rate_marks = deque(maxlen=4000)
-        marks.append(time.monotonic())
+        """One chunk (thinking, answer or tool arguments) just arrived.
+
+        Called on the turn thread while the UI thread reads the rate, so
+        the shared state is two plain attributes (atomic to assign) plus
+        a per-second bucket dict — never a container the reader iterates
+        while this thread grows it. (An earlier version iterated a deque
+        here and crashed the render loop with "deque mutated during
+        iteration".)"""
+        now = time.monotonic()
+        with _RATE_LOCK:
+            buckets = self.__dict__.get("_rate_buckets")
+            if buckets is None:
+                buckets = self._rate_buckets = {}
+            sec = int(now)
+            buckets[sec] = buckets.get(sec, 0) + 1
+            if len(buckets) > 16:
+                for old in [k for k in buckets if k < sec - 8]:
+                    del buckets[old]
+            if self.__dict__.get("_rate_first") is None:
+                self._rate_first = now
+            self._rate_last = now
+
+    def _reset_stream_rate(self) -> None:
+        with _RATE_LOCK:
+            self._rate_buckets = {}
+            self._rate_first = None
+            self._rate_last = None
 
     def _stream_rate_label(self) -> str:
         """Live provider speed for the status bar.
@@ -1437,27 +1461,27 @@ class UI:
         averaged the thinking time into the answer speed. This is the
         real rate over the last 5 seconds, for every kind of chunk — and
         when the provider goes silent it says so, with the seconds, so a
-        slow provider is never mistaken for a frozen app."""
-        marks = self.__dict__.get("_rate_marks")
-        if not marks:
-            return ""
-        now = time.monotonic()
+        slow provider is never mistaken for a frozen app. Never raises:
+        it runs inside the render loop."""
         try:
-            last = marks[-1]
-        except IndexError:
+            now = time.monotonic()
+            with _RATE_LOCK:
+                last = self.__dict__.get("_rate_last")
+                first = self.__dict__.get("_rate_first")
+                snap = dict(self.__dict__.get("_rate_buckets") or {})
+            if last is None or first is None:
+                return ""
+            silent = now - last
+            if silent >= 4.0:
+                return f" · ⏳ provider silent {int(silent)}s"
+            sec = int(now)
+            n = sum(c for k, c in snap.items() if sec - 5 < k <= sec)
+            if n < 2:
+                return ""
+            span = min(5.0, max(1.0, now - first))
+            return f" · ⚡{max(1, int(round(n / span)))} tok/s"
+        except Exception:  # noqa: BLE001 — chrome must never crash
             return ""
-        silent = now - last
-        if silent >= 4.0:
-            return f" · ⏳ provider silent {int(silent)}s"
-        n = 0
-        for ts in reversed(marks):
-            if now - ts > 5.0:
-                break
-            n += 1
-        span = min(5.0, max(1.0, now - marks[0]))
-        if n < 2:
-            return ""
-        return f" · ⚡{max(1, int(round(n / span)))} tok/s"
 
     # -- box border fragments -----------------------------------------------------
 
@@ -2301,6 +2325,43 @@ class UI:
 
     # -- construction ----------------------------------------------------------------
 
+    def _safe_frag(self, fn, name: str = ""):
+        """Wrap a chrome renderer so it can NEVER raise into the event
+        loop. prompt_toolkit calls these on every frame; one exception
+        there prints "Unhandled exception in event loop", stops the
+        redraw and leaves the session waiting on "Press ENTER". A failed
+        frame now reuses the last good one (or draws nothing) and the
+        error goes to the log file."""
+        label = name or getattr(fn, "__name__", "chrome")
+        state = {"last": []}
+
+        def render():
+            try:
+                out = fn()
+                state["last"] = out
+                return out
+            except Exception as exc:  # noqa: BLE001
+                try:
+                    self._log_chrome_error(label, exc)
+                except Exception:  # noqa: BLE001
+                    pass
+                return state["last"]
+
+        return render
+
+    def _safe_cond(self, fn):
+        """A layout filter that reads as False instead of raising."""
+        def check() -> bool:
+            try:
+                return bool(fn())
+            except Exception as exc:  # noqa: BLE001
+                try:
+                    self._log_chrome_error("filter", exc)
+                except Exception:  # noqa: BLE001
+                    pass
+                return False
+        return Condition(check)
+
     def _build(self) -> None:
         config.ensure_dirs()
         self.search_toolbar = SearchToolbar()
@@ -2332,7 +2393,8 @@ class UI:
         processors = []
         try:
             from prompt_toolkit.layout.processors import AfterInput
-            processors = [AfterInput(self._placeholder_fragments)]
+            processors = [AfterInput(
+                self._safe_frag(self._placeholder_fragments))]
         except Exception:  # noqa: BLE001 — stub prompt_toolkit / old version
             processors = []
         self.input_control = BufferControl(
@@ -2351,73 +2413,74 @@ class UI:
         )
         self.input_window = input_window
 
-        top_window = Window(FormattedTextControl(self._top_fragments),
+        top_window = Window(FormattedTextControl(self._safe_frag(self._top_fragments)),
                             height=1, dont_extend_height=True)
-        hud_window = Window(FormattedTextControl(self._hud_fragments),
+        hud_window = Window(FormattedTextControl(self._safe_frag(self._hud_fragments)),
                             height=1, dont_extend_height=True)
-        meta_window = Window(FormattedTextControl(self._meta_fragments),
+        meta_window = Window(FormattedTextControl(self._safe_frag(self._meta_fragments)),
                              height=1, dont_extend_height=True)
         agents_window = Window(
-            FormattedTextControl(self._agents_fragments),
+            FormattedTextControl(self._safe_frag(self._agents_fragments)),
             dont_extend_height=True)
         # live swarm dashboard (Ctrl+G / ↓ / /swarm): replaces the compact
         # board while open; keys are routed to it by eager bindings, so
         # the prompt keeps focus and nothing leaks into the buffer
         swarm_window = Window(
-            FormattedTextControl(self._swarm_dash_fragments),
+            FormattedTextControl(self._safe_frag(self._swarm_dash_fragments)),
             dont_extend_height=True)
-        bottom_window = Window(FormattedTextControl(self._bottom_fragments),
+        bottom_window = Window(FormattedTextControl(self._safe_frag(self._bottom_fragments)),
                                height=1, dont_extend_height=True)
         # The side bars carry one │ per possible input row (10) but ask
         # for a single row, so the input alone decides the box height and
         # a multi-line prompt keeps its border on every row.
         left_window = Window(FormattedTextControl(
-            lambda: self._side_fragments(False)),
+            self._safe_frag(lambda: self._side_fragments(False), "left")),
             width=2, dont_extend_width=True,
             height=Dimension(min=1, preferred=1))
         right_window = Window(FormattedTextControl(
-            lambda: self._side_fragments(True)),
+            self._safe_frag(lambda: self._side_fragments(True), "right")),
             width=2, dont_extend_width=True,
             height=Dimension(min=1, preferred=1))
         overlay_window = Window(
-            FormattedTextControl(self._overlay_fragments),
+            FormattedTextControl(self._safe_frag(self._overlay_fragments)),
             dont_extend_height=True)
         # Background shell jobs and progress bars remain visible while active.
         background_window = Window(
-            FormattedTextControl(self._background_fragments),
+            FormattedTextControl(self._safe_frag(self._background_fragments)),
             dont_extend_height=True)
 
         # live stream pane: the reply / thinking as it streams, directly
         # under the transcript and above every piece of prompt chrome
         live_window = Window(
-            FormattedTextControl(self._live_fragments),
+            FormattedTextControl(self._safe_frag(self._live_fragments)),
             dont_extend_height=True, wrap_lines=False)
 
         root = FloatContainer(
             HSplit([
                 ConditionalContainer(
                     live_window,
-                    filter=Condition(self._live_visible)),
+                    filter=self._safe_cond(self._live_visible)),
                 ConditionalContainer(
                     overlay_window,
-                    filter=Condition(self._overlay_open)),
+                    filter=self._safe_cond(self._overlay_open)),
                 ConditionalContainer(
                     swarm_window,
-                    filter=Condition(self._swarm_dash_open)),
+                    filter=self._safe_cond(self._swarm_dash_open)),
                 ConditionalContainer(
                     agents_window,
-                    filter=Condition(lambda: not self._swarm_dash_open()
-                                     and self._agents_visible())),
+                    filter=self._safe_cond(
+                        lambda: not self._swarm_dash_open()
+                        and self._agents_visible())),
                 hud_window,
                 top_window,
                 ConditionalContainer(
                     background_window,
-                    filter=Condition(self._background_visible)),
+                    filter=self._safe_cond(self._background_visible)),
                 VSplit([left_window, input_window, right_window], padding=0),
                 bottom_window,
                 meta_window,
                 ConditionalContainer(self.search_toolbar,
-                                     filter=Condition(self._search_visible)),
+                                     filter=self._safe_cond(self._search_visible)),
             ]),
             [
                 Float(xcursor=True, ycursor=True,
@@ -2435,6 +2498,15 @@ class UI:
             min_redraw_interval=0.05,
             mouse_support=False,
         )
+        # A terminal that does not answer cursor-position requests (web
+        # terminals, some containers) is fine — prompt_toolkit just stops
+        # asking. Its "WARNING: your terminal doesn't support cursor
+        # position requests (CPR)" line landed in the transcript on every
+        # launch; drop the message, keep the behaviour.
+        try:
+            self.app.renderer.cpr_not_supported_callback = lambda: None
+        except Exception:  # noqa: BLE001 — stub prompt_toolkit
+            pass
         # key timing for the deliberate-act checks (Ctrl+T / picker Enter)
         try:
             self.app.key_processor.after_key_press += self._note_key_done
@@ -5561,7 +5633,7 @@ class UI:
         another turn should run, else None."""
         self._turn_start_ts = time.time()
         self._stream_tokens_count = 0
-        self._rate_marks = deque(maxlen=4000)
+        self._reset_stream_rate()
         self._invalidate_agents()
         self._set_status("thinking…")
         self._start_spinner()
@@ -5960,7 +6032,7 @@ class UI:
             else:
                 self.console.print(self._tool_call_line(ev))
             self._set_status(f"running {ev.name}…")
-            self._rate_marks = deque(maxlen=4000)   # tool time ≠ silence
+            self._reset_stream_rate()   # tool time ≠ provider silence
 
         def on_tool_update(ev: ToolEvent):
             self._invalidate_agents()  # worker progress/finish is real state

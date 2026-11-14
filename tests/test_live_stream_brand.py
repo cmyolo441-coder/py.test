@@ -354,7 +354,7 @@ def test_reasoning_counts_toward_the_live_speed():
 
     ui.agent.run_turn = run
     ui._run_turn_thread("hi")
-    assert len(ui._rate_marks) == 5
+    assert sum(ui._rate_buckets.values()) == 5
 
 
 def test_failed_turn_prints_no_followup_suggestions():
@@ -495,3 +495,55 @@ def test_stream_requests_ask_for_uncompressed_events():
         == "identity"
     assert "Accept-Encoding" not in client._base_headers(prov, stream=False)
     assert client.STREAM_STALL_TIMEOUT >= 120
+
+
+# -- the render loop can never be crashed by chrome ---------------------------
+
+def test_rate_label_survives_concurrent_chunks():
+    """The UI thread reads the rate while the turn thread records chunks.
+    Iterating a growing deque here raised "deque mutated during
+    iteration" inside the render loop and froze the session."""
+    ui = _ui()
+    stop = threading.Event()
+    errors = []
+
+    def feed():
+        while not stop.is_set():
+            ui._note_stream_chunk()
+
+    threads = [threading.Thread(target=feed) for _ in range(3)]
+    for t in threads:
+        t.start()
+    try:
+        for _ in range(3000):
+            try:
+                ui._stream_rate_label()
+                ui._bottom_fragments()
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+                break
+    finally:
+        stop.set()
+        for t in threads:
+            t.join()
+    assert errors == []
+    assert len(ui._rate_buckets) <= 17          # bounded
+
+
+def test_broken_chrome_renderer_never_raises_into_the_event_loop():
+    ui = _ui()
+    ui._log_chrome_error = lambda *a: None
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("boom")
+        return [("", f"frame{calls['n']}")]
+
+    safe = ui._safe_frag(flaky)
+    assert safe() == [("", "frame1")]
+    assert safe() == [("", "frame1")]           # failed frame: last good one
+    assert safe() == [("", "frame3")]
+    cond = ui._safe_cond(lambda: 1 / 0)
+    assert cond() is False

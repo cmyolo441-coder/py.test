@@ -277,7 +277,18 @@ seconds — or `⏳ provider silent Ns` when the provider stops sending.
 - The stall watchdog waits 180 s instead of 60 s: a model that thinks for
   more than a minute without sending anything no longer dies with
   `stream stalled: no data for 60s`.
-- Printed lines are flushed every 0.04 s instead of 0.2 s.
+- Printed lines are flushed every 0.1 s instead of 0.2 s.
+
+### v4.2.3 — render-loop crash
+
+4.2.1's speed readout iterated a deque on the UI thread while the turn
+thread appended to it: `deque mutated during iteration` escaped into the
+event loop and froze the session on "Press ENTER to continue". The
+counter is now lock-guarded, and every chrome renderer and layout filter
+is wrapped so an exception in one can never reach the event loop (the
+last good frame is reused and the error is logged). The
+`terminal doesn't support cursor position requests (CPR)` warning is no
+longer printed.
 
 ## Keys
 
