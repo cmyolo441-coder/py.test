@@ -236,6 +236,16 @@ PROVIDERS: dict[str, Provider] = {
         api_key=_provider_api_key("nvidia"),
         color="#76b900",
     ),
+    # Local Devin CLI (`devin acp` over stdio) — no HTTP endpoint and no
+    # API key; auth is the `devin auth login` session. client.chat_stream
+    # routes provider.key == "devin" to fullagent.devincli instead of HTTP.
+    "devin": Provider(
+        key="devin",
+        name="Devin CLI",
+        base_url="devin://local",
+        api_key="devin-cli",
+        color="#f1fa8c",
+    ),
 }
 
 MODELS: list[Model] = [
@@ -270,6 +280,12 @@ MODELS: list[Model] = [
     Model("moonshotai/kimi-k3.1-pro", "nvidia", "Kimi K3.1 Pro (NVIDIA)",
           tag="nvidia", supports_tools=True,
           context_window=model_context_window("moonshotai/kimi-k3.1-pro")),
+    # Devin CLI swe-2-flash family — the free tier model. 262K context per
+    # `devin models list`. Tool calling is bridged through <tool_call>
+    # markup by fullagent.devincli.
+    Model("swe-2-flash-medium", "devin", "SWE-2 Flash Medium",
+          tag="devin · free", supports_tools=True, supports_reasoning=True,
+          context_window=262_144),
 ]
 # Fastest route measured 2026-10-21: default to it.
 DEFAULT_MODEL_ID = "deepseek-v4.1-flash-1017"

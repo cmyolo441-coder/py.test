@@ -2257,6 +2257,14 @@ def chat_stream(provider: Provider, model: Model, effort: Effort,
          retry with the shrunken messages.
     The payload invariant is re-asserted before every send: the request
     that goes out always satisfies input + max_tokens <= window."""
+    from . import devincli
+    if devincli.is_devin(provider):
+        return devincli.chat_stream(
+            provider, model, effort, messages, tools,
+            on_token=on_token, on_reasoning=on_reasoning,
+            on_tool_start=on_tool_start, on_tool_args=on_tool_args,
+            should_cancel=should_cancel, timeout=timeout,
+            on_status=on_status)
     _check_api_key(provider, model)
     url = provider.base_url.rstrip("/") + "/chat/completions"
     headers = _base_headers(provider, stream=True)
@@ -3166,6 +3174,11 @@ def chat_blocking(provider: Provider, model: Model, effort: Effort,
     Carries the same three-layer context-overflow recovery as chat_stream:
     pre-flight clamp, re-clamp-and-retry on rejection, and (when the input
     itself is too big) caller-driven shrink-and-retry via on_overflow."""
+    from . import devincli
+    if devincli.is_devin(provider):
+        return devincli.chat_blocking(
+            provider, model, effort, messages, tools,
+            timeout=timeout, should_cancel=should_cancel)
     _check_api_key(provider, model)
     url = provider.base_url.rstrip("/") + "/chat/completions"
     headers = _base_headers(provider, stream=False)
