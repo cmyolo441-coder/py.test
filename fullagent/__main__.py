@@ -13,6 +13,7 @@ the persistent event log without launching the UI:
     python main.py goal status         the Goal Compass
     python main.py stats               Oracle post-run analysis
     python main.py forge               environment digest
+    python main.py update [--check]    self-update to the latest release
 """
 
 from __future__ import annotations
@@ -312,6 +313,9 @@ def main() -> int:
         return 0
     if argv and argv[0] == "--self-check":
         return _self_check()
+    if argv and argv[0] == "update":
+        from . import updater
+        return updater.main(argv[1:])
     # Feature: --resume/--continue flags (peeled before headless dispatch)
     import argparse as _ap
     _p = _ap.ArgumentParser()
