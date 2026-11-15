@@ -599,11 +599,54 @@ def _coerce_value(v: str):
     return v
 
 
+# The summarizer agent's artifact always opens with a markdown heading
+# ("<summary>\n## Overview ..."), which keeps legit uses of a literal
+# <summary> tag in answers from being mistaken for it.
+_SUMMARY_OPEN = re.compile(r"<summary[^>]*>\s*##", re.IGNORECASE)
+_SUMMARY_CLOSE = "</summary>"
+
+
+def _summary_start(text: str) -> int:
+    """Index where the summarizer artifact begins, or -1."""
+    start = -1
+    for m in _SUMMARY_OPEN.finditer(text):
+        start = m.start()
+    return start
+
+
+def _strip_summary(text: str) -> str:
+    """Remove the summarizer agent's trailing ``<summary>`` artifact."""
+    start = _summary_start(text)
+    if start < 0:
+        return text
+    end = text.lower().find(_SUMMARY_CLOSE, start)
+    end = end + len(_SUMMARY_CLOSE) if end >= 0 else len(text)
+    return (text[:start] + text[end:]).rstrip()
+
+
 # ---------------------------------------------------------------------------
 # Entry points (same signatures agent.py uses from client.py)
 # ---------------------------------------------------------------------------
 
-def _run(provider, model: config.Model, messages: list[dict],
+# swe-2-flash tiers per `devin models list`: medium / high / max. Map the
+# generic effort ladder onto them so /effort actually changes the model
+# the ACP session runs, instead of being silently ignored.
+_FLASH_TIER = {
+    "low": "swe-2-flash-medium",
+    "medium": "swe-2-flash-medium",
+    "high": "swe-2-flash-high",
+    "extrahigh": "swe-2-flash-max",
+    "ultrahigh": "swe-2-flash-max",
+}
+
+
+def _effort_model_id(model_id: str, effort) -> str:
+    if model_id.startswith("swe-2-flash"):
+        return _FLASH_TIER.get(getattr(effort, "key", ""), model_id)
+    return model_id
+
+
+def _run(provider, model: config.Model, effort, messages: list[dict],
          tools: list[dict] | None, timeout: float,
          on_token, on_reasoning, on_tool_start, on_tool_args,
          should_cancel, on_status) -> StreamResult:
@@ -611,6 +654,7 @@ def _run(provider, model: config.Model, messages: list[dict],
         from .cancelguard import TurnCancelled
         raise TurnCancelled("devin call cancelled by user")
 
+    acp_model = _effort_model_id(model.id, effort)
     prompt = build_prompt(model.id, messages, tools)
     text_parts: list[str] = []
     think_parts: list[str] = []
@@ -621,10 +665,39 @@ def _run(provider, model: config.Model, messages: list[dict],
     result = None
     last_err: APIError | None = None
     for attempt in range(2):
-        acp = _Acp(model.id, os.getcwd(), timeout)
+        acp = _Acp(acp_model, os.getcwd(), timeout)
         # a retry must not duplicate the partial stream from attempt 1
         del text_parts[:]
         del think_parts[:]
+
+        # The summarizer agent appends a "<summary>...</summary>" block to
+        # every reply (its PostAgentIteration cog). It is an artifact of the
+        # ACP harness, not model output — cut it from the token stream and
+        # the final text so callers never see it.
+        summary_cut = [False]
+        emitted = [0]
+        # Hold back the tail of the stream: "<summary>\n##" can arrive
+        # split across chunks, and emitting it before the pattern matches
+        # would leak the artifact.
+        _HOLD = 32
+
+        def _emit_safe(final: bool = False) -> None:
+            if on_token is None or summary_cut[0]:
+                return
+            combined = "".join(text_parts)
+            s = _summary_start(combined)
+            if s >= 0:
+                if _SUMMARY_CLOSE in combined[s:].lower():
+                    summary_cut[0] = True
+                safe_end = s
+            else:
+                safe_end = len(combined)
+                if not final:
+                    safe_end = max(emitted[0], safe_end - _HOLD)
+            new = combined[emitted[0]:safe_end]
+            emitted[0] = safe_end
+            if new:
+                on_token(new)
 
         def on_msg(msg: dict) -> None:
             if msg.get("method") != "session/update":
@@ -637,8 +710,7 @@ def _run(provider, model: config.Model, messages: list[dict],
                 return
             if kind == "agent_message_chunk":
                 text_parts.append(chunk)
-                if on_token:
-                    on_token(chunk)
+                _emit_safe()
             elif kind == "agent_thought_chunk":
                 think_parts.append(chunk)
                 if on_reasoning:
@@ -664,6 +736,7 @@ def _run(provider, model: config.Model, messages: list[dict],
                 "sessionId": sid,
                 "prompt": [{"type": "text", "text": prompt}]},
                 on_update=on_msg, timeout=timeout)
+            _emit_safe(final=True)
             break
         except APIError as e:
             last_err = e
@@ -682,7 +755,7 @@ def _run(provider, model: config.Model, messages: list[dict],
         from .cancelguard import TurnCancelled
         raise TurnCancelled("devin call cancelled by user")
 
-    raw = "".join(text_parts)
+    raw = _strip_summary("".join(text_parts))
     schemas = _tool_schemas(tools)
     content, calls = _parse_tool_calls(raw, schemas)
     # The model sometimes imitates the flattened-history notation
@@ -737,7 +810,7 @@ def chat_stream(provider, model: config.Model, effort: config.Effort,
                 timeout: float = config.DEFAULT_TIMEOUT,
                 on_status=None, **_ignored) -> StreamResult:
     """Drop-in for client.chat_stream when provider.key == 'devin'."""
-    return _run(provider, model, messages, tools, timeout,
+    return _run(provider, model, effort, messages, tools, timeout,
                 on_token, on_reasoning, on_tool_start, on_tool_args,
                 should_cancel, on_status)
 
@@ -747,7 +820,7 @@ def chat_blocking(provider, model: config.Model, effort: config.Effort,
                   timeout: float = config.DEFAULT_TIMEOUT,
                   should_cancel=None, **_ignored) -> StreamResult:
     """Drop-in for client.chat_blocking (non-streaming callers)."""
-    return _run(provider, model, messages, tools, timeout,
+    return _run(provider, model, effort, messages, tools, timeout,
                 None, None, None, None, should_cancel, None)
 
 
