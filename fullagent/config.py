@@ -127,6 +127,8 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     # Naga catalog (api.naga.ac /models, 2026-11-15): 1,024,000-token window,
     # tools + reasoning supported natively, free tier.
     "baidu/ernie-5.5-flash-preview:free": 1_024_000,
+    # Devin CLI swe-2-flash: 262K context per `devin models list`.
+    "swe-2-flash-medium": 262_144,
 }
 # Default for models NOT in the table above: assume a small window rather
 # than risk a ~44s doomed request against an unknown cap. A request we can

@@ -116,8 +116,18 @@ def patched_prune(messages: list, bundle: "FlightBundle",
         from .agent import prune_messages  # lazy: agent imports prewarm
         return prune_messages(messages, window=window, tool_keep=tool_keep)
     rest_start = 1 if bundle.has_system else 0
-    tail_src = messages[max(rest_start, n - window):]
-    tail = [dict(m) if m.get("role") == "tool" else m for m in tail_src]
+    start = max(rest_start, n - window)
+    # mirror prune_messages: never start the kept tail on a tool
+    # response — walk left so the assistant tool_calls message stays
+    # with its responses.
+    while start > rest_start and messages[start].get("role") == "tool":
+        start -= 1
+    tail_src = messages[start:]
+    # copy EVERY dict like prune_messages does — the identity check
+    # below (`m is not fu`) only reproduces prune_messages' exact output
+    # (including its first_user duplication quirk) if the tail never
+    # aliases the originals.
+    tail = [dict(m) for m in tail_src]
     _truncate_tail(tail, tool_keep)
     out: list = []
     if bundle.has_system:
