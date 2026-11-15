@@ -91,9 +91,12 @@ echo ">> Installing FullAgent..."
 "$VENV_DIR/bin/pip" install -q --upgrade "git+https://github.com/${REPO}.git"
 
 mkdir -p "$INSTALL_DIR"
+# Use the pip console script, NOT `python -m fullagent`: -m puts the
+# caller's cwd first on sys.path, so a stray fullagent/ dir in whatever
+# folder the user happens to be in shadows the installed package.
 cat > "$INSTALL_DIR/$NAME" <<EOF
 #!/bin/sh
-exec "$VENV_DIR/bin/python" -m fullagent "\$@"
+exec "$VENV_DIR/bin/$NAME" "\$@"
 EOF
 chmod +x "$INSTALL_DIR/$NAME"
 
