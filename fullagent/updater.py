@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import tempfile
@@ -39,6 +40,22 @@ def _latest_release() -> dict:
     req = urllib.request.Request(f"{_API}/releases/latest", headers=_UA)
     with urllib.request.urlopen(req, timeout=20) as r:
         return json.load(r)
+
+
+def _main_version() -> str | None:
+    """__version__ on the main branch — what a source install would get.
+
+    Source installs track main, NOT GitHub releases: comparing against
+    releases/latest is wrong whenever a release was deleted or main is
+    ahead of the last tag.
+    """
+    url = (f"https://raw.githubusercontent.com/{REPO}/main/"
+           f"fullagent/__init__.py")
+    req = urllib.request.Request(url, headers=_UA)
+    with urllib.request.urlopen(req, timeout=20) as r:
+        text = r.read().decode("utf-8", "replace")
+    m = re.search(r'__version__\s*=\s*"([^"]+)"', text)
+    return m.group(1) if m else None
 
 
 def _binary_asset() -> str | None:
@@ -101,33 +118,48 @@ def _update_binary(asset: str, tag: str) -> int:
 def main(argv: list[str] | None = None) -> int:
     argv = list(argv or [])
     check_only = "--check" in argv
-    try:
-        rel = _latest_release()
-    except Exception as e:  # noqa: BLE001 — network/DNS/offline
-        print(f"update: could not reach GitHub releases ({e})",
-              file=sys.stderr)
-        return 1
-    tag = str(rel.get("tag_name") or "")
-    if not tag:
-        print("update: no release found", file=sys.stderr)
-        return 1
-
     from . import __version__
     cur = __version__.lstrip("v")
-    newer = _ver_tuple(tag) > _ver_tuple(cur)
-    if check_only:
-        print(f"installed: v{cur}   latest: {tag}"
-              + ("  (update available)" if newer else "  (up to date)"))
-        return 0
-    if not newer:
-        print(f"fullagent is up to date (v{cur}, latest {tag}).")
-        return 0
 
     if getattr(sys, "frozen", False):
-        asset = _binary_asset()
-        if asset is None:
-            print(f"update: no binary asset for this platform "
-                  f"({sys.platform}/{platform.machine()})", file=sys.stderr)
+        # Binary installs track GitHub Releases.
+        try:
+            tag = str(_latest_release().get("tag_name") or "")
+        except Exception as e:  # noqa: BLE001 — network/DNS/offline
+            print(f"update: could not reach GitHub releases ({e})",
+                  file=sys.stderr)
             return 1
-        return _update_binary(asset, tag)
+        latest, channel = tag.lstrip("v"), "release"
+        newer = bool(tag) and _ver_tuple(tag) > _ver_tuple(cur)
+        if newer:
+            asset = _binary_asset()
+            if asset is None:
+                print(f"update: no binary asset for this platform "
+                      f"({sys.platform}/{platform.machine()})",
+                      file=sys.stderr)
+                return 1
+            if check_only:
+                print(f"installed: v{cur}   latest: {tag}  (update available)")
+                return 0
+            return _update_binary(asset, tag)
+    else:
+        # Source installs track the main branch.
+        try:
+            latest = _main_version()
+        except Exception as e:  # noqa: BLE001
+            print(f"update: could not reach GitHub ({e})", file=sys.stderr)
+            return 1
+        channel = "main"
+        # pip decides what actually changes; version equality only skips
+        # the (slow) reinstall when main is not ahead
+        newer = bool(latest) and _ver_tuple(latest) > _ver_tuple(cur)
+
+    if check_only:
+        state = " (update available)" if newer else " (up to date)"
+        print(f"installed: v{cur}   latest {channel}: {latest or '?'}{state}")
+        return 0
+    if not newer:
+        print(f"fullagent is up to date (v{cur}, latest {channel} "
+              f"{latest or '?'}).")
+        return 0
     return _update_source()
