@@ -62,9 +62,15 @@ _KEY_TOKEN = re.compile(r"(?<![\w.])([A-Za-z_]\w*)\s*[:=]")
 #   <tool_call>run_command<arg_key>command</arg_key>
 #   <arg_value>ls -la</arg_value></tool_call>
 # instead of the {"name","arguments"} JSON we ask for. Parse it natively.
+# Closing tags tolerate whitespace (</arg_value >) and a missing
+# </arg_value> ends the value at the next <arg_key>, </tool_call>, or
+# end-of-text — otherwise the tag itself leaks INTO the argument value.
 _ARG_KEY = re.compile(
-    r"<arg_key>\s*([A-Za-z_]\w*)\s*</arg_key>\s*"
-    r"<arg_value>([\s\S]*?)</arg_value>", re.IGNORECASE)
+    r"<arg_key\s*>\s*([A-Za-z_]\w*)\s*</arg_key\s*>\s*"
+    r"<arg_value\s*>([\s\S]*?)"
+    r"(?:</arg_value\s*>|(?=<arg_key\b)|(?=</tool_call)|\Z)",
+    re.IGNORECASE)
+_ARG_TAG_JUNK = re.compile(r"</?(?:arg_key|arg_value)\b[^>]*>", re.IGNORECASE)
 # For the token STREAM only: hide whole <tool_call> blocks. A block ends
 # at </tool_call>, at the next <tool_call (lookahead — the opener is not
 # consumed), or at end-of-text (unterminated tail stays hidden).
@@ -556,8 +562,11 @@ def _parse_loose_args(rest: str, valid: set | None = None):
         except ValueError:
             pass
     # Devin-native <arg_key>/<arg_value> pairs — the model's own format.
-    pairs = {m.group(1): _coerce_value(m.group(2).strip())
-             for m in _ARG_KEY.finditer(rest)}
+    # Residual arg tags inside a value (malformed markup) are stripped so
+    # they can't leak into e.g. a shell command.
+    pairs = {m.group(1): _coerce_value(
+        _ARG_TAG_JUNK.sub("", m.group(2)).strip())
+        for m in _ARG_KEY.finditer(rest)}
     if pairs:
         return pairs
     return _parse_pairs(rest, valid)
