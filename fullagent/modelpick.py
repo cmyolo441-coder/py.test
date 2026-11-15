@@ -172,12 +172,12 @@ def _selftest() -> None:
     checks.append(("label match", (resolve_model("DeepSeek V4.1 Flash 1017") or Model("", "", "")).id == DEFAULT_MODEL_ID))
     checks.append(("fuzzy 'deepseek'", (resolve_model("deepseek") or Model("", "", "")).id == DEFAULT_MODEL_ID))
     checks.append(("unknown -> None", resolve_model("no-such-model-zzz") is None))
-    # filter finds every kios free route (gwarden route is not "-free" tagged)
+    # filter finds every free route (ids end "-free" or ":free")
     filt = list_models("free")
-    n_free = sum(1 for m in MODELS if m.id.endswith("-free"))
+    n_free = sum(1 for m in MODELS if "free" in m.id)
     checks.append(("substring filter finds free models",
                    len(filt) == n_free
-                   and all(m["id"].endswith("-free") for m in filt)))
+                   and all("free" in m["id"] for m in filt)))
 
     # 3. format contains columns
     txt = format_model_list(all_models)

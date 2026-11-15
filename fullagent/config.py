@@ -124,6 +124,9 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "moonshotai/kimi-k2.6": 262_144,
     # no published served window yet: stay conservative
     "ernie-5.5-flash-preview": 128_000,
+    # Naga catalog (api.naga.ac /models, 2026-11-15): 1,024,000-token window,
+    # tools + reasoning supported natively, free tier.
+    "baidu/ernie-5.5-flash-preview:free": 1_024_000,
 }
 # Default for models NOT in the table above: assume a small window rather
 # than risk a ~44s doomed request against an unknown cap. A request we can
@@ -215,6 +218,7 @@ def _provider_api_key(provider: str) -> str:
 _EMBEDDED_KEYS: dict[str, str] = {
     "kios": "sk-cFXQ576lsIctpudkYD5lPniF5UgHGLy1nKeXDscCEvK1LMZV",
     "gwarden": "GWAR-OM8VK0HO-94OFDH0DIE3T-U1B3V-WPPPNO-MF8VSR0U",
+    "naga": "ng-wvczxa17XqmBdM35qob7UKL8lPysyh5u",
 }
 
 
@@ -241,6 +245,16 @@ PROVIDERS: dict[str, Provider] = {
         base_url="https://integrate.api.nvidia.com/v1",
         api_key=_provider_api_key("nvidia"),
         color="#76b900",
+    ),
+    # Naga gateway (OpenRouter-style, OpenAI-compatible). Free tier; key
+    # ships in the build, override via NAGA_API_KEY or
+    # ~/.fullagent/naga_api_key.
+    "naga": Provider(
+        key="naga",
+        name="Naga API",
+        base_url="https://api.naga.ac/v1",
+        api_key=_provider_api_key("naga"),
+        color="#ff79c6",
     ),
     # Local Devin CLI (`devin acp` over stdio) — no HTTP endpoint and no
     # API key; auth is the `devin auth login` session. client.chat_stream
@@ -287,6 +301,13 @@ MODELS: list[Model] = [
     Model("moonshotai/kimi-k2.6", "nvidia", "Kimi K2.6 (NVIDIA)",
           tag="nvidia", supports_tools=True,
           context_window=model_context_window("moonshotai/kimi-k2.6")),
+    # Naga free route: 1M context, tools + reasoning verified live
+    # 2026-11-15 (chat/completions, SSE stream, tool_calls all OK).
+    Model("baidu/ernie-5.5-flash-preview:free", "naga",
+          "ERNIE 5.5 Flash (Naga)", tag="naga · free",
+          supports_tools=True, supports_reasoning=True,
+          context_window=model_context_window(
+              "baidu/ernie-5.5-flash-preview:free")),
     # Devin CLI swe-2-flash family — the free tier model. 262K context per
     # `devin models list`. Tool calling is bridged through <tool_call>
     # markup by fullagent.devincli.
@@ -463,7 +484,9 @@ def _self_check() -> None:
     assert PROVIDERS, "no providers defined"
     for key, p in PROVIDERS.items():
         assert key == p.key, f"provider dict key {key!r} != Provider.key {p.key!r}"
-        assert p.base_url.startswith(("https://", "http://")), \
+        # "devin://" is the local-CLI pseudo-scheme (no HTTP endpoint);
+        # every other provider must be a real http(s) base_url.
+        assert p.base_url.startswith(("https://", "http://", "devin://")), \
             f"provider {key!r} has bad base_url {p.base_url!r}"
     seen: set[str] = set()
     for m in MODELS:
