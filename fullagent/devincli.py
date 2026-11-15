@@ -32,8 +32,12 @@ _TOOL_CALL_CLOSE = re.compile(r"</tool_call>")
 # The model sometimes closes a <tool_call> block with a stray tag from its
 # own markup vocabulary instead of </tool_call> — or omits the closer
 # entirely before the next <tool_call>. Any of these ends the block.
+# NOTE: arg_value/arg are deliberately absent — Devin's native tool-call
+# markup legitimately contains </arg_value> INSIDE a <tool_call> block;
+# treating it as a terminator truncates the args. Orphaned copies are
+# still stripped from plain text by _ORPHAN_CLOSE.
 _STRAY_CLOSE = re.compile(
-    r"</(?:think|arg_value|arg|parameters?|invoke|function|response|json)>\s*")
+    r"</(?:think|parameters?|invoke|function|response|json)>\s*")
 # Orphan closing tags left in plain text after block extraction.
 _ORPHAN_CLOSE = re.compile(
     r"</(?:tool_call|think|arg_value|arg|parameters?|invoke|function|"
@@ -53,6 +57,14 @@ _ARG_PAIR = re.compile(
 # A `key:`/`key=` token. The lookbehind keeps `self.path = ...` inside file
 # contents from looking like an argument boundary.
 _KEY_TOKEN = re.compile(r"(?<![\w.])([A-Za-z_]\w*)\s*[:=]")
+# Devin's own tool-call markup: the model is trained on Devin CLI's
+# transcript format and often emits
+#   <tool_call>run_command<arg_key>command</arg_key>
+#   <arg_value>ls -la</arg_value></tool_call>
+# instead of the {"name","arguments"} JSON we ask for. Parse it natively.
+_ARG_KEY = re.compile(
+    r"<arg_key>\s*([A-Za-z_]\w*)\s*</arg_key>\s*"
+    r"<arg_value>([\s\S]*?)</arg_value>", re.IGNORECASE)
 _JSON = json.JSONDecoder()
 
 
@@ -537,6 +549,11 @@ def _parse_loose_args(rest: str, valid: set | None = None):
                 return merged
         except ValueError:
             pass
+    # Devin-native <arg_key>/<arg_value> pairs — the model's own format.
+    pairs = {m.group(1): _coerce_value(m.group(2).strip())
+             for m in _ARG_KEY.finditer(rest)}
+    if pairs:
+        return pairs
     return _parse_pairs(rest, valid)
 
 
@@ -622,6 +639,16 @@ def _strip_summary(text: str) -> str:
     end = text.lower().find(_SUMMARY_CLOSE, start)
     end = end + len(_SUMMARY_CLOSE) if end >= 0 else len(text)
     return (text[:start] + text[end:]).rstrip()
+
+
+def _summary_body(text: str) -> str:
+    """Inner markdown of the summarizer's ``<summary>`` block, or ""."""
+    m = re.search(r"<summary[^>]*>", text, re.IGNORECASE)
+    if not m:
+        return ""
+    end = text.lower().find(_SUMMARY_CLOSE, m.end())
+    body = text[m.end():end if end >= 0 else len(text)]
+    return body.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -755,7 +782,8 @@ def _run(provider, model: config.Model, effort, messages: list[dict],
         from .cancelguard import TurnCancelled
         raise TurnCancelled("devin call cancelled by user")
 
-    raw = _strip_summary("".join(text_parts))
+    raw_full = "".join(text_parts)
+    raw = _strip_summary(raw_full)
     schemas = _tool_schemas(tools)
     content, calls = _parse_tool_calls(raw, schemas)
     # The model sometimes imitates the flattened-history notation
@@ -763,6 +791,14 @@ def _run(provider, model: config.Model, effort, messages: list[dict],
     # recover those so the turn keeps going instead of ending early.
     content, inline = _extract_inline_calls(content, schemas)
     calls.extend(inline)
+    # The summarizer agent sometimes answers with ONLY its <summary>
+    # artifact — stripped above leaves nothing and the caller reports an
+    # "empty reply". The summary body is still coherent text; use it as
+    # a last resort rather than failing the turn.
+    if not content.strip() and not calls:
+        body = _summary_body(raw_full)
+        if body:
+            content = body
     for i, tc in enumerate(calls, 1):
         tc["id"] = f"call_{i}"
         if on_tool_start:
