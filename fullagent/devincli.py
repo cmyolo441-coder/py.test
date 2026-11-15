@@ -65,6 +65,12 @@ _KEY_TOKEN = re.compile(r"(?<![\w.])([A-Za-z_]\w*)\s*[:=]")
 _ARG_KEY = re.compile(
     r"<arg_key>\s*([A-Za-z_]\w*)\s*</arg_key>\s*"
     r"<arg_value>([\s\S]*?)</arg_value>", re.IGNORECASE)
+# For the token STREAM only: hide whole <tool_call> blocks. A block ends
+# at </tool_call>, at the next <tool_call (lookahead — the opener is not
+# consumed), or at end-of-text (unterminated tail stays hidden).
+_TOOL_CALL_DISPLAY = re.compile(
+    r"<tool_call\b[\s\S]*?(?:</tool_call\s*>|(?=<tool_call\b)|\Z)",
+    re.IGNORECASE)
 _JSON = json.JSONDecoder()
 
 
@@ -621,6 +627,9 @@ def _coerce_value(v: str):
 # <summary> tag in answers from being mistaken for it.
 _SUMMARY_OPEN = re.compile(r"<summary[^>]*>\s*##", re.IGNORECASE)
 _SUMMARY_CLOSE = "</summary>"
+_SUMMARY_NUDGE = (
+    "\n\n(Reminder: reply to the user directly — do not only produce "
+    "a summary.)")
 
 
 def _summary_start(text: str) -> int:
@@ -700,12 +709,15 @@ def _run(provider, model: config.Model, effort, messages: list[dict],
         # The summarizer agent appends a "<summary>...</summary>" block to
         # every reply (its PostAgentIteration cog). It is an artifact of the
         # ACP harness, not model output — cut it from the token stream and
-        # the final text so callers never see it.
+        # the final text so callers never see it. <tool_call> markup is
+        # likewise hidden from the stream: the caller renders tool events
+        # itself, so raw markup would just be noise (and the model often
+        # leaks it mid-sentence).
         summary_cut = [False]
         emitted = [0]
-        # Hold back the tail of the stream: "<summary>\n##" can arrive
-        # split across chunks, and emitting it before the pattern matches
-        # would leak the artifact.
+        # Hold back the tail of the stream: "<summary>\n##" and "<tool_call"
+        # can arrive split across chunks, and emitting them before the
+        # pattern matches would leak markup.
         _HOLD = 32
 
         def _emit_safe(final: bool = False) -> None:
@@ -716,13 +728,17 @@ def _run(provider, model: config.Model, effort, messages: list[dict],
             if s >= 0:
                 if _SUMMARY_CLOSE in combined[s:].lower():
                     summary_cut[0] = True
-                safe_end = s
+                head = combined[:s]
             else:
-                safe_end = len(combined)
-                if not final:
-                    safe_end = max(emitted[0], safe_end - _HOLD)
-            new = combined[emitted[0]:safe_end]
-            emitted[0] = safe_end
+                head = combined
+            # strip <tool_call .....</tool_call> regions (and an
+            # unterminated tail, which is held back until it closes)
+            display = _TOOL_CALL_DISPLAY.sub("", head)
+            cut = len(display)
+            if not final:
+                cut = max(emitted[0], cut - _HOLD)
+            new = display[emitted[0]:cut]
+            emitted[0] = max(emitted[0], cut)
             if new:
                 on_token(new)
 
@@ -763,6 +779,17 @@ def _run(provider, model: config.Model, effort, messages: list[dict],
                 "sessionId": sid,
                 "prompt": [{"type": "text", "text": prompt}]},
                 on_update=on_msg, timeout=timeout)
+            # The summarizer agent sometimes answers with ONLY its
+            # <summary> artifact — nothing for the caller. Nudge once and
+            # retry rather than returning an empty/meta reply. Safe to
+            # retry here: a summary-only turn emits no displayable tokens,
+            # so nothing was streamed to the UI yet.
+            if attempt == 0:
+                joined = "".join(text_parts)
+                if (not _strip_summary(joined).strip()
+                        and _summary_body(joined)):
+                    prompt += _SUMMARY_NUDGE
+                    continue
             _emit_safe(final=True)
             break
         except APIError as e:
@@ -791,14 +818,6 @@ def _run(provider, model: config.Model, effort, messages: list[dict],
     # recover those so the turn keeps going instead of ending early.
     content, inline = _extract_inline_calls(content, schemas)
     calls.extend(inline)
-    # The summarizer agent sometimes answers with ONLY its <summary>
-    # artifact — stripped above leaves nothing and the caller reports an
-    # "empty reply". The summary body is still coherent text; use it as
-    # a last resort rather than failing the turn.
-    if not content.strip() and not calls:
-        body = _summary_body(raw_full)
-        if body:
-            content = body
     for i, tc in enumerate(calls, 1):
         tc["id"] = f"call_{i}"
         if on_tool_start:
