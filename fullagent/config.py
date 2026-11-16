@@ -281,9 +281,10 @@ PROVIDERS: dict[str, Provider] = {
         api_key=_provider_api_key("naga"),
         color="#ff79c6",
     ),
-    # Local OpenCode desktop service. Free models (hy4-flash-free) are only
-    # reachable through the harness, so client.chat_stream routes this
-    # provider to fullagent.opencode (session bridge + Basic auth).
+    # Free models (hy4-flash-free) are only reachable inside the OpenCode
+    # harness. client.chat_stream routes this provider to fullagent.opencode,
+    # which self-bootstraps a private OpenCode service (installs the CLI if
+    # needed) and replaces base_url/api_key at runtime. No manual setup.
     "opencode": Provider(
         key="opencode",
         name="OpenCode Console",
