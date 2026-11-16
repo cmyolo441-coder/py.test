@@ -214,6 +214,29 @@ def _provider_api_key(provider: str) -> str:
     return _EMBEDDED_KEYS.get(provider, "")
 
 
+def _opencode_service_password() -> str:
+    """Password for the local OpenCode service (Basic auth, user 'opencode').
+
+    Env OPENCODE_API_KEY wins; otherwise reuse the password of the running
+    OpenCode desktop app so the free models need no manual setup.
+    """
+    key = os.environ.get("OPENCODE_API_KEY", "").strip()
+    if key:
+        return key
+    for path in (
+        Path.home() / ".config" / "opencode" / "service.json",
+        Path(os.environ.get("APPDATA", "")) / "ai.opencode.desktop" / "service.json",
+    ):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            password = str(data.get("password", "")).strip()
+            if password:
+                return password
+        except (OSError, UnicodeDecodeError, ValueError, TypeError):
+            continue
+    return ""
+
+
 # Build-time embedded API keys (zero-config). These ship inside the
 # wheel/binary. Override anytime via <PROVIDER>_API_KEY env var or
 # ~/.fullagent/<provider>_api_key file.
@@ -258,6 +281,16 @@ PROVIDERS: dict[str, Provider] = {
         api_key=_provider_api_key("naga"),
         color="#ff79c6",
     ),
+    # Local OpenCode desktop service. Free models (hy4-flash-free) are only
+    # reachable through the harness, so client.chat_stream routes this
+    # provider to fullagent.opencode (session bridge + Basic auth).
+    "opencode": Provider(
+        key="opencode",
+        name="OpenCode Console",
+        base_url="http://127.0.0.1:28894",
+        api_key=_opencode_service_password(),
+        color="#00ff9d",
+    ),
     # Local Devin CLI (`devin acp` over stdio) — no HTTP endpoint and no
     # API key; auth is the `devin auth login` session. client.chat_stream
     # routes provider.key == "devin" to fullagent.devincli instead of HTTP.
@@ -271,6 +304,11 @@ PROVIDERS: dict[str, Provider] = {
 }
 
 MODELS: list[Model] = [
+    # Free OpenCode model (limited-time promo): 1M context, multimodal, ZDR.
+    # Routed through the local OpenCode service, not a normal HTTP endpoint.
+    Model("hy4-flash-free", "opencode", "Hy4 flash Free",
+          tag="free", supports_tools=True, supports_reasoning=True,
+          context_window=1_048_576),
     # Fast default: DeepSeek accepts reasoning_effort="none" (sent by
     # client.build_payload when supports_reasoning=True), so it answers
     # immediately instead of after a long hidden chain-of-thought.

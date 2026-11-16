@@ -2280,6 +2280,14 @@ def chat_stream(provider: Provider, model: Model, effort: Effort,
             on_tool_start=on_tool_start, on_tool_args=on_tool_args,
             should_cancel=should_cancel, timeout=timeout,
             on_status=on_status)
+    from . import opencode as _opencode
+    if _opencode.is_opencode(provider):
+        return _opencode.chat_stream(
+            provider, model, effort, messages, tools,
+            on_token=on_token, on_reasoning=on_reasoning,
+            on_tool_start=on_tool_start, on_tool_args=on_tool_args,
+            should_cancel=should_cancel, timeout=timeout,
+            on_status=on_status)
     _check_api_key(provider, model)
     url = provider.base_url.rstrip("/") + "/chat/completions"
     headers = _base_headers(provider, stream=True)
@@ -3229,6 +3237,11 @@ def chat_blocking(provider: Provider, model: Model, effort: Effort,
     from . import devincli
     if devincli.is_devin(provider):
         return devincli.chat_blocking(
+            provider, model, effort, messages, tools,
+            timeout=timeout, should_cancel=should_cancel)
+    from . import opencode as _opencode
+    if _opencode.is_opencode(provider):
+        return _opencode.chat_blocking(
             provider, model, effort, messages, tools,
             timeout=timeout, should_cancel=should_cancel)
     _check_api_key(provider, model)
