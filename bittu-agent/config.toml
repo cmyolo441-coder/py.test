@@ -1,0 +1,166 @@
+# ============================================================
+#  BITTU AGENT â€” NEXT GEN TERMINAL AI HARNESS (v2 ULTRA)
+#  Developer by Bittu Chauhan
+#  SambaNova + MiniMax-M3.1-Flash  |  Max Context 1M / 16K out
+# ============================================================
+
+[developer]
+name = "Bittu Chauhan"
+title = "Developer by Bittu Chauhan"
+version = "2.0.0-ultra"
+repo = "https://github.com/bittu"
+
+[agent]
+name = "BITTU AGENT"
+style = "next-gen-ultra"
+mode = "build"
+persona = "senior engineer"
+system_prompt = "You are BITTU AGENT - an ultra-advanced terminal AI harness built by Bittu Chauhan. You are running inside a Go + BubbleTea TUI harness with tools. Be direct, powerful, and helpful. You can run shell commands, read/write files, list directories, search code, fetch URLs, and code in any language. Always prefer executing tools over guessing. Use markdown formatting. Think step-by-step, then act."
+temperature = 0.7
+
+[provider.sambanova]
+name = "SambaNova"
+base_url = "https://api.sambanova.ai/v1"
+api_key = "YOUR_KEY_HERE"
+api_key_env = "SAMBANOVA_API_KEY"
+model = "MiniMax-M3.1-Flash"
+max_context_window = 1048576
+max_output_tokens = 16384
+context_window = 1048576
+max_tokens = 16384
+temperature = 0.7
+top_p = 0.9
+timeout = 120
+
+[providers]
+active = "opencode"
+
+[providers.groq]
+name = "Groq"
+base_url = "https://api.groq.com/openai/v1"
+api_key_env = "GROQ_API_KEY"
+model = "llama-3.3-70b-versatile"
+context_window = 128000
+max_tokens = 8192
+temperature = 0.7
+timeout = 60
+
+[providers.openai]
+name = "OpenAI"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+model = "gpt-4o"
+context_window = 128000
+max_tokens = 16384
+temperature = 0.7
+timeout = 60
+
+[providers.openrouter]
+name = "OpenRouter"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+model = "openai/gpt-4o"
+context_window = 128000
+max_tokens = 16384
+temperature = 0.7
+timeout = 60
+
+# OpenCode local bridge â€” free models (hy4-flash-free) via the running
+# OpenCode desktop service. Password is auto-read from
+# ~/.config/opencode/service.json; no key needed in this file.
+[providers.opencode]
+name = "OpenCode Console"
+base_url = "http://127.0.0.1:28894"
+api_key_env = "OPENCODE_API_KEY"
+model = "hy4-flash-free"
+context_window = 1048576
+max_context_window = 1048576
+max_tokens = 65536
+max_output_tokens = 65536
+temperature = 0.7
+timeout = 180
+
+[models]
+default = "hy4-flash-free"
+available = [
+  "MiniMax-M3.1-Flash",
+  "Kiwi-V3.1",
+  "Llama-4-Maverick-17B-128E-Instruct",
+  "Qwen3-235B-A22B",
+  "llama-3.3-70b-versatile",
+  "gpt-4o",
+  "hy4-flash-free",
+]
+
+[tui]
+theme = "devin"
+animations = true
+streaming = true
+spinner = "dots"
+prompt_double_border = true
+show_tokens = true
+show_context = true
+welcome = "Welcome to BITTU AGENT ULTRA â€” command palette (Ctrl+K), modes, sessions, multi-provider."
+developer_credit = "Developer by Bittu Chauhan"
+show_sidebar = false
+show_fps = true
+show_git = true
+sidebar_width = 34
+density = "comfortable"
+command_palette = true
+approval = true
+auto_compact = true
+compact_threshold = 0.8
+
+[tools]
+enabled = true
+shell = true
+read_file = true
+write_file = true
+list_dir = true
+grep = true
+web_fetch = true
+git_status = true
+git_diff = true
+go_fmt = true
+go_test = true
+allow_destructive_shell = false
+max_parallel = 4
+
+[sessions]
+dir = ""
+auto_save = true
+auto_load = false
+max_history = 200
+
+[[commands]]
+name = "review"
+desc = "Review current git diff"
+prompt = "Review the current uncommitted changes in this repo. Use git_diff tool, then list issues by severity Critical/Major/Minor with file:line and suggested fix. Do not edit files."
+
+[[commands]]
+name = "explain"
+desc = "Explain file or snippet"
+prompt = "Explain what the attached file or selection does, its architecture, and key risks. Use read_file if needed."
+
+[[commands]]
+name = "refactor"
+desc = "Refactor @file"
+prompt = "Refactor the attached file for clarity and performance. Use edit_file tool to apply, then run go fmt and summarize changes."
+
+[keys]
+quit = "ctrl+q"
+send = "enter"
+newline = "shift+enter"
+clear = "ctrl+l"
+help = "ctrl+h"
+model = "ctrl+m"
+theme = "ctrl+t"
+palette = "ctrl+k"
+files = "ctrl+p"
+mode = "ctrl+a"
+sidebar = "ctrl+j"
+save = "ctrl+s"
+sessions = "ctrl+o"
+reasoning = "ctrl+r"
+compact = "ctrl+shift+c"
