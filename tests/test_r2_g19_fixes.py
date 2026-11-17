@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 os.environ.setdefault("FULLAGENT_HOME", tempfile.mkdtemp())
 
-from fullagent import attest, continueresume  # noqa: E402
+from fullagent import continueresume  # noqa: E402
 
 
 def _agent(user_text, prev_turns):
@@ -24,16 +24,3 @@ def test_second_capped_continue_keeps_original_goal():
     assert continueresume.seed_continue_history(agent, "continue")
     assert agent.messages[1]["content"] == "Refactor payments to Stripe"
     assert "User goal: Refactor payments to Stripe" in agent.messages[2]["content"]
-
-
-def test_envelope_with_bracket_doc_id_opens():
-    sealed = attest.seal_envelope("hello world", doc_id="doc[1] v2")
-    body, rep = attest.open_envelope(sealed)
-    assert rep.ok, rep.reason
-    assert body == "hello world"
-
-
-
-
-
-

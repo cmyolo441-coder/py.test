@@ -5324,19 +5324,26 @@ class UI:
         sub = arg.strip().lower()
         if sub in ("", "list", "status"):
             current = self.cfg.prompt
-            lines = [f"system prompt: {current}  (source: systemprompt.py)"]
+            eff = systemprompt.effective_name(current)
+            lines = [f"system prompt: {current}"
+                     + (f" -> {eff}" if eff != current else "")
+                     + "  (source: systemprompt.py)"]
             for name in systemprompt.names():
-                mark = "●" if name == current else "○"
+                mark = "●" if name == eff else "○"
                 size = len(systemprompt.get(name))
                 lines.append(f"  {mark} {name:<8} {size:>8,} chars")
-            lines.append("switch: /prompt main · /prompt master")
+            lines.append("switch: /prompt auto · /prompt main · /prompt master")
             self.print_info("\n".join(lines), C["cyan"])
             return
-        if sub not in systemprompt.PROMPTS:
+        if sub != "auto" and sub not in systemprompt.PROMPTS:
             self.print_error(f"unknown prompt {sub!r} — available: "
                              + ", ".join(systemprompt.names()))
             return
         self.cfg.prompt = sub
+        if sub == "auto":
+            self.cfg.extra.pop("prompt_pinned", None)
+        else:
+            self.cfg.extra["prompt_pinned"] = True
         self.cfg.save()
         # re-seat the live conversation's system prompt through the gate
         self.agent._reseat_system_prompt()

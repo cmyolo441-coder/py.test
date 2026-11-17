@@ -342,7 +342,7 @@ EFFORTS: list[Effort] = [
            "maximum depth, strongest thinking"),
 ]
 
-DEFAULT_EFFORT = "high"
+DEFAULT_EFFORT = "medium"  # light thinking: much faster; ^E for more
 
 
 def model_by_id(model_id: str) -> Model | None:
@@ -366,9 +366,11 @@ class Config:
     auto_approve: bool = False
     show_reasoning: bool = False
     theme: str = "dracula"
-    # which system prompt to send: "main" (compact) or "master" (main +
-    # the optional project.txt specification when present)
-    prompt: str = "main"
+    # which system prompt to send: "auto" (default) = the user's own prompt
+    # ("master": project.txt / system_prompt.txt, verbatim) whenever one
+    # exists, else the compact built-in "main". Set "main" or "master"
+    # explicitly to force one.
+    prompt: str = "auto"
     extra: dict = field(default_factory=dict)
     # PERF: sliding window for model-visible history. 0 = disabled (legacy).
     prune_window: int = 40
@@ -418,7 +420,13 @@ class Config:
         if effort_by_key(cfg.effort) is None:
             cfg.effort = DEFAULT_EFFORT
         if not isinstance(cfg.prompt, str) or not cfg.prompt:
-            cfg.prompt = "main"
+            cfg.prompt = "auto"
+        # Older versions wrote the default "main" into every saved config,
+        # which would pin existing users away from their own prompt file.
+        # A stored "main" only counts as a deliberate choice when /prompt
+        # pinned it.
+        if cfg.prompt == "main" and not cfg.extra.get("prompt_pinned"):
+            cfg.prompt = "auto"
         return cfg
 
     def save(self) -> None:

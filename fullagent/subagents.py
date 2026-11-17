@@ -813,18 +813,6 @@ class ParallelSubagents:
             self._batch_members[batch_id] = []
             from .systemprompt import subagent_prompt_sealed as \
                 _sealed_subagent_prompt
-            try:
-                from .enforce import anchor as _enforce_anchor
-                _ENFORCE_WORKERS = True
-            except Exception:
-                _ENFORCE_WORKERS = False
-
-            def _worker_anchor(aid: str) -> str:
-                try:
-                    return _enforce_anchor(self._counter + len(created))
-                except Exception:
-                    return ""
-
             for idx, item in enumerate(prepared):
                 self._counter += 1
                 aid = f"sa-{self._counter:04d}"
@@ -865,10 +853,6 @@ class ParallelSubagents:
                                 else ""
                             )
                             + f"TASK: {worker.task}"
-                            # SOVEREIGN ENFORCEMENT L3: per-worker rotating
-                            # anchor in the freshest-attention slot
-                            + ("\n\n" + _worker_anchor(aid)
-                               if _ENFORCE_WORKERS else "")
                         ),
                     },
                 ]

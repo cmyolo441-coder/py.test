@@ -8,7 +8,7 @@ from pathlib import Path  # noqa: E402
 
 import pytest  # noqa: E402
 
-from fullagent import adherence, bgsh, dashboard, forge, hierarchy, judge  # noqa: E402
+from fullagent import bgsh, dashboard, forge, hierarchy, judge  # noqa: E402
 from fullagent.kernel import EventLog, fold  # noqa: E402
 
 
@@ -61,12 +61,3 @@ def test_forge_probe_survives_non_utf8_env(tmp_path, monkeypatch):
     f = forge.Forge(log, cwd=tmp_path)
     rec = f.probe()
     assert rec["digest"] and len(fold(log).env_digests) == 1
-
-
-@pytest.mark.parametrize("line", ["END OF CONTEXT", "WRAP-ID v2: abc",
-                                  "PRE-RESPONSE CHECK now"])
-def test_adherence_seal_markers_are_defused(line):
-    body, flags = adherence.sanitize_section("intro\n" + line)
-    assert "fake-tag-defused" in flags
-    assert not adherence._FAKE_TAG_RE.search(body)
-    assert not adherence.detect_seal_spoof(body)

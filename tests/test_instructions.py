@@ -85,10 +85,11 @@ class ComposerTests(unittest.TestCase):
             "goal": "ship it",
         })
         self.assertIn("repo rule: never touch main", doc)
-        self.assertIn("PROJECT INSTRUCTIONS", doc)
-        self.assertIn("OUTPUT STYLE", doc)
-        self.assertLess(doc.index("PROJECT INSTRUCTIONS"),
-                        doc.index("LIVE CONTEXT"))
+        self.assertTrue(doc.startswith("SEALED PROMPT"))
+        self.assertIn("## Project instructions", doc)
+        self.assertIn("## Output style", doc)
+        self.assertLess(doc.index("## Project instructions"),
+                        doc.index("## Active goal"))
         self.assertEqual(
             composer.manifest({"project": "p", "output_style": "o",
                                "goal": "g"}),

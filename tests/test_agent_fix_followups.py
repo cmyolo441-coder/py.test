@@ -88,24 +88,3 @@ def test_fold_skips_inf_and_nan_costs(tmp_path):
     assert st.cost_usd == 0.5 and st.tokens_in == 10 and st.tokens_out == 2
 
 
-def test_apex_wire_check_records_each_broken_wire_once():
-    from fullagent import apex
-
-    class Chain:
-        def __init__(self):
-            self.n = 0
-
-        def append(self, *a, **k):
-            self.n += 1
-
-    eng = apex.ApexEngine.__new__(apex.ApexEngine)
-    eng.sealed = "SEALED PROMPT " * 20
-    eng.chain = Chain()
-    for _ in range(50):
-        eng.wire_check("tampered wire")
-    eng.wire_check("another tampered wire")
-    assert eng.chain.n == 2
-
-
-
-

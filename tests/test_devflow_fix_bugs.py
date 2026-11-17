@@ -26,7 +26,7 @@ if _REPO not in sys.path:
 
 import pytest  # noqa: E402
 
-from fullagent import (attest, backup, bandit, cassette, ci, codeinit,  # noqa: E402
+from fullagent import (backup, bandit, cassette, ci, codeinit,  # noqa: E402
                        cov, doctor, export, jsonout, merge, prreview,
                        report, review, streamlog, termsetup, voicein)
 from fullagent.kernel import EventLog  # noqa: E402
@@ -168,27 +168,6 @@ def test_bandit_survives_non_positive_posteriors(tmp_path):
     r = bandit.BanditRouter(log, ["m", "n"])
     rec = r.recommend("hello")          # used to ZeroDivisionError
     assert rec.arm in ("m", "n")
-
-
-# --------------------------------------------------------------------------
-# attest
-# --------------------------------------------------------------------------
-
-def test_attest_detects_tamper_of_last_record_and_hashless_envelope():
-    ch = attest.AttestChain("s")
-    ch.append("compile", "a")
-    ch.append("wrap", "b", {"p": Path("/x")})       # non-JSON meta ok
-    assert attest.verify_chain(ch).ok
-    ch.records[-1].meta["evil"] = 1
-    rep = attest.verify_chain(ch)
-    assert not rep.ok and rep.broken_at == 1
-    sealed = attest.seal_envelope("body text")
-    stripped = " ".join(t for t in sealed.split(" ")
-                        if not t.startswith("h="))
-    assert attest.open_envelope(stripped)[0] is None
-    q = "mentions [/attested-content] inside"
-    body, r2 = attest.open_envelope(attest.seal_envelope(q))
-    assert r2.ok and body == q
 
 
 # --------------------------------------------------------------------------

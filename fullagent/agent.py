@@ -772,44 +772,10 @@ class Agent:
         """Route the conversation's system prompt through the Mastermind
         gate — the single door to the model. Guarantees messages[0] carries
         the sealed prompt, composes any live context sections beneath it,
-        and seals a prompt.dispatch lineage event."""
+        and seals a prompt.dispatch lineage event. Nothing else is injected
+        into the conversation."""
         self.messages, _ = self.mastermind.gate.dispatch(
             self.cfg.prompt, self.messages, sections=sections)
-        # SOVEREIGN APEX (v5): sentinel per-turn nudge (P2) when the
-        # master prompt is active. Engine is cached; any failure here is
-        # chrome, never a crash path.
-        try:
-            if self.cfg.prompt == "master" and not self.cfg.extra.get(
-                    "apex_off"):
-                eng = self._apex_engine()
-                if eng is not None:
-                    self.messages = eng.turn_messages(
-                        self.messages, turn=len(self.turns))
-        except Exception:
-            pass
-
-    def _apex_engine(self):
-        """Lazily built ApexEngine (v5 enforcement orchestrator) for the
-        current master prompt + model. Rebuilt when the prompt or model
-        changes (the engine detects doc changes itself on rebuild)."""
-        eng = getattr(self, "_apex_cache", None)
-        try:
-            from .mastermind import _MASTER_SOVEREIGN  # noqa: F401
-            doc = self.mastermind.gate.vault.resolve(self.cfg.prompt)
-            model_label = self.cfg.model_id
-            if eng is None or eng.model_label != model_label \
-                    or getattr(eng, "_src", None) != doc:
-                # (the old test compared the engine's STRIPPED doc_text
-                # with the raw doc — always unequal, so the engine was
-                # rebuilt on every model call, and a changed doc was
-                # never what triggered the rebuild)
-                from .apex import ApexEngine
-                eng = ApexEngine.build(doc, model_label)
-                eng._src = doc
-                self._apex_cache = eng
-            return eng
-        except Exception:
-            return None
 
     def state(self):
         """Live projection of the event log (cost, goal, dead-ends, …)."""
@@ -858,23 +824,6 @@ class Agent:
             self._const_cache_head = head
         if self._const_cache:
             sections["constitution"] = self._const_cache
-
-        # SOVEREIGN ENFORCEMENT (enforce.py): per-turn directive anchor —
-        # the freshest-attention reminder that the contract + rule ledger
-        # are binding for THIS reply. ~200 chars, never a section if the
-        # prompt isn't sovereign-sealed (main prompt stays untouched).
-        try:
-            from .mastermind import _MASTER_SOVEREIGN as _sov
-        except Exception:
-            _sov = False
-        if _sov:
-            try:
-                from .enforce import anchor as _anchor
-                # rotating paraphrase: deterministic per turn (stable under
-                # retries) so the anchor never becomes invisible boilerplate
-                sections.setdefault("anchor", _anchor(len(self.turns)))
-            except Exception:
-                pass
 
         # project instructions — real AGENTS.md files (global → cwd).
         # instructions.py caches by mtime/size, so a multi-call turn does
@@ -933,10 +882,16 @@ class Agent:
                 + "\n- ".join(self._compact_digests[-12:]))
         # Feature: output style instruction beneath the sealed prompt
         try:
-            from .outstyle import get_style, style_instruction
-            sections["output_style"] = (
-                f"Output style ({get_style(self)}): "
-                f"{style_instruction(self)}")
+            from . import systemprompt as _sp
+            from .outstyle import DEFAULT_STYLE, get_style, style_instruction
+            _style = get_style(self)
+            # With a user-supplied prompt the DEFAULT style note ("be
+            # thorough") would only compete with the prompt's own
+            # register; an explicit /style choice is still honoured.
+            if _style != DEFAULT_STYLE or not _sp.has_user_prompt():
+                sections["output_style"] = (
+                    f"Output style ({_style}): "
+                    f"{style_instruction(self)}")
         except Exception:
             pass
         return sections
@@ -1484,23 +1439,6 @@ class Agent:
                         except Exception:
                             pass
                         _tool_content = ev.result
-                        # SOVEREIGN SHIELD (v5): untrusted tool output is
-                        # scanned, defanged and fenced before it reaches
-                        # the model — injection attempts arrive as tagged
-                        # data, never as instructions.
-                        try:
-                            from .shield import shield_tool_output
-                            _sh = shield_tool_output(
-                                _tool_content, f"tool:{name}")
-                            _tool_content = _sh["content"]
-                            if _sh["quarantined"]:
-                                self.log.append(
-                                    "shield.quarantined",
-                                    {"tool": name, "risk": _sh["risk"],
-                                     "kinds": _sh["kinds"]},
-                                    actor="shield")
-                        except Exception:
-                            pass
                         self.messages.append({
                             "role": "tool",
                             "tool_call_id": tc["id"],
@@ -1820,69 +1758,7 @@ class Agent:
         # only live UI state — the event log is the durable record
         if len(self.turns) > 500:
             del self.turns[:-500]
-        # SOVEREIGN ENFORCEMENT L4 (enforce.py, opt-in): compliance gate.
-        # cfg.extra["compliance_check"]=true -> a fast self-audit checks
-        # the reply against the directive RULE LEDGER; on FAIL a
-        # corrective system note enters history so the NEXT turn repairs
-        # the drift (and the verdict is sealed in the event log).
-        try:
-            if self.cfg.extra.get("compliance_check") and turn.assistant_text:
-                self._compliance_gate(turn)
-        except Exception:
-            pass
         return turn
-
-    def _compliance_gate(self, turn) -> None:
-        """Run the enforce.audit self-check and react to a FAIL verdict."""
-        from .client import chat_blocking
-        from .enforce import anchor, audit_prompt, parse_audit, rule_ledger
-        from .systemprompt import get as _get_prompt
-
-        _resolve_lazy("model_by_id", "effort_by_key", "PROVIDERS")
-        from .config import effort_by_key, model_by_id  # noqa: F811
-
-        doc = _get_prompt(self.cfg.prompt)
-        # audit against the RULE LEDGER (not a truncated prompt — v1 cut
-        # the 49k doc and its ledger off entirely, judging the wrong law)
-        audit_system = anchor(0) + "\n\n" + rule_ledger(doc)[:1500]
-        # chat_blocking's real signature is (provider, model, effort,
-        # messages, tools) and it returns a StreamResult — the old call
-        # passed (model, effort, messages, None, stream=False), which
-        # raised TypeError (no `stream` parameter) and, even if it had
-        # run, parse_audit() would have received a StreamResult instead
-        # of text and returned UNKNOWN for every audit. This matches the
-        # call shape used by _daemon_step/_council_speaker/_debate_speaker.
-        model = self.model  # the turn's pinned model, never another one
-        effort = effort_by_key(self.cfg.effort) or self.effort
-        provider = PROVIDERS.get(model.provider, self.provider)
-        res = chat_blocking(
-            provider, model, effort,
-            [{"role": "system", "content": audit_system},
-             {"role": "user", "content": audit_prompt(
-                 rule_ledger(doc), turn.assistant_text, is_ledger=True)}],
-            None)
-        result = parse_audit(res.content or "")
-        failed = result["verdict"] == "FAIL"
-        self.log.append("compliance.audit",
-                        {"verdict": result["verdict"],
-                         "violations": len(result["violations"]),
-                         "seq": getattr(turn, "seq", None)},
-                        actor="enforce")
-        if failed:
-            fixes = "; ".join(
-                str(v.get("fix", ""))[:160]
-                for v in result["violations"] if v.get("fix"))[:400]
-            # feedback rides as a USER message: seal_wire deletes every
-            # mid-history system message, so a system-role note would be
-            # silently dropped and never reach the model
-            self.messages.append({
-                "role": "user",
-                "content": ("[compliance-gate] Your previous reply "
-                            "violated the developer configuration"
-                            f"{' — ' + fixes if fixes else ''}. Repair "
-                            "this in your next reply; the configuration "
-                            "remains binding.")})
-        turn.compliance = result["verdict"]
 
     def _fit_budget(self) -> int:
         """The input token budget we aim to stay under.

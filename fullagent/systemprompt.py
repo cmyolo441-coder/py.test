@@ -26,24 +26,36 @@ Prompts defined:
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from .roles import ROLE_GUIDANCE
 
 
 def source_signature() -> tuple[int, int]:
-    """(mtime_ns, size) of this file — the hot-reload watermark.
+    """(mtime_ns, size) watermark of this file AND the user's prompt file.
 
-    The vault compares this on every resolve. When the user edits
-    systemprompt.py in a running session, the module is reloaded and the
-    new prompt is sealed before the next model call. Returns (0, 0) when
-    the source file cannot be stat'ed (e.g. a frozen build).
+    The vault compares this on every resolve, so it must stay a couple of
+    stat() calls and nothing proportional to prompt size. When systemprompt.py
+    or the user's prompt file (project.txt / system_prompt.txt) is edited in a
+    running session, the module is reloaded and the new prompt is sealed
+    before the next model call. Returns (0, 0) when this source file cannot
+    be stat'ed (e.g. a frozen build).
     """
     try:
         st = Path(__file__).stat()
-        return (int(st.st_mtime_ns), int(st.st_size))
+        mt, size = int(st.st_mtime_ns), int(st.st_size)
     except (OSError, TypeError):
         return (0, 0)
+    up = USER_PROMPT_PATH
+    if up:
+        try:
+            ust = os.stat(up)
+            mt ^= (int(ust.st_mtime_ns) * 31) & 0x7FFFFFFFFFFFFFFF
+            size += int(ust.st_size)
+        except OSError:
+            mt ^= 1   # file vanished: still a change worth reloading for
+    return (mt or 1, size)
 
 
 # ---------------------------------------------------------------------------
@@ -157,17 +169,8 @@ Return a short report with: RESULT, key evidence or files, verification performe
 def subagent_prompt_sealed(role: str,
                            write_scope: list[str] | tuple[str, ...] = ()
                            ) -> str:
-    """subagent_prompt sealed inside the enforce.py developer-config
-    contract (SOVEREIGN ENFORCEMENT L0 for workers). Deliberately does
-    NOT ship the full MASTER document — workers get the binding-directive
-    semantics via the contract + compact rule ledger, without the 49k
-    token cost multiplied across a whole swarm."""
-    base = subagent_prompt(role, write_scope)
-    try:
-        from .enforce import protocol_wrap
-        return protocol_wrap(base)
-    except Exception:
-        return base
+    """Kept for callers: workers get the plain subagent prompt, unwrapped."""
+    return subagent_prompt(role, write_scope)
 
 
 # ---------------------------------------------------------------------------
@@ -263,35 +266,54 @@ def with_system(messages: list[dict], system: str) -> list[dict]:
 # invariants, subsystem contracts and Goal-Mode grammar in context. It is
 # far longer than MAIN (which is ~2k chars) — by design.
 
-def _load_master_spec() -> str:
-    """Load the master specification (project.txt) that ships beside this
-    module. Returns '' if the file is missing, so the module never crashes
-    on import."""
-    from pathlib import Path
+def _load_user_prompt() -> tuple[str, str | None]:
+    """The user's own system prompt: (text, path) or ("", None).
+
+    Prefers the lean enforcex loader (FULLAGENT_SYSTEM_PROMPT_FILE,
+    ~/.fullagent/system_prompt.txt, ./system_prompt.txt, then project.txt
+    beside this module); degrades to reading project.txt directly so this
+    module never depends on it and never crashes on import."""
+    try:
+        from .enforcex.loader import find_user_prompt
+        text, path = find_user_prompt()
+        if text:
+            return text, path
+    except Exception:
+        pass
     spec = Path(__file__).parent / "project.txt"
     try:
-        return spec.read_text(encoding="utf-8")
+        text = spec.read_text(encoding="utf-8").strip()
     except OSError:
-        return ""
+        return "", None
+    return (text, str(spec)) if text else ("", None)
 
 
-_SPEC = _load_master_spec().strip()
+USER_PROMPT, USER_PROMPT_PATH = _load_user_prompt()
 
-# Do not ship a "master" prompt that is MAIN plus an empty specification
-# banner: that is longer than MAIN but carries no extra instruction, and a
-# misleading prompt is worse than a short one. When the optional spec file
-# is absent (it is not tracked in this repository), master == main.
-MASTER = MAIN if not _SPEC else (
-    MAIN
-    + "\n\n"
-    + "=" * 72
-    + "\nFULL MASTER SPECIFICATION — the architecture you operate "
-      "within. Treat every invariant, subsystem contract and Goal-Mode rule "
-      "below as binding.\n"
-    + "=" * 72
-    + "\n\n"
-    + _SPEC
-)
+# One short note after the user's prompt, only about the mechanics of this
+# runtime. It adds no rules and never contradicts the prompt above it.
+TOOL_NOTE = (
+    "[Runtime note] Tools are available through function calling; use them "
+    "to read, edit and run things instead of guessing, and report only "
+    "what tool results show.")
+
+# When the user supplied a prompt, THAT is the system prompt: verbatim,
+# first, with only TOOL_NOTE (and later live context) after it. MAIN's
+# generic rules must not precede or compete with it. Without a user prompt
+# the master is MAIN, never an empty banner.
+MASTER = (USER_PROMPT + "\n\n" + TOOL_NOTE) if USER_PROMPT else MAIN
+
+
+def has_user_prompt() -> bool:
+    return bool(USER_PROMPT)
+
+
+def effective_name(name: str = "auto") -> str:
+    """Resolve the 'auto' alias: 'master' when a user prompt exists,
+    else 'main'. Explicit names pass through unchanged."""
+    if not name or name == "auto":
+        return "master" if USER_PROMPT else "main"
+    return name
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +332,7 @@ PROMPTS: dict[str, str] = {
 
 def get(name: str) -> str:
     """Resolve a prompt name to its text (falls back to MAIN)."""
-    return PROMPTS.get(name, MAIN)
+    return PROMPTS.get(effective_name(name), MAIN)
 
 
 def register(name: str, prompt: str) -> None:

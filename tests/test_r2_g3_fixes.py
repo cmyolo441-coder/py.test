@@ -6,7 +6,7 @@ os.environ.setdefault("FULLAGENT_HOME", tempfile.mkdtemp())
 import threading
 from types import SimpleNamespace
 
-from fullagent import apex, subagents
+from fullagent import subagents
 from fullagent.cassette import Cassette
 
 
@@ -19,22 +19,6 @@ def test_cassette_record_after_torn_tail_survives_reload(tmp_path):
     rec.close()
     play = Cassette(p, mode="replay")
     assert play.replay("m", msgs, None) == {"content": "ok"}
-
-
-def test_apex_rebuild_failed_layer_does_not_keep_old_state(monkeypatch):
-    eng = apex.build_engine("# Rules\n1. Always answer briefly.\n", "m")
-    assert eng.sentinel is not None
-    import fullagent.sentinel as sentinel
-
-    def boom(*a, **k):
-        raise RuntimeError("x")
-
-    monkeypatch.setattr(sentinel, "build_payload", boom)
-    eng.rebuild("# Rules\n1. Never answer briefly.\n")
-    assert eng.report.layers["sentinel"] is False
-    assert eng.sentinel is None
-    msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
-    assert eng.turn_messages(msgs) is msgs
 
 
 def _manager():

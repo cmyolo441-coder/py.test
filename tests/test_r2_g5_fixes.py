@@ -8,7 +8,6 @@ from pathlib import Path
 from fullagent.cancelguard import sleep_cancellable
 from fullagent.kernel import EventLog
 from fullagent.loopdetect import LoopDetector, normalize_error
-from fullagent.sentinel import WireSentinel, build_payload, injection_plan_for
 from fullagent.webfetch import _extract
 
 
@@ -34,17 +33,6 @@ def test_webfetch_entities_not_double_unescaped():
                            "<p>use &amp;lt;b&amp;gt; tags</p>")
     assert title == "A &amp; B"
     assert text == "use &lt;b&gt; tags"
-
-
-def test_sentinel_prefix_idempotent_for_plain_contract_head():
-    p = build_payload("HEAD RULES", "LEDGER", "n", "tag")
-    s = WireSentinel(p, injection_plan_for("x", p.fingerprint))
-    m = [{"role": "system", "content": "BASE"},
-         {"role": "user", "content": "hi"}]
-    once = s.apply(m)
-    twice = s.apply(once)
-    assert twice[0]["content"] == once[0]["content"]
-    assert twice[0]["content"].count("HEAD RULES") == 1
 
 
 def test_sleep_cancellable_nan_returns():

@@ -1,69 +1,46 @@
-"""Mastermind — the coherence architecture for systemprompt.py.
+"""Mastermind — the single door between the user's system prompt and the model.
 
-How does the agent follow the prompts in systemprompt.py *inevitably*,
-with zero enforcement, zero coercion, zero policing? By making the prompt
-the coherent center of every request. Nothing forces the model — the
-structure simply leaves nothing else to follow.
+The user's prompt IS the system prompt. This module keeps it that way and
+does nothing else to it:
 
-Three cooperating mechanisms, all deterministic Python (rung 1):
+  PromptVault          Seals every prompt at startup with a sha256
+                       fingerprint (cheap, cached) and records it in the
+                       event log. Hot-reloads when the source changed
+                       (a couple of stat() calls per lookup).
 
-  PromptVault          Every prompt is sealed at startup with a sha256
-                       fingerprint and recorded in the event log. The
-                       vault is the ONLY source a prompt is ever read
-                       from — a prompt that was never sealed cannot reach
-                       a model.
+  PromptGate           gate.dispatch() / gate.seal_wire() guarantee that
+                       messages[0] is the ONE system message and that it
+                       starts with the sealed prompt byte-for-byte. A
+                       missing/shadowed prompt is re-seated; stray extra
+                       system messages are removed.
 
-   PromptGate           The single door to the model. Every request —
-                        main agent, worker — passes gate.dispatch(),
-                       which guarantees messages[0] carries the sealed
-                       prompt (byte-for-byte prefix) and seals a
-                       prompt.dispatch lineage event. If the prompt is
-                       missing or shadowed it is simply re-seated — an
-                       integrity restore, like a checksum, not a penalty.
-                        gate.seal_wire() is the final check on the exact
-                        payload about to be sent: it re-seats a missing
-                        prompt and removes every extra system message, so
-                        pruning, compaction or a runtime hint can never
-                        shadow or fork the prompt at the wire.
+  CoherenceComposer    Dynamic context (goal, memory, project rules, ...)
+                       is appended plainly AFTER the prompt, each under a
+                       short heading, followed (for a user prompt) by one
+                       short recency checklist of the prompt's own rules
+                       (enforcex.rules.checklist, computed once per prompt
+                       and cached).
 
-  CoherenceComposer    The advanced piece. Dynamic context (goal, memory,
-                       constitution, web mode) is never appended as raw
-                       text that could compete with the prompt. It is
-                       COMPOSED into one coherent document: the sealed
-                       prompt stands first as the constitution, and every
-                       context section is explicitly framed as *input to*
-                       that constitution — provenance-tagged, ordered,
-                       deduplicated. The model follows the prompt because
-                       everything else in the message points back at it.
-                       Coherence, not coercion.
-
-There is no enforcement layer, no injection policing, no output contract
-auditing. The system observes and records (PromptLineage) — it never
-punishes. Every dispatch is sealed into the event log; the lineage IS the
-proof of what the model saw.
+There are no priority headers, recaps, re-anchor seams, protocol wrappers,
+per-turn nudges or audit calls: nothing rewrites, dilutes or competes with
+the prompt. The lineage log records what was sent; it never punishes.
 """
 
 from __future__ import annotations
 
 import hashlib
 import importlib
+import os
 import threading
 from dataclasses import dataclass, field
 
 from . import systemprompt
-from . import adherence
 from .kernel import EventLog, fold
 from ._foundation import get_logger
 
 _log = get_logger("mastermind")
 
-# Sovereign-seal flag read by agent.py (`from .mastermind import
-# _MASTER_SOVEREIGN`). It MUST exist at module level: PromptVault.__init__
-# flips it to True via globals() once the master prompt is sealed, but a
-# fresh-process import before any vault exists raised ImportError, which
-# agent.py swallowed — silently disabling ApexEngine (agent.py:723) and
-# the per-turn sovereign anchor (agent.py:788). Default False = prompt
-# not yet sovereign-sealed; the __init__ assignment flips it to True.
+# Kept for import compatibility only; nothing reads it any more.
 _MASTER_SOVEREIGN = False
 
 # ---------------------------------------------------------------------------
@@ -88,27 +65,11 @@ class PromptVault:
         self._sealed: dict[str, str] = {}
         self._source_sig = self._source_signature()
         self._reload_lock = threading.Lock()
+        self._fp_cache: dict[str, tuple[str, str]] = {}
         self._seal("main", systemprompt.main())
         self._seal("master", systemprompt.get("master"))
-        globals()["_MASTER_SOVEREIGN"] = True
-
+        
     def _seal(self, name: str, text: str) -> None:
-        # SOVEREIGN ENFORCEMENT: every (re)seal of the master prompt is
-        # wrapped in the binding Directive Contract. resolve() re-seals
-        # whenever upstream text changes, so the wrap must live HERE to
-        # survive hot-reloads — not only in __init__.
-        if name == "master" and isinstance(text, str):
-            try:
-                from .enforce import is_sovereign, protocol_wrap
-                if not is_sovereign(text):
-                    text = protocol_wrap(text)
-            except Exception as exc:  # never crash the vault on wrap
-                try:
-                    self.log.append("prompt.wrap_failed",
-                                    {"name": name, "error": repr(exc)},
-                                    actor="kernel")
-                except Exception:
-                    pass
         self._sealed[name] = text
         self.log.append("prompt.sealed",
                         {"name": name, "fingerprint": fingerprint(text),
@@ -191,26 +152,21 @@ class PromptVault:
 
     def _upstream_text(self, name: str) -> str | None:
         """Return the currently registered source text for a prompt."""
-        text = systemprompt.PROMPTS.get(name)
-        if name == "master" and isinstance(text, str):
-            # SOVEREIGN ENFORCEMENT: the comparison baseline for "has the
-            # source changed?" must be the WRAPPED form, else every
-            # resolve() would see a mismatch and re-seal (event-log spam).
-            try:
-                from .enforce import is_sovereign, protocol_wrap
-                if not is_sovereign(text):
-                    text = protocol_wrap(text)
-            except Exception:
-                pass
-        return text
+        return systemprompt.PROMPTS.get(name)
+
+    @staticmethod
+    def canon(name: str) -> str:
+        """Resolve the 'auto' alias (master if a user prompt exists)."""
+        return systemprompt.effective_name(name)
 
     def get(self, name: str) -> str | None:
         self._maybe_reload()
-        return self._sealed.get(name)
+        return self._sealed.get(self.canon(name))
 
     def resolve(self, name: str) -> str:
         """Return a sealed prompt, synchronizing registered text as needed."""
         self._maybe_reload()
+        name = self.canon(name)
         if name in self._sealed:
             text = self._upstream_text(name)
             if text is None:
@@ -227,172 +183,92 @@ class PromptVault:
         return self._sealed[name]
 
     def fp(self, name: str) -> str | None:
+        name = self.canon(name)
         text = self._sealed.get(name)
-        return fingerprint(text) if text else None
+        if not text:
+            return None
+        hit = self._fp_cache.get(name)
+        if hit is not None and hit[0] is text:
+            return hit[1]
+        fpr = fingerprint(text)
+        self._fp_cache[name] = (text, fpr)
+        return fpr
 
     def names(self) -> list[str]:
         return sorted(self._sealed)
 
     def verify(self, name: str, content: str) -> bool:
-        """True if `content` still carries the sealed prompt for `name`.
-
-        Composed context legally FOLLOWS the sealed prompt, and long
-        prompts legally open with the sandwich's priority header — so
-        this delegates to the composer's integrity test instead of a
-        bare prefix check (which false-negatived on every composed
-        long prompt)."""
-        sealed = self._sealed.get(name)
+        """True if `content` still opens with the sealed prompt for `name`
+        (composed context legally follows it)."""
+        sealed = self._sealed.get(self.canon(name))
         if sealed is None:
             return False
         return CoherenceComposer.intact_prefix(sealed, content)
 
 
 # ---------------------------------------------------------------------------
-# CoherenceComposer — one coherent document, one voice
+# CoherenceComposer — the prompt, then plain context beneath it
 # ---------------------------------------------------------------------------
 
-# Context sections, in authority order. Each section is framed as input TO
-# the sealed prompt — never as a peer instruction. That framing is the
-# whole trick: the prompt stays the only voice giving direction, and the
-# model follows it because everything else defers to it.
-_SECTION_ORDER = ("anchor", "constitution", "project", "output_style",
+# Context sections in a stable order, each under a short plain heading.
+_SECTION_ORDER = ("constitution", "project", "output_style",
                   "goal", "web", "memory", "compacted")
 
 _SECTION_FRAMES = {
-    "anchor": ("DIRECTIVE ANCHOR — binding for THIS reply, re-read before "
-               "answering:"),
-    "constitution": ("STANDING CONTEXT — standing rules that apply within "
-                     "the directives above:"),
-    "project": ("PROJECT INSTRUCTIONS — repository rules written by the "
-                "user for this workspace, to follow within the directives "
-                "above:"),
-    "output_style": ("OUTPUT STYLE — the answer register the directives "
-                     "above request for this session:"),
-    "goal": ("LIVE CONTEXT — the active goal contract the directives above "
-             "are currently serving:"),
-    "web": ("LIVE CONTEXT — this turn needs real-time data; per the "
-            "directives above, use web_search / web_fetch for current "
-            "facts and quote sources:"),
-    "memory": ("RECALL CONTEXT — relevant memory from prior work, to "
-               "inform the directives above:"),
-    "compacted": ("COMPACTED HISTORY — knowledge preserved from compressed "
-                  "turns, to inform the directives above:"),
+    "constitution": "Standing context",
+    "project": "Project instructions",
+    "output_style": "Output style",
+    "goal": "Active goal",
+    "web": "Live data",
+    "memory": "Memory",
+    "compacted": "Compacted history",
 }
+
+_CHECKLIST_CACHE: dict[str, str] = {}
+
+
+def _checklist_for(sealed_prompt: str) -> str:
+    """enforcex.rules.checklist(prompt), computed once per prompt text and
+    cached (dict lookup on an already-hashed str; never re-derived per
+    turn). Empty when enforcex is unavailable."""
+    hit = _CHECKLIST_CACHE.get(sealed_prompt)
+    if hit is not None:
+        return hit
+    try:
+        from .enforcex.rules import checklist
+        out = checklist(sealed_prompt) or ""
+    except Exception:
+        out = ""
+    if len(_CHECKLIST_CACHE) >= 8:
+        _CHECKLIST_CACHE.clear()
+    _CHECKLIST_CACHE[sealed_prompt] = out
+    return out
 
 
 class CoherenceComposer:
-    """Composes dynamic context into one coherent system document.
+    """sealed prompt (verbatim) + plain context sections + optional
+    one-shot checklist. Nothing is inserted before or inside the prompt."""
 
-    The sealed prompt is the constitution; context sections are composed
-    beneath it, each framed as input to the constitution, deduplicated and
-    ordered. The output is a single document with a single voice — the
-    prompt's.
-    
-    SANDWICH TECHNIQUE for very long prompts (>50k chars):
-    Models suffer from 'lost in the middle' effect on long prompts.
-    To combat this, a long document is wrapped in a neutral map:
-      1. a short DOCUMENT MAP at the beginning — states that the operating
-         contract governs and the later sections only inform
-      2. the sealed prompt itself (the operating contract)
-      3. an END OF CONTEXT marker at the very end — closes the context so
-         the model does not treat the last context section as policy
-
-    Deliberately no threats, no all-caps "MUST OBEY" block, and no
-    repeated compliance chanting. Modern models discount that language,
-    and it competes with the actual prompt for attention."""
-
-    # Wrapping threshold — long prompts get the document map.
-    # Adherence engine's 20k: prompt-aware map + recap sandwich.
-    _REINFORCE_THRESHOLD = adherence.DEFAULT_THRESHOLD
-
-    # DOCUMENT MAP — prompt-aware: numbered TOC built from the prompt's
-    # own headings, so a 49k contract is navigable, not a flat wall.
-    _PRIORITY_HEADER = staticmethod(adherence.header_for)
-
-    # END OF CONTEXT + CRITICAL RECAP — placed at the very END of a long
-    # prompt: the contract's own binding rules re-stated at the strongest
-    # attention position, then the seal that closes the document.
-    _REINFORCEMENT = staticmethod(adherence.footer_for)
-
-    def compose(self, sealed_prompt: str,
-                sections: dict[str, str]) -> str:
-        """sealed prompt + framed, ordered, deduplicated context sections.
-        
-        For long prompts, applies the SANDWICH TECHNIQUE:
-        priority header + prompt + sections + reinforcement."""
-        
-        is_long = len(sealed_prompt) > self._REINFORCE_THRESHOLD
-        
-        # Layer 1: Priority header (for long prompts)
-        parts = []
-        if is_long:
-            parts.append(self._PRIORITY_HEADER(sealed_prompt))
-        
-        # Layer 2: The sealed prompt (constitution)
-        parts.append(sealed_prompt)
-        
-    # Layer 3: Context sections — sanitized against injection channels
-    # (fake role tags, bidi smuggling) and, for long prompts, separated by
-    # re-anchor seams so mid-document sections stay contract-bound.
+    def compose(self, sealed_prompt: str, sections: dict[str, str],
+                checklist_src: str | None = None) -> str:
+        parts = [sealed_prompt]
         seen: set[str] = set()
-        reanchor_i = 0
         for key in _SECTION_ORDER:
             body = (sections.get(key) or "").strip()
-            if not body:
+            if not body or body in seen:
                 continue
-            digest = hashlib.sha256(body.encode()).hexdigest()[:12]
-            if digest in seen:
-                continue
-            seen.add(digest)
-            body, _flags = adherence.sanitize_section(body)
-            if is_long:
-                reanchor_i += 1
-                parts.append(adherence.reanchor(sealed_prompt, reanchor_i))
-            parts.append(f"\n\n{_SECTION_FRAMES[key]}\n{body}")
-        
-        result = "".join(parts)
-        
-        # Layer 4: Critical recap + reinforcement (for long prompts).
-        # The seal now attests the whole document: SECTION-MANIFEST binds
-        # each composed section's digest into the footer, so any post-hoc
-        # edit of a section breaks the seal detectably.
-        if is_long:
-            manifest = adherence.section_digests(sections)
-            result += self._REINFORCEMENT(sealed_prompt, manifest)
-        
-        return result
-    
-    def tail_for(self, sealed_prompt: str,
-                 sections: dict[str, str] | None = None) -> str:
-        """The suffix a composed document ends with for THIS prompt: the
-        reinforcement when the sandwich wraps it (long prompts), else
-        "" — the document then ends with the last context section."""
-        if len(sealed_prompt) > self._REINFORCE_THRESHOLD:
-            manifest = adherence.section_digests(sections or {})
-            return self._REINFORCEMENT(sealed_prompt, manifest)
-        return ""
-
-    @staticmethod
-    def intact_suffix(sealed_prompt: str, content: str) -> bool:
-        """True if the composed document closes with the exact seal for
-        this prompt — full-sandwich integrity, front and back."""
-        return adherence.intact_suffix(sealed_prompt, content)
+            seen.add(body)
+            parts.append(f"\n\n## {_SECTION_FRAMES[key]}\n{body}")
+        if checklist_src:
+            cl = _checklist_for(checklist_src)
+            if cl:
+                parts.append("\n\n" + cl)
+        return "".join(parts)
 
     @staticmethod
     def intact_prefix(sealed_prompt: str, content: str) -> bool:
-        """True if `content` opens with the sealed prompt, byte-for-byte
-        — behind the priority header when the sandwich wraps a long
-        prompt. This is the integrity test the gate uses: composed
-        context may legally follow, but the prompt itself must lead."""
-        if not content:
-            return False
-        if (len(sealed_prompt) > CoherenceComposer._REINFORCE_THRESHOLD
-                and content.startswith(
-                    CoherenceComposer._PRIORITY_HEADER(sealed_prompt))):
-            return content.startswith(
-                CoherenceComposer._PRIORITY_HEADER(sealed_prompt)
-                + sealed_prompt)
-        return content.startswith(sealed_prompt)
+        """True if `content` opens with the sealed prompt, byte-for-byte."""
+        return bool(content) and content.startswith(sealed_prompt)
 
     @staticmethod
     def manifest(sections: dict[str, str]) -> list[str]:
@@ -451,6 +327,7 @@ class PromptGate:
         `sections` is optional live context ({'goal': …, 'memory': …});
         it is composed beneath the sealed prompt, framed as input to it.
         Passing sections=None leaves an intact system message untouched."""
+        prompt_name = self.vault.canon(prompt_name)
         sealed = self.vault.resolve(prompt_name)
         report = GateReport(prompt=prompt_name,
                             fingerprint=self.vault.fp(prompt_name) or "")
@@ -463,7 +340,10 @@ class PromptGate:
                                                          current_text))
 
         if sections is not None:
-            desired = self.composer.compose(sealed, sections)
+            desired = self.composer.compose(
+                sealed, sections,
+                checklist_src=(systemprompt.USER_PROMPT
+                               if prompt_name == "master" else None))
             report.sections = self.composer.manifest(sections)
             if current_text != desired:
                 systemprompt.with_system(messages, desired)
@@ -500,8 +380,7 @@ class PromptGate:
         behind. The invariant enforced here is simple and absolute:
 
           * exactly one system message exists, and it is messages[0];
-          * its content opens with the sealed prompt (byte-for-byte,
-            allowing the composer's document map for long prompts);
+          * its content opens with the sealed prompt (byte-for-byte);
           * if not, the sealed prompt is re-seated and the restore is
             recorded.
 
@@ -509,6 +388,7 @@ class PromptGate:
         this runs on every tool iteration, and the audit trail should
         hold restores, not noise.
         """
+        prompt_name = self.vault.canon(prompt_name)
         sealed = self.vault.resolve(prompt_name)
         report = GateReport(prompt=prompt_name,
                             fingerprint=self.vault.fp(prompt_name) or "")
@@ -636,9 +516,9 @@ if __name__ == "__main__":
             assert "master" in mm.vault.names()
             # Every registered prompt is available through the vault.
             assert mm.vault.resolve("main") == systemprompt.main()
-            # SOVEREIGN ENFORCEMENT: the master prompt is served contract-wrapped
-            assert "[CONFIG_LAYER: developer_policy" in mm.vault.resolve("master")
-            assert "[CONFIG_LAYER: developer_policy" in mm.vault.get("master")
+            # the master prompt is served verbatim (no wrapper)
+            assert mm.vault.resolve("master") == systemprompt.get("master")
+            assert mm.vault.get("master") == systemprompt.get("master")
 
             assert mm.vault.verify("main", systemprompt.main())
             assert mm.vault.verify("main", systemprompt.main()
@@ -652,14 +532,14 @@ if __name__ == "__main__":
                 "memory": "tokenizer is line-based",
             })
             assert mm.composer.intact_prefix(systemprompt.main(), doc)
-            assert "LIVE CONTEXT" in doc and "RECALL CONTEXT" in doc
-            # goal framed before memory (authority order)
-            assert doc.index("LIVE CONTEXT") < doc.index("RECALL CONTEXT")
-            # empty sections are skipped; duplicates collapse
+            assert "Active goal" in doc and "Memory" in doc
+            # goal before memory (stable order)
+            assert doc.index("Active goal") < doc.index("Memory")
+            # empty sections are skipped
             doc2 = mm.composer.compose(systemprompt.main(),
                                        {"goal": "", "memory": "x",
                                         "web": "x" * 0})
-            assert "LIVE CONTEXT" not in doc2 and "RECALL CONTEXT" in doc2
+            assert "Active goal" not in doc2 and "Memory" in doc2
             assert mm.composer.manifest({"goal": "g", "memory": "",
                                          "web": "w"}) == ["goal", "web"]
 
