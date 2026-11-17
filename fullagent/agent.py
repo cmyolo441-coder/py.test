@@ -788,6 +788,26 @@ class Agent:
         into the conversation."""
         self.messages, _ = self.mastermind.gate.dispatch(
             self.cfg.prompt, self.messages, sections=sections)
+        # promptcore: attention engineering for long user prompts. The
+        # FULL prompt stays verbatim at the front (dispatch guarantees
+        # that); promptcore appends its distilled digest + this turn's
+        # rule anchor AFTER it. No enforcement - pure salience layers.
+        try:
+            from .promptcore import Conductor
+            if not hasattr(self, "_promptcore"):
+                self._promptcore = Conductor()
+            wire = self._promptcore.weave(query=self._turn_user_text or "")
+            if wire and self.messages and \
+                    self.messages[0].get("role") == "system":
+                cur = str(self.messages[0].get("content", ""))
+                base = self._base_prompt()
+                if base and cur.startswith(base) and wire.startswith(base):
+                    tail = cur[len(base):]
+                    layers = wire[len(base):]
+                    if layers and layers not in cur:
+                        self.messages[0]["content"] = base + layers + tail
+        except Exception:
+            pass  # attention layers are optional; never break a turn
 
     def state(self):
         """Live projection of the event log (cost, goal, dead-ends, …)."""
@@ -1691,6 +1711,18 @@ class Agent:
                             {"rules": [v.rule.id for v in _fv]},
                             actor="kernel")
                         continue
+                # promptcore.mirror - ADVISORY reflection only: log which
+                # visible directives the reply drifted from. Never blocks,
+                # never rewrites, never triggers a retry. Observability.
+                try:
+                    if hasattr(self, "_promptcore") and result.content:
+                        _notes = self._promptcore.mirror(result.content)
+                        if _notes:
+                            self.log.append("promptcore.reflection",
+                                            {"notes": _notes},
+                                            actor="kernel")
+                except Exception:
+                    pass
                 # plain assistant reply — done
                 turn.assistant_text += result.content
                 turn.usage = result.usage
