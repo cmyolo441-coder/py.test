@@ -282,6 +282,9 @@ class ToolCallDelta:
     # stream loop visibly slower as the arguments grew.
     name_parts: list = field(default_factory=list)
     arguments_parts: list = field(default_factory=list)
+    # running total length of arguments_parts (lets the stream loop skip the
+    # O(n) join for every fragment shorter than the accumulator)
+    arguments_len: int = 0
 
     @property
     def name(self) -> str:
@@ -2884,13 +2887,21 @@ def _chat_stream_once(url: str, headers: dict, payload: dict,
                     # same resend-vs-fragment guard as the name above:
                     # identical or cumulative-prefix resends replace the
                     # accumulator instead of corrupting it
-                    _cur_args = acc.arguments
-                    if _args == _cur_args:
+                    # Only a chunk at least as long as the accumulator can
+                    # be an identical/cumulative resend, so the O(n) join is
+                    # skipped for ordinary fragments (was O(n^2) overall).
+                    if _args and len(_args) >= acc.arguments_len:
+                        _cur_args = acc.arguments
+                    else:
+                        _cur_args = None
+                    if _cur_args is not None and _args == _cur_args:
                         pass
                     elif _cur_args and _args.startswith(_cur_args):
                         acc.arguments_parts = [_args]
+                        acc.arguments_len = len(_args)
                     else:
                         acc.arguments_parts.append(_args)
+                        acc.arguments_len += len(_args)
                     stall.token_received()  # visible activity
                     if on_tool_args:
                         on_tool_args(acc.name, _args)
