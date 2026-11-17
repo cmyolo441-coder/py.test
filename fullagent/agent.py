@@ -1230,6 +1230,7 @@ class Agent:
         except Exception:
             pass
         _exit_tracker = _EarlyExitTracker()  # earlyexit: per-turn novelty
+        _follow_tries = 0  # enforcex.follow: at most one repair per turn
         self._turn_status = on_status
         try:
             while iterations < config.MAX_TOOL_ITERATIONS:
@@ -1654,6 +1655,24 @@ class Agent:
                     self.messages.extend(_pending_notes)
                     continue
 
+                # enforcex.follow — verify the reply against the hard rules
+                # compiled from the user's systemprompt.py prompt. Pure
+                # Python (no model call); at most ONE repair pass per turn,
+                # and only when a rule is actually broken.
+                if _follow_tries < 1 and result.content:
+                    _fv = self._follow_violations(result.content)
+                    if _fv:
+                        _follow_tries += 1
+                        from .enforcex.follow import repair_note as _rn
+                        self.messages.append(
+                            {"role": "assistant", "content": result.content})
+                        self.messages.append(
+                            {"role": "user", "content": _rn(_fv)})
+                        self.log.append(
+                            "prompt.follow_repair",
+                            {"rules": [v.rule.id for v in _fv]},
+                            actor="kernel")
+                        continue
                 # plain assistant reply — done
                 turn.assistant_text += result.content
                 turn.usage = result.usage
@@ -1759,6 +1778,18 @@ class Agent:
         if len(self.turns) > 500:
             del self.turns[:-500]
         return turn
+
+    def _follow_violations(self, reply: str) -> list:
+        """Hard-rule violations of `reply` vs the user's system prompt.
+        [] when the slot is empty, nothing is checkable, or on any error."""
+        try:
+            from . import systemprompt as _sp
+            if not _sp.USER_PROMPT or self.cfg.extra.get("follow_off"):
+                return []
+            from .enforcex.follow import compile_rules, check
+            return check(reply, compile_rules(_sp.USER_PROMPT))
+        except Exception:
+            return []
 
     def _fit_budget(self) -> int:
         """The input token budget we aim to stay under.

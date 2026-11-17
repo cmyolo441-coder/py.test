@@ -1,53 +1,62 @@
-import os
+"""enforcex: loader reads systemprompt.py only; rules/compose/follow."""
+import pytest
 
-from fullagent import enforcex
-from fullagent.enforcex import loader
-
-
-def test_loader_order_and_cache(tmp_path, monkeypatch):
-    home = tmp_path / "home"
-    home.mkdir()
-    (home / "system_prompt.txt").write_text("from home")
-    monkeypatch.setenv("FULLAGENT_HOME", str(home))
-    monkeypatch.delenv("FULLAGENT_SYSTEM_PROMPT_FILE", raising=False)
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "system_prompt.txt").write_text("from cwd")
-    assert enforcex.find_user_prompt() == ("from home", str(home / "system_prompt.txt"))
-    env = tmp_path / "env.txt"
-    env.write_bytes(b"\xef\xbb\xbfa\r\nb")
-    monkeypatch.setenv("FULLAGENT_SYSTEM_PROMPT_FILE", str(env))
-    assert enforcex.find_user_prompt() == ("a\nb", str(env))
-    # cache invalidates on change
-    env.write_text("changed text")
-    assert enforcex.find_user_prompt()[0] == "changed text"
-    # missing env file falls through
-    monkeypatch.setenv("FULLAGENT_SYSTEM_PROMPT_FILE", str(tmp_path / "nope"))
-    assert enforcex.find_user_prompt()[0] == "from home"
+from fullagent import systemprompt
+from fullagent.enforcex import (checklist, compose, extract_rules,
+                                find_user_prompt, compile_rules, check,
+                                repair_note)
 
 
-def test_loader_cache_hit(tmp_path, monkeypatch):
-    f = tmp_path / "p.txt"
-    f.write_text("Always x y z")
-    monkeypatch.setenv("FULLAGENT_SYSTEM_PROMPT_FILE", str(f))
-    enforcex.find_user_prompt()
-    n = len(loader._CACHE)
-    enforcex.find_user_prompt()
-    assert len(loader._CACHE) == n
+@pytest.fixture()
+def slot():
+    yield systemprompt.set_user_prompt
+    systemprompt.set_user_prompt("")
 
 
-def test_rules_extraction():
-    t = "intro\n1. Always reply in English.\n* Never exceed 100 words.\nrandom\n"
-    assert enforcex.extract_rules(t) == ["Always reply in English.", "Never exceed 100 words."]
-    assert len(enforcex.extract_rules("always do it\n" * 3 + "\n".join(f"Never do {i}" for i in range(99)), 10)) == 10
-    c = enforcex.checklist(t)
-    assert len(c) < 1500 and "Always reply in English." in c
-    assert c.upper() != c
+def test_loader_reads_only_systemprompt_slot(slot):
+    slot("")
+    assert find_user_prompt() == ("", None)
+    slot("Always answer in French.")
+    text, path = find_user_prompt()
+    assert text == "Always answer in French."
+    assert path.endswith("systemprompt.py")
 
 
-def test_compose_verbatim_prefix():
-    up = "  Weird   spacing\r\nAlways be kind.\n"
-    out = enforcex.compose(up, {"ctx": "x"})
-    assert out.startswith(up)
-    assert out.index("[ctx]") < out.index("Reminder of your instructions")
-    assert enforcex.compose(up, None).startswith(up)
-    assert enforcex.__version__ == "3.0.0"
+def test_slot_text_is_stripped_and_newlines_normalised(slot):
+    slot("\r\n  hello\r\nworld  \r\n")
+    assert systemprompt.USER_PROMPT == "hello\nworld"
+
+
+def test_rules_and_checklist():
+    t = "Intro.\n1. Always answer in French.\n- Never use emojis.\n- Never use emojis."
+    assert extract_rules(t) == ["Always answer in French.", "Never use emojis."]
+    assert checklist(t).startswith("Reminder of your instructions:")
+    assert checklist("nothing") == ""
+
+
+def test_compose_keeps_prompt_verbatim_first():
+    p = "  RAW  prompt\nline2 "
+    out = compose(p, {"goal": "g"})
+    assert out.startswith(p) and "g" in out
+
+
+PROMPT = ('Never say "As an AI". Always respond in Hinglish only. '
+          'Keep every reply under 20 words. Do not use emojis. '
+          'Start every reply with "Boss,".')
+
+
+def test_follow_compiles_and_checks():
+    rules = compile_rules(PROMPT)
+    assert {r.kind for r in rules} >= {"forbid", "lang_latin", "max_words",
+                                       "no_emoji", "starts"}
+    assert check("Boss, ho gaya.", rules) == []
+    bad = check("As an AI, यह हो गया 😀", rules)
+    assert {v.rule.kind for v in bad} >= {"forbid", "lang_latin",
+                                          "no_emoji", "starts"}
+    assert "Rewrite" in repair_note(bad)
+
+
+def test_follow_ignores_code_blocks_and_empty():
+    rules = compile_rules(PROMPT)
+    assert check("Boss, dekho:\n```\nAs an AI 😀\n```", rules) == []
+    assert check("", rules) == [] and check("x", ()) == []

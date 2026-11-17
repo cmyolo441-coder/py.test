@@ -31,31 +31,38 @@ from pathlib import Path
 
 from .roles import ROLE_GUIDANCE
 
+# ===========================================================================
+#  >>>  YOUR SYSTEM PROMPT GOES HERE — this is the ONLY place to put it  <<<
+# ===========================================================================
+# Paste your full prompt (any length, 49k+ is fine) between the two lines of
+# three single quotes below. It is a RAW string: backslashes, quotes, ``code
+# fences`` and """triple double quotes""" inside your prompt are all fine.
+# The ONE thing it cannot contain is three single quotes in a row (''').
+#
+# While the slot is empty the built-in default prompt (MAIN) is used.
+# Once filled, your text is sent to the model VERBATIM as the system message —
+# nothing is added before or inside it — and the prompt-follow engine
+# (fullagent/enforcex) compiles its checkable rules and keeps replies in line.
+# Edits are picked up live on the next message, no restart needed.
+# `python -m fullagent.systemprompt` shows what was loaded.
+
+SYSTEM_PROMPT = r'''
+'''
+
+
 
 def source_signature() -> tuple[int, int]:
-    """(mtime_ns, size) watermark of this file AND the user's prompt file.
+    """(mtime_ns, size) of this file — the hot-reload watermark.
 
-    The vault compares this on every resolve, so it must stay a couple of
-    stat() calls and nothing proportional to prompt size. When systemprompt.py
-    or the user's prompt file (project.txt / system_prompt.txt) is edited in a
-    running session, the module is reloaded and the new prompt is sealed
-    before the next model call. Returns (0, 0) when this source file cannot
-    be stat'ed (e.g. a frozen build).
+    Just one stat(): the user's prompt lives in this very file, so editing
+    it in a running session re-seals the prompt before the next model call.
+    Returns (0, 0) when the file cannot be stat'ed (e.g. a frozen build).
     """
     try:
         st = Path(__file__).stat()
-        mt, size = int(st.st_mtime_ns), int(st.st_size)
+        return (int(st.st_mtime_ns), int(st.st_size))
     except (OSError, TypeError):
         return (0, 0)
-    up = USER_PROMPT_PATH
-    if up:
-        try:
-            ust = os.stat(up)
-            mt ^= (int(ust.st_mtime_ns) * 31) & 0x7FFFFFFFFFFFFFFF
-            size += int(ust.st_size)
-        except OSError:
-            mt ^= 1   # file vanished: still a change worth reloading for
-    return (mt or 1, size)
 
 
 # ---------------------------------------------------------------------------
@@ -266,42 +273,28 @@ def with_system(messages: list[dict], system: str) -> list[dict]:
 # invariants, subsystem contracts and Goal-Mode grammar in context. It is
 # far longer than MAIN (which is ~2k chars) — by design.
 
-def _load_user_prompt() -> tuple[str, str | None]:
-    """The user's own system prompt: (text, path) or ("", None).
+USER_PROMPT = SYSTEM_PROMPT.replace("\r\n", "\n").replace("\r", "\n").strip()
+USER_PROMPT_PATH = __file__ if USER_PROMPT else None
 
-    Prefers the lean enforcex loader (FULLAGENT_SYSTEM_PROMPT_FILE,
-    ~/.fullagent/system_prompt.txt, ./system_prompt.txt, then project.txt
-    beside this module); degrades to reading project.txt directly so this
-    module never depends on it and never crashes on import."""
-    try:
-        from .enforcex.loader import find_user_prompt
-        text, path = find_user_prompt()
-        if text:
-            return text, path
-    except Exception:
-        pass
-    spec = Path(__file__).parent / "project.txt"
-    try:
-        text = spec.read_text(encoding="utf-8").strip()
-    except OSError:
-        return "", None
-    return (text, str(spec)) if text else ("", None)
+# When SYSTEM_PROMPT is filled, THAT is the system prompt: verbatim, first and
+# alone. "main" and "master" both resolve to it, so no selector can leave the
+# model on a different prompt. Empty slot -> the built-in default.
+_DEFAULT_MAIN = MAIN
+MASTER = USER_PROMPT if USER_PROMPT else MAIN
+if USER_PROMPT:
+    MAIN = USER_PROMPT
 
 
-USER_PROMPT, USER_PROMPT_PATH = _load_user_prompt()
-
-# One short note after the user's prompt, only about the mechanics of this
-# runtime. It adds no rules and never contradicts the prompt above it.
-TOOL_NOTE = (
-    "[Runtime note] Tools are available through function calling; use them "
-    "to read, edit and run things instead of guessing, and report only "
-    "what tool results show.")
-
-# When the user supplied a prompt, THAT is the system prompt: verbatim,
-# first, with only TOOL_NOTE (and later live context) after it. MAIN's
-# generic rules must not precede or compete with it. Without a user prompt
-# the master is MAIN, never an empty banner.
-MASTER = (USER_PROMPT + "\n\n" + TOOL_NOTE) if USER_PROMPT else MAIN
+def set_user_prompt(text: str) -> None:
+    """Swap the user prompt at runtime (tests, tooling). Normal use is to
+    paste into SYSTEM_PROMPT above; this keeps every derived name in sync."""
+    global USER_PROMPT, USER_PROMPT_PATH, MAIN, MASTER
+    USER_PROMPT = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    USER_PROMPT_PATH = __file__ if USER_PROMPT else None
+    MAIN = USER_PROMPT or _DEFAULT_MAIN
+    MASTER = MAIN
+    PROMPTS["main"] = MAIN
+    PROMPTS["master"] = MASTER
 
 
 def has_user_prompt() -> bool:
@@ -380,3 +373,9 @@ if __name__ == "__main__":
     assert get("custom") == "hello prompt"
     assert "master" in names() and "main" in names()
     print(f"SYSTEMPROMPT SELF-TEST PASS  (MASTER = {len(MASTER):,} chars)")
+    if USER_PROMPT:
+        print(f"SYSTEM_PROMPT slot: loaded {len(USER_PROMPT):,} chars — "
+              f"sent verbatim as the system message.")
+    else:
+        print("SYSTEM_PROMPT slot is EMPTY — built-in default prompt in use. "
+              "Paste your prompt into SYSTEM_PROMPT in this file.")

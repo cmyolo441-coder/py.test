@@ -7,7 +7,6 @@ overhead. No network: a scripted provider sits at the chat_stream seam.
 """
 from __future__ import annotations
 
-import importlib
 import os
 import random
 import tempfile
@@ -46,14 +45,12 @@ PROMPT = _make_prompt()
 
 
 @pytest.fixture()
-def user_prompt_file(tmp_path, monkeypatch):
-    f = tmp_path / "system_prompt.txt"
-    f.write_text(PROMPT, encoding="utf-8")
-    monkeypatch.setenv("FULLAGENT_SYSTEM_PROMPT_FILE", str(f))
-    importlib.reload(systemprompt)
-    yield f
-    monkeypatch.delenv("FULLAGENT_SYSTEM_PROMPT_FILE", raising=False)
-    importlib.reload(systemprompt)
+def user_prompt_file():
+    """The user's prompt lives in systemprompt.SYSTEM_PROMPT; tests set it
+    at runtime through the same derived-name sync the module itself uses."""
+    systemprompt.set_user_prompt(PROMPT)
+    yield None
+    systemprompt.set_user_prompt("")
 
 
 @pytest.fixture()
@@ -88,25 +85,17 @@ def test_default_prompt_is_auto_and_resolves_to_user_prompt(user_prompt_file):
     assert Config().prompt == "auto"
     assert systemprompt.effective_name("auto") == "master"
     assert systemprompt.get("auto") == systemprompt.MASTER
-    assert systemprompt.MASTER.startswith(PROMPT)
+    # verbatim and alone: nothing before, nothing after
+    assert systemprompt.MASTER == PROMPT
+    assert systemprompt.get("main") == PROMPT
     assert "FULL MASTER SPECIFICATION" not in systemprompt.MASTER
-    # the only thing after the user's prompt is the short runtime note
-    assert systemprompt.MASTER[len(PROMPT):].strip() == systemprompt.TOOL_NOTE
 
 
-def test_auto_falls_back_to_main_without_user_prompt(monkeypatch, tmp_path):
-    monkeypatch.setenv("FULLAGENT_SYSTEM_PROMPT_FILE", str(tmp_path / "nope"))
-    monkeypatch.setenv("FULLAGENT_HOME", str(tmp_path / "home"))
-    monkeypatch.chdir(tmp_path)
-    try:
-        importlib.reload(systemprompt)
-        if systemprompt.has_user_prompt():   # a project.txt ships here
-            pytest.skip("a project.txt is present in this checkout")
-        assert systemprompt.effective_name("auto") == "main"
-        assert systemprompt.get("auto") == systemprompt.MAIN
-    finally:
-        monkeypatch.undo()
-        importlib.reload(systemprompt)
+def test_auto_falls_back_to_main_without_user_prompt():
+    systemprompt.set_user_prompt("")
+    assert not systemprompt.has_user_prompt()
+    assert systemprompt.effective_name("auto") == "main"
+    assert systemprompt.get("auto") == systemprompt.MAIN
 
 
 def test_wire_has_exact_prompt_first_single_system_no_injection(agent):
@@ -135,7 +124,7 @@ def test_wire_has_exact_prompt_first_single_system_no_injection(agent):
 
 def test_no_main_prompt_text_in_system_message(agent):
     _run(agent, "hi")
-    assert systemprompt.MAIN[:200] not in agent._calls[0][0]["content"]
+    assert systemprompt._DEFAULT_MAIN[:200] not in agent._calls[0][0]["content"]
 
 
 def test_compliance_flag_makes_no_extra_model_call(agent):
@@ -214,9 +203,7 @@ def test_user_prompt_edit_is_picked_up_by_vault(user_prompt_file, tmp_path):
     mm = Mastermind(EventLog(tmp_path / "e.jsonl"))
     assert mm.vault.resolve("auto").startswith(PROMPT)
     new = "Completely different prompt.\n" + PROMPT
-    user_prompt_file.write_text(new, encoding="utf-8")
-    st = user_prompt_file.stat()
-    os.utime(user_prompt_file, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000))
+    systemprompt.set_user_prompt(new)
     assert mm.vault.resolve("auto").startswith(new)
 
 
@@ -225,3 +212,28 @@ def test_subagent_prompt_sealed_is_plain():
             == systemprompt.subagent_prompt("researcher"))
     assert (systemprompt.subagent_prompt_sealed("coder", ["a.py"])
             == systemprompt.subagent_prompt("coder", ["a.py"]))
+
+
+def test_follow_repair_runs_once_and_only_on_violation(agent, monkeypatch):
+    systemprompt.set_user_prompt(
+        PROMPT + '\nStart every reply with "Boss,". Keep every reply '
+                 'under 50 words.')
+    replies = iter(["ok", "Boss, ok"])
+
+    def fake_chat(provider, model, effort, messages, schemas, **kw):
+        agent._calls.append([dict(m) for m in messages])
+        return StreamResult(content=next(replies), reasoning="",
+                            tool_calls=[], usage=None, model="t")
+
+    monkeypatch.setattr(agent_mod, "chat_stream", fake_chat)
+    t = _run(agent, "hi")
+    assert len(agent._calls) == 2            # exactly one repair pass
+    assert "broke rules" in agent._calls[1][-1]["content"]
+    assert t.assistant_text == "Boss, ok"    # only the corrected reply kept
+
+
+def test_follow_off_switch(agent, monkeypatch):
+    systemprompt.set_user_prompt('Start every reply with "Boss,".')
+    agent.cfg.extra["follow_off"] = True
+    _run(agent, "hi")
+    assert len(agent._calls) == 1
