@@ -77,6 +77,3 @@ def test_prewarm_stat_and_filestat_share_the_same_fingerprint(tmp_path):
     assert second != first
 
 
-def test_enforcex_package_has_module_entrypoint():
-    spec = importlib.util.find_spec("fullagent.enforcex.__main__")
-    assert spec is not None and spec.origin

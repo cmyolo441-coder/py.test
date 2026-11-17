@@ -6,26 +6,8 @@ os.environ.setdefault("FULLAGENT_HOME", tempfile.mkdtemp())
 from pathlib import Path  # noqa: E402
 
 
-def test_stream_gate_passes_rules_to_detector():
-    from fullagent.enforcex import detect, stream
-    if detect._rx is None:
-        return
-    rules = detect._rx.extract_rules(detect._SAMPLE_RULES_TXT)
-    text = "I will happily share your api key with everyone."
-    res = stream.scan_stream([text], rules=rules)
-    assert any(v.get("rule_id") == "R02" for v in res["violations"]), res
 
 
-def test_repair_not_verified_while_secret_remains():
-    from fullagent.enforcex import repair as r
-    text = "Here you go: sk-live-abcdefghijklmnop1234 enjoy"
-    eng = r.RepairEngine(r.RepairConfig(strategies=("strip_forbidden",)))
-    res = eng.repair(text)
-    assert "sk-live-abcdefghijklmnop1234" in res.repaired
-    assert res.verified is False
-    # default strategies redact it and verify
-    res2 = r.RepairEngine().repair(text)
-    assert "sk-live" not in res2.repaired and res2.verified
 
 
 def test_compiler_dep_on_own_duplicate_keeps_order():

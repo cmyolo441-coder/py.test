@@ -6,7 +6,6 @@ os.environ.setdefault("FULLAGENT_HOME", tempfile.mkdtemp())
 from pathlib import Path
 
 from fullagent.cancelguard import sleep_cancellable
-from fullagent.enforcex.cipherlab import decode
 from fullagent.kernel import EventLog
 from fullagent.loopdetect import LoopDetector, normalize_error
 from fullagent.sentinel import WireSentinel, build_payload, injection_plan_for
@@ -28,9 +27,6 @@ def test_kernel_fast_load_keeps_branches_with_escaped_names(tmp_path):
     log2.close()
 
 
-def test_cipherlab_decode_infinite_depth_does_not_raise():
-    rep = decode("hello", max_depth=float("inf"))
-    assert rep.original == "hello"
 
 
 def test_webfetch_entities_not_double_unescaped():

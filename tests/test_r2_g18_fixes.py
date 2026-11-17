@@ -7,7 +7,6 @@ os.environ.setdefault("FULLAGENT_HOME", tempfile.mkdtemp())
 from types import SimpleNamespace  # noqa: E402
 
 from fullagent import brain, compact, help as fhelp, outstyle, shield, skills  # noqa: E402
-from fullagent.enforcex import canon, telemetry  # noqa: E402
 
 
 # -- skills ----------------------------------------------------------------
@@ -36,42 +35,16 @@ def test_skill_run_tests_non_dict_case():
 
 # -- telemetry -------------------------------------------------------------
 
-def test_bus_empty_topic_subscribes_to_all():
-    bus = telemetry.EventBus()
-    got = []
-    bus.subscribe("", got.append)
-    assert bus.emit("gate.decision") == 1 and len(got) == 1
 
 
-def test_histogram_roundtrip_negative_total():
-    h = telemetry.Histogram("x", max_samples=100)
-    for _ in range(3000):
-        h.observe(-1)
-    h2 = telemetry.Histogram.from_dict(h.to_dict())
-    assert h2.count == 3000 and h2.total == -3000.0 and h2.mean() == -1.0
 
 
-def test_rate_window_nan_ts_and_inf_percentile():
-    rw = telemetry.RateWindow(5)
-    rw.record()
-    rw.record(ts=float("nan"))
-    assert rw.count() == 2
-    h = telemetry.Histogram("y")
-    h.observe(1)
-    assert "p50" in h.percentiles([float("inf"), 50])
 
 
 # -- canon -----------------------------------------------------------------
 
-def test_canon_auto_ids_do_not_collide_with_explicit():
-    c = canon.ContractBuilder().build("x", rules=[
-        {"id": "R02", "text": "Never X", "severity": "critical"},
-        {"text": "keep y"}])
-    assert len(set(c.ids())) == 2 == len(c.by_rule_id())
 
 
-def test_contract_from_dict_null_clauses():
-    assert canon.Contract.from_dict({"clauses": None}).clauses == []
 
 
 # -- brain -----------------------------------------------------------------

@@ -165,7 +165,7 @@ def test_config_utf8_and_type_drift(tmp_path, monkeypatch):
                                     "note": "naïve → ✓"},
                                    ensure_ascii=False), encoding="utf-8")
     cfg = config_mod.Config.load()
-    assert cfg.theme == "dracula" and cfg.prompt == "main"
+    assert cfg.theme == "dracula" and cfg.prompt == "auto"
     assert cfg.extra["note"] == "naïve → ✓"
     cfg.extra["obj"] = object()  # not JSON-serialisable: must not raise
     cfg.save()

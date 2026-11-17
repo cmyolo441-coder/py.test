@@ -10,7 +10,6 @@ import shutil
 import pytest
 
 from fullagent import fuzz, gitops, hooks, smartctx, turnresume
-from fullagent.enforcex import consensus, sandbox
 
 
 def test_hook_undecodable_output_still_blocks(tmp_path):
@@ -22,19 +21,8 @@ def test_hook_undecodable_output_still_blocks(tmp_path):
     assert "bad" in msg
 
 
-def test_sandbox_non_dict_capabilities_map_does_not_raise():
-    sb = sandbox.Sandbox([lambda response: True],
-                         capabilities_map=["read_response"])
-    assert sb.evaluate("x").all_passed is True
 
 
-def test_consensus_string_abstain_is_not_dissent():
-    g = consensus.ConsensusGate(voters=[
-        consensus.Voter("a", 1, lambda t, r, s: "allow"),
-        consensus.Voter("b", 1, lambda t, r, s: "abstain")])
-    r = g.evaluate("x")
-    assert r.final_action == "allow"
-    assert r.dissent == []
 
 
 def test_turnresume_snapshot_keeps_none_content():

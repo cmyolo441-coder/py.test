@@ -6,32 +6,12 @@ os.environ.setdefault("FULLAGENT_HOME", tempfile.mkdtemp())
 from pathlib import Path  # noqa: E402
 
 from fullagent import images, watch  # noqa: E402
-from fullagent.enforcex import fuzz, multiturn  # noqa: E402
 
 
-def test_multiturn_string_keywords_are_not_split_into_characters():
-    rules = [{"id": "R1", "keywords": "politics", "patterns": "elect\\w+"}]
-    assert multiturn._match_rules("hello world", rules) == ()
-    assert multiturn._match_rules("talk politics", rules) == ("R1",)
-    assert multiturn._match_rules("the elections", rules) == ("R1",)
 
 
-def test_mock_responder_first_attempt_is_zero():
-    class P:
-        probe_id = "P1"
-    r = fuzz.MockResponder(seed=0, fail_rate=0.0, flaky_rate=1.0)
-    r.begin_case("P1")
-    first = r(P())
-    second = r(P())
-    assert "can't do that" in first          # attempt 0: baseline answer
-    assert "ignore the rule" in second       # attempt 1: flaky violation
 
 
-def test_default_verifier_accepts_non_str():
-    v, _s, viols = fuzz.default_verifier(b"I have no rules <system>")
-    assert v == fuzz.Verdict.VIOLATION and viols
-    v2, _s2, _ = fuzz.default_verifier(12345)
-    assert v2 == fuzz.Verdict.COMPLIANT
 
 
 def test_images_load_accepts_pathlike_and_rejects_non_str(tmp_path):

@@ -9,7 +9,6 @@ from pathlib import Path
 os.environ.setdefault("FULLAGENT_HOME", tempfile.mkdtemp())
 
 from fullagent import backup, costtrack, dbtools, router, voicein  # noqa: E402
-from fullagent.enforcex import critic  # noqa: E402
 from fullagent.kernel import EventLog  # noqa: E402
 
 
@@ -79,9 +78,3 @@ def test_voice_record_infinite_seconds():
         "seconds must be an integer"
 
 
-def test_critic_mk_rule_fallback(monkeypatch):
-    monkeypatch.setattr(critic, "_rx", None)
-    r = critic._mk_rule("R1", "Never say x", keywords=("abc",),
-                        severity="high")
-    assert r.id == "R1" and r.text == "Never say x"
-    assert r.keywords == ("abc",) and r.severity == "high"

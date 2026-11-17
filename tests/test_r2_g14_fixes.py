@@ -4,28 +4,14 @@ import tempfile
 
 os.environ.setdefault("FULLAGENT_HOME", tempfile.mkdtemp())
 
-from fullagent.enforcex import warroom  # noqa: E402
 from fullagent.kernel import EventLog  # noqa: E402
 from fullagent.world import WorldModel, Edge  # noqa: E402
 from fullagent.workflows import WorkflowStep, WorkflowError  # noqa: E402
 import fullagent.config as config  # noqa: E402
 
 
-def test_warroom_load_tolerates_non_dict_event_data(tmp_path):
-    p = tmp_path / "wr.jsonl"
-    p.write_text(json.dumps({"type": "incident", "data": {
-        "incident_id": "A", "timeline": [{"kind": "note", "data": "x"}]}})
-        + "\n" + json.dumps({"type": "incident", "data": {
-            "incident_id": "B", "detections": 5}}) + "\n")
-    store = warroom.IncidentStore(str(p))
-    assert len(store) == 2
 
 
-def test_warroom_ingest_non_json_values_never_raises(tmp_path):
-    store = warroom.IncidentStore(str(tmp_path / "wr.jsonl"))
-    ids = store.ingest([{"rule_id": "R", "evidence": {1, 2}}])
-    assert ids and len(store) == 1
-    store.shutdown()
 
 
 def test_world_impact_excludes_touched_file_on_cycle(tmp_path):

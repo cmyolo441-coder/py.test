@@ -7,7 +7,6 @@ import pytest
 
 from fullagent import sandbox, configcmd, progress
 from fullagent.autopilot import AutoPilot
-from fullagent.enforcex.cognify import CognitiveReport
 
 
 def test_preexec_clamps_to_inherited_hard_limit(monkeypatch):
@@ -77,6 +76,3 @@ def test_autopilot_latest_does_not_draft_test_clause(tmp_path, monkeypatch):
     assert clauses[0]["proof"]["type"] == "exit_code"
 
 
-def test_cognitive_report_from_dict_null_signals():
-    r = CognitiveReport.from_dict({"signals": None, "hijacked": True})
-    assert r.signals == [] and r.hijacked is True

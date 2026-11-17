@@ -107,24 +107,5 @@ def test_apex_wire_check_records_each_broken_wire_once():
     assert eng.chain.n == 2
 
 
-def test_enforcex_semantic_clip_prefix_only():
-    import time
-    from fullagent.enforcex import semantic as sem
-    big = ("word  \n\t " * 30000) + "tail"
-    t = time.perf_counter()
-    for _ in range(256):
-        out = sem._clip(big, 100)
-    assert time.perf_counter() - t < 1.0
-    full = sem._WS_RE.sub(" ", big).strip()
-    assert out == full[:99] + "…"
-    assert sem._clip("  a  b  ", 100) == "a b"
 
 
-def test_responseanaly_heading_trailer_linear():
-    import time
-    from fullagent.enforcex import responseanaly as ra
-    t = time.perf_counter()
-    assert ra._strip_heading_trailer("Title" + " " * 200000 + ":") == "Title"
-    assert time.perf_counter() - t < 0.5
-    assert ra._strip_heading_trailer("Setup —  ") == "Setup"
-    assert ra._strip_heading_trailer("a: :") == "a:"

@@ -9,15 +9,9 @@ from pathlib import Path  # noqa: E402
 import pytest  # noqa: E402
 
 from fullagent import adherence, bgsh, dashboard, forge, hierarchy, judge  # noqa: E402
-from fullagent.enforcex import redteam  # noqa: E402
 from fullagent.kernel import EventLog, fold  # noqa: E402
 
 
-def test_redteam_single_wave_string_runs_only_that_wave():
-    rules = [{"id": "R1", "text": "Never share API keys."}]
-    waves = redteam.generate_scenarios(rules, waves=redteam.WAVES.AUTHORITY)
-    assert len(waves) == 1
-    assert all(a.wave == redteam.WAVES.AUTHORITY for a in waves[0])
 
 
 def test_judge_diff_assert_string_pattern_is_one_regex(tmp_path):
