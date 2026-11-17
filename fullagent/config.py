@@ -105,28 +105,22 @@ MAX_TOKENS = 200_000
 # otherwise. The backend can still teach a smaller window at runtime
 # (client.learn_context_window) — that only ever shrinks these.
 MODEL_CONTEXT_WINDOWS: dict[str, int] = {
-    # upstream: deepseek/deepseek-v4.1-flash (1,048,576-token window)
-    "deepseek-v4.1-flash-free": 1_048_576,
-    # same flash family, Gwarden route (2026-10 snapshot)
+    # upstream: deepseek/deepseek-v4.1-flash (1,048,576-token window),
+    # Gwarden route (2026-10 snapshot)
     "deepseek-v4.1-flash-1017": 1_048_576,
     # upstream: google/gemini-4-argon (1,000,000-token window)
     "gemini-4-argon": 1_000_000,
     # Mistral Large 4 model card (build.nvidia.com, 2026-11-13): 262,144
     "mistralai/mistral-large-4-1t-a52b": 262_144,
     "mistral-large-4": 262_144,
-    # Kimi K3.1 Pro — REAL model (3T-class, 1M ctx, released 2026-11-04)
-    # BUT NVIDIA has not opened programmatic API access yet: the catalog
-    # page says "preview/playground only — no API key will authorize it"
-    # and calls currently return 404 until NVIDIA grants access (or the
-    # account is whitelisted via the developer forum). Kept in the menu
-    # so it works the moment access opens.
-    "moonshotai/kimi-k3.1-pro": 1_048_576,
-    "moonshotai/kimi-k2.6": 262_144,
     # no published served window yet: stay conservative
     "ernie-5.5-flash-preview": 128_000,
     # Naga catalog (api.naga.ac /models, 2026-11-15): 1,024,000-token window,
     # tools + reasoning supported natively, free tier.
     "baidu/ernie-5.5-flash-preview:free": 1_024_000,
+    # Naga catalog metadata (2026-11-17): 1,048,576-token window,
+    # text+image input, reasoning_effort native, free tier.
+    "inclusionai/ling-3.2-flash:free": 1_048_576,
     # Devin CLI swe-2-flash: 262K context per `devin models list`.
     "swe-2-flash-medium": 262_144,
 }
@@ -214,29 +208,6 @@ def _provider_api_key(provider: str) -> str:
     return _EMBEDDED_KEYS.get(provider, "")
 
 
-def _opencode_service_password() -> str:
-    """Password for the local OpenCode service (Basic auth, user 'opencode').
-
-    Env OPENCODE_API_KEY wins; otherwise reuse the password of the running
-    OpenCode desktop app so the free models need no manual setup.
-    """
-    key = os.environ.get("OPENCODE_API_KEY", "").strip()
-    if key:
-        return key
-    for path in (
-        Path.home() / ".config" / "opencode" / "service.json",
-        Path(os.environ.get("APPDATA", "")) / "ai.opencode.desktop" / "service.json",
-    ):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            password = str(data.get("password", "")).strip()
-            if password:
-                return password
-        except (OSError, UnicodeDecodeError, ValueError, TypeError):
-            continue
-    return ""
-
-
 # Build-time embedded API keys (zero-config). These ship inside the
 # wheel/binary. Override anytime via <PROVIDER>_API_KEY env var or
 # ~/.fullagent/<provider>_api_key file.
@@ -281,17 +252,6 @@ PROVIDERS: dict[str, Provider] = {
         api_key=_provider_api_key("naga"),
         color="#ff79c6",
     ),
-    # Free models (hy4-flash-free) are only reachable inside the OpenCode
-    # harness. client.chat_stream routes this provider to fullagent.opencode,
-    # which self-bootstraps a private OpenCode service (installs the CLI if
-    # needed) and replaces base_url/api_key at runtime. No manual setup.
-    "opencode": Provider(
-        key="opencode",
-        name="OpenCode Console",
-        base_url="http://127.0.0.1:28894",
-        api_key=_opencode_service_password(),
-        color="#00ff9d",
-    ),
     # Local Devin CLI (`devin acp` over stdio) — no HTTP endpoint and no
     # API key; auth is the `devin auth login` session. client.chat_stream
     # routes provider.key == "devin" to fullagent.devincli instead of HTTP.
@@ -305,11 +265,6 @@ PROVIDERS: dict[str, Provider] = {
 }
 
 MODELS: list[Model] = [
-    # Free OpenCode model (limited-time promo): 1M context, multimodal, ZDR.
-    # Routed through the local OpenCode service, not a normal HTTP endpoint.
-    Model("hy4-flash-free", "opencode", "Hy4 flash Free",
-          tag="free", supports_tools=True, supports_reasoning=True,
-          context_window=1_048_576),
     # Fast default: DeepSeek accepts reasoning_effort="none" (sent by
     # client.build_payload when supports_reasoning=True), so it answers
     # immediately instead of after a long hidden chain-of-thought.
@@ -321,27 +276,20 @@ MODELS: list[Model] = [
     Model("gemini-4-argon", "gwarden", "Gemini 4 Argon",
           tag="gwarden", supports_tools=True, supports_reasoning=True,
           context_window=model_context_window("gemini-4-argon")),
-    # Kios routes (2026-11): exactly these three.
+    # Kios routes (2026-11): mistral-large-4 + ernie-5.5-flash-preview.
+    # (deepseek-v4.1-flash-free retired — Kios returns 503 model_not_found.)
     Model("mistral-large-4", "kios", "Mistral Large 4",
           tag="kios", supports_tools=True,
           context_window=model_context_window("mistral-large-4")),
     Model("ernie-5.5-flash-preview", "kios", "ERNIE 5.5 Flash Preview",
           tag="kios", supports_tools=True,
           context_window=model_context_window("ernie-5.5-flash-preview")),
-    Model("deepseek-v4.1-flash-free", "kios", "DeepSeek V4.1 Flash Free",
-          tag="free", supports_tools=True, supports_reasoning=True,
-          context_window=model_context_window("deepseek-v4.1-flash-free")),
-    # NVIDIA catalog id confirmed on the public model list 2026-11-13
+    # NVIDIA catalog id confirmed on the public model list 2026-11-13.
+    # BYOK only: needs NVIDIA_API_KEY (no embedded key ships).
     Model("mistralai/mistral-large-4-1t-a52b", "nvidia",
           "Mistral Large 4 (NVIDIA)", tag="nvidia", supports_tools=True,
           context_window=model_context_window(
               "mistralai/mistral-large-4-1t-a52b")),
-    # Kimi K3.1 Pro is NOT listed: it exists upstream but NVIDIA has not
-    # opened programmatic API access — every call returns 404 for every
-    # key, so offering it in the menu is a guaranteed dead end.
-    Model("moonshotai/kimi-k2.6", "nvidia", "Kimi K2.6 (NVIDIA)",
-          tag="nvidia", supports_tools=True,
-          context_window=model_context_window("moonshotai/kimi-k2.6")),
     # Naga free route: 1M context, tools + reasoning verified live
     # 2026-11-15 (chat/completions, SSE stream, tool_calls all OK).
     Model("baidu/ernie-5.5-flash-preview:free", "naga",
@@ -349,6 +297,13 @@ MODELS: list[Model] = [
           supports_tools=True, supports_reasoning=True,
           context_window=model_context_window(
               "baidu/ernie-5.5-flash-preview:free")),
+    # Naga free route: Ling 3.2 Flash — 1M context, multimodal, tools +
+    # reasoning verified live 2026-11-17 (chat, SSE stream, tool_calls).
+    Model("inclusionai/ling-3.2-flash:free", "naga",
+          "Ling 3.2 Flash (Naga)", tag="naga · free",
+          supports_tools=True, supports_reasoning=True,
+          context_window=model_context_window(
+              "inclusionai/ling-3.2-flash:free")),
     # Devin CLI swe-2-flash family — the free tier model. 262K context per
     # `devin models list`. Tool calling is bridged through <tool_call>
     # markup by fullagent.devincli.

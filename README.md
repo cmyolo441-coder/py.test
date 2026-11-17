@@ -117,10 +117,10 @@ without artificial animation delays.
  ██║     ██║  ██║                   │ 4. Be specific for the best results      │
  ╚═╝     ╚═╝  ╚═╝                   ╰──────────────────────────────────────────╯
   FullAgent CLI v4.0.0
-  API key · built-in (Kios API)
-  DeepSeek V4.1 Flash Free  ·  high
+  API key · built-in (Gwarden API)
+  DeepSeek V4.1 Flash 1017  ·  high
   ~/Desktop  ·  session a1b2c3d4
- ❯ model  DeepSeek V4.1 Flash Free   effort  high   autonomy  L3   session  a1b2c3d4
+ ❯ model  DeepSeek V4.1 Flash 1017   effort  high   autonomy  L3   session  a1b2c3d4
    / commands · Ctrl+T models · Ctrl+E effort · Shift+Tab pilot · Ctrl+O expand output
 ```
 
@@ -155,11 +155,11 @@ python main.py
 
 ## Provider and rate limits
 
-`DeepSeek V4.1 Flash Free` (Kios API) is the default configured model and works without
+`DeepSeek V4.1 Flash 1017` (Gwarden API) is the default configured model and works without
 manually setting an API key. The app does not impose a five-requests-per-minute
-client cap; when Kios returns a rate-limit response, it honors `Retry-After`
+client cap; when a provider returns a rate-limit response, it honors `Retry-After`
 or waits with backoff and retries until the request succeeds or you cancel
-with `Ctrl+C`. Kios still controls its own free-tier capacity and quotas, so
+with `Ctrl+C`. Providers still control their own free-tier capacity and quotas, so
 the app cannot guarantee literally unlimited service.
 
 Browser automation is optional. Install it with `pip install 'fullagent[browser]'`
@@ -341,7 +341,7 @@ Event-log commands:
   composed context, lineage)
 - `/dashboard` — live observability: cost, goal, councils, router, spec,
   memory, health in one screen
-- `/router` — task classification and routing history; model: DeepSeek V4.1 Flash Free
+- `/router` — task classification and routing history; model: DeepSeek V4.1 Flash 1017
 - `/spec` — speculative execution: prefetch stats + hit-rate
 - `/recall <question>` — semantic (meaning-based) memory recall
 - `/mission [start|tick|list|abandon]` — daemon mission control
@@ -363,27 +363,39 @@ tokens, temperature, and reasoning effort.
 
 ## Models & providers
 
-**Kios API is the only configured provider.** Two models ship, all on Kios:
+Eight models ship across five providers:
 
-| Model | Tag | Context |
-|---|---|---|
-| `deepseek-v4.1-flash-free` (default) | free | 1.0m |
-| `minimax-m3.1-flash-free` | free | 1.0m |
+| Model | Provider | Tag | Context |
+|---|---|---|---|
+| `deepseek-v4.1-flash-1017` (default) | Gwarden | gwarden | 1.0m |
+| `gemini-4-argon` | Gwarden | gwarden | 1.0m |
+| `mistral-large-4` | Kios | kios | 262k |
+| `ernie-5.5-flash-preview` | Kios | kios | 128k |
+| `mistralai/mistral-large-4-1t-a52b` | NVIDIA | nvidia (BYOK) | 262k |
+| `baidu/ernie-5.5-flash-preview:free` | Naga | naga · free | 1.0m |
+| `inclusionai/ling-3.2-flash:free` | Naga | naga · free | 1.0m |
+| `swe-2-flash-medium` | Devin CLI | devin · free | 262k |
 
-`deepseek-v4.1-flash-free` is the fastest Kios free route we measured
+`deepseek-v4.1-flash-1017` is the fastest route we measured
 (~1s to first token); it is the default and runs with reasoning disabled so
-answers stream immediately. MiniMax keeps its provider-default reasoning.
-Unknown or retired model ids now fail immediately instead of retrying the
-provider's 503 for ~14s.
+answers stream immediately. Unknown or retired model ids fail immediately
+instead of retrying the provider's 503 for ~14s.
 
-Zero-config: a Kios API key is embedded in the build, so it works right after
-installation with no setup. Override anytime via the `KIOS_API_KEY` environment
-variable or `~/.fullagent/kios_api_key` (keep the file private); the env var
-takes precedence, then the key file, then the embedded key.
+Zero-config: API keys for Kios, Gwarden and Naga are embedded in the build,
+so they work right after installation with no setup. Override anytime via the
+`<PROVIDER>_API_KEY` environment variable or `~/.fullagent/<provider>_api_key`
+(keep the file private); the env var takes precedence, then the key file,
+then the embedded key. NVIDIA is BYOK-only — set `NVIDIA_API_KEY` to enable
+`mistralai/mistral-large-4-1t-a52b`. The Devin provider uses your local
+`devin auth login` session (`devin acp`), no key needed.
 
 | Provider | Base URL | Key required? |
 |---|---|---|
 | Kios API | `https://kiosapi.com/v1` | No (embedded zero-config key) |
+| Gwarden API | `https://gwarden.su/v1` | No (embedded zero-config key) |
+| NVIDIA API | `https://integrate.api.nvidia.com/v1` | Yes (`NVIDIA_API_KEY`) |
+| Naga API | `https://api.naga.ac/v1` | No (embedded zero-config key) |
+| Devin CLI | `devin://local` | No (`devin auth login` session) |
 
 `/models list` shows configured models; `/model` or Ctrl+T opens the selector.
 The turn stays on its selected model during an outage; no automatic provider

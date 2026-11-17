@@ -2280,14 +2280,6 @@ def chat_stream(provider: Provider, model: Model, effort: Effort,
             on_tool_start=on_tool_start, on_tool_args=on_tool_args,
             should_cancel=should_cancel, timeout=timeout,
             on_status=on_status)
-    from . import opencode as _opencode
-    if _opencode.is_opencode(provider):
-        return _opencode.chat_stream(
-            provider, model, effort, messages, tools,
-            on_token=on_token, on_reasoning=on_reasoning,
-            on_tool_start=on_tool_start, on_tool_args=on_tool_args,
-            should_cancel=should_cancel, timeout=timeout,
-            on_status=on_status)
     _check_api_key(provider, model)
     url = provider.base_url.rstrip("/") + "/chat/completions"
     headers = _base_headers(provider, stream=True)
@@ -3239,11 +3231,6 @@ def chat_blocking(provider: Provider, model: Model, effort: Effort,
         return devincli.chat_blocking(
             provider, model, effort, messages, tools,
             timeout=timeout, should_cancel=should_cancel)
-    from . import opencode as _opencode
-    if _opencode.is_opencode(provider):
-        return _opencode.chat_blocking(
-            provider, model, effort, messages, tools,
-            timeout=timeout, should_cancel=should_cancel)
     _check_api_key(provider, model)
     url = provider.base_url.rstrip("/") + "/chat/completions"
     headers = _base_headers(provider, stream=False)
@@ -3682,8 +3669,8 @@ if __name__ == "__main__":
             check(f"weird {weird!r} no crash ({e})", False)
 
     # -- 9. per-model window table ----------------------------------------------
-    check("DeepSeek V4.1 Flash Free window is 1048576",
-          config.model_context_window("deepseek-v4.1-flash-free") == 1_048_576)
+    check("DeepSeek V4.1 Flash 1017 window is 1048576",
+          config.model_context_window("deepseek-v4.1-flash-1017") == 1_048_576)
     check("unknown model defaults to 128k",
           config.model_context_window("nope-xyz") == 128_000)
     check("every shipped model has a sane window",

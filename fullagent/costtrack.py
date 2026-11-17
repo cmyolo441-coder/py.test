@@ -41,7 +41,7 @@ _FILENAME_RE = re.compile(r"[^A-Za-z0-9_.-]")
 # pricing — "pricing unknown" is reported in that case (see
 # :func:`cost_of`).
 PRICING: Dict[str, tuple[float, float]] = {
-    "deepseek-v4.1-flash-free": (0.0, 0.0),
+    "deepseek-v4.1-flash-1017": (0.0, 0.0),
 }
 
 USAGE = "usage:\n  /cost        show session token usage and estimated cost\n  /cost reset  clear this session's counters"
@@ -306,9 +306,9 @@ def _selftest() -> int:
 
     # 1. known free-route pricing
     check("known pricing math",
-          cost_of("deepseek-v4.1-flash-free", 500_000, 250_000) == 0.0)
-    check("pricing_for known", pricing_for("deepseek-v4.1-flash-free") == (0.0, 0.0))
-    check("is_pricing_known true", is_pricing_known("deepseek-v4.1-flash-free"))
+          cost_of("deepseek-v4.1-flash-1017", 500_000, 250_000) == 0.0)
+    check("pricing_for known", pricing_for("deepseek-v4.1-flash-1017") == (0.0, 0.0))
+    check("is_pricing_known true", is_pricing_known("deepseek-v4.1-flash-1017"))
 
     # 2. unknown model handling
     check("unknown -> (0,0)", pricing_for("nope/mystery-9") == (0.0, 0.0))
@@ -321,8 +321,8 @@ def _selftest() -> int:
     check("register attaches tracker",
           isinstance(getattr(agent, "cost_tracker", None), CostTracker))
     t = agent.cost_tracker
-    t.add_turn("deepseek-v4.1-flash-free", 500_000, 250_000)
-    t.add_turn("deepseek-v4.1-flash-free", 500_000, 250_000)
+    t.add_turn("deepseek-v4.1-flash-1017", 500_000, 250_000)
+    t.add_turn("deepseek-v4.1-flash-1017", 500_000, 250_000)
     t.add_turn("nope/mystery-9", 1_000_000, 0)        # $0.00, unknown pricing
     tot = t.totals()
     check("totals turns", tot["turns"] == 3)
@@ -333,7 +333,7 @@ def _selftest() -> int:
     check("breakdown flags unknown",
           not tot["by_model"]["nope/mystery-9"]["pricing_known"])
     check("breakdown flags known",
-          tot["by_model"]["deepseek-v4.1-flash-free"]["pricing_known"])
+          tot["by_model"]["deepseek-v4.1-flash-1017"]["pricing_known"])
 
     # 4. persistence round-trip with the temp dir
     path = os.path.join(tmp, "cost-selftest.json")
@@ -367,7 +367,7 @@ def _selftest() -> int:
         def print_error(self, s):
             self.errs.append(s)
 
-    t.add_turn("deepseek-v4.1-flash-free", 1_000_000, 0)
+    t.add_turn("deepseek-v4.1-flash-1017", 1_000_000, 0)
     t.add_turn("nope/mystery-9", 100, 200)
     ui = FakeUI(agent)
     handle_cost(ui, "")

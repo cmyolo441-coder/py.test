@@ -39,7 +39,7 @@ _log = get_logger("router")
 # cost_in/out: relative $ per 1k tokens (free tiers are 0). These are
 # relative units used to compare routes, not billing truth.
 MODEL_TABLE: dict[str, dict[str, Any]] = {
-    "deepseek-v4.1-flash-free": {"capability": 0.95, "cost_in": 0.0,
+    "deepseek-v4.1-flash-1017": {"capability": 0.95, "cost_in": 0.0,
                                  "cost_out": 0.0, "tools": True,
                                  "reasoning": True},
 }

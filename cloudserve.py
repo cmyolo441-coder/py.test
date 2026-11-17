@@ -130,8 +130,9 @@ def _ensure_working_model(cfg) -> str:
     current = getattr(cfg, "model_id", "")
     if has_key(current):
         return current
-    for mid in ("deepseek-v4.1-flash-free", "mistral-large-4",
-                "ernie-5.5-flash-preview"):
+    for mid in ("deepseek-v4.1-flash-1017", "mistral-large-4",
+                "ernie-5.5-flash-preview",
+                "baidu/ernie-5.5-flash-preview:free"):
         if has_key(mid):
             cfg.model_id = mid
             return mid
