@@ -342,7 +342,9 @@ EFFORTS: list[Effort] = [
            "maximum depth, strongest thinking"),
 ]
 
-DEFAULT_EFFORT = "medium"  # light thinking: much faster; ^E for more
+DEFAULT_EFFORT = "low"  # instant answers: reasoning_effort="none" goes on
+                        # the wire (no hidden chain-of-thought before the
+                        # first token); ^E raises effort when wanted
 
 
 def model_by_id(model_id: str) -> Model | None:

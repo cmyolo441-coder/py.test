@@ -657,7 +657,19 @@ class Agent:
                                           "model": self.cfg.model_id,
                                           "effort": self.cfg.effort},
                         actor="system")
-        self.forge.probe()  # PERCEIVE: stamp the environment
+        # SPEED: PERCEIVE off the critical path. forge.probe() spawns
+        # several `--version` subprocesses (each with its own timeout);
+        # a slow/hanging tool used to stall the FIRST turn by seconds.
+        # The digest is observational — nothing in the turn reads it
+        # synchronously — so seal it from a daemon thread instead.
+        import threading as _threading
+        def _probe_bg():
+            try:
+                self.forge.probe()
+            except Exception:
+                pass  # env stamping must never break a turn
+        _threading.Thread(target=_probe_bg, name="forge-probe",
+                          daemon=True).start()
         # SPEED: pre-warm the TCP+TLS connection to the provider in the
         # background — the first model call hits a warm socket, not a cold
         # handshake (saves 200-800ms on the first turn)
@@ -818,12 +830,18 @@ class Agent:
         sections: dict[str, str] = {}
         head = self.log.head()
 
-        # constitution — cached until the log grows (it's a file read)
-        if not hasattr(self, "_const_cache") or self._const_cache_head != head:
-            self._const_cache = self.oracle.read_constitution().strip()
-            self._const_cache_head = head
-        if self._const_cache:
-            sections["constitution"] = self._const_cache
+        # constitution — cached until the log grows (it's a file read).
+        # With a user-supplied system prompt the built-in constitution
+        # would COMPETE with the user's own rules (two masters problem):
+        # the user's prompt is the sole authority, so skip it entirely.
+        from . import systemprompt as _sp_const
+        if not _sp_const.has_user_prompt():
+            if (not hasattr(self, "_const_cache")
+                    or self._const_cache_head != head):
+                self._const_cache = self.oracle.read_constitution().strip()
+                self._const_cache_head = head
+            if self._const_cache:
+                sections["constitution"] = self._const_cache
 
         # project instructions — real AGENTS.md files (global → cwd).
         # instructions.py caches by mtime/size, so a multi-call turn does

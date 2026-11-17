@@ -340,10 +340,13 @@ class PromptGate:
                                                          current_text))
 
         if sections is not None:
+            # The user's rules reminder rides at the END of the system
+            # prompt on EVERY prompt name — not just "master". A long
+            # custom prompt loses attention on its early rules; the
+            # recency checklist is what keeps them followed.
             desired = self.composer.compose(
                 sealed, sections,
-                checklist_src=(systemprompt.USER_PROMPT
-                               if prompt_name == "master" else None))
+                checklist_src=(systemprompt.USER_PROMPT or None))
             report.sections = self.composer.manifest(sections)
             if current_text != desired:
                 systemprompt.with_system(messages, desired)
