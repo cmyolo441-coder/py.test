@@ -1,0 +1,51 @@
+pipeline:
+  id: pipeline_cmyolo441_coder_py_test_build_ff1d
+  name: pipeline_cmyolo441_coder_py_test_build_ff1d
+  stages:
+    - name: Build and Test
+      id: build_and_test
+      runtime: cloud
+      platform:
+        os: linux
+        arch: amd64
+      clone:
+        enabled: true
+      cache:
+        enabled: true
+      steps:
+        - name: Setup Python
+          id: setup_python
+          run:
+            shell: bash
+            script: |-
+              python3 --version
+              pip3 --version
+        - name: Install Dependencies
+          id: install_deps
+          run:
+            shell: bash
+            script: pip install -r requirements.txt
+        - name: Compile Check
+          id: compile_check
+          run:
+            shell: bash
+            script: python -m compileall -q fullagent
+        - name: Run Module Self-Tests
+          id: run_selftests
+          run:
+            shell: bash
+            script: python run_selftests.py
+        - name: Run Unit Tests
+          id: run_unit_tests
+          run:
+            shell: bash
+            script: |-
+              mkdir -p .harness/reports
+              pip install pytest --no-input
+              pytest tests/ --junitxml=.harness/reports/junit.xml -v
+            report:
+              type: junit
+              paths:
+                - .harness/reports/junit.xml
+  tags:
+    onboarding: "true"
